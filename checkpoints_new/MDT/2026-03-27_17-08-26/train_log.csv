@@ -1,2 +1,0 @@
-epoch,train_loss,val_loss,val_dice,val_iou,val_acc,val_acc_pixel,val_hd95
-1,1.2904,1.0863,0.5903,0.4188,0.9236,0.9967,42.0745
