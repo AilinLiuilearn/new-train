@@ -1,0 +1,66 @@
+# -*- coding: utf-8 -*-
+import argparse
+from configs.base import ConfigBase, str2bool
+
+
+class SegMDTConfig(ConfigBase):
+
+    @staticmethod
+    def data_parser():
+        p = argparse.ArgumentParser("Data", add_help=False)
+        p.add_argument("--root", type=str, default="../data/PCLT20K")
+        p.add_argument("--random_state", type=int, default=2023)
+        p.add_argument("--val_ratio", type=float, default=0.1)
+        p.add_argument("--use_case_split", type=str2bool, default=True)
+        p.add_argument("--cipa_aligned", type=str2bool, default=False)
+        p.add_argument("--image_size_2d", type=int, default=512)
+        p.add_argument("--num_workers", type=int, default=4)
+        p.add_argument("--aug_strong", type=str2bool, default=False)
+        return p
+
+    @staticmethod
+    def model_parser():
+        p = argparse.ArgumentParser("Model", add_help=False)
+        p.add_argument("--backbone", type=str, default="pvt_v2_b2")
+        p.add_argument("--student_backbone", type=str, default="pvt_v2_b0", choices=("pvtv2_b0", "pvt_v2_b0", "mit_b0", "mit_b1", "mit_b2", "resnet18", "resnet34"))
+        p.add_argument("--pretrained_backbone", type=str2bool, default=True)
+        p.add_argument("--pretrained_path", type=str, default=None)
+        p.add_argument("--student_pretrained_path", type=str, default=None)
+        p.add_argument("--ct_to_3ch", type=str2bool, default=False)
+        return p
+
+    @staticmethod
+    def train_parser():
+        p = argparse.ArgumentParser("Train", add_help=False)
+        p.add_argument("--epochs", type=int, default=70)
+        p.add_argument("--batch_size", type=int, default=16)
+        p.add_argument("--accumulation_steps", type=int, default=1, help="梯度累加步数")
+        p.add_argument("--optimizer", type=str, default="adamw", choices=("sgd", "adamw"))
+        p.add_argument("--learning_rate", type=float, default=1e-4)
+        p.add_argument("--decoder_lr", type=float, default=1e-4)
+        p.add_argument("--weight_decay", type=float, default=1e-4)
+        p.add_argument("--cosine_warmup", type=int, default=10)
+        p.add_argument("--cosine_min_lr", type=float, default=1e-6)
+        p.add_argument("--mixed_precision", type=str2bool, default=True)
+        p.add_argument("--early_stop_patience", type=int, default=15)
+        p.add_argument("--eval_threshold", type=float, default=0.5)
+        p.add_argument("--grad_clip", type=float, default=0.5)
+        return p
+
+    @staticmethod
+    def task_specific_parser():
+        p = argparse.ArgumentParser("Task", add_help=False)
+        p.add_argument("--dice_smooth", type=float, default=1.0)
+        p.add_argument("--pos_weight", type=float, default=None)
+        p.add_argument("--bce_weight", type=float, default=1.0)
+        p.add_argument("--dice_weight", type=float, default=1.0)
+        return p
+
+    @classmethod
+    def parse_arguments(cls):
+        parents = [cls.ddp_parser(), cls.data_parser(), cls.model_parser(),
+                   cls.train_parser(), cls.logging_parser(), cls.task_specific_parser()]
+        parser = argparse.ArgumentParser(add_help=True, parents=parents)
+        config = cls()
+        parser.parse_args(namespace=config)
+        return config

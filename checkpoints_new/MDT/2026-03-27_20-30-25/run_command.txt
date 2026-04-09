@@ -1,0 +1,1 @@
+run_mdt_seg.py --root /root/autodl-tmp/data/PCLT20K --epochs 100 --batch_size 8 --backbone mit_b3 --teacher_decoder fpn --alpha_seg 1.0 --alpha_hsic 0.05 --alpha_cross_scale 0.1 --umsd_low_freq_ratio 0.25 --learning_rate 1e-4 --weight_decay 5e-4 --mixed_precision True --pretrained_path pretrained/mit-b3 --cipa_aligned True

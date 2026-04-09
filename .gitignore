@@ -1,0 +1,11 @@
+# 忽略所有数据集目录
+datasets/
+data/
+# 忽略权重文件
+*.pth
+*.pkl
+*.zip
+*.tar
+# 忽略日志
+log/
+__pycache__/
