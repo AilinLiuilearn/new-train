@@ -1,1 +1,0 @@
-run_mdt_seg.py --root /root/autodl-tmp/data/PCLT20K --backbone mit_b3 --use_cmx True --cipa_aligned True --epochs 100 --batch_size 8 --early_stop_patience 20 --random_state 2024 --num_workers 4 --pretrained_backbone True --pretrained_path pretrained/mit-b3 --teacher_decoder mlp --fdmf_loss_scale 3
