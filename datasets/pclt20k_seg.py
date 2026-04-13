@@ -112,13 +112,23 @@ class PCLT20KSegDataset(Dataset):
             img, mask = elasticTransform(img, mask, alpha=80, sigma=8, u=0.8)
             if mask.ndim == 3 and mask.shape[2] == 1:
                 mask = mask.squeeze(2)
-        img = np.array(img, np.float32).transpose(2, 0, 1) / 255.0 * 3.2 - 1.6
+        img = np.array(img, np.float32).transpose(2, 0, 1) / 255.0
         mask = np.array(mask, np.float32)
         mask = mask[None, ...] if mask.ndim == 2 else mask.transpose(2, 0, 1)
         mask = mask / 255.0
         mask[mask >= 0.5] = 1.0
         mask[mask < 0.5] = 0.0
-        return img[0:1], img[1:2], mask
+
+        pet_ch = img[0:1]
+        ct_ch = img[1:2]
+        pet_rgb = np.repeat(pet_ch, 3, axis=0)
+        ct_rgb = np.repeat(ct_ch, 3, axis=0)
+
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+        pet_rgb = (pet_rgb - mean) / std
+        ct_rgb = (ct_rgb - mean) / std
+        return pet_rgb, ct_rgb, mask
 
     def __getitem__(self, idx):
         pet_ch, ct_ch, mask = self._load_and_augment(idx)
