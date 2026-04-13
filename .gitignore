@@ -1,5 +1,5 @@
 # 忽略所有数据集目录
-datasets/
+# datasets/
 data/
 pretrained/
 # 忽略权重文件
