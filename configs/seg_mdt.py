@@ -22,11 +22,7 @@ class SegMDTConfig(ConfigBase):
     def model_parser():
         p = argparse.ArgumentParser("Model", add_help=False)
         p.add_argument("--backbone", type=str, default="pvt_v2_b2")
-        p.add_argument("--student_backbone", type=str, default="pvt_v2_b0", choices=("pvtv2_b0", "pvt_v2_b0", "mit_b0", "mit_b1", "mit_b2", "resnet18", "resnet34"))
-        p.add_argument("--pretrained_backbone", type=str2bool, default=True)
         p.add_argument("--pretrained_path", type=str, default=None)
-        p.add_argument("--student_pretrained_path", type=str, default=None)
-        p.add_argument("--ct_to_3ch", type=str2bool, default=False)
         return p
 
     @staticmethod
@@ -42,6 +38,8 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--cosine_warmup", type=int, default=10)
         p.add_argument("--cosine_min_lr", type=float, default=1e-6)
         p.add_argument("--mixed_precision", type=str2bool, default=True)
+        p.add_argument("--vis_every_epoch", type=str2bool, default=True)
+        p.add_argument("--vis_epoch_samples", type=int, default=2)
         p.add_argument("--early_stop_patience", type=int, default=15)
         p.add_argument("--eval_threshold", type=float, default=0.5)
         p.add_argument("--grad_clip", type=float, default=0.5)
@@ -58,8 +56,7 @@ class SegMDTConfig(ConfigBase):
 
     @classmethod
     def parse_arguments(cls):
-        parents = [cls.ddp_parser(), cls.data_parser(), cls.model_parser(),
-                   cls.train_parser(), cls.logging_parser(), cls.task_specific_parser()]
+        parents = [cls.ddp_parser(), cls.data_parser(), cls.model_parser(), cls.train_parser(), cls.logging_parser(), cls.task_specific_parser()]
         parser = argparse.ArgumentParser(add_help=True, parents=parents)
         config = cls()
         parser.parse_args(namespace=config)

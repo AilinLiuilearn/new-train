@@ -1,0 +1,49 @@
+{
+  "overall": {
+    "n": 4514,
+    "mean_dice": 0.62962160761195,
+    "mean_iou": 0.5337533575206342,
+    "mean_sensitivity": 0.6442165592456524,
+    "mean_precision": 0.6869362905813114,
+    "miss_count": 598,
+    "miss_rate": 0.13247673903411608
+  },
+  "by_size": {
+    "tiny(<=50)": {
+      "n": 476,
+      "mean_dice": 0.14451659112414295,
+      "mean_iou": 0.10357127749650864,
+      "mean_sensitivity": 0.25723087797328403,
+      "mean_precision": 0.1437543199063515,
+      "miss_count": 292,
+      "miss_rate": 0.6134453781512605
+    },
+    "small(51-200)": {
+      "n": 957,
+      "mean_dice": 0.48801253384382626,
+      "mean_iou": 0.39031321773061556,
+      "mean_sensitivity": 0.5206664236806695,
+      "mean_precision": 0.5576113085793325,
+      "miss_count": 169,
+      "miss_rate": 0.17659352142110762
+    },
+    "medium(201-1000)": {
+      "n": 2000,
+      "mean_dice": 0.7169646545479725,
+      "mean_iou": 0.6101735858971258,
+      "mean_sensitivity": 0.7265043932757482,
+      "mean_precision": 0.7708318140314884,
+      "miss_count": 112,
+      "miss_rate": 0.056
+    },
+    "large(>1000)": {
+      "n": 1081,
+      "mean_dice": 0.8069979050885943,
+      "mean_iou": 0.7087750292297433,
+      "mean_sensitivity": 0.7717530957499492,
+      "mean_precision": 0.8853891850464525,
+      "miss_count": 25,
+      "miss_rate": 0.02312673450508788
+    }
+  }
+}
