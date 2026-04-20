@@ -7,6 +7,7 @@ pretrained/
 *.pkl
 *.zip
 *.tar
+*.png
 # 忽略日志
 log/
 __pycache__/

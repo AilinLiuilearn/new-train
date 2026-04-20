@@ -214,7 +214,6 @@ class CAB(nn.Module):
             ratio = in_channels
         reduced_channels = in_channels // ratio
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
         self.activation = act_layer(activation, inplace=True)
         self.fc1 = nn.Conv2d(in_channels, reduced_channels, 1, bias=False)
         self.fc2 = nn.Conv2d(reduced_channels, in_channels, 1, bias=False)
@@ -225,8 +224,10 @@ class CAB(nn.Module):
         named_apply(partial(_init_weights, scheme=scheme), self)
 
     def forward(self, x):
-        avg_out = self.fc2(self.activation(self.fc1(self.avg_pool(x))))
-        max_out = self.fc2(self.activation(self.fc1(self.max_pool(x))))
+        avg_pool = self.avg_pool(x)
+        max_pool = torch.amax(x, dim=(2, 3), keepdim=True)
+        avg_out = self.fc2(self.activation(self.fc1(avg_pool)))
+        max_out = self.fc2(self.activation(self.fc1(max_pool)))
         return self.sigmoid(avg_out + max_out)
 
 

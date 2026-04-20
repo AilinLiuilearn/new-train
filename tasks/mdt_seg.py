@@ -42,51 +42,24 @@ class WeightedBCELoss(nn.Module):
         return F.binary_cross_entropy_with_logits(logits, target, pos_weight=pw)
 
 
-# class MutationLoss(nn.Module):
-#     def __init__(self, pos_weight=None, smooth=1.0):
-#         super().__init__()
-#         self.bce = WeightedBCELoss(pos_weight=pos_weight)
-#         self.iou = WeightedIoULoss(smooth=smooth)
-
-#     def _single(self, pred, target):
-#         return self.bce(pred, target) + self.iou(pred, target)
-
-#     def forward(self, preds, target):
-#         losses = [self._single(p, target) for p in preds]
-#         psum = preds[0]
-#         for p in preds[1:]:
-#             psum = psum + p
-#         losses.append(self._single(psum, target))
-#         return sum(losses), losses
-class MutationLoss(nn.Module):
+class TeacherBaselineLoss(nn.Module):
     def __init__(self, pos_weight=None, smooth=1.0):
         super().__init__()
         self.bce = WeightedBCELoss(pos_weight=pos_weight)
         self.iou = WeightedIoULoss(smooth=smooth)
-        # 针对 p1, p2, p3, p4 设置递增的权重
-        self.weights = [1.0, 1.0, 1.0, 1.0] 
 
     def _single(self, pred, target):
         return self.bce(pred, target) + self.iou(pred, target)
 
     def forward(self, preds, target):
-        # 假设 preds 顺序为 [p1, p2, p3, p4] (低分辨率到高分辨率)
-        loss = 0.0
-        losses = []
-        for i, p in enumerate(preds):
-            l = self._single(p, target)
-            loss += self.weights[i] * l
-            losses.append(l)
-            
-        # 你的原逻辑中有 psum，如果是加和输出，可以给一个固定权重
+        p1 = preds[0]
         psum = preds[0]
         for p in preds[1:]:
             psum = psum + p
-        psum_loss = self._single(psum, target)
-        loss += 1.0 * psum_loss
-        losses.append(psum_loss)
-        
-        return loss, losses
+        loss_p1 = self._single(p1, target)
+        loss_sum = self._single(psum, target)
+        total = loss_p1 + 0.5 * loss_sum
+        return total, [loss_p1, loss_sum]
 
 
 def _forward(nets, ct, pet, target_size):
@@ -102,7 +75,7 @@ class MDTSegTeacher:
             v.to(self.device)
 
         self.scaler = torch.amp.GradScaler('cuda') if config.mixed_precision else None
-        self.loss_seg = MutationLoss(
+        self.loss_seg = TeacherBaselineLoss(
             pos_weight=getattr(config, 'pos_weight', None),
             smooth=getattr(config, 'dice_smooth', 1.0),
         ).to(self.device)
@@ -117,13 +90,22 @@ class MDTSegTeacher:
         )
         self.scheduler = None
 
+    def _compute_total_loss(self, outputs, mask):
+        preds = outputs['preds'] if isinstance(outputs, dict) else outputs
+        loss_seg, _ = self.loss_seg(preds, mask)
+        loss_dict = {
+            'loss_seg': loss_seg.detach(),
+            'loss_total': loss_seg.detach(),
+        }
+        return loss_seg, preds, loss_dict
+
     def train_step(self, batch):
         ct = batch['ct'].float().to(self.device)
         pet = batch['pet'].float().to(self.device)
         mask = batch['mask'].float().to(self.device)
-        preds = _forward(self.networks, ct, pet, mask.shape[-2:])
-        loss, _ = self.loss_seg(preds, mask)
-        return loss, preds[0], mask, {'loss_seg': loss.detach()}
+        outputs = _forward(self.networks, ct, pet, mask.shape[-2:])
+        loss, preds, loss_dict = self._compute_total_loss(outputs, mask)
+        return loss, preds[0], mask, loss_dict
 
     @torch.no_grad()
     def evaluate(self, loader, threshold=None):
@@ -137,8 +119,8 @@ class MDTSegTeacher:
             ct = batch['ct'].float().to(self.device)
             pet = batch['pet'].float().to(self.device)
             mask = batch['mask'].float().to(self.device)
-            preds = _forward(self.networks, ct, pet, mask.shape[-2:])
-            loss, _ = self.loss_seg(preds, mask)
+            outputs = _forward(self.networks, ct, pet, mask.shape[-2:])
+            loss, preds, _ = self._compute_total_loss(outputs, mask)
             total_loss += loss.item() * ct.size(0)
             n += ct.size(0)
             m.update(preds[0], mask)
