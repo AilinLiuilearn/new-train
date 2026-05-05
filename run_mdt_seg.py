@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Teacher training entry for PVTv2-EMCAD baseline."""
+"""Teacher training entry for PVTv2-B1 lightweight UNet baseline."""
 
 import importlib.util
 import json
@@ -66,7 +66,6 @@ def _build_loaders(config):
             config.batch_size,
             config.num_workers,
             config.random_state,
-            getattr(config, 'aug_strong', False),
             pin_memory=getattr(config, 'pin_memory', True),
         )
     return dataset_mod.get_pclt20k_loaders(
@@ -77,7 +76,6 @@ def _build_loaders(config):
         val_ratio=config.val_ratio,
         random_state=config.random_state,
         use_case_split=getattr(config, 'use_case_split', True),
-        aug_strong=getattr(config, 'aug_strong', False),
         pin_memory=getattr(config, 'pin_memory', True),
     )
 
