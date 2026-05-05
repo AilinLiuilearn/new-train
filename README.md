@@ -1,0 +1,37 @@
+完整的教师的执行的命令：
+cd /root/autodl-tmp/mkd-main/new-train && CUDA_VISIBLE_DEVICES=0 python run_mdt_seg.py \
+  --gpus 0 \
+  --root /root/autodl-tmp/data/PCLT20K \
+  --cipa_aligned true \
+  --image_size_2d 512 \
+  --num_workers 4 \
+  --aug_strong true \
+  --backbone pvt_v2_b2 \
+  --pretrained_path /root/autodl-tmp/mkd-main/new-train/pretrained/pvt_v2_b2 \
+  --epochs 60 \
+  --batch_size 8 \
+  --accumulation_steps 2 \
+  --optimizer adamw \
+  --learning_rate 8e-5 \
+  --decoder_lr 8e-5 \
+  --weight_decay 1e-4 \
+  --cosine_warmup 2 \
+  --cosine_min_lr 1e-6 \
+  --mixed_precision true \
+  --vis_every_epoch true \
+  --vis_epoch_samples 2 \
+  --early_stop_patience 15 \
+  --eval_threshold 0.5 \
+  --grad_clip 0.5 \
+  --ema_decay 0.999 \
+  --ema_warmup_epochs 3 \
+  --checkpoint_root ./checkpoints_new/ \
+  --save_every 5 \
+  --enable_wandb false \
+  --loss_type bce_iou \
+  --dice_smooth 1.0 \
+  --bce_weight 1.0 \
+  --dice_weight 1.0 \
+  --iou_weight 1.0 \
+  --p_sum_weights 0.5 0.2 0.2 0.1 \
+  --p_sum_loss_weight 0.3
