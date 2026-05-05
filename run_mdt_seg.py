@@ -67,6 +67,7 @@ def _build_loaders(config):
             config.num_workers,
             config.random_state,
             getattr(config, 'aug_strong', False),
+            pin_memory=getattr(config, 'pin_memory', True),
         )
     return dataset_mod.get_pclt20k_loaders(
         config.root,
@@ -77,6 +78,7 @@ def _build_loaders(config):
         random_state=config.random_state,
         use_case_split=getattr(config, 'use_case_split', True),
         aug_strong=getattr(config, 'aug_strong', False),
+        pin_memory=getattr(config, 'pin_memory', True),
     )
 
 
@@ -117,6 +119,7 @@ def main():
         warmup_steps=config.cosine_warmup * updates_per_epoch,
         min_lr=config.cosine_min_lr,
         steps_per_epoch=updates_per_epoch,
+        flat_ratio=getattr(config, 'lr_flat_ratio', 0.3),
     )
 
     log_path = os.path.join(config.checkpoint_dir, 'train_log.csv')
@@ -133,6 +136,7 @@ def main():
         tloss, tn = 0.0, 0
         if hasattr(task.networks.get('model'), 'set_epoch'):
             task.networks['model'].set_epoch(epoch)
+        task.set_epoch(epoch)
         task.optimizer.zero_grad()
 
         for i, batch in enumerate(train_loader):
@@ -150,6 +154,7 @@ def main():
                     task.scaler.step(task.optimizer)
                     task.scaler.update()
                     task.optimizer.zero_grad()
+                    task.update_ema()
                     stepped = True
             else:
                 loss.backward()
@@ -158,6 +163,7 @@ def main():
                         torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
                     task.optimizer.step()
                     task.optimizer.zero_grad()
+                    task.update_ema()
                     stepped = True
 
             if task.scheduler and stepped:
@@ -210,6 +216,8 @@ def main():
         for k, v in task.networks.items():
             if k in ckpt:
                 v.load_state_dict(ckpt[k], strict=False)
+        if task.use_ema and 'ema_model' in ckpt:
+            task.ema_model.load_state_dict(ckpt['ema_model'], strict=False)
 
     best_dice_path = os.path.join(config.checkpoint_dir, 'ckpt.best_dice.pth.tar')
     best_hd95_path = os.path.join(config.checkpoint_dir, 'ckpt.best_hd95.pth.tar')
@@ -239,28 +247,6 @@ def main():
         num_samples=min(8, config.batch_size),
         threshold=getattr(config, 'eval_threshold', 0.5),
     )
-
-    _load_checkpoint(best_dice_path)
-
-    with open(os.path.join(config.checkpoint_dir, 'test_results_best_dice.json'), 'w') as f:
-        json.dump({k: float(v) for k, v in test_m_dice.items()}, f, indent=2)
-    with open(os.path.join(config.checkpoint_dir, 'test_results_best_hd95.json'), 'w') as f:
-        json.dump({k: float(v) for k, v in test_m_hd95.items()}, f, indent=2)
-    with open(os.path.join(config.checkpoint_dir, 'test_results.json'), 'w') as f:
-        json.dump({k: float(v) for k, v in test_m_dice.items()}, f, indent=2)
-    with open(os.path.join(config.checkpoint_dir, 'summary.json'), 'w') as f:
-        json.dump({
-            'best_dice_epoch': int(best_dice_epoch),
-            'best_val_dice': float(best_dice),
-            'best_hd95_epoch': int(best_hd95_epoch),
-            'best_val_hd95': float(best_hd95),
-            'test_best_dice': {k: float(v) for k, v in test_m_dice.items()},
-            'test_best_hd95': {k: float(v) for k, v in test_m_hd95.items()},
-            'final_epoch': int(epoch),
-        }, f, indent=4)
-
-    print('Best Dice epoch:', best_dice_epoch, ' Val Dice:', round(best_dice, 4))
-    print('Best HD95 epoch:', best_hd95_epoch, ' Val HD95:', round(best_hd95, 4))
 
 
 if __name__ == '__main__':

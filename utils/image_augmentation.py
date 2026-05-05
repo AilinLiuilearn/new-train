@@ -61,6 +61,35 @@ def randomcrop(image, mask, u=0.6):
     return image, mask
 
 
+def randomcrop_lesion_center(image, mask, u=0.5, crop_range=(0.82, 0.94), jitter_ratio=0.08):
+    if np.random.random() >= u:
+        return image, mask
+
+    h, w, c = image.shape
+    pos = np.argwhere(mask > 127)
+    if pos.size == 0:
+        return randomcrop(image, mask, u=1.0)
+
+    crop_rate = np.random.uniform(crop_range[0], crop_range[1])
+    crop_h = max(8, int(h * crop_rate))
+    crop_w = max(8, int(w * crop_rate))
+
+    cy, cx = pos[np.random.randint(len(pos))]
+    max_jy = max(1, int(crop_h * jitter_ratio))
+    max_jx = max(1, int(crop_w * jitter_ratio))
+    cy = int(np.clip(cy + np.random.randint(-max_jy, max_jy + 1), 0, h - 1))
+    cx = int(np.clip(cx + np.random.randint(-max_jx, max_jx + 1), 0, w - 1))
+
+    y1 = int(np.clip(cy - crop_h // 2, 0, max(0, h - crop_h)))
+    x1 = int(np.clip(cx - crop_w // 2, 0, max(0, w - crop_w)))
+    y2 = y1 + crop_h
+    x2 = x1 + crop_w
+
+    image = cv2.resize(image[y1:y2, x1:x2, :], (w, h), interpolation=cv2.INTER_CUBIC)
+    mask = cv2.resize(mask[y1:y2, x1:x2], (w, h), interpolation=cv2.INTER_NEAREST)
+    return image, mask
+
+
 def elasticTransform(image, mask, alpha=80, sigma=8, u=0.5):
     """
     弹性形变（Elastic Transform）：对医学肿瘤边界非常重要。

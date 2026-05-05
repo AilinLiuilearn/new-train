@@ -102,6 +102,16 @@ def _normalize_rgb(single_channel):
     return (rgb - IMAGENET_MEAN) / IMAGENET_STD
 
 
+def _normalize_ct_slice(ct_uint8):
+    ct = ct_uint8.astype(np.float32) / 255.0
+    return ct[None, ...]
+
+
+def _normalize_pet_slice(pet_uint8):
+    pet = pet_uint8.astype(np.float32) / 255.0
+    return pet[None, ...]
+
+
 class PCLT20KSegDataset(Dataset):
     def __init__(self, records, image_size=512, train=False, pet_available_list=None, random_state=2023, aug_strong=False):
         self.records = records
@@ -131,11 +141,31 @@ class PCLT20KSegDataset(Dataset):
     def _augment(self, img, mask):
         if not self.train:
             return img, mask
-        img, mask = randomShiftScaleRotate(img, mask, shift_limit=(-0.15, 0.15), scale_limit=(-0.12, 0.12), u=0.7)
-        img, mask = randomHorizontalFlip(img, mask)
-        img, mask = randomVerticalFlip(img, mask, u=0.5)
-        img, mask = randomcrop(img, mask, u=0.6)
-        img, mask = elasticTransform(img, mask, alpha=80, sigma=8, u=0.8)
+
+        if self.aug_strong:
+            img, mask = randomShiftScaleRotate(
+                img,
+                mask,
+                shift_limit=(-0.15, 0.15),
+                scale_limit=(-0.12, 0.12),
+                rotate_limit=(-30, 30),
+                u=0.7,
+            )
+            img, mask = randomHorizontalFlip(img, mask, u=0.5)
+            img, mask = randomVerticalFlip(img, mask, u=0.3)
+            img, mask = randomcrop(img, mask, u=0.5)
+            img, mask = elasticTransform(img, mask, alpha=60, sigma=7, u=0.4)
+        else:
+            img, mask = randomShiftScaleRotate(
+                img,
+                mask,
+                shift_limit=(-0.05, 0.05),
+                scale_limit=(-0.05, 0.05),
+                rotate_limit=(-8, 8),
+                u=0.45,
+            )
+            img, mask = randomHorizontalFlip(img, mask, u=0.5)
+
         return img, mask
 
     def __getitem__(self, idx):
@@ -149,7 +179,7 @@ class PCLT20KSegDataset(Dataset):
         img = np.stack([pet, ct], axis=-1)
         img, mask = self._augment(img, mask)
 
-        img = img.astype(np.float32).transpose(2, 0, 1) / 255.0
+        img = img.astype(np.float32).transpose(2, 0, 1)
         mask = (mask.astype(np.float32) / 255.0)
         if mask.ndim == 2:
             mask = mask[None, ...]
@@ -157,8 +187,8 @@ class PCLT20KSegDataset(Dataset):
             mask = mask.transpose(2, 0, 1)
         mask = (mask >= 0.5).astype(np.float32)
 
-        pet_ch = img[0:1]
-        ct_ch = img[1:2]
+        pet_ch = _normalize_pet_slice(img[0])
+        ct_ch = _normalize_ct_slice(img[1])
         ct_rgb = _normalize_rgb(ct_ch)
         if self.pet_available[idx]:
             pet_rgb = _normalize_rgb(pet_ch)
@@ -180,7 +210,7 @@ def _seed_worker(worker_id):
     random.seed(worker_seed)
 
 
-def _make_loader(dataset, batch_size, num_workers, shuffle, drop_last, seed):
+def _make_loader(dataset, batch_size, num_workers, shuffle, drop_last, seed, pin_memory=True):
     generator = torch.Generator()
     generator.manual_seed(int(seed))
     return DataLoader(
@@ -189,13 +219,13 @@ def _make_loader(dataset, batch_size, num_workers, shuffle, drop_last, seed):
         shuffle=shuffle,
         num_workers=num_workers,
         drop_last=drop_last,
-        pin_memory=True,
+        pin_memory=pin_memory,
         worker_init_fn=_seed_worker,
         generator=generator,
     )
 
 
-def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_workers=4, random_state=2023, aug_strong=False):
+def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_workers=4, random_state=2023, aug_strong=False, pin_memory=True):
     train_ids = _read_list(os.path.join(root, 'train.txt'))
     test_ids = _read_list(os.path.join(root, 'test.txt'))
     if train_ids is None or test_ids is None:
@@ -208,6 +238,8 @@ def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_wor
 
     print(f'[CIPA对齐] 训练(complete配对): {len(complete_records)}  测试/验证: {len(test_records)}')
     print('  ← 对比 CIPA: train.txt 全量用于训练, test.txt 既做 early stop 也是最终报告')
+    print(f'  ← 数据增强: {"strong" if aug_strong else "weak"}')
+    print('  ← PET归一化: /255 + ImageNet 标准化')
 
     train_ds = PCLT20KSegDataset(
         complete_records,
@@ -219,13 +251,13 @@ def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_wor
     )
     test_ds = PCLT20KSegDataset(test_records, image_size=image_size, train=False)
     return (
-        _make_loader(train_ds, batch_size, num_workers, True, True, random_state + 11),
-        _make_loader(test_ds, batch_size, num_workers, False, False, random_state + 17),
-        _make_loader(test_ds, batch_size, num_workers, False, False, random_state + 17),
+        _make_loader(train_ds, batch_size, num_workers, True, True, random_state + 11, pin_memory=pin_memory),
+        _make_loader(test_ds, batch_size, num_workers, False, False, random_state + 17, pin_memory=pin_memory),
+        _make_loader(test_ds, batch_size, num_workers, False, False, random_state + 17, pin_memory=pin_memory),
     )
 
 
-def get_pclt20k_loaders(root, image_size=512, batch_size=8, num_workers=4, missing_rate=0.0, val_ratio=0.1, val_ids=None, random_state=2023, use_case_split=False, aug_strong=False):
+def get_pclt20k_loaders(root, image_size=512, batch_size=8, num_workers=4, missing_rate=0.0, val_ratio=0.1, val_ids=None, random_state=2023, use_case_split=False, aug_strong=False, pin_memory=True):
     train_txt = os.path.join(root, 'train.txt')
     test_txt = os.path.join(root, 'test.txt')
     val_txt = os.path.join(root, 'val.txt')
@@ -249,51 +281,17 @@ def get_pclt20k_loaders(root, image_size=512, batch_size=8, num_workers=4, missi
         train_records, val_records, test_records = _collect_records(root, random_state=random_state)
 
     complete_records, _ = _split_complete_incomplete(train_records, missing_rate, random_state)
+
     print(f'教师：complete {len(complete_records)} 验证 {len(val_records)} 测试 {len(test_records)}')
+    print(f'  ← 数据增强: {"strong" if aug_strong else "weak"}')
+    print('  ← PET归一化: /255 + ImageNet 标准化')
 
     train_ds = PCLT20KSegDataset(complete_records, image_size=image_size, train=True, pet_available_list=[True] * len(complete_records), random_state=random_state, aug_strong=aug_strong)
     val_ds = PCLT20KSegDataset(val_records, image_size=image_size, train=False)
     test_ds = PCLT20KSegDataset(test_records, image_size=image_size, train=False)
     return (
-        _make_loader(train_ds, batch_size, num_workers, True, True, random_state + 11),
-        _make_loader(val_ds, batch_size, num_workers, False, False, random_state + 17),
-        _make_loader(test_ds, batch_size, num_workers, False, False, random_state + 23),
+        _make_loader(train_ds, batch_size, num_workers, True, True, random_state + 11, pin_memory=pin_memory),
+        _make_loader(val_ds, batch_size, num_workers, False, False, random_state + 17, pin_memory=pin_memory),
+        _make_loader(test_ds, batch_size, num_workers, False, False, random_state + 23, pin_memory=pin_memory),
     )
 
-
-def get_pclt20k_loaders_student(root, image_size=512, batch_size=8, num_workers=4, missing_rate=0.3, val_ratio=0.1, val_ids=None, random_state=2023, use_case_split=False, aug_strong=False):
-    train_txt = os.path.join(root, 'train.txt')
-    test_txt = os.path.join(root, 'test.txt')
-    val_txt = os.path.join(root, 'val.txt')
-
-    if use_case_split:
-        train_records, val_records, test_records = _collect_records(root, random_state=random_state)
-    elif os.path.isfile(train_txt) and os.path.isfile(test_txt):
-        train_ids = _read_list(train_txt)
-        test_ids = _read_list(test_txt)
-        if val_ids is None and os.path.isfile(val_txt):
-            val_ids = _read_list(val_txt)
-        train_records, val_records, test_records = _collect_records(
-            root,
-            train_ids,
-            test_ids,
-            val_ids=val_ids,
-            val_ratio=val_ratio,
-            random_state=random_state,
-        )
-    else:
-        train_records, val_records, test_records = _collect_records(root, random_state=random_state)
-
-    complete_records, incomplete_records = _split_complete_incomplete(train_records, missing_rate, random_state)
-    print(f'学生：配对 {len(complete_records)} 非配对 {len(incomplete_records)} 验证 {len(val_records)} 测试 {len(test_records)}')
-
-    train_paired_ds = PCLT20KSegDataset(complete_records, image_size=image_size, train=True, pet_available_list=[True] * len(complete_records), random_state=random_state, aug_strong=aug_strong)
-    train_unpaired_ds = PCLT20KSegDataset(incomplete_records, image_size=image_size, train=True, pet_available_list=[False] * len(incomplete_records), random_state=random_state, aug_strong=aug_strong)
-    val_ds = PCLT20KSegDataset(val_records, image_size=image_size, train=False)
-    test_ds = PCLT20KSegDataset(test_records, image_size=image_size, train=False)
-
-    train_paired_loader = _make_loader(train_paired_ds, batch_size, num_workers, True, True, random_state + 11) if len(complete_records) > 0 else None
-    train_unpaired_loader = _make_loader(train_unpaired_ds, batch_size, num_workers, True, True, random_state + 13) if len(incomplete_records) > 0 else None
-    val_loader = _make_loader(val_ds, batch_size, num_workers, False, False, random_state + 17)
-    test_loader = _make_loader(test_ds, batch_size, num_workers, False, False, random_state + 23)
-    return train_paired_loader, train_unpaired_loader, val_loader, test_loader

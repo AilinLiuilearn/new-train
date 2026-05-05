@@ -42,31 +42,39 @@ def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshol
             prob_img = prob[i]
             gt_img = (gt[i] > 0.5).astype(np.float32)
             pred_bin = (prob_img > threshold).astype(np.float32)
+
+            tp = np.logical_and(gt_img > 0.5, pred_bin > 0.5)
             fn = np.logical_and(gt_img > 0.5, pred_bin < 0.5)
             fp = np.logical_and(gt_img < 0.5, pred_bin > 0.5)
 
-            err = np.zeros((gt_img.shape[0], gt_img.shape[1], 3), dtype=np.float32)
-            err[..., 0] = fn.astype(np.float32)
-            err[..., 2] = fp.astype(np.float32)
-
-            gt_rgb = np.stack([ct_img, ct_img, ct_img], axis=-1)
-            gt_rgb[..., 0] = np.clip(gt_rgb[..., 0] + 1.0 * gt_img, 0, 1)
-            gt_rgb[..., 1] = np.clip(gt_rgb[..., 1] * (1.0 - 0.85 * gt_img), 0, 1)
-            gt_rgb[..., 2] = np.clip(gt_rgb[..., 2] * (1.0 - 0.85 * gt_img), 0, 1)
             gt_binary = np.stack([gt_img, gt_img, gt_img], axis=-1)
+            pred_binary = np.zeros((gt_img.shape[0], gt_img.shape[1], 3), dtype=np.float32)
+            pred_binary[..., 1] = pred_bin.astype(np.float32)
+
+            gt_overlay = _overlay_mask_on_gray(ct_img, gt_img, color=(1.0, 0.0, 0.0), alpha=0.85)
+            pred_overlay = _overlay_mask_on_gray(ct_img, pred_bin, color=(0.0, 1.0, 0.0), alpha=0.90)
+            compare_overlay = _overlay_gt_pred_on_gray(ct_img, gt_img, pred_bin)
+            error_map = _make_error_map(tp, fn, fp)
+            zoom_error = _make_zoom_error_panel(ct_img, gt_img, pred_bin, tp, fn, fp)
+            fusion_panels = _extract_fusion_panels(task.networks['model'], i)
 
             panels = [
                 ('CT', ct_img, 'gray'),
                 ('PET', pet_img, 'inferno'),
                 ('Confidence', prob_img, 'jet'),
-                ('GT Overlay', gt_rgb, None),
+                ('GT Overlay', gt_overlay, None),
+                ('Pred Overlay', pred_overlay, None),
+                ('GT vs Pred', compare_overlay, None),
                 ('GT Mask', gt_binary, None),
-                ('FN/FP', err, None),
+                ('Pred Mask', pred_binary, None),
+                ('FN/FP/TP', error_map, None),
+                ('Zoomed Error', zoom_error, None),
             ]
+            panels.extend(fusion_panels[:10])
 
-            ncols = 4
+            ncols = 5
             nrows = int(np.ceil(len(panels) / ncols))
-            fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 3.6 * nrows))
+            fig, axes = plt.subplots(nrows, ncols, figsize=(4.8 * ncols, 4.0 * nrows))
             axes = np.atleast_1d(axes).reshape(nrows, ncols)
 
             for ax, (title, img, cmap) in zip(axes.flat, panels):
@@ -81,7 +89,7 @@ def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshol
                 ax.axis('off')
 
             plt.tight_layout()
-            plt.savefig(os.path.join(out_dir, f'diagnostic_{saved:03d}.png'), dpi=140)
+            plt.savefig(os.path.join(out_dir, f'diagnostic_{saved:03d}.png'), dpi=160)
             plt.close(fig)
             saved += 1
 
@@ -89,6 +97,101 @@ def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshol
             break
 
     print(f'[vis_teacher] saved {saved} diagnostics to {out_dir}')
+
+
+def _extract_fusion_panels(model, sample_idx):
+    if not hasattr(model, 'get_fusion_visuals'):
+        return []
+    visuals = model.get_fusion_visuals()
+    if not visuals:
+        return []
+
+    panels = []
+    for stage_name in ('fuse1', 'fuse2', 'fuse3', 'fuse4'):
+        if stage_name not in visuals:
+            continue
+        stage = visuals[stage_name]
+        for key in sorted(stage.keys()):
+            if key == 'scale':
+                continue
+            val = stage[key]
+            if not isinstance(val, torch.Tensor):
+                continue
+            if val.dim() < 3:
+                continue
+            cmap = 'viridis' if 'ct' in key else ('inferno' if 'pet' in key else 'magma')
+            panels.append((f'{stage_name} {key}', _tensor_map(val, sample_idx), cmap))
+    return panels
+
+
+def _tensor_map(tensor, sample_idx):
+    idx = min(sample_idx, tensor.shape[0] - 1)
+    arr = tensor[idx].detach().float().cpu().numpy()
+    if arr.ndim == 3:
+        arr = arr.mean(axis=0)
+    arr = arr - arr.min()
+    arr = arr / (arr.max() + 1e-8)
+    return arr
+
+
+def _overlay_mask_on_gray(gray_img, mask, color=(0.0, 1.0, 0.0), alpha=0.85):
+    rgb = np.stack([gray_img, gray_img, gray_img], axis=-1).astype(np.float32)
+    mask = (mask > 0.5).astype(np.float32)[..., None]
+    color_arr = np.array(color, dtype=np.float32).reshape(1, 1, 3)
+    rgb = rgb * (1.0 - alpha * mask) + color_arr * (alpha * mask) + rgb * (0.15 * mask)
+    return np.clip(rgb, 0.0, 1.0)
+
+
+def _overlay_gt_pred_on_gray(gray_img, gt_mask, pred_mask):
+    rgb = np.stack([gray_img, gray_img, gray_img], axis=-1).astype(np.float32)
+    gt_mask = gt_mask > 0.5
+    pred_mask = pred_mask > 0.5
+
+    tp = np.logical_and(gt_mask, pred_mask)
+    fn = np.logical_and(gt_mask, np.logical_not(pred_mask))
+    fp = np.logical_and(np.logical_not(gt_mask), pred_mask)
+
+    rgb[tp] = np.array([1.0, 1.0, 0.0], dtype=np.float32)
+    rgb[fn] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    rgb[fp] = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    return np.clip(rgb, 0.0, 1.0)
+
+
+def _make_error_map(tp, fn, fp):
+    err = np.zeros((tp.shape[0], tp.shape[1], 3), dtype=np.float32)
+    err[..., 0] = fn.astype(np.float32)
+    err[..., 1] = np.maximum(tp.astype(np.float32), fp.astype(np.float32) * 0.95)
+    err[..., 2] = fp.astype(np.float32)
+    return np.clip(err, 0.0, 1.0)
+
+
+def _make_zoom_error_panel(ct_img, gt_img, pred_bin, tp, fn, fp, pad=24, min_size=96):
+    union = np.logical_or(gt_img > 0.5, pred_bin > 0.5)
+    if union.any():
+        ys, xs = np.where(union)
+        y0, y1 = ys.min(), ys.max() + 1
+        x0, x1 = xs.min(), xs.max() + 1
+        y0 = max(0, y0 - pad)
+        x0 = max(0, x0 - pad)
+        y1 = min(ct_img.shape[0], y1 + pad)
+        x1 = min(ct_img.shape[1], x1 + pad)
+    else:
+        h, w = ct_img.shape
+        cy, cx = h // 2, w // 2
+        half = min_size // 2
+        y0, y1 = max(0, cy - half), min(h, cy + half)
+        x0, x1 = max(0, cx - half), min(w, cx + half)
+
+    crop_ct = ct_img[y0:y1, x0:x1]
+    crop_tp = tp[y0:y1, x0:x1]
+    crop_fn = fn[y0:y1, x0:x1]
+    crop_fp = fp[y0:y1, x0:x1]
+
+    base = np.stack([crop_ct, crop_ct, crop_ct], axis=-1).astype(np.float32)
+    base[crop_tp] = np.array([1.0, 1.0, 0.0], dtype=np.float32)
+    base[crop_fn] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    base[crop_fp] = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    return np.clip(base, 0.0, 1.0)
 
 
 def _to_display(img_3ch):
