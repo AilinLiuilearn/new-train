@@ -1,4 +1,5 @@
 import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,7 +34,7 @@ def load_local_weights_safe(model, path, name='Encoder'):
         print(f'[-] {name}: Path not found {path}. Training from scratch.')
         return
     if os.path.isdir(path):
-        for cand in ('pytorch_model.bin', 'model.safetensors', 'pvt_v2_b2.pth', 'pvt_v2_b0.pth'):
+        for cand in ('pytorch_model.bin', 'model.safetensors', 'pvt_v2_b2.pth'):
             full = os.path.join(path, cand)
             if os.path.exists(full):
                 path = full
@@ -59,20 +60,11 @@ def load_local_weights_safe(model, path, name='Encoder'):
 
 
 class DualPVTB2EMCAD(nn.Module):
-    """Teacher baseline: dual PVTv2-B2 encoder with four-stage additive fusion."""
+    """Teacher baseline: dual-stream CT/PET PVTv2-B2 encoder with additive EMCAD decoder."""
 
-    def __init__(
-        self,
-        pretrained_path=None,
-        in_channels=3,
-        out_channels=1,
-        kernel_sizes=(1, 3, 5),
-        expansion_factor=2,
-        dw_parallel=True,
-        add=True,
-        lgag_ks=3,
-        activation='relu6',
-    ):
+    def __init__(self, pretrained_path=None, in_channels=3, out_channels=1,
+                 kernel_sizes=(1, 3, 5), expansion_factor=2, dw_parallel=True, add=True,
+                 lgag_ks=3, activation='relu6'):
         super().__init__()
         self.enc_ct = timm.create_model(
             'pvt_v2_b2', pretrained=False, features_only=True, out_indices=(0, 1, 2, 3), in_chans=in_channels
@@ -108,10 +100,13 @@ class DualPVTB2EMCAD(nn.Module):
     def forward(self, ct, pet, target_size=None):
         ct = self._to_3ch(ct)
         pet = self._to_3ch(pet)
+        ct_feats = self.enc_ct(ct)
+        pet_feats = self.enc_pet(pet)
 
-        feats_ct = self.enc_ct(ct)
-        feats_pet = self.enc_pet(pet)
-        x1, x2, x3, x4 = [feat_ct + feat_pet for feat_ct, feat_pet in zip(feats_ct, feats_pet)]
+        x1 = ct_feats[0] + pet_feats[0]
+        x2 = ct_feats[1] + pet_feats[1]
+        x3 = ct_feats[2] + pet_feats[2]
+        x4 = ct_feats[3] + pet_feats[3]
 
         d4, d3, d2, d1 = self.decoder(x4, [x3, x2, x1])
         if target_size is None:
@@ -132,4 +127,4 @@ def build_mdt_seg_teacher(config):
         in_channels=3,
         out_channels=1,
     )
-    return {'model': model}
+    return dict(model=model)
