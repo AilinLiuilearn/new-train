@@ -122,7 +122,8 @@ class LightUNetDecoder(nn.Module):
 class DualPVTB1LightUNet(nn.Module):
     """Dual CT/PET PVTv2-B1 teacher with BiomedCLIP-guided TCPM fusion."""
 
-    def __init__(self, pretrained_path=None, in_channels=3, out_channels=1, freeze_text_encoder=True):
+    def __init__(self, pretrained_path=None, in_channels=3, out_channels=1, freeze_text_encoder=True,
+             tcpm_topk_ratio=0.5, tcpm_text_hidden=256, tcpm_se_ratio=8, tcpm_attn_ratio=0.75):
         super().__init__()
         self.enc_ct = timm.create_model(
             'pvt_v2_b1', pretrained=False, features_only=True, out_indices=(0, 1, 2, 3), in_chans=in_channels
@@ -137,7 +138,15 @@ class DualPVTB1LightUNet(nn.Module):
         encoder_channels = self.enc_ct.feature_info.channels()
         self.text_encoder = BiomedCLIPTextEncoder(freeze=freeze_text_encoder)
         self.tcpm_blocks = nn.ModuleList([
-            MULTI_shuffle_high_text(ch_dim=channel, num_heads=head, lin_ch=512)
+            MULTI_shuffle_high_text(
+                ch_dim=channel,
+                num_heads=head,
+                lin_ch=512,
+                topk_ratio=tcpm_topk_ratio,
+                text_hidden=tcpm_text_hidden,
+                se_ratio=tcpm_se_ratio,
+                attn_ratio=tcpm_attn_ratio,
+            )
             for channel, head in zip(encoder_channels, (1, 2, 4, 8))
         ])
         self.decoder = LightUNetDecoder(encoder_channels)
@@ -180,5 +189,9 @@ def build_mdt_seg_teacher(config):
         in_channels=3,
         out_channels=1,
         freeze_text_encoder=getattr(config, 'freeze_text_encoder', True),
+        tcpm_topk_ratio=getattr(config, 'tcpm_topk_ratio', 0.5),
+        tcpm_text_hidden=getattr(config, 'tcpm_text_hidden', 256),
+        tcpm_se_ratio=getattr(config, 'tcpm_se_ratio', 8),
+        tcpm_attn_ratio=getattr(config, 'tcpm_attn_ratio', 0.75),
     )
     return dict(model=model)

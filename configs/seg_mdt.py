@@ -23,6 +23,10 @@ class SegMDTConfig(ConfigBase):
         p = argparse.ArgumentParser("Model", add_help=False)
         p.add_argument("--backbone", type=str, default="pvt_v2_b1")
         p.add_argument("--pretrained_path", type=str, default=None)
+        p.add_argument("--tcpm_topk_ratio", type=float, default=0.5)
+        p.add_argument("--tcpm_text_hidden", type=int, default=256)
+        p.add_argument("--tcpm_se_ratio", type=int, default=8)
+        p.add_argument("--tcpm_attn_ratio", type=float, default=0.75)
         return p
 
     @staticmethod

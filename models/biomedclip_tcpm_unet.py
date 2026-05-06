@@ -85,6 +85,24 @@ class LayerNorm2d(nn.Module):
         return self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
 
 
+class LiteFeedForward(nn.Module):
+    def __init__(self, c, expansion=0.5):
+        super().__init__()
+        h = max(8, int(c * expansion))
+        self.net = nn.Sequential(
+            nn.Conv2d(c, h, 1, bias=False),
+            nn.BatchNorm2d(h),
+            nn.GELU(),
+            nn.Conv2d(h, h, 3, padding=1, groups=h, bias=False),
+            nn.BatchNorm2d(h),
+            nn.GELU(),
+            nn.Conv2d(h, c, 1, bias=False),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class FeedForward(nn.Module):
     def __init__(self, c, expansion=2.0):
         super().__init__()
@@ -101,21 +119,25 @@ class FeedForward(nn.Module):
 
 
 class TopmCrossAttentionRestormerPrivileged(nn.Module):
-    def __init__(self, c, heads=4, keep_ratio=0.9):
+    def __init__(self, c, heads=4, keep_ratio=0.9, attn_ratio=0.5):
         super().__init__()
-        assert c % heads == 0, f"channels {c} must be divisible by heads {heads}"
         self.heads = heads
         self.keep_ratio = keep_ratio
+        attn_c = max(heads, int(c * attn_ratio))
+        attn_c = max(heads, (attn_c // heads) * heads)
+        self.attn_c = attn_c
         self.temperature = nn.Parameter(torch.ones(heads, 1, 1))
-        self.q = nn.Sequential(nn.Conv2d(c, c, 1), nn.Conv2d(c, c, 3, padding=1, groups=c))
-        self.kv = nn.Sequential(nn.Conv2d(c, c * 2, 1), nn.Conv2d(c * 2, c * 2, 3, padding=1, groups=c * 2))
-        self.proj = nn.Conv2d(c, c, 1)
+        self.q_reduce = nn.Conv2d(c, attn_c, 1, bias=False)
+        self.kv_reduce = nn.Conv2d(c, attn_c * 2, 1, bias=False)
+        self.q_dw = nn.Conv2d(attn_c, attn_c, 3, padding=1, groups=attn_c, bias=False)
+        self.kv_dw = nn.Conv2d(attn_c * 2, attn_c * 2, 3, padding=1, groups=attn_c * 2, bias=False)
+        self.proj = nn.Conv2d(attn_c, c, 1, bias=False)
         self.scale = nn.Parameter(torch.tensor([0.2]))
 
     def forward(self, x_q, x_kv):
         _, _, h, w = x_q.shape
-        q = self.q(x_q)
-        k, v = self.kv(x_kv).chunk(2, dim=1)
+        q = self.q_dw(self.q_reduce(x_q))
+        k, v = self.kv_dw(self.kv_reduce(x_kv)).chunk(2, dim=1)
         q = rearrange(q, "b (hd c) h w -> b hd c (h w)", hd=self.heads)
         k = rearrange(k, "b (hd c) h w -> b hd c (h w)", hd=self.heads)
         v = rearrange(v, "b (hd c) h w -> b hd c (h w)", hd=self.heads)
@@ -131,19 +153,33 @@ class TopmCrossAttentionRestormerPrivileged(nn.Module):
 
 
 class MULTI_shuffle_high_text(nn.Module):
-    def __init__(self, ch_dim, num_heads=4, lin_ch=512, topk_ratio=0.5):
+    def __init__(self, ch_dim, num_heads=4, lin_ch=512, topk_ratio=0.5, text_hidden=256, se_ratio=8, attn_ratio=0.75, gate_init=-1.0):
         super().__init__()
         self.dim = ch_dim
         self.topk = max(1, int(2 * ch_dim * topk_ratio))
-        hidden = max(1, 2 * ch_dim // 8)
-        self.text_fc = nn.Sequential(nn.Linear(lin_ch, lin_ch), nn.ReLU(True), nn.Linear(lin_ch, 2 * ch_dim))
-        self.se_fc = nn.Sequential(nn.Linear(2 * ch_dim, hidden), nn.ReLU(True), nn.Linear(hidden, 2 * ch_dim), nn.Sigmoid())
+        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+        hidden = max(4, 2 * ch_dim // se_ratio)
+        text_hidden = min(text_hidden, lin_ch)
+        self.text_fc = nn.Sequential(
+            nn.Linear(lin_ch, text_hidden, bias=False),
+            nn.ReLU(True),
+            nn.Linear(text_hidden, 2 * ch_dim, bias=False),
+        )
+        self.se_fc = nn.Sequential(
+            nn.Linear(2 * ch_dim, hidden, bias=False),
+            nn.ReLU(True),
+            nn.Linear(hidden, 2 * ch_dim, bias=False),
+            nn.Sigmoid(),
+        )
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.pick_conv = nn.Conv2d(self.topk, 2 * ch_dim, 1)
-        self.out_conv = nn.Conv2d(2 * ch_dim, ch_dim, 1)
+        self.pick_conv = nn.Sequential(
+            nn.Conv2d(self.topk, self.topk, 3, padding=1, groups=self.topk, bias=False),
+            nn.Conv2d(self.topk, 2 * ch_dim, 1, bias=False),
+        )
+        self.out_conv = nn.Conv2d(2 * ch_dim, ch_dim, 1, bias=False)
         self.n1, self.n2, self.n3 = LayerNorm2d(ch_dim), LayerNorm2d(ch_dim), LayerNorm2d(ch_dim)
-        self.attn = TopmCrossAttentionRestormerPrivileged(ch_dim, num_heads)
-        self.ffn = FeedForward(ch_dim)
+        self.attn = TopmCrossAttentionRestormerPrivileged(ch_dim, num_heads, attn_ratio=attn_ratio)
+        self.ffn = LiteFeedForward(ch_dim, expansion=0.5)
 
     def forward(self, pet_feature, ct_feature, text_code):
         b, _, h, w = pet_feature.shape
@@ -156,7 +192,13 @@ class MULTI_shuffle_high_text(nn.Module):
         q = self.out_conv(img)
         ref = self.out_conv(both)
         att = self.attn(self.n1(q), self.n2(ref))
-        return att + self.ffn(self.n3(att)), ref
+        tcpm_out = att + self.ffn(self.n3(att))
+
+        base = pet_feature + ct_feature
+        gate = torch.sigmoid(self.gate)
+        out = base + gate * (tcpm_out - base)
+
+        return out, ref
 
 
 class ConvBlock(nn.Module):
