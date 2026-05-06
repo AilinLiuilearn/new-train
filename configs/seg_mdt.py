@@ -16,13 +16,12 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--image_size_2d", type=int, default=512)
         p.add_argument("--num_workers", type=int, default=4)
         p.add_argument("--pin_memory", type=str2bool, default=True)
-        p.add_argument("--aug_strong", type=str2bool, default=True)
         return p
 
     @staticmethod
     def model_parser():
         p = argparse.ArgumentParser("Model", add_help=False)
-        p.add_argument("--backbone", type=str, default="pvt_v2_b2")
+        p.add_argument("--backbone", type=str, default="pvt_v2_b1")
         p.add_argument("--pretrained_path", type=str, default=None)
         return p
 
@@ -51,16 +50,10 @@ class SegMDTConfig(ConfigBase):
     @staticmethod
     def task_specific_parser():
         p = argparse.ArgumentParser("Task", add_help=False)
-        p.add_argument("--dice_smooth", type=float, default=1.0)
+        p.add_argument("--iou_smooth", type=float, default=1.0)
         p.add_argument("--pos_weight", type=float, default=None)
         p.add_argument("--bce_weight", type=float, default=1.0)
-        p.add_argument("--dice_weight", type=float, default=1.0)
         p.add_argument("--iou_weight", type=float, default=1.0)
-        p.add_argument("--focal_weight", type=float, default=1.0)
-        p.add_argument("--focal_gamma", type=float, default=2.0)
-        p.add_argument("--loss_type", type=str, default="bce_iou", choices=("bce_iou", "bce_dice", "bce_dice_focal"))
-        p.add_argument("--p_sum_weights", type=float, nargs='+', default=[0.5, 0.2, 0.2, 0.1])
-        p.add_argument("--p_sum_loss_weight", type=float, default=0.3)
         p.add_argument("--lr_flat_ratio", type=float, default=0.3)
         return p
 

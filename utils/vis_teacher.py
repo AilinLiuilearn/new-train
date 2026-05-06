@@ -25,8 +25,9 @@ def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshol
         pet = batch['pet'].float().to(task.device)
         mask = batch['mask'].float().to(task.device)
         outputs = task.networks['model'](ct, pet, target_size=mask.shape[-2:])
-        preds = outputs['preds'] if isinstance(outputs, dict) else outputs
-        logit = preds[0]
+        logit = outputs['preds'] if isinstance(outputs, dict) else outputs
+        if isinstance(logit, (list, tuple)):
+            logit = logit[0]
 
         prob = torch.sigmoid(logit).squeeze(1).cpu().numpy()
         gt = mask.squeeze(1).cpu().numpy()
