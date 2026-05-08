@@ -12,6 +12,11 @@ from utils.image_augmentation import (
     randomShiftScaleRotate,
     randomVerticalFlip,
     randomcrop,
+    randomcrop_lesion_center,
+    elasticTransform,
+    randomBrightnessContrast,
+    randomGaussianNoise,
+    randomGaussianBlur,
 )
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
@@ -140,17 +145,20 @@ class PCLT20KSegDataset(Dataset):
         if not self.train:
             return img, mask
 
+        img, mask = randomcrop_lesion_center(img, mask, u=0.4, crop_range=(0.80, 0.95))
         img, mask = randomShiftScaleRotate(
-            img,
-            mask,
-            shift_limit=(-0.08, 0.08),
-            scale_limit=(-0.08, 0.08),
-            rotate_limit=(-15, 15),
-            u=0.5,
+            img, mask,
+            shift_limit=(-0.1, 0.1),
+            scale_limit=(-0.15, 0.15),
+            rotate_limit=(-20, 20),
+            u=0.6,
         )
         img, mask = randomHorizontalFlip(img, mask, u=0.5)
-        img, mask = randomVerticalFlip(img, mask, u=0.2)
-        img, mask = randomcrop(img, mask, u=0.3)
+        img, mask = randomVerticalFlip(img, mask, u=0.3)
+        img, mask = elasticTransform(img, mask, alpha=60, sigma=7, u=0.3)
+        img, mask = randomBrightnessContrast(img, mask, brightness_limit=0.12, contrast_limit=0.12, u=0.4)
+        img, mask = randomGaussianNoise(img, mask, var_limit=(3.0, 15.0), u=0.25)
+        img, mask = randomGaussianBlur(img, mask, kernel_range=(3, 5), u=0.15)
         return img, mask
 
     def __getitem__(self, idx):

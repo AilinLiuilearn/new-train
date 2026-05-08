@@ -22,7 +22,7 @@ class SegMDTConfig(ConfigBase):
     def model_parser():
         p = argparse.ArgumentParser("Model", add_help=False)
         p.add_argument("--backbone", type=str, default="pvt_v2_b1")
-        p.add_argument("--pretrained_path", type=str, default="./pretrained/pvt_v2_b1")
+        p.add_argument("--pretrained_path", type=str, default=None)
         return p
 
     @staticmethod
@@ -50,10 +50,10 @@ class SegMDTConfig(ConfigBase):
     @staticmethod
     def task_specific_parser():
         p = argparse.ArgumentParser("Task", add_help=False)
-        p.add_argument("--iou_smooth", type=float, default=1.0)
-        p.add_argument("--pos_weight", type=float, default=None)
+        p.add_argument("--loss_smooth", type=float, default=1.0)
         p.add_argument("--bce_weight", type=float, default=1.0)
-        p.add_argument("--iou_weight", type=float, default=1.0)
+        p.add_argument("--dice_weight", type=float, default=1.0)
+        p.add_argument("--pos_weight", type=float, default=None)
         p.add_argument("--lr_flat_ratio", type=float, default=0.3)
         return p
 
