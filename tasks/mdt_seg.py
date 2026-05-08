@@ -1,46 +1,9 @@
 # -*- coding: utf-8 -*-
 import os
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from utils.metrics_seg import SegmentationMetricsCIPA
 from utils.optimization import get_optimizer
-
-
-def _prepare_target(logits, target):
-    if target.dim() == 3:
-        target = target.unsqueeze(1)
-    target = target.float()
-    if target.shape[-2:] != logits.shape[-2:]:
-        target = F.interpolate(target, size=logits.shape[-2:], mode='nearest')
-    return target
-
-
-class BCEIoULoss(nn.Module):
-    def __init__(self, pos_weight=None, smooth=1.0, bce_weight=1.0, iou_weight=1.0):
-        super().__init__()
-        self.pos_weight = pos_weight
-        self.smooth = smooth
-        self.bce_weight = bce_weight
-        self.iou_weight = iou_weight
-
-    def forward(self, logits, target):
-        target = _prepare_target(logits, target)
-        pw = self.pos_weight
-        if pw is not None and isinstance(pw, (int, float)):
-            pw = torch.tensor(pw, dtype=logits.dtype, device=logits.device)
-        bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pw)
-        pred = torch.sigmoid(logits)
-        intersection = (pred * target).sum(dim=(1, 2, 3))
-        union = pred.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3)) - intersection
-        iou = 1.0 - (intersection + self.smooth) / (union + self.smooth)
-        iou = iou.mean()
-        total = self.bce_weight * bce + self.iou_weight * iou
-        stats = {
-            'loss_bce': bce.detach(),
-            'loss_iou': iou.detach(),
-        }
-        return total, stats
+from utils.seg_losses import BCEDiceLoss
 
 
 def _forward(nets, ct, pet, target_size):
@@ -74,11 +37,11 @@ class MDTSegTeacher:
             self._ema_initialized = True
 
         self.scaler = torch.amp.GradScaler('cuda') if config.mixed_precision else None
-        self.loss_seg = BCEIoULoss(
-            pos_weight=getattr(config, 'pos_weight', None),
-            smooth=getattr(config, 'iou_smooth', 1.0),
+        self.loss_seg = BCEDiceLoss(
             bce_weight=getattr(config, 'bce_weight', 1.0),
-            iou_weight=getattr(config, 'iou_weight', 1.0),
+            dice_weight=getattr(config, 'dice_weight', 1.0),
+            smooth=getattr(config, 'loss_smooth', 1.0),
+            pos_weight=getattr(config, 'pos_weight', None),
         ).to(self.device)
 
         lr = getattr(config, 'decoder_lr', None) or config.learning_rate
@@ -112,10 +75,19 @@ class MDTSegTeacher:
     def set_epoch(self, epoch):
         self._current_epoch = epoch
 
+    def _select_main_pred(self, outputs):
+        if isinstance(outputs, dict):
+            if 'pred' in outputs:
+                return outputs['pred']
+            preds = outputs.get('preds')
+            if isinstance(preds, (list, tuple)):
+                return preds[0]
+        if isinstance(outputs, (list, tuple)):
+            return outputs[0]
+        return outputs
+
     def _compute_total_loss(self, outputs, mask, pixel_weight=None):
-        pred = outputs['preds'] if isinstance(outputs, dict) else outputs
-        if isinstance(pred, (list, tuple)):
-            pred = pred[0]
+        pred = self._select_main_pred(outputs)
         loss_seg, loss_stats = self.loss_seg(pred, mask)
         loss_dict = {
             'loss_seg': loss_seg.detach(),
@@ -150,7 +122,8 @@ class MDTSegTeacher:
             ct = batch['ct'].float().to(self.device)
             pet = batch['pet'].float().to(self.device)
             mask = batch['mask'].float().to(self.device)
-            pred = eval_model(ct, pet, target_size=mask.shape[-2:])
+            outputs = eval_model(ct, pet, target_size=mask.shape[-2:])
+            pred = self._select_main_pred(outputs)
             loss_seg, _ = self.loss_seg(pred, mask)
             total_loss += loss_seg.item() * ct.size(0)
             n += ct.size(0)

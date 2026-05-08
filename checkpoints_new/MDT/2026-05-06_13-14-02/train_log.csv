@@ -1,0 +1,1 @@
+epoch,train_loss,val_loss,val_dice,val_iou,val_acc,val_acc_pixel,val_hd95

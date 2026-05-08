@@ -91,10 +91,6 @@ def randomcrop_lesion_center(image, mask, u=0.5, crop_range=(0.82, 0.94), jitter
 
 
 def elasticTransform(image, mask, alpha=80, sigma=8, u=0.5):
-    """
-    弹性形变（Elastic Transform）：对医学肿瘤边界非常重要。
-    alpha: 形变强度；sigma: 高斯平滑核大小（控制形变平滑度）
-    """
     if np.random.random() >= u:
         return image, mask
     h, w = image.shape[:2]
@@ -112,3 +108,30 @@ def elasticTransform(image, mask, alpha=80, sigma=8, u=0.5):
     mask_out = cv2.remap(mask, map_x, map_y, cv2.INTER_NEAREST,
                          borderMode=cv2.BORDER_REFLECT_101)
     return image_out, mask_out
+
+
+def randomBrightnessContrast(image, mask, brightness_limit=0.15, contrast_limit=0.15, u=0.5):
+    if np.random.random() >= u:
+        return image, mask
+    img = image.astype(np.float32)
+    alpha = 1.0 + np.random.uniform(-contrast_limit, contrast_limit)
+    beta = np.random.uniform(-brightness_limit, brightness_limit) * 255.0
+    img = np.clip(alpha * img + beta, 0, 255).astype(np.uint8)
+    return img, mask
+
+
+def randomGaussianNoise(image, mask, var_limit=(5.0, 25.0), u=0.3):
+    if np.random.random() >= u:
+        return image, mask
+    var = np.random.uniform(var_limit[0], var_limit[1])
+    noise = np.random.normal(0, var, image.shape).astype(np.float32)
+    img = np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    return img, mask
+
+
+def randomGaussianBlur(image, mask, kernel_range=(3, 7), u=0.2):
+    if np.random.random() >= u:
+        return image, mask
+    k = np.random.choice(range(kernel_range[0], kernel_range[1] + 1, 2))
+    image = cv2.GaussianBlur(image, (k, k), 0)
+    return image, mask
