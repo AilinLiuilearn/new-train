@@ -299,16 +299,25 @@ class LightConcatUNetDecoder(nn.Module):
 class DualBackboneUNet(nn.Module):
     """Dual CT/PET teacher with configurable timm backbone and traditional UNet decoder."""
 
-    def __init__(self, backbone='pvt_v2_b1', pretrained_path=None, in_channels=3, out_channels=1):
+    def __init__(self, backbone='pvt_v2_b1', pretrained_path=None,
+                 in_channels=3, out_channels=1, use_tcpm=False):
         super().__init__()
         self.backbone = backbone
+        self.use_tcpm = use_tcpm
         self.enc_ct = create_feature_backbone(backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(backbone, in_channels=in_channels)
         if pretrained_path:
             load_local_weights_safe(self.enc_ct, pretrained_path, name='Teacher_CT_Encoder')
             load_local_weights_safe(self.enc_pet, pretrained_path, name='Teacher_PET_Encoder')
 
-        self.decoder = AttentionUNetDecoder(self.enc_ct.feature_info.channels(), out_channels=out_channels)
+        enc_channels = self.enc_ct.feature_info.channels()
+        self.decoder = AttentionUNetDecoder(enc_channels, out_channels=out_channels)
+
+        if use_tcpm:
+            from models.cudm_text_fusion import MultiStageCUDMTextFusion
+            self.fusion = MultiStageCUDMTextFusion(enc_channels)
+        else:
+            self.fusion = None
 
     @staticmethod
     def _to_3ch(x):
@@ -321,11 +330,23 @@ class DualBackboneUNet(nn.Module):
         pet = self._to_3ch(pet)
         ct_feats = self.enc_ct(ct)
         pet_feats = self.enc_pet(pet)
-        fused_feats = [ct_feat + pet_feat for ct_feat, pet_feat in zip(ct_feats, pet_feats)]
+
+        if self.fusion is not None:
+            fusion_out = self.fusion(ct_feats, pet_feats)
+            if isinstance(fusion_out, tuple):
+                fused_feats, fusion_aux = fusion_out
+            else:
+                fused_feats, fusion_aux = fusion_out, None
+        else:
+            fused_feats = [c + p for c, p in zip(ct_feats, pet_feats)]
+            fusion_aux = None
 
         if target_size is None:
             target_size = ct.shape[-2:]
-        return self.decoder(fused_feats, target_size)
+        outputs = self.decoder(fused_feats, target_size)
+        if fusion_aux is not None and isinstance(outputs, dict):
+            outputs['fusion_aux'] = fusion_aux
+        return outputs
 
     def set_epoch(self, epoch):
         return None
@@ -337,5 +358,6 @@ def build_mdt_seg_teacher(config):
         pretrained_path=getattr(config, 'pretrained_path', None),
         in_channels=3,
         out_channels=1,
+        use_tcpm=getattr(config, 'use_tcpm', False),
     )
     return dict(model=model)

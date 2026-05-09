@@ -23,6 +23,7 @@ class SegMDTConfig(ConfigBase):
         p = argparse.ArgumentParser("Model", add_help=False)
         p.add_argument("--backbone", type=str, default="pvt_v2_b1")
         p.add_argument("--pretrained_path", type=str, default=None)
+        p.add_argument("--use_tcpm", type=str2bool, default=False)
         return p
 
     @staticmethod
@@ -54,6 +55,10 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--bce_weight", type=float, default=1.0)
         p.add_argument("--dice_weight", type=float, default=1.0)
         p.add_argument("--pos_weight", type=float, default=None)
+        p.add_argument("--cudm_tumor_weight", type=float, default=0.0)
+        p.add_argument("--cudm_bg_weight", type=float, default=0.0)
+        p.add_argument("--cudm_orth_weight", type=float, default=0.0)
+        p.add_argument("--cudm_loss_start_stage", type=int, default=3)
         p.add_argument("--lr_flat_ratio", type=float, default=0.3)
         return p
 

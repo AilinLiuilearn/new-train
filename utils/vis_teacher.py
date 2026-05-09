@@ -5,6 +5,7 @@ import os
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 @torch.no_grad()
@@ -58,6 +59,7 @@ def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshol
             error_map = _make_error_map(tp, fn, fp)
             zoom_error = _make_zoom_error_panel(ct_img, gt_img, pred_bin, tp, fn, fp)
             fusion_panels = _extract_fusion_panels(task.networks['model'], i)
+            cudm_panels = _extract_cudm_panels(outputs, i, target_size=gt_img.shape, ct_img=ct_img)
 
             panels = [
                 ('CT', ct_img, 'gray'),
@@ -71,6 +73,7 @@ def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshol
                 ('FN/FP/TP', error_map, None),
                 ('Zoomed Error', zoom_error, None),
             ]
+            panels.extend(cudm_panels)
             panels.extend(fusion_panels[:10])
 
             ncols = 5
@@ -98,6 +101,49 @@ def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshol
             break
 
     print(f'[vis_teacher] saved {saved} diagnostics to {out_dir}')
+
+
+def _extract_cudm_panels(outputs, sample_idx, target_size, ct_img):
+    if not isinstance(outputs, dict) or not outputs.get('fusion_aux'):
+        return []
+
+    panels = []
+    for idx, aux in enumerate(outputs['fusion_aux'], start=1):
+        common = aux.get('common') if isinstance(aux, dict) else None
+        tumor = aux.get('tumor') if isinstance(aux, dict) else None
+        if not isinstance(common, torch.Tensor) or not isinstance(tumor, torch.Tensor):
+            continue
+
+        tumor_map = _feature_energy_map(tumor, sample_idx, target_size)
+        common_map = _feature_energy_map(common, sample_idx, target_size)
+        panels.append((f'CUDM S{idx} Tumor', tumor_map, 'magma'))
+        panels.append((f'CUDM S{idx} Common', common_map, 'viridis'))
+
+        if idx == len(outputs['fusion_aux']):
+            overlay = _overlay_heatmap_on_gray(ct_img, tumor_map, cmap_name='magma', alpha=0.55)
+            panels.append((f'CUDM S{idx} Tumor Overlay', overlay, None))
+    return panels
+
+
+def _feature_energy_map(tensor, sample_idx, target_size):
+    idx = min(sample_idx, tensor.shape[0] - 1)
+    feat = tensor[idx:idx + 1].detach().float()
+    energy = feat.abs().mean(dim=1, keepdim=True)
+    energy = F.interpolate(energy, size=target_size, mode='bilinear', align_corners=False)
+    arr = energy.squeeze().cpu().numpy()
+    arr = arr - arr.min()
+    arr = arr / (arr.max() + 1e-8)
+    return arr
+
+
+def _overlay_heatmap_on_gray(gray_img, heatmap, cmap_name='magma', alpha=0.55):
+    import matplotlib.pyplot as plt
+    cmap = plt.get_cmap(cmap_name)
+    heat_rgb = cmap(np.clip(heatmap, 0.0, 1.0))[..., :3].astype(np.float32)
+    gray_rgb = np.stack([gray_img, gray_img, gray_img], axis=-1).astype(np.float32)
+    weighted_alpha = alpha * np.clip(heatmap, 0.0, 1.0)[..., None]
+    out = gray_rgb * (1.0 - weighted_alpha) + heat_rgb * weighted_alpha
+    return np.clip(out, 0.0, 1.0)
 
 
 def _extract_fusion_panels(model, sample_idx):

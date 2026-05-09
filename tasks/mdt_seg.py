@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import torch
+import torch.nn.functional as F
 from utils.metrics_seg import SegmentationMetricsCIPA
 from utils.optimization import get_optimizer
 from utils.seg_losses import BCEDiceLoss
@@ -86,15 +87,69 @@ class MDTSegTeacher:
             return outputs[0]
         return outputs
 
+    def _compute_cudm_disentangle_loss(self, outputs, mask):
+        bg_weight = float(getattr(self.config, 'cudm_bg_weight', 0.0))
+        legacy_tumor_weight = float(getattr(self.config, 'cudm_tumor_weight', 0.0))
+        if bg_weight <= 0 and legacy_tumor_weight > 0:
+            bg_weight = legacy_tumor_weight
+        orth_weight = float(getattr(self.config, 'cudm_orth_weight', 0.0))
+        start_stage = max(1, int(getattr(self.config, 'cudm_loss_start_stage', 3)))
+        if bg_weight <= 0 and orth_weight <= 0:
+            zero = mask.new_tensor(0.0)
+            return zero, {
+                'loss_cudm_bg': zero.detach(),
+                'loss_cudm_orth': zero.detach(),
+            }
+        if not isinstance(outputs, dict) or not outputs.get('fusion_aux'):
+            zero = mask.new_tensor(0.0)
+            return zero, {
+                'loss_cudm_bg': zero.detach(),
+                'loss_cudm_orth': zero.detach(),
+            }
+
+        bg_losses, orth_losses = [], []
+        eps = 1e-6
+        for stage_idx, aux in enumerate(outputs['fusion_aux'], start=1):
+            if stage_idx < start_stage:
+                continue
+            common = aux['common'].float()
+            tumor = aux['tumor'].float()
+            mask_s = F.interpolate(mask.float(), size=tumor.shape[-2:], mode='nearest')
+
+            energy = tumor.abs().mean(dim=1, keepdim=True)
+            energy = energy / (energy.mean(dim=(2, 3), keepdim=True) + eps)
+            background = 1.0 - mask_s
+            bg_loss = (energy * background).sum(dim=(1, 2, 3)) / (background.sum(dim=(1, 2, 3)) + eps)
+            bg_losses.append(bg_loss.mean())
+
+            common_desc = F.adaptive_avg_pool2d(common, 1).flatten(1)
+            tumor_desc = F.adaptive_avg_pool2d(tumor, 1).flatten(1)
+            common_desc = common_desc - common_desc.mean(dim=1, keepdim=True)
+            tumor_desc = tumor_desc - tumor_desc.mean(dim=1, keepdim=True)
+            cosine = F.cosine_similarity(common_desc, tumor_desc, dim=1, eps=eps)
+            orth_losses.append((cosine ** 2).mean())
+
+        loss_bg = torch.stack(bg_losses).mean() if bg_losses else mask.new_tensor(0.0)
+        loss_orth = torch.stack(orth_losses).mean() if orth_losses else mask.new_tensor(0.0)
+        loss = bg_weight * loss_bg + orth_weight * loss_orth
+        return loss, {
+            'loss_cudm_bg': loss_bg.detach(),
+            'loss_cudm_orth': loss_orth.detach(),
+        }
+
     def _compute_total_loss(self, outputs, mask, pixel_weight=None):
         pred = self._select_main_pred(outputs)
         loss_seg, loss_stats = self.loss_seg(pred, mask)
+        loss_cudm, cudm_stats = self._compute_cudm_disentangle_loss(outputs, mask)
+        loss_total = loss_seg + loss_cudm
         loss_dict = {
             'loss_seg': loss_seg.detach(),
-            'loss_total': loss_seg.detach(),
+            'loss_cudm': loss_cudm.detach(),
+            'loss_total': loss_total.detach(),
         }
         loss_dict.update(loss_stats)
-        return loss_seg, pred, loss_dict
+        loss_dict.update(cudm_stats)
+        return loss_total, pred, loss_dict
 
     def train_step(self, batch):
         ct = batch['ct'].float().to(self.device)
