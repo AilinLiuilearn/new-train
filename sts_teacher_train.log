@@ -1,0 +1,117 @@
+GPU=0 backbone=convnext_nano single_modality=False
+lr=0.00012 wd=0.0005 bs=16
+[STS] patient-level split
+  train: slices=1337 patients=36 min/max per patient=15/82
+  val: slices=222 patients=5 min/max per patient=19/81
+  test: slices=361 patients=10 min/max per patient=15/58
+  ← 数据增强: train only, light paired CT/PET/mask augment
+  ← CT/PET归一化: PNG range -> /255 or /65535 + ImageNet 标准化
+[+] Teacher_CT_Encoder: Loading local weights from ./pretrained/convnext_nano/pytorch_model.bin
+[+] Teacher_CT_Encoder loaded params: 142, skipped: 0
+[+] Teacher_CT_Encoder load status: <All keys matched successfully>
+[+] Teacher_PET_Encoder: Loading local weights from ./pretrained/convnext_nano/pytorch_model.bin
+[+] Teacher_PET_Encoder loaded params: 142, skipped: 0
+[+] Teacher_PET_Encoder load status: <All keys matched successfully>
+
+============================== MODEL PROFILE ==============================
+[INFO] Register count_convNd() for <class 'torch.nn.modules.conv.Conv2d'>.
+[INFO] Register zero_ops() for <class 'torch.nn.modules.dropout.Dropout'>.
+[INFO] Register zero_ops() for <class 'torch.nn.modules.container.Sequential'>.
+[INFO] Register count_normalization() for <class 'torch.nn.modules.batchnorm.BatchNorm2d'>.
+[INFO] Register zero_ops() for <class 'torch.nn.modules.activation.ReLU'>.
+[INFO] Register count_adap_avgpool() for <class 'torch.nn.modules.pooling.AdaptiveAvgPool2d'>.
+[INFO] Register count_linear() for <class 'torch.nn.modules.linear.Linear'>.
+[INFO] Register count_normalization() for <class 'torch.nn.modules.normalization.LayerNorm'>.
+[teacher_baseline] Params: 38.57M  FLOPs: 35.09G
+===========================================================================
+
+[+] EMA enabled, decay=0.9995, warmup_epochs=5
+  Ep1[50/83] loss=1.5538 seg=1.5538 lr=0.000024
+/root/miniconda3/lib/python3.8/site-packages/torch/autograd/__init__.py:200: UserWarning: upsample_bilinear2d_backward_out_cuda does not have a deterministic implementation, but you set 'torch.use_deterministic_algorithms(True, warn_only=True)'. You can file an issue at https://github.com/pytorch/pytorch/issues to help us prioritize adding deterministic support for this operation. (Triggered internally at ../aten/src/ATen/Context.cpp:71.)
+  Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+Epoch 1 loss=1.5718 Dice=0.7228 IoU=0.5659 HD95=52.36
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_001
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/ckpt.best.pth.tar
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/ckpt.best_dice.pth.tar
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/ckpt.best_hd95.pth.tar
+  Ep2[50/83] loss=1.4161 seg=1.4161 lr=0.000064
+/root/miniconda3/lib/python3.8/site-packages/torch/autograd/__init__.py:200: UserWarning: upsample_bilinear2d_backward_out_cuda does not have a deterministic implementation, but you set 'torch.use_deterministic_algorithms(True, warn_only=True)'. You can file an issue at https://github.com/pytorch/pytorch/issues to help us prioritize adding deterministic support for this operation. (Triggered internally at ../aten/src/ATen/Context.cpp:71.)
+  Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+Epoch 2 loss=1.3925 Dice=0.7733 IoU=0.6304 HD95=48.62
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_002
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/ckpt.best.pth.tar
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/ckpt.best_dice.pth.tar
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/ckpt.best_hd95.pth.tar
+  Ep3[50/83] loss=1.2147 seg=1.2147 lr=0.000104
+Epoch 3 loss=1.2739 Dice=0.8053 IoU=0.6741 HD95=41.15
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_003
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/ckpt.best.pth.tar
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/ckpt.best_dice.pth.tar
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/ckpt.best_hd95.pth.tar
+  Ep4[50/83] loss=1.1515 seg=1.1515 lr=0.000120
+Epoch 4 loss=1.1803 Dice=0.7791 IoU=0.6382 HD95=45.37
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_004
+  Ep5[50/83] loss=1.0807 seg=1.0807 lr=0.000120
+Epoch 5 loss=1.0648 Dice=0.7875 IoU=0.6495 HD95=55.16
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_005
+  Ep6[50/83] loss=0.9356 seg=0.9356 lr=0.000120
+Epoch 6 loss=0.9741 Dice=0.3818 IoU=0.2359 HD95=80.16
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_006
+  Ep7[50/83] loss=0.9189 seg=0.9189 lr=0.000119
+Epoch 7 loss=0.8931 Dice=0.3868 IoU=0.2398 HD95=82.23
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_007
+  Ep8[50/83] loss=0.8058 seg=0.8058 lr=0.000119
+Epoch 8 loss=0.8232 Dice=0.7448 IoU=0.5934 HD95=51.44
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_008
+  Ep9[50/83] loss=0.7817 seg=0.7817 lr=0.000118
+Epoch 9 loss=0.7675 Dice=0.0024 IoU=0.0012 HD95=166.00
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_009
+  Ep10[50/83] loss=0.6587 seg=0.6587 lr=0.000117
+Epoch 10 loss=0.7123 Dice=0.4708 IoU=0.3079 HD95=66.26
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_010
+  Ep11[50/83] loss=0.7336 seg=0.7336 lr=0.000116
+Epoch 11 loss=0.6613 Dice=0.1738 IoU=0.0952 HD95=108.11
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_011
+  Ep12[50/83] loss=0.6698 seg=0.6698 lr=0.000115
+Epoch 12 loss=0.6147 Dice=0.1699 IoU=0.0928 HD95=105.18
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_012
+  Ep13[50/83] loss=0.6083 seg=0.6083 lr=0.000114
+Epoch 13 loss=0.5518 Dice=0.0198 IoU=0.0100 HD95=147.74
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_013
+  Ep14[50/83] loss=0.4756 seg=0.4756 lr=0.000113
+Epoch 14 loss=0.5039 Dice=0.1489 IoU=0.0804 HD95=107.58
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_014
+  Ep15[50/83] loss=0.4640 seg=0.4640 lr=0.000112
+Epoch 15 loss=0.4525 Dice=0.2282 IoU=0.1288 HD95=100.07
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_015
+  Ep16[50/83] loss=0.3772 seg=0.3772 lr=0.000110
+Epoch 16 loss=0.4018 Dice=0.1406 IoU=0.0756 HD95=109.88
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_016
+  Ep17[50/83] loss=0.3954 seg=0.3954 lr=0.000109
+Epoch 17 loss=0.3631 Dice=0.0994 IoU=0.0523 HD95=120.76
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_017
+  Ep18[50/83] loss=0.3298 seg=0.3298 lr=0.000107
+Epoch 18 loss=0.3343 Dice=0.0759 IoU=0.0394 HD95=125.93
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_018
+  Ep19[50/83] loss=0.2700 seg=0.2700 lr=0.000105
+Epoch 19 loss=0.3062 Dice=0.0353 IoU=0.0180 HD95=138.97
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_019
+  Ep20[50/83] loss=0.4048 seg=0.4048 lr=0.000104
+Epoch 20 loss=0.2782 Dice=0.1211 IoU=0.0645 HD95=112.36
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_020
+  Ep21[50/83] loss=0.1893 seg=0.1893 lr=0.000102
+Epoch 21 loss=0.2542 Dice=0.1499 IoU=0.0810 HD95=100.82
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_021
+  Ep22[50/83] loss=0.1923 seg=0.1923 lr=0.000100
+Epoch 22 loss=0.2361 Dice=0.1454 IoU=0.0784 HD95=101.50
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_022
+  Ep23[50/83] loss=0.1796 seg=0.1796 lr=0.000098
+Epoch 23 loss=0.2247 Dice=0.1171 IoU=0.0622 HD95=108.11
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_epochs/epoch_023
+Early stop at epoch 23
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/ckpt.last.pth.tar
+
+=== TEST(best_dice) Dice=0.2865 IoU=0.1672 Acc=0.5846 HD95=84.02 ===
+[vis_teacher] saved 8 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_best_dice
+=== TEST(best_hd95) Dice=0.2865 IoU=0.1672 Acc=0.5846 HD95=84.02 ===
+[vis_teacher] saved 8 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-23-13/vis_best_hd95

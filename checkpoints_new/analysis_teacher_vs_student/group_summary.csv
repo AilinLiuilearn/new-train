@@ -1,0 +1,4 @@
+group,count,teacher_dice_mean,student_dice_mean,dice_gap_mean,teacher_hd95_mean,student_hd95_mean,hd95_gap_mean
+hard,1505,0.6312,0.4887,0.1425,15.73,33.64,17.91
+medium,1591,0.6139,0.6064,0.0075,22.99,25.15,2.17
+easy,1418,0.7267,0.7672,-0.0405,11.68,8.77,-2.90

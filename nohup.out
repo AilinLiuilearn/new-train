@@ -1,0 +1,113 @@
+GPU=0 backbone=convnext_nano single_modality=False
+lr=0.00012 wd=0.0005 bs=16
+[CIPA对齐] 训练(complete配对): 17416  测试/验证: 4514
+  ← 对比 CIPA: train.txt 全量用于训练, test.txt 既做 early stop 也是最终报告
+  ← 数据增强: 固定轻量增强
+  ← CT/PET归一化: /255 + ImageNet 标准化
+[+] Teacher_CT_Encoder: Loading local weights from ./pretrained/convnext_nano/pytorch_model.bin
+[+] Teacher_CT_Encoder loaded params: 142, skipped: 0
+[+] Teacher_CT_Encoder load status: <All keys matched successfully>
+[+] Teacher_PET_Encoder: Loading local weights from ./pretrained/convnext_nano/pytorch_model.bin
+[+] Teacher_PET_Encoder loaded params: 142, skipped: 0
+[+] Teacher_PET_Encoder load status: <All keys matched successfully>
+
+============================== MODEL PROFILE ==============================
+[INFO] Register count_convNd() for <class 'torch.nn.modules.conv.Conv2d'>.
+[INFO] Register zero_ops() for <class 'torch.nn.modules.dropout.Dropout'>.
+[INFO] Register zero_ops() for <class 'torch.nn.modules.container.Sequential'>.
+[INFO] Register count_normalization() for <class 'torch.nn.modules.batchnorm.BatchNorm2d'>.
+[INFO] Register zero_ops() for <class 'torch.nn.modules.activation.ReLU'>.
+[INFO] Register count_adap_avgpool() for <class 'torch.nn.modules.pooling.AdaptiveAvgPool2d'>.
+[INFO] Register count_linear() for <class 'torch.nn.modules.linear.Linear'>.
+[INFO] Register count_normalization() for <class 'torch.nn.modules.normalization.LayerNorm'>.
+[teacher_baseline] Params: 38.78M  FLOPs: 35.09G
+===========================================================================
+
+[+] EMA enabled, decay=0.9995, warmup_epochs=5
+/root/autodl-tmp/mkd-main/new-train/tasks/mdt_seg.py:40: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  self.scaler = torch.cuda.amp.GradScaler() if config.mixed_precision else None
+/root/autodl-tmp/mkd-main/new-train/run_mdt_seg.py:188: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(enabled=config.mixed_precision):
+  Ep1[50/1088] loss=1.6671 seg=1.6671 lr=0.000002
+Traceback (most recent call last):
+  File "/root/autodl-tmp/mkd-main/new-train/run_mdt_seg.py", line 310, in <module>
+    main()
+  File "/root/autodl-tmp/mkd-main/new-train/run_mdt_seg.py", line 189, in main
+    loss, _, _, loss_dict = task.train_step(batch)
+  File "/root/autodl-tmp/mkd-main/new-train/tasks/mdt_seg.py", line 158, in train_step
+    outputs = _forward(self.networks, ct, pet, mask.shape[-2:])
+  File "/root/autodl-tmp/mkd-main/new-train/tasks/mdt_seg.py", line 11, in _forward
+    return nets['model'](ct, pet, target_size=target_size)
+  File "/root/miniconda3/envs/myenv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/root/miniconda3/envs/myenv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/root/autodl-tmp/mkd-main/new-train/models/build_mdt_seg.py", line 383, in forward
+    fusion_out = self.fusion(ct_feats, pet_feats)
+  File "/root/miniconda3/envs/myenv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/root/miniconda3/envs/myenv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/root/autodl-tmp/mkd-main/new-train/models/cudm_text_fusion.py", line 303, in forward
+    out, stage_aux = stage(pet_f, ct_f, text_code)
+  File "/root/miniconda3/envs/myenv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/root/miniconda3/envs/myenv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/root/autodl-tmp/mkd-main/new-train/models/cudm_text_fusion.py", line 265, in forward
+    attn_out = self.attn(self.nq(clean_query), self.nkv(tumor))
+  File "/root/miniconda3/envs/myenv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/root/miniconda3/envs/myenv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/root/autodl-tmp/mkd-main/new-train/models/cudm_text_fusion.py", line 133, in forward
+    k, v = self.kv_dw(self.kv(kv_feature)).chunk(2, dim=1)
+KeyboardInterrupt
+GPU=0 backbone=convnext_nano single_modality=False
+lr=0.00012 wd=0.0005 bs=16
+[CIPA对齐] 训练(complete配对): 17416  测试/验证: 4514
+  ← 对比 CIPA: train.txt 全量用于训练, test.txt 既做 early stop 也是最终报告
+  ← 数据增强: 固定轻量增强
+  ← CT/PET归一化: /255 + ImageNet 标准化
+[+] Teacher_CT_Encoder: Loading local weights from ./pretrained/convnext_nano/pytorch_model.bin
+[+] Teacher_CT_Encoder loaded params: 142, skipped: 0
+[+] Teacher_CT_Encoder load status: <All keys matched successfully>
+[+] Teacher_PET_Encoder: Loading local weights from ./pretrained/convnext_nano/pytorch_model.bin
+[+] Teacher_PET_Encoder loaded params: 142, skipped: 0
+[+] Teacher_PET_Encoder load status: <All keys matched successfully>
+
+============================== MODEL PROFILE ==============================
+[INFO] Register count_convNd() for <class 'torch.nn.modules.conv.Conv2d'>.
+[INFO] Register zero_ops() for <class 'torch.nn.modules.dropout.Dropout'>.
+[INFO] Register zero_ops() for <class 'torch.nn.modules.container.Sequential'>.
+[INFO] Register count_normalization() for <class 'torch.nn.modules.batchnorm.BatchNorm2d'>.
+[INFO] Register zero_ops() for <class 'torch.nn.modules.activation.ReLU'>.
+[INFO] Register count_adap_avgpool() for <class 'torch.nn.modules.pooling.AdaptiveAvgPool2d'>.
+[INFO] Register count_linear() for <class 'torch.nn.modules.linear.Linear'>.
+[INFO] Register count_normalization() for <class 'torch.nn.modules.normalization.LayerNorm'>.
+[teacher_baseline] Params: 38.78M  FLOPs: 35.09G
+===========================================================================
+
+[+] EMA enabled, decay=0.9995, warmup_epochs=5
+/root/autodl-tmp/mkd-main/new-train/tasks/mdt_seg.py:40: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  self.scaler = torch.cuda.amp.GradScaler() if config.mixed_precision else None
+/root/autodl-tmp/mkd-main/new-train/run_mdt_seg.py:188: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(enabled=config.mixed_precision):
+  Ep1[50/1088] loss=1.6671 seg=1.6671 lr=0.000002
+  Ep1[100/1088] loss=1.6517 seg=1.6517 lr=0.000004
+  Ep1[150/1088] loss=1.6201 seg=1.6201 lr=0.000006
+  Ep1[200/1088] loss=1.5907 seg=1.5907 lr=0.000007
+Traceback (most recent call last):
+  File "/root/autodl-tmp/mkd-main/new-train/run_mdt_seg.py", line 310, in <module>
+    main()
+  File "/root/autodl-tmp/mkd-main/new-train/run_mdt_seg.py", line 197, in main
+    torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
+  File "/root/miniconda3/envs/myenv/lib/python3.10/site-packages/torch/nn/utils/clip_grad.py", line 38, in _no_grad_wrapper
+    return func(*args, **kwargs)
+  File "/root/miniconda3/envs/myenv/lib/python3.10/site-packages/torch/nn/utils/clip_grad.py", line 219, in clip_grad_norm_
+    total_norm = _get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
+  File "/root/miniconda3/envs/myenv/lib/python3.10/site-packages/torch/nn/utils/clip_grad.py", line 38, in _no_grad_wrapper
+    return func(*args, **kwargs)
+  File "/root/miniconda3/envs/myenv/lib/python3.10/site-packages/torch/nn/utils/clip_grad.py", line 91, in _get_total_norm
+    norms.extend(torch._foreach_norm(device_tensors, norm_type))
+KeyboardInterrupt

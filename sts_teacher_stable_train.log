@@ -1,0 +1,116 @@
+GPU=0 backbone=convnext_nano single_modality=False
+lr=5e-05 wd=0.0005 bs=16
+[STS] patient-level split
+  train: slices=1337 patients=36 min/max per patient=15/82
+  val: slices=222 patients=5 min/max per patient=19/81
+  test: slices=361 patients=10 min/max per patient=15/58
+  ← 数据增强: train only, preset=stable
+  ← CT/PET归一化: PNG range -> /255 or /65535 + ImageNet 标准化
+[+] Teacher_CT_Encoder: Loading local weights from ./pretrained/convnext_nano/pytorch_model.bin
+[+] Teacher_CT_Encoder loaded params: 142, skipped: 0
+[+] Teacher_CT_Encoder load status: <All keys matched successfully>
+[+] Teacher_PET_Encoder: Loading local weights from ./pretrained/convnext_nano/pytorch_model.bin
+[+] Teacher_PET_Encoder loaded params: 142, skipped: 0
+[+] Teacher_PET_Encoder load status: <All keys matched successfully>
+
+============================== MODEL PROFILE ==============================
+[INFO] Register count_convNd() for <class 'torch.nn.modules.conv.Conv2d'>.
+[INFO] Register zero_ops() for <class 'torch.nn.modules.dropout.Dropout'>.
+[INFO] Register zero_ops() for <class 'torch.nn.modules.container.Sequential'>.
+[INFO] Register count_normalization() for <class 'torch.nn.modules.batchnorm.BatchNorm2d'>.
+[INFO] Register zero_ops() for <class 'torch.nn.modules.activation.ReLU'>.
+[INFO] Register count_adap_avgpool() for <class 'torch.nn.modules.pooling.AdaptiveAvgPool2d'>.
+[INFO] Register count_linear() for <class 'torch.nn.modules.linear.Linear'>.
+[INFO] Register count_normalization() for <class 'torch.nn.modules.normalization.LayerNorm'>.
+[teacher_baseline] Params: 38.57M  FLOPs: 35.09G
+===========================================================================
+
+  Ep1[50/83] loss=1.6020 seg=1.6020 lr=0.000010
+/root/miniconda3/lib/python3.8/site-packages/torch/autograd/__init__.py:200: UserWarning: upsample_bilinear2d_backward_out_cuda does not have a deterministic implementation, but you set 'torch.use_deterministic_algorithms(True, warn_only=True)'. You can file an issue at https://github.com/pytorch/pytorch/issues to help us prioritize adding deterministic support for this operation. (Triggered internally at ../aten/src/ATen/Context.cpp:71.)
+  Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+  threshold_search best_th=0.55 Dice=0.7680 IoU=0.6234
+Epoch 1 loss=1.6035 Dice=0.7563 IoU=0.6081 HD95=118.21
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_epochs/epoch_001
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/ckpt.best.pth.tar
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/ckpt.best_dice.pth.tar
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/ckpt.best_hd95.pth.tar
+  Ep2[50/83] loss=1.4572 seg=1.4572 lr=0.000027
+/root/miniconda3/lib/python3.8/site-packages/torch/autograd/__init__.py:200: UserWarning: upsample_bilinear2d_backward_out_cuda does not have a deterministic implementation, but you set 'torch.use_deterministic_algorithms(True, warn_only=True)'. You can file an issue at https://github.com/pytorch/pytorch/issues to help us prioritize adding deterministic support for this operation. (Triggered internally at ../aten/src/ATen/Context.cpp:71.)
+  Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+  threshold_search best_th=0.60 Dice=0.7742 IoU=0.6316
+Epoch 2 loss=1.4695 Dice=0.7338 IoU=0.5795 HD95=49.17
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_epochs/epoch_002
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/ckpt.best_hd95.pth.tar
+  Ep3[50/83] loss=1.3679 seg=1.3679 lr=0.000043
+  threshold_search best_th=0.50 Dice=0.7712 IoU=0.6275
+Epoch 3 loss=1.3986 Dice=0.7712 IoU=0.6275 HD95=39.68
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_epochs/epoch_003
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/ckpt.best.pth.tar
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/ckpt.best_dice.pth.tar
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/ckpt.best_hd95.pth.tar
+  Ep4[50/83] loss=1.3277 seg=1.3277 lr=0.000050
+  threshold_search best_th=0.50 Dice=0.7680 IoU=0.6234
+Epoch 4 loss=1.3381 Dice=0.7680 IoU=0.6234 HD95=39.68
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_epochs/epoch_004
+  Ep5[50/83] loss=1.2789 seg=1.2789 lr=0.000050
+  threshold_search best_th=0.45 Dice=0.7998 IoU=0.6663
+Epoch 5 loss=1.2844 Dice=0.7979 IoU=0.6637 HD95=38.37
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_epochs/epoch_005
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/ckpt.best.pth.tar
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/ckpt.best_dice.pth.tar
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/ckpt.best_hd95.pth.tar
+  Ep6[50/83] loss=1.2196 seg=1.2196 lr=0.000049
+  threshold_search best_th=0.40 Dice=0.7581 IoU=0.6105
+Epoch 6 loss=1.2409 Dice=0.7460 IoU=0.5949 HD95=43.42
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_epochs/epoch_006
+  Ep7[50/83] loss=1.2201 seg=1.2201 lr=0.000049
+  threshold_search best_th=0.40 Dice=0.7784 IoU=0.6372
+Epoch 7 loss=1.2037 Dice=0.7657 IoU=0.6204 HD95=40.75
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_epochs/epoch_007
+  Ep8[50/83] loss=1.1669 seg=1.1669 lr=0.000048
+  threshold_search best_th=0.45 Dice=0.8054 IoU=0.6742
+Epoch 8 loss=1.1741 Dice=0.8054 IoU=0.6742 HD95=36.89
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_epochs/epoch_008
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/ckpt.best.pth.tar
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/ckpt.best_dice.pth.tar
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/ckpt.best_hd95.pth.tar
+  Ep9[50/83] loss=1.1497 seg=1.1497 lr=0.000047
+  threshold_search best_th=0.50 Dice=0.7950 IoU=0.6597
+Epoch 9 loss=1.1485 Dice=0.7950 IoU=0.6597 HD95=34.95
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_epochs/epoch_009
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/ckpt.best_hd95.pth.tar
+  Ep10[50/83] loss=1.0964 seg=1.0964 lr=0.000045
+  threshold_search best_th=0.55 Dice=0.8002 IoU=0.6670
+Epoch 10 loss=1.1240 Dice=0.8002 IoU=0.6669 HD95=39.36
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_epochs/epoch_010
+  Ep11[50/83] loss=1.1267 seg=1.1267 lr=0.000044
+  threshold_search best_th=0.40 Dice=0.7822 IoU=0.6423
+Epoch 11 loss=1.1025 Dice=0.7763 IoU=0.6343 HD95=39.89
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_epochs/epoch_011
+  Ep12[50/83] loss=1.0791 seg=1.0791 lr=0.000042
+  threshold_search best_th=0.40 Dice=0.7857 IoU=0.6470
+Epoch 12 loss=1.0817 Dice=0.7779 IoU=0.6365 HD95=38.18
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_epochs/epoch_012
+  Ep13[50/83] loss=1.0933 seg=1.0933 lr=0.000040
+  threshold_search best_th=0.40 Dice=0.7948 IoU=0.6595
+Epoch 13 loss=1.0609 Dice=0.7917 IoU=0.6553 HD95=35.48
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_epochs/epoch_013
+  Ep14[50/83] loss=1.0490 seg=1.0490 lr=0.000038
+  threshold_search best_th=0.35 Dice=0.7949 IoU=0.6596
+Epoch 14 loss=1.0412 Dice=0.7878 IoU=0.6499 HD95=39.78
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_epochs/epoch_014
+  Ep15[50/83] loss=1.0295 seg=1.0295 lr=0.000036
+  threshold_search best_th=0.30 Dice=0.7730 IoU=0.6300
+Epoch 15 loss=1.0222 Dice=0.7613 IoU=0.6146 HD95=39.69
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_epochs/epoch_015
+  Ep16[50/83] loss=0.9889 seg=0.9889 lr=0.000034
+  threshold_search best_th=0.30 Dice=0.7485 IoU=0.5981
+Epoch 16 loss=1.0056 Dice=0.7371 IoU=0.5837 HD95=41.02
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_epochs/epoch_016
+Early stop at epoch 16
+Saved: ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/ckpt.last.pth.tar
+
+=== TEST(best_dice) Dice=0.7330 IoU=0.5785 Acc=0.9054 HD95=41.04 ===
+[vis_teacher] saved 8 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_best_dice
+=== TEST(best_hd95) Dice=0.7222 IoU=0.5652 Acc=0.9041 HD95=45.69 ===
+[vis_teacher] saved 8 diagnostics to ./checkpoints_new/MDT-STS-teacher/2026-05-10_17-43-59/vis_best_hd95

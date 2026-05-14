@@ -1,0 +1,4 @@
+rank,sample_id,group,teacher_dice,student_dice,dice_gap,teacher_hd95,student_hd95,hd95_gap
+1,2983,hard,0.8419,0.0000,0.8419,2.83,118.73,115.91
+2,3014,hard,0.7826,0.0000,0.7826,2.83,121.03,118.20
+3,4209,hard,0.7810,0.0000,0.7810,3.45,68.55,65.10

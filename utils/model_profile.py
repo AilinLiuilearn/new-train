@@ -31,6 +31,41 @@ def _get_flops_params_gm(model_wrapper, input_args):
         return None, params_m
 
 
+class BaselineStudentWrapper(nn.Module):
+    def __init__(self, networks):
+        super().__init__()
+        for k, v in networks.items():
+            setattr(self, k, v)
+
+    def forward(self, ct):
+        return self.model(ct, target_size=(ct.shape[-2], ct.shape[-1]))
+
+
+def print_student_profile(networks, config, image_size=None, tag='student'):
+    image_size = image_size or getattr(config, 'image_size_2d', 512)
+    device = torch.device('cuda', int(config.gpus[0]))
+
+    params_m = count_params_m(networks)
+    flops_g = None
+
+    try:
+        nets_copy = {k: copy.deepcopy(v) for k, v in networks.items()}
+        wrapper = BaselineStudentWrapper(nets_copy).to(device).eval()
+        ct = torch.randn(1, 1, image_size, image_size, device=device)
+        with torch.no_grad():
+            flops_g, _ = _get_flops_params_gm(wrapper, (ct,))
+        del wrapper, nets_copy
+        torch.cuda.empty_cache()
+    except Exception as e:
+        print(f'  [profile] FLOPs computation failed: {e}')
+
+    if flops_g is not None:
+        print(f'[{tag}] Params: {params_m:.2f}M  FLOPs: {flops_g:.2f}G')
+    else:
+        print(f'[{tag}] Params: {params_m:.2f}M  (FLOPs needs thop: pip install thop)')
+    return params_m, flops_g
+
+
 def print_baseline_profile(networks, config, image_size=None, tag='teacher_baseline'):
     image_size = image_size or getattr(config, 'image_size_2d', 512)
     device = torch.device('cuda', int(config.gpus[0]))

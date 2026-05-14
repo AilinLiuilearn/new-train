@@ -16,6 +16,11 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--image_size_2d", type=int, default=512)
         p.add_argument("--num_workers", type=int, default=4)
         p.add_argument("--pin_memory", type=str2bool, default=True)
+        p.add_argument("--dataset", type=str, default="pclt20k", choices=("pclt20k", "sts"))
+        p.add_argument("--split_json", type=str, default=None)
+        p.add_argument("--test_ratio", type=float, default=0.2)
+        p.add_argument("--sts_aug_preset", type=str, default="stable", choices=("none", "stable", "light", "default"))
+        p.add_argument("--val_threshold_search", type=str2bool, default=False)
         return p
 
     @staticmethod
@@ -24,6 +29,21 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--backbone", type=str, default="pvt_v2_b1")
         p.add_argument("--pretrained_path", type=str, default=None)
         p.add_argument("--use_tcpm", type=str2bool, default=False)
+        p.add_argument("--disable_text_fusion", type=str2bool, default=False,
+                       help="Disable text-guided query while keeping CUDM visual fusion.")
+        p.add_argument("--pet_drop_rate", type=float, default=0.0,
+                       help="Probability of dropping PET modality during training for robustness.")
+        p.add_argument("--use_shaspec_disentangle", type=str2bool, default=False,
+                       help="Enable stage-wise shared/specific disentanglement before MT-CUDM fusion.")
+        p.add_argument("--light_teacher", type=str2bool, default=False,
+                       help="Use student-scale ConvNeXt dual encoders as a lightweight multimodal teacher.")
+        p.add_argument("--light_backbone", type=str, default="convnext_atto",
+                       choices=("convnext_atto", "convnext_femto", "convnext_pico", "convnext_nano"))
+        p.add_argument("--light_pretrained_path", type=str, default=None)
+        p.add_argument("--light_no_pretrained", type=str2bool, default=False)
+        p.add_argument("--light_decoder_type", type=str, default="light", choices=("light", "attention"))
+        p.add_argument("--light_share_encoder", type=str2bool, default=False,
+                       help="Share CT/PET encoder weights to minimize parameters.")
         return p
 
     @staticmethod
@@ -59,6 +79,11 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--cudm_bg_weight", type=float, default=0.0)
         p.add_argument("--cudm_orth_weight", type=float, default=0.0)
         p.add_argument("--cudm_loss_start_stage", type=int, default=3)
+        p.add_argument("--dis_common_weight", type=float, default=0.0)
+        p.add_argument("--dis_orth_weight", type=float, default=0.0)
+        p.add_argument("--dis_specific_weight", type=float, default=0.0)
+        p.add_argument("--dis_recon_weight", type=float, default=0.0)
+        p.add_argument("--dis_loss_start_stage", type=int, default=1)
         p.add_argument("--lr_flat_ratio", type=float, default=0.3)
         return p
 

@@ -2,7 +2,7 @@
 import os
 import torch
 import torch.nn.functional as F
-from utils.metrics_seg import SegmentationMetricsCIPA, compute_metrics_at_threshold
+from utils.metrics_seg import SegmentationMetricsCIPA
 from utils.optimization import get_optimizer
 from utils.seg_losses import BCEDiceLoss
 
@@ -37,7 +37,7 @@ class MDTSegTeacher:
             self.ema_model = None
             self._ema_initialized = True
 
-        self.scaler = torch.cuda.amp.GradScaler() if config.mixed_precision else None
+        self.scaler = torch.amp.GradScaler('cuda') if config.mixed_precision else None
         self.loss_seg = BCEDiceLoss(
             bce_weight=getattr(config, 'bce_weight', 1.0),
             dice_weight=getattr(config, 'dice_weight', 1.0),
@@ -137,84 +137,18 @@ class MDTSegTeacher:
             'loss_cudm_orth': loss_orth.detach(),
         }
 
-    def _feature_desc(self, x):
-        desc = F.adaptive_avg_pool2d(x.float(), 1).flatten(1)
-        return F.normalize(desc, dim=1)
-
-    def _compute_shaspec_disentangle_loss(self, outputs):
-        common_w = float(getattr(self.config, 'dis_common_weight', 0.0))
-        orth_w = float(getattr(self.config, 'dis_orth_weight', 0.0))
-        specific_w = float(getattr(self.config, 'dis_specific_weight', 0.0))
-        recon_w = float(getattr(self.config, 'dis_recon_weight', 0.0))
-        start_stage = max(1, int(getattr(self.config, 'dis_loss_start_stage', 1)))
-        if common_w <= 0 and orth_w <= 0 and specific_w <= 0 and recon_w <= 0:
-            zero = next(iter(self.networks.values())).parameters().__next__().new_tensor(0.0)
-            return zero, {
-                'loss_dis_common': zero.detach(),
-                'loss_dis_orth': zero.detach(),
-                'loss_dis_specific': zero.detach(),
-                'loss_dis_recon': zero.detach(),
-            }
-        if not isinstance(outputs, dict) or not outputs.get('disentangle_aux'):
-            zero = next(iter(self.networks.values())).parameters().__next__().new_tensor(0.0)
-            return zero, {
-                'loss_dis_common': zero.detach(),
-                'loss_dis_orth': zero.detach(),
-                'loss_dis_specific': zero.detach(),
-                'loss_dis_recon': zero.detach(),
-            }
-
-        common_losses, orth_losses, specific_losses, recon_losses = [], [], [], []
-        for stage_idx, aux in enumerate(outputs['disentangle_aux'], start=1):
-            if stage_idx < start_stage or not aux.get('pet_present', True):
-                continue
-            ct_common = aux['ct_common']
-            pet_common = aux['pet_common']
-            ct_specific = aux['ct_specific']
-            pet_specific = aux['pet_specific']
-
-            ct_common_d = self._feature_desc(ct_common)
-            pet_common_d = self._feature_desc(pet_common)
-            ct_specific_d = self._feature_desc(ct_specific)
-            pet_specific_d = self._feature_desc(pet_specific)
-
-            common_losses.append(1.0 - F.cosine_similarity(ct_common_d, pet_common_d, dim=1).mean())
-            orth_losses.append((F.cosine_similarity(ct_common_d, ct_specific_d, dim=1) ** 2).mean())
-            orth_losses.append((F.cosine_similarity(pet_common_d, pet_specific_d, dim=1) ** 2).mean())
-            specific_losses.append((F.cosine_similarity(ct_specific_d, pet_specific_d, dim=1) ** 2).mean())
-
-            recon_losses.append(F.mse_loss(aux['ct_recon'].float(), aux['ct_feature'].float()))
-            if aux.get('pet_recon') is not None and aux.get('pet_feature') is not None:
-                recon_losses.append(F.mse_loss(aux['pet_recon'].float(), aux['pet_feature'].float()))
-
-        zero_ref = next(iter(self.networks.values())).parameters().__next__().new_tensor(0.0)
-        loss_common = torch.stack(common_losses).mean() if common_losses else zero_ref
-        loss_orth = torch.stack(orth_losses).mean() if orth_losses else zero_ref
-        loss_specific = torch.stack(specific_losses).mean() if specific_losses else zero_ref
-        loss_recon = torch.stack(recon_losses).mean() if recon_losses else zero_ref
-        loss = common_w * loss_common + orth_w * loss_orth + specific_w * loss_specific + recon_w * loss_recon
-        return loss, {
-            'loss_dis_common': loss_common.detach(),
-            'loss_dis_orth': loss_orth.detach(),
-            'loss_dis_specific': loss_specific.detach(),
-            'loss_dis_recon': loss_recon.detach(),
-        }
-
     def _compute_total_loss(self, outputs, mask, pixel_weight=None):
         pred = self._select_main_pred(outputs)
         loss_seg, loss_stats = self.loss_seg(pred, mask)
         loss_cudm, cudm_stats = self._compute_cudm_disentangle_loss(outputs, mask)
-        loss_dis, dis_stats = self._compute_shaspec_disentangle_loss(outputs)
-        loss_total = loss_seg + loss_cudm + loss_dis
+        loss_total = loss_seg + loss_cudm
         loss_dict = {
             'loss_seg': loss_seg.detach(),
             'loss_cudm': loss_cudm.detach(),
-            'loss_dis': loss_dis.detach(),
             'loss_total': loss_total.detach(),
         }
         loss_dict.update(loss_stats)
         loss_dict.update(cudm_stats)
-        loss_dict.update(dis_stats)
         return loss_total, pred, loss_dict
 
     def train_step(self, batch):
@@ -256,35 +190,6 @@ class MDTSegTeacher:
         out = m.compute()
         out['total_loss'] = total_loss / max(n, 1)
         return out
-
-    @torch.no_grad()
-    def evaluate_thresholds(self, loader, thresholds=(0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6), use_ema=True):
-        use_ema_actual = use_ema and self.use_ema and self._current_epoch > self.ema_warmup_epochs
-        eval_model = self.ema_model if use_ema_actual else self.networks['model']
-        eval_model.eval()
-        probs, targets = [], []
-        for batch in loader:
-            ct = batch['ct'].float().to(self.device)
-            pet = batch['pet'].float().to(self.device)
-            mask = batch['mask'].float().to(self.device)
-            outputs = eval_model(ct, pet, target_size=mask.shape[-2:])
-            pred = self._select_main_pred(outputs)
-            probs.append(torch.sigmoid(pred).detach().cpu())
-            targets.append(mask.detach().cpu())
-        if not use_ema_actual:
-            for v in self.networks.values():
-                v.train()
-        probs = torch.cat(probs, dim=0)
-        targets = torch.cat(targets, dim=0)
-        rows = []
-        best = {'threshold': 0.5, 'dice': -1.0, 'iou': 0.0, 'acc': 0.0, 'acc_pixel': 0.0}
-        for th in thresholds:
-            metrics = compute_metrics_at_threshold(probs, targets, float(th))
-            row = {'threshold': float(th), **metrics}
-            rows.append(row)
-            if metrics['dice'] > best['dice']:
-                best = {'threshold': float(th), **metrics}
-        return best, rows
 
     def save_checkpoint(self, path, epoch):
         os.makedirs(os.path.dirname(path), exist_ok=True)

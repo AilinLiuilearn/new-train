@@ -93,6 +93,10 @@ class ConfigBase(object):
             subdir = 'CIPA-baseline-teacher'
         elif task == 'CIPA_VMamba_Baseline_Teacher':
             subdir = 'CIPA-vmamba-baseline-teacher'
+        elif task == 'MDT_STS_Teacher':
+            subdir = 'MDT-STS-teacher'
+        elif task == 'MDT_Light_Teacher':
+            subdir = 'MDT-light-teacher'
         else:
             subdir = 'MDT'
         ckpt = os.path.join(self.checkpoint_root, subdir, self.hash)

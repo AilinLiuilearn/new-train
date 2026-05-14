@@ -5,6 +5,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 import timm
 
+LIGHT_TEACHER_BACKBONES = {
+    'convnext_atto': (0, 1, 2, 3),
+    'convnext_femto': (0, 1, 2, 3),
+    'convnext_pico': (0, 1, 2, 3),
+    'convnext_nano': (0, 1, 2, 3),
+}
+
+LIGHT_TEACHER_DECODER_PRESETS = {
+    'convnext_atto': (256, 128, 64, 32),
+    'convnext_femto': (256, 128, 64, 32),
+    'convnext_pico': (384, 192, 96, 48),
+    'convnext_nano': (512, 256, 128, 64),
+}
+
+LIGHT_TEACHER_DECODER_PRESETS_LIGHT = {
+    'convnext_atto': (128, 64, 32, 16),
+    'convnext_femto': (192, 96, 48, 24),
+    'convnext_pico': (256, 128, 64, 32),
+    'convnext_nano': (384, 192, 96, 48),
+}
+
 
 def _unwrap_state_dict(state_dict):
     if isinstance(state_dict, dict):
@@ -23,6 +44,7 @@ def _sanitize_state_dict(state_dict):
             if nk.startswith(prefix):
                 nk = nk[len(prefix):]
         nk = nk.replace('stages.', 'stages_')
+        nk = nk.replace('stem.', 'stem_')
         cleaned[nk] = v
     return cleaned
 
@@ -87,6 +109,26 @@ def create_feature_backbone(backbone, in_channels=3):
         out_indices=_get_backbone_out_indices(backbone),
         in_chans=in_channels,
     )
+
+
+def create_light_teacher_backbone(backbone, in_channels=3):
+    if backbone not in LIGHT_TEACHER_BACKBONES:
+        raise ValueError(
+            f'Unsupported light teacher backbone: {backbone}. '
+            f'Supported: {list(LIGHT_TEACHER_BACKBONES.keys())}'
+        )
+    return timm.create_model(
+        backbone,
+        pretrained=False,
+        features_only=True,
+        out_indices=LIGHT_TEACHER_BACKBONES[backbone],
+        in_chans=in_channels,
+    )
+
+
+def resolve_local_pretrained(backbone):
+    path = os.path.join('.', 'pretrained', backbone)
+    return path if os.path.isdir(path) else None
 
 
 class ConvBNAct(nn.Module):
@@ -296,14 +338,18 @@ class LightConcatUNetDecoder(nn.Module):
         return {'preds': [p1, p2, p3, p4], 'pred': p1}
 
 
+
 class DualBackboneUNet(nn.Module):
     """Dual CT/PET teacher with configurable timm backbone and traditional UNet decoder."""
 
     def __init__(self, backbone='pvt_v2_b1', pretrained_path=None,
-                 in_channels=3, out_channels=1, use_tcpm=False):
+                 in_channels=3, out_channels=1, use_tcpm=False, disable_text_fusion=False,
+                 pet_drop_rate=0.0, use_shaspec_disentangle=False):
         super().__init__()
         self.backbone = backbone
         self.use_tcpm = use_tcpm
+        self.pet_drop_rate = pet_drop_rate
+        self.use_shaspec_disentangle = use_shaspec_disentangle
         self.enc_ct = create_feature_backbone(backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(backbone, in_channels=in_channels)
         if pretrained_path:
@@ -313,9 +359,18 @@ class DualBackboneUNet(nn.Module):
         enc_channels = self.enc_ct.feature_info.channels()
         self.decoder = AttentionUNetDecoder(enc_channels, out_channels=out_channels)
 
+        if use_shaspec_disentangle:
+            from models.cudm_text_fusion import MultiStageShaSpecDisentangle
+            self.disentangle = MultiStageShaSpecDisentangle(enc_channels)
+        else:
+            self.disentangle = None
+
         if use_tcpm:
             from models.cudm_text_fusion import MultiStageCUDMTextFusion
-            self.fusion = MultiStageCUDMTextFusion(enc_channels)
+            self.fusion = MultiStageCUDMTextFusion(
+                enc_channels,
+                disable_text=disable_text_fusion,
+            )
         else:
             self.fusion = None
 
@@ -329,7 +384,17 @@ class DualBackboneUNet(nn.Module):
         ct = self._to_3ch(ct)
         pet = self._to_3ch(pet)
         ct_feats = self.enc_ct(ct)
-        pet_feats = self.enc_pet(pet)
+
+        drop_pet = self.training and self.pet_drop_rate > 0 and torch.rand(1).item() < self.pet_drop_rate
+        if drop_pet:
+            pet_feats = None
+        else:
+            pet_feats = self.enc_pet(pet)
+
+        if self.disentangle is not None:
+            ct_feats, pet_feats, disentangle_aux = self.disentangle(ct_feats, pet_feats)
+        else:
+            disentangle_aux = None
 
         if self.fusion is not None:
             fusion_out = self.fusion(ct_feats, pet_feats)
@@ -338,7 +403,10 @@ class DualBackboneUNet(nn.Module):
             else:
                 fused_feats, fusion_aux = fusion_out, None
         else:
-            fused_feats = [c + p for c, p in zip(ct_feats, pet_feats)]
+            if pet_feats is not None:
+                fused_feats = [c + p for c, p in zip(ct_feats, pet_feats)]
+            else:
+                fused_feats = ct_feats
             fusion_aux = None
 
         if target_size is None:
@@ -346,6 +414,8 @@ class DualBackboneUNet(nn.Module):
         outputs = self.decoder(fused_feats, target_size)
         if fusion_aux is not None and isinstance(outputs, dict):
             outputs['fusion_aux'] = fusion_aux
+        if disentangle_aux is not None and isinstance(outputs, dict):
+            outputs['disentangle_aux'] = disentangle_aux
         return outputs
 
     def set_epoch(self, epoch):
@@ -359,5 +429,139 @@ def build_mdt_seg_teacher(config):
         in_channels=3,
         out_channels=1,
         use_tcpm=getattr(config, 'use_tcpm', False),
+        disable_text_fusion=getattr(config, 'disable_text_fusion', False),
+        pet_drop_rate=getattr(config, 'pet_drop_rate', 0.0),
+        use_shaspec_disentangle=getattr(config, 'use_shaspec_disentangle', False),
     )
     return dict(model=model)
+
+
+class DualLightBackboneUNet(nn.Module):
+    """Dual-modality teacher using student-scale ConvNeXt encoders plus teacher fusion."""
+
+    def __init__(
+        self,
+        backbone='convnext_atto',
+        pretrained_path=None,
+        in_channels=3,
+        out_channels=1,
+        use_tcpm=True,
+        disable_text_fusion=False,
+        pet_drop_rate=0.0,
+        use_shaspec_disentangle=False,
+        decoder_type='light',
+        decoder_channels=None,
+        share_encoder=False,
+    ):
+        super().__init__()
+        self.backbone = backbone
+        self.use_tcpm = use_tcpm
+        self.pet_drop_rate = pet_drop_rate
+        self.use_shaspec_disentangle = use_shaspec_disentangle
+        self.decoder_type = decoder_type
+        self.share_encoder = share_encoder
+        self.enc_ct = create_light_teacher_backbone(backbone, in_channels=in_channels)
+        self.enc_pet = self.enc_ct if share_encoder else create_light_teacher_backbone(backbone, in_channels=in_channels)
+        if pretrained_path:
+            load_local_weights_safe(self.enc_ct, pretrained_path, name='LightTeacher_CT_Encoder')
+            if not share_encoder:
+                load_local_weights_safe(self.enc_pet, pretrained_path, name='LightTeacher_PET_Encoder')
+
+        enc_channels = self.enc_ct.feature_info.channels()
+        if decoder_channels is None:
+            if decoder_type == 'light':
+                decoder_channels = LIGHT_TEACHER_DECODER_PRESETS_LIGHT.get(backbone, (128, 64, 32, 16))
+            else:
+                decoder_channels = LIGHT_TEACHER_DECODER_PRESETS.get(backbone, (256, 128, 64, 32))
+
+        if decoder_type == 'light':
+            self.decoder = LightConcatUNetDecoder(enc_channels, out_channels=out_channels, decoder_channels=decoder_channels)
+        elif decoder_type == 'attention':
+            self.decoder = AttentionUNetDecoder(enc_channels, out_channels=out_channels, decoder_channels=decoder_channels)
+        else:
+            raise ValueError(f'Unknown decoder_type={decoder_type}. Supported: light, attention')
+
+        if use_shaspec_disentangle:
+            from models.cudm_text_fusion import MultiStageShaSpecDisentangle
+            self.disentangle = MultiStageShaSpecDisentangle(enc_channels)
+        else:
+            self.disentangle = None
+
+        if use_tcpm:
+            from models.cudm_text_fusion import MultiStageCUDMTextFusion
+            self.fusion = MultiStageCUDMTextFusion(
+                enc_channels,
+                disable_text=disable_text_fusion,
+            )
+        else:
+            self.fusion = None
+
+    @staticmethod
+    def _to_3ch(x):
+        if x.shape[1] == 1:
+            return x.repeat(1, 3, 1, 1)
+        return x
+
+    def forward(self, ct, pet, target_size=None):
+        ct = self._to_3ch(ct)
+        pet = self._to_3ch(pet)
+        ct_feats = self.enc_ct(ct)
+
+        drop_pet = self.training and self.pet_drop_rate > 0 and torch.rand(1).item() < self.pet_drop_rate
+        if drop_pet:
+            pet_feats = None
+        else:
+            pet_feats = self.enc_pet(pet)
+
+        if self.disentangle is not None:
+            ct_feats, pet_feats, disentangle_aux = self.disentangle(ct_feats, pet_feats)
+        else:
+            disentangle_aux = None
+
+        if self.fusion is not None:
+            fusion_out = self.fusion(ct_feats, pet_feats)
+            if isinstance(fusion_out, tuple):
+                fused_feats, fusion_aux = fusion_out
+            else:
+                fused_feats, fusion_aux = fusion_out, None
+        else:
+            if pet_feats is not None:
+                fused_feats = [c + p for c, p in zip(ct_feats, pet_feats)]
+            else:
+                fused_feats = ct_feats
+            fusion_aux = None
+
+        if target_size is None:
+            target_size = ct.shape[-2:]
+        outputs = self.decoder(fused_feats, target_size)
+        if fusion_aux is not None and isinstance(outputs, dict):
+            outputs['fusion_aux'] = fusion_aux
+        if disentangle_aux is not None and isinstance(outputs, dict):
+            outputs['disentangle_aux'] = disentangle_aux
+        return outputs
+
+    def set_epoch(self, epoch):
+        return None
+
+
+def build_mdt_seg_light_teacher(config):
+    pretrained_path = getattr(config, 'light_pretrained_path', None)
+    if not getattr(config, 'light_no_pretrained', False) and not pretrained_path:
+        pretrained_path = resolve_local_pretrained(getattr(config, 'light_backbone', 'convnext_atto'))
+    if getattr(config, 'light_no_pretrained', False):
+        pretrained_path = None
+    model = DualLightBackboneUNet(
+        backbone=getattr(config, 'light_backbone', 'convnext_atto'),
+        pretrained_path=pretrained_path,
+        in_channels=3,
+        out_channels=1,
+        use_tcpm=getattr(config, 'use_tcpm', True),
+        disable_text_fusion=getattr(config, 'disable_text_fusion', False),
+        pet_drop_rate=getattr(config, 'pet_drop_rate', 0.0),
+        use_shaspec_disentangle=getattr(config, 'use_shaspec_disentangle', False),
+        decoder_type=getattr(config, 'light_decoder_type', 'light'),
+        decoder_channels=getattr(config, 'light_decoder_channels', None),
+        share_encoder=getattr(config, 'light_share_encoder', False),
+    )
+    return dict(model=model)
+

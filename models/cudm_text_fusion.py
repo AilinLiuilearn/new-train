@@ -28,8 +28,8 @@ BIOMEDCLIP_MODEL = "biomedclip_local"
 BIOMEDCLIP_WEIGHTS = os.path.join(LOCAL_BIOMEDCLIP_DIR, "open_clip_pytorch_model.bin")
 
 TUMOR_PROMPT = (
-    "A focal bright tumor hotspot with abnormal metabolic activity "
-    "and clear lesion boundary."
+    "A focal lesion region showing abnormal tissue density on CT "
+    "with elevated metabolic uptake on PET imaging."
 )
 
 
@@ -71,7 +71,9 @@ def _encode_prompt(prompt):
 class FixedPromptEmbedding(nn.Module):
     def __init__(self, prompt=TUMOR_PROMPT):
         super().__init__()
-        safe_name = "cudm_tumor_prompt_embedding.pt"
+        import hashlib
+        prompt_hash = hashlib.md5(prompt.encode()).hexdigest()[:8]
+        safe_name = f"cudm_prompt_embedding_{prompt_hash}.pt"
         cache_path = os.path.join(LOCAL_BIOMEDCLIP_DIR, safe_name)
         if os.path.exists(cache_path):
             text_code = torch.load(cache_path, map_location="cpu")
@@ -142,39 +144,20 @@ class LiteChannelAttention(nn.Module):
         return self.proj(out)
 
 
-class TextGuidedChannelAttention(nn.Module):
-    """Text-guided channel attention for cleaning tumor query features."""
+class TextConditionedChannelGate(nn.Module):
+    """Text-conditioned channel selection: text embedding directly produces channel weights."""
 
-    def __init__(self, channels, text_dim=512, reduction=8):
+    def __init__(self, channels, text_dim=512):
         super().__init__()
-        hidden = max(8, channels // reduction)
-        self.text_proj = nn.Sequential(
-            nn.Linear(text_dim, hidden, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, channels, bias=False),
-        )
-        self.visual_proj = nn.Sequential(
-            nn.Linear(channels * 2, hidden, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, channels, bias=False),
-        )
-        self.fusion = nn.Sequential(
-            nn.Linear(channels * 4, hidden, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, channels, bias=False),
+        self.gate = nn.Sequential(
+            nn.Linear(text_dim, channels, bias=False),
             nn.Sigmoid(),
         )
 
     def forward(self, tumor_feature, text_code):
         b, c, _, _ = tumor_feature.shape
-        avg_desc = tumor_feature.mean(dim=(2, 3))
-        max_desc = tumor_feature.amax(dim=(2, 3))
-        visual = self.visual_proj(torch.cat([avg_desc, max_desc], dim=1))
-        text = self.text_proj(text_code)
-        interaction = visual * text
-        difference = torch.abs(visual - text)
-        gate = self.fusion(torch.cat([visual, text, interaction, difference], dim=1))
-        return tumor_feature * gate.view(b, c, 1, 1), gate
+        w = self.gate(text_code).view(b, c, 1, 1)
+        return tumor_feature * w, w.squeeze(-1).squeeze(-1)
 
 
 class MutualGate(nn.Module):
@@ -209,18 +192,20 @@ class MutualGate(nn.Module):
 
 
 class CUDMTextGate(nn.Module):
-    """Commonality-Uniqueness Disentanglement with text-gated attention."""
+    """CUDM fusion on already-composed CT/PET features with text-conditioned query."""
 
-    def __init__(self, channels, heads=4, text_dim=512, attn_ratio=0.125):
+    def __init__(self, channels, heads=4, text_dim=512, attn_ratio=0.125,
+                 disable_text=False):
         super().__init__()
+        self.disable_text = disable_text
         self.mutual_gate = MutualGate(channels)
         self.unique_fuse = nn.Sequential(
             nn.Conv2d(channels * 2, channels, 1, bias=False),
             nn.BatchNorm2d(channels),
             nn.GELU(),
         )
-        self.tgca = TextGuidedChannelAttention(
-            channels, text_dim=text_dim, reduction=8,
+        self.tgca = None if disable_text else TextConditionedChannelGate(
+            channels, text_dim=text_dim,
         )
         self.nq = LayerNorm2d(channels)
         self.nkv = LayerNorm2d(channels)
@@ -230,12 +215,18 @@ class CUDMTextGate(nn.Module):
         self.out_gate = nn.Parameter(torch.tensor(0.5))
 
     def forward(self, pet_feature, ct_feature, text_code):
+        if pet_feature is None:
+            pet_feature = ct_feature
+
         common = self.mutual_gate(ct_feature, pet_feature)
         unique_pet = pet_feature - common
         unique_ct = ct_feature - common
         tumor = self.unique_fuse(torch.cat([unique_pet, unique_ct], dim=1))
 
-        clean_query, _ = self.tgca(tumor, text_code)
+        if self.disable_text:
+            clean_query = tumor
+        else:
+            clean_query, _ = self.tgca(tumor, text_code)
 
         attn_out = self.attn(self.nq(clean_query), self.nkv(tumor))
         enhanced = attn_out + self.ffn(self.nf(attn_out))
@@ -243,27 +234,137 @@ class CUDMTextGate(nn.Module):
         base = pet_feature + ct_feature
         gate = torch.sigmoid(self.out_gate)
         out = base * (1.0 - gate) + (base + enhanced) * gate
-        return out, {"common": common, "tumor": tumor}
+
+        return out, {
+            "common": common,
+            "tumor": tumor,
+            "unique_pet": unique_pet,
+            "unique_ct": unique_ct,
+        }
+
+
+class StageDisentangleBlock(nn.Module):
+    """Stage-wise ShaSpec-style shared/specific disentanglement for CT/PET features."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.ct_common = nn.Sequential(
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+        )
+        self.pet_common = nn.Sequential(
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+        )
+        self.ct_specific = nn.Sequential(
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+        )
+        self.pet_specific = nn.Sequential(
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+        )
+        self.compose = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+        )
+        self.reconstruct = nn.Conv2d(channels * 2, channels, 1, bias=False)
+
+    def forward(self, ct_feature, pet_feature=None):
+        pet_present = pet_feature is not None
+        ct_common = self.ct_common(ct_feature)
+        ct_specific = self.ct_specific(ct_feature)
+
+        if pet_present:
+            pet_common = self.pet_common(pet_feature)
+            pet_specific = self.pet_specific(pet_feature)
+        else:
+            pet_common = ct_common
+            pet_specific = torch.zeros_like(ct_specific)
+
+        ct_residual = self.compose(torch.cat([ct_common, ct_specific], dim=1))
+        pet_residual = self.compose(torch.cat([pet_common, pet_specific], dim=1))
+        ct_composed = ct_common + ct_residual
+        pet_composed = pet_common + pet_residual if pet_present else pet_common
+
+        ct_recon = self.reconstruct(torch.cat([ct_common, ct_specific], dim=1))
+        pet_recon = self.reconstruct(torch.cat([pet_common, pet_specific], dim=1)) if pet_present else None
+
+        aux = {
+            "ct_feature": ct_feature,
+            "pet_feature": pet_feature,
+            "ct_common": ct_common,
+            "pet_common": pet_common,
+            "ct_specific": ct_specific,
+            "pet_specific": pet_specific,
+            "ct_composed": ct_composed,
+            "pet_composed": pet_composed,
+            "ct_recon": ct_recon,
+            "pet_recon": pet_recon,
+            "pet_present": pet_present,
+        }
+        return ct_composed, pet_composed, aux
+
+
+class MultiStageShaSpecDisentangle(nn.Module):
+    """Apply ShaSpec-style disentanglement to all encoder stages."""
+
+    def __init__(self, encoder_channels):
+        super().__init__()
+        self.stages = nn.ModuleList([
+            StageDisentangleBlock(ch) for ch in encoder_channels
+        ])
+
+    def forward(self, ct_feats, pet_feats=None):
+        pet_missing = pet_feats is None
+        ct_out, pet_out, aux = [], [], []
+        for i, (stage, ct_f) in enumerate(zip(self.stages, ct_feats)):
+            pet_f = None if pet_missing else pet_feats[i]
+            ct_c, pet_c, stage_aux = stage(ct_f, pet_f)
+            ct_out.append(ct_c)
+            pet_out.append(pet_c)
+            aux.append(stage_aux)
+        return ct_out, pet_out, aux
 
 
 class MultiStageCUDMTextFusion(nn.Module):
     """Apply CUDMTextGate to all encoder stages."""
 
-    def __init__(self, encoder_channels, text_dim=512, heads_per_stage=(1, 2, 4, 8)):
+    def __init__(
+        self,
+        encoder_channels,
+        text_dim=512,
+        heads_per_stage=(1, 2, 4, 8),
+        disable_text=False,
+    ):
         super().__init__()
-        self.text_encoder = FixedPromptEmbedding(prompt=TUMOR_PROMPT)
+        self.disable_text = disable_text
+        self.text_encoder = None if disable_text else FixedPromptEmbedding(prompt=TUMOR_PROMPT)
         self.stages = nn.ModuleList([
-            CUDMTextGate(channels=ch, heads=head, text_dim=text_dim, attn_ratio=0.125)
+            CUDMTextGate(
+                channels=ch,
+                heads=head,
+                text_dim=text_dim,
+                attn_ratio=0.125,
+                disable_text=disable_text,
+            )
             for ch, head in zip(encoder_channels, heads_per_stage)
         ])
 
     def forward(self, ct_feats, pet_feats):
         b = ct_feats[0].shape[0]
         device = ct_feats[0].device
-        text_code = self.text_encoder(b, device)
+        text_code = None if self.disable_text else self.text_encoder(b, device)
+        pet_missing = pet_feats is None
         fused = []
         aux = []
-        for stage, ct_f, pet_f in zip(self.stages, ct_feats, pet_feats):
+        for i, (stage, ct_f) in enumerate(zip(self.stages, ct_feats)):
+            pet_f = None if pet_missing else pet_feats[i]
             out, stage_aux = stage(pet_f, ct_f, text_code)
             fused.append(out)
             aux.append(stage_aux)

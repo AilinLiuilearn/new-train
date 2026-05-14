@@ -1,0 +1,10 @@
+{
+  "split": "test",
+  "top_k": 12,
+  "num_samples": 4514,
+  "groups": {
+    "hard": 1505,
+    "medium": 1591,
+    "easy": 1418
+  }
+}

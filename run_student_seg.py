@@ -1,8 +1,18 @@
 # -*- coding: utf-8 -*-
-"""Teacher training entry for PVTv2-B1 lightweight UNet baseline."""
+"""Student baseline training entry — single-modality CT-only segmentation.
+
+Usage examples:
+    # ConvNeXt-Pico + AttentionUNet decoder (teacher-identical decoder)
+    python run_student_seg.py --student_backbone convnext_pico --student_decoder_type attention
+
+    # ConvNeXt-Atto + lightweight decoder
+    python run_student_seg.py --student_backbone convnext_atto --student_decoder_type light
+
+    # ConvNeXt-Nano + AttentionUNet (same scale as teacher encoder)
+    python run_student_seg.py --student_backbone convnext_nano --student_decoder_type attention
+"""
 
 import importlib.util
-import csv
 import json
 import math
 import os
@@ -12,26 +22,21 @@ import sys
 import numpy as np
 import torch
 
-from configs.seg_mdt import SegMDTConfig
-from models.build_mdt_seg import build_mdt_seg_light_teacher, build_mdt_seg_teacher
-from tasks.mdt_seg import MDTSegTeacher
-from utils.model_profile import print_baseline_profile
+from configs.seg_student import SegStudentConfig
+from models.build_student_seg import build_student_seg
+from tasks.student_seg import StudentSegTask
+from utils.model_profile import print_student_profile
 from utils.optimization import get_cosine_scheduler
 from utils.train_logger import append_epoch_log, init_train_log
-from utils.vis_teacher import save_segmentation_diagnostics
+from utils.vis_student import save_student_diagnostics
 
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:128')
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 
-def _load_dataset_module(dataset='pclt20k'):
+def _load_dataset_module():
     root = os.getcwd()
-    if dataset == 'sts':
-        dataset_path = os.path.join(root, 'datasets', 'sts_seg.py')
-        module_name = 'local_sts_seg'
-    else:
-        dataset_path = os.path.join(root, 'datasets', 'pclt20k_seg.py')
-        module_name = 'local_pclt20k_seg'
-    spec = importlib.util.spec_from_file_location(module_name, dataset_path)
+    dataset_path = os.path.join(root, 'datasets', 'pclt20k_seg.py')
+    spec = importlib.util.spec_from_file_location('local_pclt20k_seg', dataset_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -59,29 +64,12 @@ def _prepare_env(config):
         torch.backends.cuda.enable_mem_efficient_sdp(False)
     if hasattr(torch.backends.cuda, 'enable_math_sdp'):
         torch.backends.cuda.enable_math_sdp(True)
-    try:
-        torch.use_deterministic_algorithms(True, warn_only=True)
-    except TypeError:
-        torch.use_deterministic_algorithms(False)
+    torch.use_deterministic_algorithms(True)
     return g0
 
 
 def _build_loaders(config):
-    dataset_name = getattr(config, 'dataset', 'pclt20k')
-    dataset_mod = _load_dataset_module(dataset_name)
-    if dataset_name == 'sts':
-        return dataset_mod.get_sts_loaders(
-            config.root,
-            config.image_size_2d,
-            config.batch_size,
-            config.num_workers,
-            config.random_state,
-            split_json=getattr(config, 'split_json', None),
-            val_ratio=config.val_ratio,
-            test_ratio=getattr(config, 'test_ratio', 0.2),
-            pin_memory=getattr(config, 'pin_memory', True),
-            aug_preset=getattr(config, 'sts_aug_preset', 'stable'),
-        )
+    dataset_mod = _load_dataset_module()
     if getattr(config, 'cipa_aligned', False):
         return dataset_mod.get_pclt20k_loaders_cipa_aligned(
             config.root,
@@ -115,41 +103,34 @@ def main():
     sys.path.insert(0, os.getcwd())
     sys.modules.pop('datasets', None)
 
-    config = SegMDTConfig.parse_arguments()
-    if getattr(config, 'light_teacher', False):
-        config.task = 'MDT_Light_Teacher'
-        config.use_tcpm = True if getattr(config, 'use_tcpm', False) is False else config.use_tcpm
-        if not getattr(config, 'light_no_pretrained', False) and not getattr(config, 'light_pretrained_path', None):
-            auto_path = os.path.join('.', 'pretrained', getattr(config, 'light_backbone', 'convnext_atto'))
-            if os.path.isdir(auto_path):
-                config.light_pretrained_path = auto_path
-                print(f'[+] Auto-resolved light teacher pretrained: {auto_path}')
-        if getattr(config, 'light_no_pretrained', False):
-            config.light_pretrained_path = None
-            print('[!] Light teacher encoder weights are disabled; training from scratch')
-    else:
-        config.task = 'MDT_STS_Teacher' if getattr(config, 'dataset', 'pclt20k') == 'sts' else 'MDT_Teacher'
+    config = SegStudentConfig.parse_arguments()
+    config.task = 'MDT_Student'
     g0 = _prepare_env(config)
 
-    if getattr(config, 'light_teacher', False):
-        print(
-            f'GPU={g0} light_teacher=True backbone={config.light_backbone} '
-            f'decoder={config.light_decoder_type} use_tcpm={config.use_tcpm} '
-            f'share_encoder={config.light_share_encoder}'
-        )
-    else:
-        print(f'GPU={g0} backbone={config.backbone} single_modality={getattr(config, "single_modality", False)}')
-    print(f'lr={config.learning_rate} wd={config.weight_decay} bs={config.batch_size}')
+    backbone = getattr(config, 'student_backbone', 'convnext_pico')
+    dec_type = getattr(config, 'student_decoder_type', 'attention')
+
+    if not getattr(config, 'no_pretrained', False) and not getattr(config, 'student_pretrained_path', None):
+        auto_path = os.path.join('.', 'pretrained', backbone)
+        if os.path.isdir(auto_path):
+            config.student_pretrained_path = auto_path
+            print(f'[+] Auto-resolved pretrained: {auto_path}')
+    if getattr(config, 'no_pretrained', False):
+        config.student_pretrained_path = None
+        print('[!] No pretrained encoder weights (training from scratch)')
+
+    print(f'GPU={g0}  backbone={backbone}  decoder={dec_type}')
+    print(f'lr={config.learning_rate}  wd={config.weight_decay}  bs={config.batch_size}')
 
     _save_config(config)
     train_loader, val_loader, test_loader = _build_loaders(config)
 
-    networks = build_mdt_seg_light_teacher(config) if getattr(config, 'light_teacher', False) else build_mdt_seg_teacher(config)
-    print('\n' + '=' * 30 + ' MODEL PROFILE ' + '=' * 30)
-    print_baseline_profile(networks, config)
-    print('=' * 75 + '\n')
+    networks = build_student_seg(config)
+    print('\n' + '=' * 30 + ' STUDENT MODEL PROFILE ' + '=' * 30)
+    print_student_profile(networks, config, tag=f'student_{backbone}_{dec_type}')
+    print('=' * 83 + '\n')
 
-    task = MDTSegTeacher(networks, config)
+    task = StudentSegTask(networks, config)
     spe = len(train_loader)
     accum_iter = max(1, int(getattr(config, 'accumulation_steps', 1)))
     updates_per_epoch = math.ceil(spe / accum_iter)
@@ -164,10 +145,6 @@ def main():
 
     log_path = os.path.join(config.checkpoint_dir, 'train_log.csv')
     init_train_log(log_path)
-    threshold_log_path = os.path.join(config.checkpoint_dir, 'threshold_log.csv')
-    if getattr(config, 'val_threshold_search', False):
-        with open(threshold_log_path, 'w', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(['epoch', 'best_threshold', 'best_dice', 'best_iou', 'best_acc', 'best_acc_pixel'])
 
     grad_clip = getattr(config, 'grad_clip', 0.5)
     clip_params = [p for net in task.networks.values() for p in net.parameters()]
@@ -178,14 +155,12 @@ def main():
 
     for epoch in range(1, config.epochs + 1):
         tloss, tn = 0.0, 0
-        if hasattr(task.networks.get('model'), 'set_epoch'):
-            task.networks['model'].set_epoch(epoch)
         task.set_epoch(epoch)
         task.optimizer.zero_grad()
 
         for i, batch in enumerate(train_loader):
             stepped = False
-            with torch.cuda.amp.autocast(enabled=config.mixed_precision):
+            with torch.amp.autocast('cuda', enabled=config.mixed_precision):
                 loss, _, _, loss_dict = task.train_step(batch)
                 loss = loss / accum_iter
 
@@ -226,24 +201,11 @@ def main():
 
         val_m = task.evaluate(val_loader)
         append_epoch_log(log_path, epoch, tloss / max(tn, 1), val_m)
-        if getattr(config, 'val_threshold_search', False):
-            th_best, _ = task.evaluate_thresholds(val_loader)
-            with open(threshold_log_path, 'a', newline='', encoding='utf-8') as f:
-                csv.writer(f).writerow([
-                    epoch,
-                    f"{th_best['threshold']:.2f}",
-                    f"{th_best['dice']:.4f}",
-                    f"{th_best['iou']:.4f}",
-                    f"{th_best['acc']:.4f}",
-                    f"{th_best['acc_pixel']:.4f}",
-                ])
-            print('  threshold_search best_th={:.2f} Dice={:.4f} IoU={:.4f}'.format(
-                th_best['threshold'], th_best['dice'], th_best['iou']))
         print('Epoch {} loss={:.4f} Dice={:.4f} IoU={:.4f} HD95={:.2f}'.format(
             epoch, tloss / max(tn, 1), val_m['dice'], val_m['iou'], val_m['hd95']))
 
         if getattr(config, 'vis_every_epoch', False):
-            save_segmentation_diagnostics(
+            save_student_diagnostics(
                 task=task,
                 loader=val_loader,
                 out_dir=os.path.join(config.checkpoint_dir, 'vis_epochs', f'epoch_{epoch:03d}'),
@@ -284,7 +246,7 @@ def main():
     print('\n=== TEST(best_dice) Dice={:.4f} IoU={:.4f} Acc={:.4f} HD95={:.2f} ==='.format(
         test_m_dice['dice'], test_m_dice['iou'], test_m_dice['acc'], test_m_dice['hd95']))
 
-    save_segmentation_diagnostics(
+    save_student_diagnostics(
         task=task,
         loader=test_loader,
         out_dir=os.path.join(config.checkpoint_dir, 'vis_best_dice'),
@@ -297,7 +259,7 @@ def main():
     print('=== TEST(best_hd95) Dice={:.4f} IoU={:.4f} Acc={:.4f} HD95={:.2f} ==='.format(
         test_m_hd95['dice'], test_m_hd95['iou'], test_m_hd95['acc'], test_m_hd95['hd95']))
 
-    save_segmentation_diagnostics(
+    save_student_diagnostics(
         task=task,
         loader=test_loader,
         out_dir=os.path.join(config.checkpoint_dir, 'vis_best_hd95'),
