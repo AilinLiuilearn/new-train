@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/root/autodl-tmp/mkd-main/new-train/eval_mdt_seg_checkpoint.py", line 147, in <module>
+    main()
+  File "/root/autodl-tmp/mkd-main/new-train/eval_mdt_seg_checkpoint.py", line 52, in main
+    raise FileNotFoundError(f"config_args.json not found: {config_path}")
+FileNotFoundError: config_args.json not found: /root/autodl-tmp/mkd-main/new-train/checkpoints_new/mit-b1_sum_attn_noema_baseline/MDT/2026-06-09_10-52-26/config_args.json

@@ -82,20 +82,7 @@ class ConfigBase(object):
 
     @property
     def checkpoint_dir(self) -> str:
-        task = getattr(self, '_task', 'MDT')
-        if task == 'MDT_Student':
-            subdir = 'MDT-student'
-        elif task == 'MDT_Plus':
-            subdir = 'MDT-plus'
-        elif task == 'Student_Baseline_Aligned':
-            subdir = 'MDT-baseline'
-        elif task == 'CIPA_Baseline_Teacher':
-            subdir = 'CIPA-baseline-teacher'
-        elif task == 'CIPA_VMamba_Baseline_Teacher':
-            subdir = 'CIPA-vmamba-baseline-teacher'
-        else:
-            subdir = 'MDT'
-        ckpt = os.path.join(self.checkpoint_root, subdir, self.hash)
+        ckpt = os.path.join(self.checkpoint_root, 'MDT', self.hash)
         os.makedirs(ckpt, exist_ok=True)
         return ckpt
 

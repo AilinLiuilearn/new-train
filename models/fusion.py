@@ -208,7 +208,6 @@ class MutualGate(nn.Module):
         return common
 
 
-
 class CUDMTextGate(nn.Module):
     """Commonality-Uniqueness Disentanglement with text-gated attention."""
 

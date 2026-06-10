@@ -25,7 +25,12 @@ def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshol
         ct = batch['ct'].float().to(task.device)
         pet = batch['pet'].float().to(task.device)
         mask = batch['mask'].float().to(task.device)
-        outputs = task.networks['model'](ct, pet, target_size=mask.shape[-2:])
+        model = task.networks['model']
+        if hasattr(model, 'set_adc_mac_visuals'):
+            model.set_adc_mac_visuals(True)
+        outputs = model(ct, pet, target_size=mask.shape[-2:])
+        if hasattr(model, 'set_adc_mac_visuals'):
+            model.set_adc_mac_visuals(False)
         logit = outputs['preds'] if isinstance(outputs, dict) else outputs
         if isinstance(logit, (list, tuple)):
             logit = logit[0]
@@ -59,6 +64,7 @@ def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshol
             error_map = _make_error_map(tp, fn, fp)
             zoom_error = _make_zoom_error_panel(ct_img, gt_img, pred_bin, tp, fn, fp)
             fusion_panels = _extract_fusion_panels(task.networks['model'], i)
+            adc_mac_panels = _extract_adc_mac_panels(task.networks['model'], i, target_size=gt_img.shape, ct_img=ct_img, pet_img=pet_img)
             cudm_panels = _extract_cudm_panels(outputs, i, target_size=gt_img.shape, ct_img=ct_img)
 
             panels = [
@@ -74,7 +80,8 @@ def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshol
                 ('Zoomed Error', zoom_error, None),
             ]
             panels.extend(cudm_panels)
-            panels.extend(fusion_panels[:10])
+            panels.extend(adc_mac_panels)
+            panels.extend(fusion_panels)
 
             ncols = 5
             nrows = int(np.ceil(len(panels) / ncols))
@@ -103,6 +110,39 @@ def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshol
     print(f'[vis_teacher] saved {saved} diagnostics to {out_dir}')
 
 
+def _extract_adc_mac_panels(model, sample_idx, target_size, ct_img, pet_img):
+    if not hasattr(model, 'get_adc_mac_visuals'):
+        return []
+    visuals = model.get_adc_mac_visuals()
+    if not visuals:
+        return []
+
+    panels = []
+    direction_names = ('H', 'V', 'D', 'AD')
+    for modality, base_img, cmap in (('ct', ct_img, 'viridis'), ('pet', pet_img, 'inferno')):
+        modality_visuals = visuals.get(modality, {})
+        stage_feats = modality_visuals.get('features', {}) if isinstance(modality_visuals, dict) else {}
+        stage_weights = modality_visuals.get('weights', {}) if isinstance(modality_visuals, dict) else {}
+        for stage_idx in range(1, 5):
+            feat = stage_feats.get(f'stage{stage_idx}')
+            if not isinstance(feat, torch.Tensor):
+                continue
+            energy_map = _feature_energy_map(feat, sample_idx, target_size)
+            panels.append((f'ADC-MAC {modality.upper()} S{stage_idx}', energy_map, cmap))
+            overlay = _overlay_heatmap_on_gray(base_img, energy_map, cmap_name=cmap, alpha=0.55)
+            panels.append((f'ADC-MAC {modality.upper()} S{stage_idx} Overlay', overlay, None))
+
+            weights = stage_weights.get(f'stage{stage_idx}')
+            if isinstance(weights, torch.Tensor):
+                for dir_idx, dir_name in enumerate(direction_names):
+                    panels.append((
+                        f'ADC-MAC {modality.upper()} S{stage_idx} {dir_name} w',
+                        _direction_weight_map(weights, sample_idx, dir_idx, target_size),
+                        'jet',
+                    ))
+    return panels
+
+
 def _extract_cudm_panels(outputs, sample_idx, target_size, ct_img):
     if not isinstance(outputs, dict) or not outputs.get('fusion_aux'):
         return []
@@ -123,6 +163,14 @@ def _extract_cudm_panels(outputs, sample_idx, target_size, ct_img):
             overlay = _overlay_heatmap_on_gray(ct_img, tumor_map, cmap_name='magma', alpha=0.55)
             panels.append((f'CUDM S{idx} Tumor Overlay', overlay, None))
     return panels
+
+
+def _direction_weight_map(weights, sample_idx, dir_idx, target_size):
+    idx = min(sample_idx, weights.shape[0] - 1)
+    w = weights[idx:idx + 1, dir_idx:dir_idx + 1].detach().float()
+    w = F.interpolate(w, size=target_size, mode='bilinear', align_corners=False)
+    arr = w.squeeze().cpu().numpy()
+    return np.clip(arr, 0.0, 1.0)
 
 
 def _feature_energy_map(tensor, sample_idx, target_size):
@@ -243,6 +291,9 @@ def _make_zoom_error_panel(ct_img, gt_img, pred_bin, tp, fn, fp, pad=24, min_siz
 
 def _to_display(img_3ch):
     if img_3ch.shape[0] == 3:
+        if np.allclose(img_3ch[0], img_3ch[1], atol=1e-5) and np.allclose(img_3ch[1], img_3ch[2], atol=1e-5):
+            img = (img_3ch[0] + 1.6) / 3.2
+            return np.clip(img, 0, 1)
         img = np.transpose(img_3ch, (1, 2, 0))
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)

@@ -1,0 +1,390 @@
+GPU=0 backbone=convnextv2_atto single_modality=False
+lr=0.00012 wd=0.0005 bs=16
+[CIPA对齐] 训练(complete配对): 17416  测试/验证: 4514
+  ← 对比 CIPA: train.txt 全量用于训练, test.txt 既做 early stop 也是最终报告
+  ← 数据增强: 固定轻量增强
+  ← CT/PET归一化: /255 + ImageNet 标准化
+[-] Teacher_CT_Encoder: Path not found none. Training from scratch.
+[-] Teacher_PET_Encoder: Path not found none. Training from scratch.
+
+============================== MODEL PROFILE ==============================
+[INFO] Register count_convNd() for <class 'torch.nn.modules.conv.Conv2d'>.
+[INFO] Register zero_ops() for <class 'torch.nn.modules.dropout.Dropout'>.
+[INFO] Register zero_ops() for <class 'torch.nn.modules.container.Sequential'>.
+[INFO] Register count_normalization() for <class 'torch.nn.modules.batchnorm.BatchNorm2d'>.
+[INFO] Register zero_ops() for <class 'torch.nn.modules.activation.ReLU'>.
+[teacher_baseline] Params: 10.09M  FLOPs: 13.16G
+===========================================================================
+
+  Ep1[50/1088] loss=1.5610 seg=1.5610 lr=0.000002
+  Ep1[100/1088] loss=1.5057 seg=1.5057 lr=0.000004
+  Ep1[150/1088] loss=1.4193 seg=1.4193 lr=0.000006
+  Ep1[200/1088] loss=1.3505 seg=1.3505 lr=0.000007
+  Ep1[250/1088] loss=1.3320 seg=1.3320 lr=0.000009
+  Ep1[300/1088] loss=1.3069 seg=1.3069 lr=0.000011
+  Ep1[350/1088] loss=1.2916 seg=1.2916 lr=0.000013
+  Ep1[400/1088] loss=1.2796 seg=1.2796 lr=0.000015
+  Ep1[450/1088] loss=1.2723 seg=1.2723 lr=0.000017
+  Ep1[500/1088] loss=1.2635 seg=1.2635 lr=0.000018
+  Ep1[550/1088] loss=1.2606 seg=1.2606 lr=0.000020
+  Ep1[600/1088] loss=1.2494 seg=1.2494 lr=0.000022
+  Ep1[650/1088] loss=1.2423 seg=1.2423 lr=0.000024
+  Ep1[700/1088] loss=1.2437 seg=1.2437 lr=0.000026
+  Ep1[750/1088] loss=1.2279 seg=1.2279 lr=0.000028
+  Ep1[800/1088] loss=1.2238 seg=1.2238 lr=0.000029
+  Ep1[850/1088] loss=1.2073 seg=1.2073 lr=0.000031
+  Ep1[900/1088] loss=1.2106 seg=1.2106 lr=0.000033
+  Ep1[950/1088] loss=1.1959 seg=1.1959 lr=0.000035
+  Ep1[1000/1088] loss=1.1897 seg=1.1897 lr=0.000037
+  Ep1[1050/1088] loss=1.1777 seg=1.1777 lr=0.000039
+/root/miniconda3/lib/python3.8/site-packages/torch/autograd/__init__.py:200: UserWarning: upsample_bilinear2d_backward_out_cuda does not have a deterministic implementation, but you set 'torch.use_deterministic_algorithms(True, warn_only=True)'. You can file an issue at https://github.com/pytorch/pytorch/issues to help us prioritize adding deterministic support for this operation. (Triggered internally at ../aten/src/ATen/Context.cpp:71.)
+  Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+Epoch 1 loss=1.2909 Dice=0.5188 IoU=0.3503 HD95=52.30
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT/2026-06-03_19-42-11/vis_epochs/epoch_001
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best.pth.tar
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best_dice.pth.tar
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best_hd95.pth.tar
+  Ep2[50/1088] loss=1.1696 seg=1.1696 lr=0.000042
+  Ep2[100/1088] loss=1.1649 seg=1.1649 lr=0.000044
+  Ep2[150/1088] loss=1.1492 seg=1.1492 lr=0.000046
+  Ep2[200/1088] loss=1.1255 seg=1.1255 lr=0.000047
+  Ep2[250/1088] loss=1.1245 seg=1.1245 lr=0.000049
+  Ep2[300/1088] loss=1.1243 seg=1.1243 lr=0.000051
+  Ep2[350/1088] loss=1.1102 seg=1.1102 lr=0.000053
+  Ep2[400/1088] loss=1.1144 seg=1.1144 lr=0.000055
+  Ep2[450/1088] loss=1.1035 seg=1.1035 lr=0.000057
+  Ep2[500/1088] loss=1.0926 seg=1.0926 lr=0.000058
+  Ep2[550/1088] loss=1.0753 seg=1.0753 lr=0.000060
+  Ep2[600/1088] loss=1.0659 seg=1.0659 lr=0.000062
+  Ep2[650/1088] loss=1.0683 seg=1.0683 lr=0.000064
+  Ep2[700/1088] loss=1.0631 seg=1.0631 lr=0.000066
+  Ep2[750/1088] loss=1.0378 seg=1.0378 lr=0.000068
+  Ep2[800/1088] loss=1.0498 seg=1.0498 lr=0.000069
+  Ep2[850/1088] loss=1.0519 seg=1.0519 lr=0.000071
+  Ep2[900/1088] loss=1.0368 seg=1.0368 lr=0.000073
+  Ep2[950/1088] loss=1.0369 seg=1.0369 lr=0.000075
+  Ep2[1000/1088] loss=1.0082 seg=1.0082 lr=0.000077
+  Ep2[1050/1088] loss=0.9971 seg=0.9971 lr=0.000079
+/root/miniconda3/lib/python3.8/site-packages/torch/autograd/__init__.py:200: UserWarning: upsample_bilinear2d_backward_out_cuda does not have a deterministic implementation, but you set 'torch.use_deterministic_algorithms(True, warn_only=True)'. You can file an issue at https://github.com/pytorch/pytorch/issues to help us prioritize adding deterministic support for this operation. (Triggered internally at ../aten/src/ATen/Context.cpp:71.)
+  Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+Epoch 2 loss=1.0844 Dice=0.5712 IoU=0.3998 HD95=43.73
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT/2026-06-03_19-42-11/vis_epochs/epoch_002
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best.pth.tar
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best_dice.pth.tar
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best_hd95.pth.tar
+  Ep3[50/1088] loss=0.9688 seg=0.9688 lr=0.000082
+  Ep3[100/1088] loss=0.9889 seg=0.9889 lr=0.000084
+  Ep3[150/1088] loss=0.9987 seg=0.9987 lr=0.000086
+  Ep3[200/1088] loss=0.9444 seg=0.9444 lr=0.000087
+  Ep3[250/1088] loss=0.9765 seg=0.9765 lr=0.000089
+  Ep3[300/1088] loss=0.9941 seg=0.9941 lr=0.000091
+  Ep3[350/1088] loss=0.9565 seg=0.9565 lr=0.000093
+  Ep3[400/1088] loss=0.9514 seg=0.9514 lr=0.000095
+  Ep3[450/1088] loss=0.9495 seg=0.9495 lr=0.000097
+  Ep3[500/1088] loss=0.8629 seg=0.8629 lr=0.000098
+  Ep3[550/1088] loss=0.8718 seg=0.8718 lr=0.000100
+  Ep3[600/1088] loss=0.8198 seg=0.8198 lr=0.000102
+  Ep3[650/1088] loss=0.8644 seg=0.8644 lr=0.000104
+  Ep3[700/1088] loss=0.8130 seg=0.8130 lr=0.000106
+  Ep3[750/1088] loss=0.8243 seg=0.8243 lr=0.000108
+  Ep3[800/1088] loss=0.7435 seg=0.7435 lr=0.000109
+  Ep3[850/1088] loss=0.8035 seg=0.8035 lr=0.000111
+  Ep3[900/1088] loss=0.7220 seg=0.7220 lr=0.000113
+  Ep3[950/1088] loss=0.8121 seg=0.8121 lr=0.000115
+  Ep3[1000/1088] loss=0.6929 seg=0.6929 lr=0.000117
+  Ep3[1050/1088] loss=0.5595 seg=0.5595 lr=0.000119
+Epoch 3 loss=0.8566 Dice=0.6495 IoU=0.4809 HD95=37.35
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT/2026-06-03_19-42-11/vis_epochs/epoch_003
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best.pth.tar
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best_dice.pth.tar
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best_hd95.pth.tar
+  Ep4[50/1088] loss=0.7112 seg=0.7112 lr=0.000120
+  Ep4[100/1088] loss=0.5759 seg=0.5759 lr=0.000120
+  Ep4[150/1088] loss=0.6906 seg=0.6906 lr=0.000120
+  Ep4[200/1088] loss=0.6337 seg=0.6337 lr=0.000120
+  Ep4[250/1088] loss=0.5511 seg=0.5511 lr=0.000120
+  Ep4[300/1088] loss=0.5988 seg=0.5988 lr=0.000120
+  Ep4[350/1088] loss=0.4583 seg=0.4583 lr=0.000120
+  Ep4[400/1088] loss=0.5685 seg=0.5685 lr=0.000120
+  Ep4[450/1088] loss=0.4359 seg=0.4359 lr=0.000120
+  Ep4[500/1088] loss=0.5940 seg=0.5940 lr=0.000120
+  Ep4[550/1088] loss=0.4702 seg=0.4702 lr=0.000120
+  Ep4[600/1088] loss=0.3734 seg=0.3734 lr=0.000120
+  Ep4[650/1088] loss=0.5883 seg=0.5883 lr=0.000120
+  Ep4[700/1088] loss=0.4401 seg=0.4401 lr=0.000120
+  Ep4[750/1088] loss=0.5743 seg=0.5743 lr=0.000120
+  Ep4[800/1088] loss=0.5549 seg=0.5549 lr=0.000120
+  Ep4[850/1088] loss=0.5528 seg=0.5528 lr=0.000120
+  Ep4[900/1088] loss=0.4966 seg=0.4966 lr=0.000120
+  Ep4[950/1088] loss=0.4526 seg=0.4526 lr=0.000120
+  Ep4[1000/1088] loss=0.4706 seg=0.4706 lr=0.000120
+  Ep4[1050/1088] loss=0.5755 seg=0.5755 lr=0.000120
+Epoch 4 loss=0.5442 Dice=0.7243 IoU=0.5677 HD95=27.05
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT/2026-06-03_19-42-11/vis_epochs/epoch_004
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best.pth.tar
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best_dice.pth.tar
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best_hd95.pth.tar
+  Ep5[50/1088] loss=0.4232 seg=0.4232 lr=0.000120
+  Ep5[100/1088] loss=0.4661 seg=0.4661 lr=0.000120
+  Ep5[150/1088] loss=0.4679 seg=0.4679 lr=0.000120
+  Ep5[200/1088] loss=0.4256 seg=0.4256 lr=0.000120
+  Ep5[250/1088] loss=0.3228 seg=0.3228 lr=0.000120
+  Ep5[300/1088] loss=0.5128 seg=0.5128 lr=0.000120
+  Ep5[350/1088] loss=0.4674 seg=0.4674 lr=0.000120
+  Ep5[400/1088] loss=0.4292 seg=0.4292 lr=0.000120
+  Ep5[450/1088] loss=0.4912 seg=0.4912 lr=0.000120
+  Ep5[500/1088] loss=0.5514 seg=0.5514 lr=0.000120
+  Ep5[550/1088] loss=0.4745 seg=0.4745 lr=0.000120
+  Ep5[600/1088] loss=0.4028 seg=0.4028 lr=0.000120
+  Ep5[650/1088] loss=0.4445 seg=0.4445 lr=0.000120
+  Ep5[700/1088] loss=0.5147 seg=0.5147 lr=0.000120
+  Ep5[750/1088] loss=0.4220 seg=0.4220 lr=0.000120
+  Ep5[800/1088] loss=0.3955 seg=0.3955 lr=0.000120
+  Ep5[850/1088] loss=0.4388 seg=0.4388 lr=0.000120
+  Ep5[900/1088] loss=0.4096 seg=0.4096 lr=0.000120
+  Ep5[950/1088] loss=0.5722 seg=0.5722 lr=0.000120
+  Ep5[1000/1088] loss=0.4908 seg=0.4908 lr=0.000120
+  Ep5[1050/1088] loss=0.4875 seg=0.4875 lr=0.000120
+Epoch 5 loss=0.4422 Dice=0.7282 IoU=0.5726 HD95=34.78
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT/2026-06-03_19-42-11/vis_epochs/epoch_005
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best.pth.tar
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best_dice.pth.tar
+  Ep6[50/1088] loss=0.4232 seg=0.4232 lr=0.000120
+  Ep6[100/1088] loss=0.5108 seg=0.5108 lr=0.000120
+  Ep6[150/1088] loss=0.4006 seg=0.4006 lr=0.000120
+  Ep6[200/1088] loss=0.4840 seg=0.4840 lr=0.000120
+  Ep6[250/1088] loss=0.4887 seg=0.4887 lr=0.000120
+  Ep6[300/1088] loss=0.3363 seg=0.3363 lr=0.000120
+  Ep6[350/1088] loss=0.4745 seg=0.4745 lr=0.000120
+  Ep6[400/1088] loss=0.4604 seg=0.4604 lr=0.000120
+  Ep6[450/1088] loss=0.4693 seg=0.4693 lr=0.000120
+  Ep6[500/1088] loss=0.3747 seg=0.3747 lr=0.000120
+  Ep6[550/1088] loss=0.4909 seg=0.4909 lr=0.000120
+  Ep6[600/1088] loss=0.4597 seg=0.4597 lr=0.000120
+  Ep6[650/1088] loss=0.4991 seg=0.4991 lr=0.000120
+  Ep6[700/1088] loss=0.4540 seg=0.4540 lr=0.000120
+  Ep6[750/1088] loss=0.2358 seg=0.2358 lr=0.000120
+  Ep6[800/1088] loss=0.3406 seg=0.3406 lr=0.000120
+  Ep6[850/1088] loss=0.2986 seg=0.2986 lr=0.000120
+  Ep6[900/1088] loss=0.4937 seg=0.4937 lr=0.000120
+  Ep6[950/1088] loss=0.3600 seg=0.3600 lr=0.000119
+  Ep6[1000/1088] loss=0.4489 seg=0.4489 lr=0.000119
+  Ep6[1050/1088] loss=0.4266 seg=0.4266 lr=0.000119
+Epoch 6 loss=0.4145 Dice=0.7442 IoU=0.5926 HD95=25.24
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT/2026-06-03_19-42-11/vis_epochs/epoch_006
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best.pth.tar
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best_dice.pth.tar
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best_hd95.pth.tar
+  Ep7[50/1088] loss=0.5725 seg=0.5725 lr=0.000119
+  Ep7[100/1088] loss=0.4435 seg=0.4435 lr=0.000119
+  Ep7[150/1088] loss=0.3905 seg=0.3905 lr=0.000119
+  Ep7[200/1088] loss=0.4134 seg=0.4134 lr=0.000119
+  Ep7[250/1088] loss=0.4710 seg=0.4710 lr=0.000119
+  Ep7[300/1088] loss=0.4083 seg=0.4083 lr=0.000119
+  Ep7[350/1088] loss=0.3174 seg=0.3174 lr=0.000119
+  Ep7[400/1088] loss=0.3582 seg=0.3582 lr=0.000119
+  Ep7[450/1088] loss=0.3684 seg=0.3684 lr=0.000119
+  Ep7[500/1088] loss=0.4066 seg=0.4066 lr=0.000119
+  Ep7[550/1088] loss=0.2775 seg=0.2775 lr=0.000119
+  Ep7[600/1088] loss=0.2240 seg=0.2240 lr=0.000119
+  Ep7[650/1088] loss=0.2149 seg=0.2149 lr=0.000119
+  Ep7[700/1088] loss=0.3998 seg=0.3998 lr=0.000119
+  Ep7[750/1088] loss=0.2982 seg=0.2982 lr=0.000119
+  Ep7[800/1088] loss=0.4341 seg=0.4341 lr=0.000119
+  Ep7[850/1088] loss=0.3754 seg=0.3754 lr=0.000119
+  Ep7[900/1088] loss=0.3457 seg=0.3457 lr=0.000119
+  Ep7[950/1088] loss=0.3081 seg=0.3081 lr=0.000119
+  Ep7[1000/1088] loss=0.4258 seg=0.4258 lr=0.000119
+  Ep7[1050/1088] loss=0.5091 seg=0.5091 lr=0.000119
+Epoch 7 loss=0.4019 Dice=0.7513 IoU=0.6017 HD95=26.41
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT/2026-06-03_19-42-11/vis_epochs/epoch_007
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best.pth.tar
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best_dice.pth.tar
+  Ep8[50/1088] loss=0.3189 seg=0.3189 lr=0.000119
+  Ep8[100/1088] loss=0.3345 seg=0.3345 lr=0.000119
+  Ep8[150/1088] loss=0.4522 seg=0.4522 lr=0.000119
+  Ep8[200/1088] loss=0.3609 seg=0.3609 lr=0.000119
+  Ep8[250/1088] loss=0.2255 seg=0.2255 lr=0.000119
+  Ep8[300/1088] loss=0.4619 seg=0.4619 lr=0.000119
+  Ep8[350/1088] loss=0.4300 seg=0.4300 lr=0.000119
+  Ep8[400/1088] loss=0.1960 seg=0.1960 lr=0.000119
+  Ep8[450/1088] loss=0.4857 seg=0.4857 lr=0.000119
+  Ep8[500/1088] loss=0.4488 seg=0.4488 lr=0.000119
+  Ep8[550/1088] loss=0.4093 seg=0.4093 lr=0.000119
+  Ep8[600/1088] loss=0.4758 seg=0.4758 lr=0.000119
+  Ep8[650/1088] loss=0.4080 seg=0.4080 lr=0.000119
+  Ep8[700/1088] loss=0.3397 seg=0.3397 lr=0.000119
+  Ep8[750/1088] loss=0.4732 seg=0.4732 lr=0.000119
+  Ep8[800/1088] loss=0.4552 seg=0.4552 lr=0.000119
+  Ep8[850/1088] loss=0.4796 seg=0.4796 lr=0.000119
+  Ep8[900/1088] loss=0.3274 seg=0.3274 lr=0.000119
+  Ep8[950/1088] loss=0.4874 seg=0.4874 lr=0.000119
+  Ep8[1000/1088] loss=0.3481 seg=0.3481 lr=0.000119
+  Ep8[1050/1088] loss=0.3570 seg=0.3570 lr=0.000118
+Epoch 8 loss=0.3947 Dice=0.7414 IoU=0.5891 HD95=27.00
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT/2026-06-03_19-42-11/vis_epochs/epoch_008
+  Ep9[50/1088] loss=0.3016 seg=0.3016 lr=0.000118
+  Ep9[100/1088] loss=0.3797 seg=0.3797 lr=0.000118
+  Ep9[150/1088] loss=0.3253 seg=0.3253 lr=0.000118
+  Ep9[200/1088] loss=0.4804 seg=0.4804 lr=0.000118
+  Ep9[250/1088] loss=0.2903 seg=0.2903 lr=0.000118
+  Ep9[300/1088] loss=0.6179 seg=0.6179 lr=0.000118
+  Ep9[350/1088] loss=0.4748 seg=0.4748 lr=0.000118
+  Ep9[400/1088] loss=0.4227 seg=0.4227 lr=0.000118
+  Ep9[450/1088] loss=0.3947 seg=0.3947 lr=0.000118
+  Ep9[500/1088] loss=0.4434 seg=0.4434 lr=0.000118
+  Ep9[550/1088] loss=0.4803 seg=0.4803 lr=0.000118
+  Ep9[600/1088] loss=0.2496 seg=0.2496 lr=0.000118
+  Ep9[650/1088] loss=0.2130 seg=0.2130 lr=0.000118
+  Ep9[700/1088] loss=0.3543 seg=0.3543 lr=0.000118
+  Ep9[750/1088] loss=0.4733 seg=0.4733 lr=0.000118
+  Ep9[800/1088] loss=0.3438 seg=0.3438 lr=0.000118
+  Ep9[850/1088] loss=0.3272 seg=0.3272 lr=0.000118
+  Ep9[900/1088] loss=0.3336 seg=0.3336 lr=0.000118
+  Ep9[950/1088] loss=0.3491 seg=0.3491 lr=0.000118
+  Ep9[1000/1088] loss=0.3482 seg=0.3482 lr=0.000118
+  Ep9[1050/1088] loss=0.4381 seg=0.4381 lr=0.000118
+Epoch 9 loss=0.3848 Dice=0.7508 IoU=0.6010 HD95=26.10
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT/2026-06-03_19-42-11/vis_epochs/epoch_009
+  Ep10[50/1088] loss=0.3933 seg=0.3933 lr=0.000118
+  Ep10[100/1088] loss=0.4064 seg=0.4064 lr=0.000118
+  Ep10[150/1088] loss=0.3462 seg=0.3462 lr=0.000118
+  Ep10[200/1088] loss=0.5097 seg=0.5097 lr=0.000118
+  Ep10[250/1088] loss=0.3395 seg=0.3395 lr=0.000118
+  Ep10[300/1088] loss=0.3547 seg=0.3547 lr=0.000118
+  Ep10[350/1088] loss=0.4087 seg=0.4087 lr=0.000118
+  Ep10[400/1088] loss=0.3543 seg=0.3543 lr=0.000117
+  Ep10[450/1088] loss=0.2633 seg=0.2633 lr=0.000117
+  Ep10[500/1088] loss=0.3697 seg=0.3697 lr=0.000117
+  Ep10[550/1088] loss=0.4500 seg=0.4500 lr=0.000117
+  Ep10[600/1088] loss=0.4370 seg=0.4370 lr=0.000117
+  Ep10[650/1088] loss=0.3715 seg=0.3715 lr=0.000117
+  Ep10[700/1088] loss=0.3419 seg=0.3419 lr=0.000117
+  Ep10[750/1088] loss=0.4991 seg=0.4991 lr=0.000117
+  Ep10[800/1088] loss=0.3680 seg=0.3680 lr=0.000117
+  Ep10[850/1088] loss=0.3651 seg=0.3651 lr=0.000117
+  Ep10[900/1088] loss=0.3345 seg=0.3345 lr=0.000117
+  Ep10[950/1088] loss=0.3433 seg=0.3433 lr=0.000117
+  Ep10[1000/1088] loss=0.4080 seg=0.4080 lr=0.000117
+  Ep10[1050/1088] loss=0.3403 seg=0.3403 lr=0.000117
+Epoch 10 loss=0.3766 Dice=0.7576 IoU=0.6097 HD95=25.29
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT/2026-06-03_19-42-11/vis_epochs/epoch_010
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best.pth.tar
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best_dice.pth.tar
+  Ep11[50/1088] loss=0.2863 seg=0.2863 lr=0.000117
+  Ep11[100/1088] loss=0.3170 seg=0.3170 lr=0.000117
+  Ep11[150/1088] loss=0.3588 seg=0.3588 lr=0.000117
+  Ep11[200/1088] loss=0.1992 seg=0.1992 lr=0.000117
+  Ep11[250/1088] loss=0.3354 seg=0.3354 lr=0.000117
+  Ep11[300/1088] loss=0.4036 seg=0.4036 lr=0.000117
+  Ep11[350/1088] loss=0.2945 seg=0.2945 lr=0.000117
+  Ep11[400/1088] loss=0.4018 seg=0.4018 lr=0.000117
+  Ep11[450/1088] loss=0.4089 seg=0.4089 lr=0.000117
+  Ep11[500/1088] loss=0.2819 seg=0.2819 lr=0.000117
+  Ep11[550/1088] loss=0.2956 seg=0.2956 lr=0.000117
+  Ep11[600/1088] loss=0.2420 seg=0.2420 lr=0.000116
+  Ep11[650/1088] loss=0.4166 seg=0.4166 lr=0.000116
+  Ep11[700/1088] loss=0.2751 seg=0.2751 lr=0.000116
+  Ep11[750/1088] loss=0.2811 seg=0.2811 lr=0.000116
+  Ep11[800/1088] loss=0.4198 seg=0.4198 lr=0.000116
+  Ep11[850/1088] loss=0.3613 seg=0.3613 lr=0.000116
+  Ep11[900/1088] loss=0.4268 seg=0.4268 lr=0.000116
+  Ep11[950/1088] loss=0.3520 seg=0.3520 lr=0.000116
+  Ep11[1000/1088] loss=0.3613 seg=0.3613 lr=0.000116
+  Ep11[1050/1088] loss=0.2917 seg=0.2917 lr=0.000116
+Epoch 11 loss=0.3704 Dice=0.7496 IoU=0.5995 HD95=26.09
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT/2026-06-03_19-42-11/vis_epochs/epoch_011
+  Ep12[50/1088] loss=0.3217 seg=0.3217 lr=0.000116
+  Ep12[100/1088] loss=0.3310 seg=0.3310 lr=0.000116
+  Ep12[150/1088] loss=0.3193 seg=0.3193 lr=0.000116
+  Ep12[200/1088] loss=0.4201 seg=0.4201 lr=0.000116
+  Ep12[250/1088] loss=0.3352 seg=0.3352 lr=0.000116
+  Ep12[300/1088] loss=0.4020 seg=0.4020 lr=0.000116
+  Ep12[350/1088] loss=0.3938 seg=0.3938 lr=0.000116
+  Ep12[400/1088] loss=0.3429 seg=0.3429 lr=0.000116
+  Ep12[450/1088] loss=0.2809 seg=0.2809 lr=0.000116
+  Ep12[500/1088] loss=0.3392 seg=0.3392 lr=0.000116
+  Ep12[550/1088] loss=0.3166 seg=0.3166 lr=0.000116
+  Ep12[600/1088] loss=0.5070 seg=0.5070 lr=0.000116
+  Ep12[650/1088] loss=0.2827 seg=0.2827 lr=0.000115
+  Ep12[700/1088] loss=0.4116 seg=0.4116 lr=0.000115
+  Ep12[750/1088] loss=0.4317 seg=0.4317 lr=0.000115
+  Ep12[800/1088] loss=0.3064 seg=0.3064 lr=0.000115
+  Ep12[850/1088] loss=0.4068 seg=0.4068 lr=0.000115
+  Ep12[900/1088] loss=0.3728 seg=0.3728 lr=0.000115
+  Ep12[950/1088] loss=0.3695 seg=0.3695 lr=0.000115
+  Ep12[1000/1088] loss=0.3850 seg=0.3850 lr=0.000115
+  Ep12[1050/1088] loss=0.2165 seg=0.2165 lr=0.000115
+Epoch 12 loss=0.3631 Dice=0.7598 IoU=0.6126 HD95=29.16
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT/2026-06-03_19-42-11/vis_epochs/epoch_012
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best.pth.tar
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best_dice.pth.tar
+  Ep13[50/1088] loss=0.3800 seg=0.3800 lr=0.000115
+  Ep13[100/1088] loss=0.4841 seg=0.4841 lr=0.000115
+  Ep13[150/1088] loss=0.3508 seg=0.3508 lr=0.000115
+  Ep13[200/1088] loss=0.2863 seg=0.2863 lr=0.000115
+  Ep13[250/1088] loss=0.2656 seg=0.2656 lr=0.000115
+  Ep13[300/1088] loss=0.4082 seg=0.4082 lr=0.000115
+  Ep13[350/1088] loss=0.3689 seg=0.3689 lr=0.000115
+  Ep13[400/1088] loss=0.2743 seg=0.2743 lr=0.000115
+  Ep13[450/1088] loss=0.4227 seg=0.4227 lr=0.000115
+  Ep13[500/1088] loss=0.3318 seg=0.3318 lr=0.000115
+  Ep13[550/1088] loss=0.3272 seg=0.3272 lr=0.000114
+  Ep13[600/1088] loss=0.4012 seg=0.4012 lr=0.000114
+  Ep13[650/1088] loss=0.3152 seg=0.3152 lr=0.000114
+  Ep13[700/1088] loss=0.3802 seg=0.3802 lr=0.000114
+  Ep13[750/1088] loss=0.4448 seg=0.4448 lr=0.000114
+  Ep13[800/1088] loss=0.4562 seg=0.4562 lr=0.000114
+  Ep13[850/1088] loss=0.3016 seg=0.3016 lr=0.000114
+  Ep13[900/1088] loss=0.2912 seg=0.2912 lr=0.000114
+  Ep13[950/1088] loss=0.4030 seg=0.4030 lr=0.000114
+  Ep13[1000/1088] loss=0.4131 seg=0.4131 lr=0.000114
+  Ep13[1050/1088] loss=0.3351 seg=0.3351 lr=0.000114
+Epoch 13 loss=0.3597 Dice=0.7430 IoU=0.5911 HD95=24.04
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT/2026-06-03_19-42-11/vis_epochs/epoch_013
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best_hd95.pth.tar
+  Ep14[50/1088] loss=0.3676 seg=0.3676 lr=0.000114
+  Ep14[100/1088] loss=0.2617 seg=0.2617 lr=0.000114
+  Ep14[150/1088] loss=0.1521 seg=0.1521 lr=0.000114
+  Ep14[200/1088] loss=0.3234 seg=0.3234 lr=0.000114
+  Ep14[250/1088] loss=0.4477 seg=0.4477 lr=0.000114
+  Ep14[300/1088] loss=0.3198 seg=0.3198 lr=0.000114
+  Ep14[350/1088] loss=0.3396 seg=0.3396 lr=0.000113
+  Ep14[400/1088] loss=0.3733 seg=0.3733 lr=0.000113
+  Ep14[450/1088] loss=0.3666 seg=0.3666 lr=0.000113
+  Ep14[500/1088] loss=0.2956 seg=0.2956 lr=0.000113
+  Ep14[550/1088] loss=0.3037 seg=0.3037 lr=0.000113
+  Ep14[600/1088] loss=0.4534 seg=0.4534 lr=0.000113
+  Ep14[650/1088] loss=0.3342 seg=0.3342 lr=0.000113
+  Ep14[700/1088] loss=0.3173 seg=0.3173 lr=0.000113
+  Ep14[750/1088] loss=0.4099 seg=0.4099 lr=0.000113
+  Ep14[800/1088] loss=0.5106 seg=0.5106 lr=0.000113
+  Ep14[850/1088] loss=0.2472 seg=0.2472 lr=0.000113
+  Ep14[900/1088] loss=0.3604 seg=0.3604 lr=0.000113
+  Ep14[950/1088] loss=0.4272 seg=0.4272 lr=0.000113
+  Ep14[1000/1088] loss=0.3480 seg=0.3480 lr=0.000113
+  Ep14[1050/1088] loss=0.3666 seg=0.3666 lr=0.000113
+Epoch 14 loss=0.3513 Dice=0.7219 IoU=0.5649 HD95=23.46
+[vis_teacher] saved 2 diagnostics to ./checkpoints_new/MDT/2026-06-03_19-42-11/vis_epochs/epoch_014
+Saved: ./checkpoints_new/MDT/2026-06-03_19-42-11/ckpt.best_hd95.pth.tar
+  Ep15[50/1088] loss=0.3328 seg=0.3328 lr=0.000113
+  Ep15[100/1088] loss=0.3702 seg=0.3702 lr=0.000113
+  Ep15[150/1088] loss=0.3180 seg=0.3180 lr=0.000112
+  Ep15[200/1088] loss=0.3921 seg=0.3921 lr=0.000112
+  Ep15[250/1088] loss=0.2672 seg=0.2672 lr=0.000112
+  Ep15[300/1088] loss=0.3558 seg=0.3558 lr=0.000112
+  Ep15[350/1088] loss=0.3119 seg=0.3119 lr=0.000112
+  Ep15[400/1088] loss=0.2954 seg=0.2954 lr=0.000112
+  Ep15[450/1088] loss=0.3994 seg=0.3994 lr=0.000112
+  Ep15[500/1088] loss=0.4420 seg=0.4420 lr=0.000112
+  Ep15[550/1088] loss=0.2632 seg=0.2632 lr=0.000112
+  Ep15[600/1088] loss=0.3829 seg=0.3829 lr=0.000112
+  Ep15[650/1088] loss=0.4533 seg=0.4533 lr=0.000112
+  Ep15[700/1088] loss=0.3431 seg=0.3431 lr=0.000112
+  Ep15[750/1088] loss=0.2994 seg=0.2994 lr=0.000112
+  Ep15[800/1088] loss=0.3296 seg=0.3296 lr=0.000112
+  Ep15[850/1088] loss=0.2863 seg=0.2863 lr=0.000112
+  Ep15[900/1088] loss=0.2989 seg=0.2989 lr=0.000112
+  Ep15[950/1088] loss=0.4712 seg=0.4712 lr=0.000111
+  Ep15[1000/1088] loss=0.3070 seg=0.3070 lr=0.000111
+  Ep15[1050/1088] loss=0.3533 seg=0.3533 lr=0.000111

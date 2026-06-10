@@ -16,13 +16,8 @@ class MDTSegTeacher:
         self.networks = {k: v for k, v in networks.items() if v is not None}
         self.config = config
         self.device = torch.device('cuda', int(config.gpus[0]))
-        self.data_parallel = torch.cuda.is_available() and len(getattr(config, 'gpus', [])) > 1
-        for key, v in list(self.networks.items()):
+        for v in self.networks.values():
             v.to(self.device)
-            if self.data_parallel:
-                self.networks[key] = torch.nn.DataParallel(v, device_ids=list(config.gpus), output_device=int(config.gpus[0]))
-        if self.data_parallel:
-            print(f'[+] DataParallel enabled on GPUs: {list(config.gpus)}')
 
         self.scaler = torch.cuda.amp.GradScaler() if config.mixed_precision else None
         self.loss_seg = BCEDiceLoss(
@@ -226,18 +221,9 @@ class MDTSegTeacher:
         out['total_loss'] = total_loss / max(n, 1)
         return out
 
-    def _unwrap(self, model):
-        return model.module if isinstance(model, torch.nn.DataParallel) else model
-
-    def model_state_dict(self, model):
-        return self._unwrap(model).state_dict()
-
-    def load_model_state_dict(self, model, state_dict, strict=False):
-        return self._unwrap(model).load_state_dict(state_dict, strict=strict)
-
     def save_checkpoint(self, path, epoch):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        ckpt = {k: self.model_state_dict(v) for k, v in self.networks.items()}
+        ckpt = {k: v.state_dict() for k, v in self.networks.items()}
         ckpt['epoch'] = epoch
         ckpt['optimizer'] = self.optimizer.state_dict()
         torch.save(ckpt, path)
