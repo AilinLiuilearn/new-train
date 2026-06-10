@@ -19,7 +19,9 @@ from utils.optimization import get_cosine_scheduler
 from utils.train_logger import append_epoch_log, init_train_log
 from utils.vis_teacher import save_segmentation_diagnostics
 
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+_torch_version = tuple(int(part) for part in torch.__version__.split('+')[0].split('.')[:2])
+if _torch_version >= (2, 1):
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 
 def _load_dataset_module():
@@ -32,8 +34,14 @@ def _load_dataset_module():
 
 
 def _prepare_env(config):
-    g0 = int(config.gpus[0]) if config.gpus else 0
-    config.gpus = [g0]
+    gpus = [int(g) for g in config.gpus] if config.gpus else [0]
+    if torch.cuda.is_available():
+        visible = torch.cuda.device_count()
+        gpus = [g for g in gpus if 0 <= g < visible]
+        if not gpus:
+            gpus = [0]
+    config.gpus = gpus
+    g0 = gpus[0]
     seed = int(config.random_state)
     os.environ['PYTHONHASHSEED'] = str(seed)
     os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
@@ -53,7 +61,7 @@ def _prepare_env(config):
         torch.backends.cuda.enable_mem_efficient_sdp(False)
     if hasattr(torch.backends.cuda, 'enable_math_sdp'):
         torch.backends.cuda.enable_math_sdp(True)
-    torch.use_deterministic_algorithms(True)
+    torch.use_deterministic_algorithms(True, warn_only=True)
     return g0
 
 
@@ -67,6 +75,8 @@ def _build_loaders(config):
             config.num_workers,
             config.random_state,
             pin_memory=getattr(config, 'pin_memory', True),
+            aug_mode=getattr(config, 'aug_mode', 'cipa'),
+            norm_mode=getattr(config, 'norm_mode', 'imagenet'),
         )
     return dataset_mod.get_pclt20k_loaders(
         config.root,
@@ -77,6 +87,8 @@ def _build_loaders(config):
         random_state=config.random_state,
         use_case_split=getattr(config, 'use_case_split', True),
         pin_memory=getattr(config, 'pin_memory', True),
+        aug_mode=getattr(config, 'aug_mode', 'cipa'),
+        norm_mode=getattr(config, 'norm_mode', 'imagenet'),
     )
 
 
@@ -84,6 +96,30 @@ def _save_config(config):
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     with open(os.path.join(config.checkpoint_dir, 'config_args.json'), 'w') as f:
         json.dump(vars(config), f, indent=4)
+
+
+def _unwrap_model(model):
+    return model.module if isinstance(model, torch.nn.DataParallel) else model
+
+
+def _collect_adc_gamma(task):
+    model = _unwrap_model(task.networks.get('model'))
+    gammas = {}
+    for branch_name in ('enc_ct', 'enc_pet'):
+        encoder = getattr(model, branch_name, None)
+        if encoder is None or not hasattr(encoder, 'adc_mac'):
+            continue
+        for stage_idx, mac in enumerate(encoder.adc_mac, start=1):
+            gamma = getattr(mac, 'gamma', None)
+            if gamma is not None:
+                gammas[f'{branch_name}_s{stage_idx}_gamma'] = float(gamma.detach().cpu())
+    return gammas
+
+
+def _adc_gamma_headers(config):
+    if not getattr(config, 'use_adc_mac', False):
+        return []
+    return [f'{branch}_s{stage}_gamma' for branch in ('enc_ct', 'enc_pet') for stage in range(1, 5)]
 
 
 def main():
@@ -121,7 +157,8 @@ def main():
     )
 
     log_path = os.path.join(config.checkpoint_dir, 'train_log.csv')
-    init_train_log(log_path)
+    gamma_headers = _adc_gamma_headers(config)
+    init_train_log(log_path, extra_headers=gamma_headers)
 
     grad_clip = getattr(config, 'grad_clip', 0.5)
     clip_params = [p for net in task.networks.values() for p in net.parameters()]
@@ -132,14 +169,16 @@ def main():
 
     for epoch in range(1, config.epochs + 1):
         tloss, tn = 0.0, 0
-        if hasattr(task.networks.get('model'), 'set_epoch'):
-            task.networks['model'].set_epoch(epoch)
+        grad_norm_sum, grad_norm_steps = 0.0, 0
+        model_for_epoch = _unwrap_model(task.networks.get('model'))
+        if hasattr(model_for_epoch, 'set_epoch'):
+            model_for_epoch.set_epoch(epoch)
         task.set_epoch(epoch)
         task.optimizer.zero_grad()
 
         for i, batch in enumerate(train_loader):
             stepped = False
-            with torch.amp.autocast('cuda', enabled=config.mixed_precision):
+            with torch.cuda.amp.autocast(enabled=config.mixed_precision):
                 loss, _, _, loss_dict = task.train_step(batch)
                 loss = loss / accum_iter
 
@@ -148,20 +187,24 @@ def main():
                 if (i + 1) % accum_iter == 0 or (i + 1) == spe:
                     if grad_clip > 0:
                         task.scaler.unscale_(task.optimizer)
+                        total_norm = torch.nn.utils.clip_grad_norm_(clip_params, float('inf'))
+                        grad_norm_sum += float(total_norm)
+                        grad_norm_steps += 1
                         torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
                     task.scaler.step(task.optimizer)
                     task.scaler.update()
                     task.optimizer.zero_grad()
-                    task.update_ema()
                     stepped = True
             else:
                 loss.backward()
                 if (i + 1) % accum_iter == 0 or (i + 1) == spe:
                     if grad_clip > 0:
+                        total_norm = torch.nn.utils.clip_grad_norm_(clip_params, float('inf'))
+                        grad_norm_sum += float(total_norm)
+                        grad_norm_steps += 1
                         torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
                     task.optimizer.step()
                     task.optimizer.zero_grad()
-                    task.update_ema()
                     stepped = True
 
             if task.scheduler and stepped:
@@ -179,9 +222,23 @@ def main():
                 )
 
         val_m = task.evaluate(val_loader)
-        append_epoch_log(log_path, epoch, tloss / max(tn, 1), val_m)
-        print('Epoch {} loss={:.4f} Dice={:.4f} IoU={:.4f} HD95={:.2f}'.format(
-            epoch, tloss / max(tn, 1), val_m['dice'], val_m['iou'], val_m['hd95']))
+        avg_grad_norm = grad_norm_sum / max(grad_norm_steps, 1)
+        curr_lr = task.optimizer.param_groups[0]['lr']
+        gamma_metrics = _collect_adc_gamma(task)
+        append_epoch_log(
+            log_path,
+            epoch,
+            tloss / max(tn, 1),
+            val_m,
+            lr=curr_lr,
+            grad_norm=avg_grad_norm,
+            extra_metrics=gamma_metrics,
+        )
+        gamma_text = ''
+        if gamma_metrics:
+            gamma_text = ' ' + ' '.join(f'{k}={v:.4f}' for k, v in gamma_metrics.items())
+        print('Epoch {} loss={:.4f} Dice={:.4f} IoU={:.4f} HD95={:.2f} lr={:.6f} grad={:.4f}{}'.format(
+            epoch, tloss / max(tn, 1), val_m['dice'], val_m['iou'], val_m['hd95'], curr_lr, avg_grad_norm, gamma_text))
 
         if getattr(config, 'vis_every_epoch', False):
             save_segmentation_diagnostics(
@@ -213,9 +270,7 @@ def main():
         ckpt = torch.load(path, map_location='cpu')
         for k, v in task.networks.items():
             if k in ckpt:
-                v.load_state_dict(ckpt[k], strict=False)
-        if task.use_ema and 'ema_model' in ckpt:
-            task.ema_model.load_state_dict(ckpt['ema_model'], strict=False)
+                task.load_model_state_dict(v, ckpt[k], strict=False)
 
     best_dice_path = os.path.join(config.checkpoint_dir, 'ckpt.best_dice.pth.tar')
     best_hd95_path = os.path.join(config.checkpoint_dir, 'ckpt.best_hd95.pth.tar')

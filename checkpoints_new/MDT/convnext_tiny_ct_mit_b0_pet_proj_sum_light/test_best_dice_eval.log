@@ -1,0 +1,56 @@
+[TEST] exp_dir: /root/autodl-tmp/mkd-main/new-train/checkpoints_new/MDT/convnext_tiny_ct_mit_b0_pet_proj_sum_light
+[TEST] checkpoint: /root/autodl-tmp/mkd-main/new-train/checkpoints_new/MDT/convnext_tiny_ct_mit_b0_pet_proj_sum_light/ckpt.best_dice.pth.tar
+[TEST] root: /root/autodl-tmp/data/PCLT20K
+[TEST] split mode cipa_aligned: True
+[TEST] aug_mode: cipa
+[TEST] norm_mode: cipa
+[TEST] batch_size: 8
+[TEST] num_workers: 4
+[TEST] eval_threshold: 0.5
+[CIPA对齐] 训练(complete配对): 13757  验证: 3659  测试: 4514
+  ← 使用当前划分: train.txt 训练, val.txt early stop/选最佳, test.txt 最终报告
+  ← 数据增强: cipa
+  ← CT/PET归一化: cipa
+[+] Teacher_CT_ConvNeXt_Encoder: Loading local weights from /root/autodl-tmp/mkd-main/new-train/pretrained/convnext_tiny/pytorch_model.bin
+[+] Teacher_CT_ConvNeXt_Encoder loaded params: 178, skipped: 4
+[+] Teacher_CT_ConvNeXt_Encoder skipped examples: ['convnext.stem_weight', 'convnext.stem_bias', 'classifier.weight', 'classifier.bias']
+[+] Teacher_CT_ConvNeXt_Encoder load status: _IncompatibleKeys(missing_keys=['model.embeddings.patch_embeddings.weight', 'model.embeddings.patch_embeddings.bias'], unexpected_keys=[])
+[+] Teacher_PET_MiT_Encoder: Loading local weights from /root/autodl-tmp/mkd-main/new-train/pretrained/mit-b0/pytorch_model.bin
+[+] Teacher_PET_MiT_Encoder loaded params: 192, skipped: 2
+[+] Teacher_PET_MiT_Encoder skipped examples: ['classifier.weight', 'classifier.bias']
+[+] Teacher_PET_MiT_Encoder load status: <All keys matched successfully>
+[TEST] loaded checkpoint epoch: 21
+[VIS] saving 16 diagnostics to: /root/autodl-tmp/mkd-main/new-train/checkpoints_new/MDT/convnext_tiny_ct_mit_b0_pet_proj_sum_light/vis_test_best_dice
+[vis_teacher] saved 16 diagnostics to /root/autodl-tmp/mkd-main/new-train/checkpoints_new/MDT/convnext_tiny_ct_mit_b0_pet_proj_sum_light/vis_test_best_dice
+[TEST] start evaluating test.txt: batches=565, samples=4514
+[TEST progress] 1/565 batches, 8/4514 samples | Dice=0.8069 IoU=0.6763 HD95=18.85
+[TEST progress] 20/565 batches, 160/4514 samples | Dice=0.9031 IoU=0.8233 HD95=11.17
+[TEST progress] 40/565 batches, 320/4514 samples | Dice=0.8397 IoU=0.7238 HD95=16.16
+[TEST progress] 60/565 batches, 480/4514 samples | Dice=0.8189 IoU=0.6933 HD95=14.81
+[TEST progress] 80/565 batches, 640/4514 samples | Dice=0.7463 IoU=0.5953 HD95=15.72
+[TEST progress] 100/565 batches, 800/4514 samples | Dice=0.7681 IoU=0.6235 HD95=15.58
+[TEST progress] 120/565 batches, 960/4514 samples | Dice=0.7632 IoU=0.6171 HD95=19.53
+[TEST progress] 140/565 batches, 1120/4514 samples | Dice=0.7773 IoU=0.6357 HD95=18.96
+[TEST progress] 160/565 batches, 1280/4514 samples | Dice=0.7775 IoU=0.6360 HD95=20.09
+[TEST progress] 180/565 batches, 1440/4514 samples | Dice=0.7802 IoU=0.6396 HD95=19.14
+[TEST progress] 200/565 batches, 1600/4514 samples | Dice=0.7904 IoU=0.6535 HD95=18.13
+[TEST progress] 220/565 batches, 1760/4514 samples | Dice=0.7925 IoU=0.6563 HD95=17.48
+[TEST progress] 240/565 batches, 1920/4514 samples | Dice=0.7964 IoU=0.6617 HD95=17.00
+[TEST progress] 260/565 batches, 2080/4514 samples | Dice=0.7971 IoU=0.6626 HD95=16.75
+[TEST progress] 280/565 batches, 2240/4514 samples | Dice=0.7990 IoU=0.6653 HD95=16.90
+[TEST progress] 300/565 batches, 2400/4514 samples | Dice=0.8048 IoU=0.6733 HD95=16.25
+[TEST progress] 320/565 batches, 2560/4514 samples | Dice=0.8052 IoU=0.6739 HD95=16.08
+[TEST progress] 340/565 batches, 2720/4514 samples | Dice=0.8050 IoU=0.6736 HD95=16.36
+[TEST progress] 360/565 batches, 2880/4514 samples | Dice=0.7926 IoU=0.6564 HD95=18.62
+[TEST progress] 380/565 batches, 3040/4514 samples | Dice=0.7911 IoU=0.6544 HD95=18.31
+[TEST progress] 400/565 batches, 3200/4514 samples | Dice=0.7845 IoU=0.6454 HD95=18.86
+[TEST progress] 420/565 batches, 3360/4514 samples | Dice=0.7838 IoU=0.6445 HD95=18.89
+[TEST progress] 440/565 batches, 3520/4514 samples | Dice=0.7802 IoU=0.6396 HD95=19.61
+[TEST progress] 460/565 batches, 3680/4514 samples | Dice=0.7781 IoU=0.6368 HD95=19.65
+[TEST progress] 480/565 batches, 3840/4514 samples | Dice=0.7774 IoU=0.6358 HD95=19.55
+[TEST progress] 500/565 batches, 4000/4514 samples | Dice=0.7714 IoU=0.6279 HD95=19.56
+[TEST progress] 520/565 batches, 4160/4514 samples | Dice=0.7721 IoU=0.6287 HD95=19.59
+[TEST progress] 540/565 batches, 4320/4514 samples | Dice=0.7708 IoU=0.6271 HD95=19.54
+[TEST progress] 560/565 batches, 4480/4514 samples | Dice=0.7716 IoU=0.6281 HD95=19.23
+[TEST progress] 565/565 batches, 4514/4514 samples | Dice=0.7706 IoU=0.6268 HD95=19.19
+[TEST FINAL best_dice] Dice=0.7706 IoU=0.6268 Acc=0.8500 Acc_pixel=0.9988 Sen=0.7004 Spe=0.9997 Pre=0.8564 F1=0.7706 HD95=19.19 loss=0.3852

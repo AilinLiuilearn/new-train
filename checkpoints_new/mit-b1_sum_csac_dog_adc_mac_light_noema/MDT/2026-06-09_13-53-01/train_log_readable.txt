@@ -1,0 +1,211 @@
+Training Log 74.95；75.85
+================================================================
+Epoch 1
+  train_loss    : 1.3512
+  val_loss      : 1.1813
+  val_dice      : 0.5714
+  val_iou       : 0.4000
+  val_acc       : 0.8371
+  val_acc_pixel : 0.9971
+  val_hd95      : 49.4929
+  lr            : 0.00006667
+  grad_norm     : inf
+  enc_ct_s1_gamma: 0.125731
+  enc_ct_s2_gamma: 0.145504
+  enc_ct_s3_gamma: 0.130272
+  enc_ct_s4_gamma: 0.130273
+  enc_pet_s1_gamma: 0.103145
+  enc_pet_s2_gamma: 0.101645
+  enc_pet_s3_gamma: 0.111825
+  enc_pet_s4_gamma: 0.123328
+----------------------------------------------------------------
+Epoch 2
+  train_loss    : 1.0447
+  val_loss      : 0.7982
+  val_dice      : 0.6279
+  val_iou       : 0.4576
+  val_acc       : 0.8132
+  val_acc_pixel : 0.9979
+  val_hd95      : 38.2104
+  lr            : 0.00013333
+  grad_norm     : inf
+  enc_ct_s1_gamma: 0.167530
+  enc_ct_s2_gamma: 0.213916
+  enc_ct_s3_gamma: 0.183589
+  enc_ct_s4_gamma: 0.184305
+  enc_pet_s1_gamma: 0.104792
+  enc_pet_s2_gamma: 0.116017
+  enc_pet_s3_gamma: 0.126596
+  enc_pet_s4_gamma: 0.149660
+----------------------------------------------------------------
+Epoch 3
+  train_loss    : 0.7492
+  val_loss      : 0.6585
+  val_dice      : 0.6017
+  val_iou       : 0.4303
+  val_acc       : 0.8000
+  val_acc_pixel : 0.9977
+  val_hd95      : 41.3464
+  lr            : 0.00020000
+  grad_norm     : 1.365860
+  enc_ct_s1_gamma: 0.199986
+  enc_ct_s2_gamma: 0.241277
+  enc_ct_s3_gamma: 0.206324
+  enc_ct_s4_gamma: 0.212113
+  enc_pet_s1_gamma: 0.114590
+  enc_pet_s2_gamma: 0.128220
+  enc_pet_s3_gamma: 0.144872
+  enc_pet_s4_gamma: 0.153322
+----------------------------------------------------------------
+Epoch 4
+  train_loss    : 0.4947
+  val_loss      : 0.4735
+  val_dice      : 0.6860
+  val_iou       : 0.5221
+  val_acc       : 0.8380
+  val_acc_pixel : 0.9982
+  val_hd95      : 35.5864
+  lr            : 0.00019952
+  grad_norm     : 1.246266
+  enc_ct_s1_gamma: 0.227833
+  enc_ct_s2_gamma: 0.264397
+  enc_ct_s3_gamma: 0.225467
+  enc_ct_s4_gamma: 0.240339
+  enc_pet_s1_gamma: 0.116790
+  enc_pet_s2_gamma: 0.152968
+  enc_pet_s3_gamma: 0.158715
+  enc_pet_s4_gamma: 0.153976
+----------------------------------------------------------------
+Epoch 5
+  train_loss    : 0.4017
+  val_loss      : 0.4428
+  val_dice      : 0.7153
+  val_iou       : 0.5568
+  val_acc       : 0.8451
+  val_acc_pixel : 0.9984
+  val_hd95      : 27.6723
+  lr            : 0.00019808
+  grad_norm     : inf
+  enc_ct_s1_gamma: 0.249489
+  enc_ct_s2_gamma: 0.281004
+  enc_ct_s3_gamma: 0.243684
+  enc_ct_s4_gamma: 0.248927
+  enc_pet_s1_gamma: 0.129165
+  enc_pet_s2_gamma: 0.196111
+  enc_pet_s3_gamma: 0.164897
+  enc_pet_s4_gamma: 0.155743
+----------------------------------------------------------------
+Epoch 6
+  train_loss    : 0.3779
+  val_loss      : 0.4371
+  val_dice      : 0.7232
+  val_iou       : 0.5664
+  val_acc       : 0.8553
+  val_acc_pixel : 0.9984
+  val_hd95      : 29.0626
+  lr            : 0.00019569
+  grad_norm     : 0.950101
+  enc_ct_s1_gamma: 0.264778
+  enc_ct_s2_gamma: 0.297902
+  enc_ct_s3_gamma: 0.253254
+  enc_ct_s4_gamma: 0.263485
+  enc_pet_s1_gamma: 0.142000
+  enc_pet_s2_gamma: 0.235123
+  enc_pet_s3_gamma: 0.177479
+  enc_pet_s4_gamma: 0.151934
+----------------------------------------------------------------
+Epoch 7
+  train_loss    : 0.3675
+  val_loss      : 0.4672
+  val_dice      : 0.6073
+  val_iou       : 0.4360
+  val_acc       : 0.8609
+  val_acc_pixel : 0.9973
+  val_hd95      : 39.6624
+  lr            : 0.00019239
+  grad_norm     : inf
+  enc_ct_s1_gamma: 0.277601
+  enc_ct_s2_gamma: 0.314106
+  enc_ct_s3_gamma: 0.262735
+  enc_ct_s4_gamma: 0.273973
+  enc_pet_s1_gamma: 0.145922
+  enc_pet_s2_gamma: 0.261004
+  enc_pet_s3_gamma: 0.186021
+  enc_pet_s4_gamma: 0.151430
+----------------------------------------------------------------
+Epoch 8
+  train_loss    : 0.3577
+  val_loss      : 0.4487
+  val_dice      : 0.7161
+  val_iou       : 0.5578
+  val_acc       : 0.8321
+  val_acc_pixel : 0.9985
+  val_hd95      : 27.2097
+  lr            : 0.00018819
+  grad_norm     : inf
+  enc_ct_s1_gamma: 0.290630
+  enc_ct_s2_gamma: 0.328730
+  enc_ct_s3_gamma: 0.274483
+  enc_ct_s4_gamma: 0.282528
+  enc_pet_s1_gamma: 0.160278
+  enc_pet_s2_gamma: 0.283288
+  enc_pet_s3_gamma: 0.201036
+  enc_pet_s4_gamma: 0.151429
+----------------------------------------------------------------
+Epoch 9
+  train_loss    : 0.3479
+  val_loss      : 0.4515
+  val_dice      : 0.6892
+  val_iou       : 0.5258
+  val_acc       : 0.8044
+  val_acc_pixel : 0.9984
+  val_hd95      : 26.3045
+  lr            : 0.00018315
+  grad_norm     : 0.890044
+  enc_ct_s1_gamma: 0.302144
+  enc_ct_s2_gamma: 0.344647
+  enc_ct_s3_gamma: 0.288959
+  enc_ct_s4_gamma: 0.291490
+  enc_pet_s1_gamma: 0.163626
+  enc_pet_s2_gamma: 0.310122
+  enc_pet_s3_gamma: 0.209038
+  enc_pet_s4_gamma: 0.152477
+----------------------------------------------------------------
+Epoch 10
+  train_loss    : 0.3439
+  val_loss      : 0.4374
+  val_dice      : 0.7160
+  val_iou       : 0.5576
+  val_acc       : 0.8567
+  val_acc_pixel : 0.9984
+  val_hd95      : 26.6762
+  lr            : 0.00017730
+  grad_norm     : 0.948528
+  enc_ct_s1_gamma: 0.311009
+  enc_ct_s2_gamma: 0.356601
+  enc_ct_s3_gamma: 0.298631
+  enc_ct_s4_gamma: 0.294947
+  enc_pet_s1_gamma: 0.165809
+  enc_pet_s2_gamma: 0.333286
+  enc_pet_s3_gamma: 0.215554
+  enc_pet_s4_gamma: 0.158034
+----------------------------------------------------------------
+Epoch 11
+  train_loss    : 0.3355
+  val_loss      : 0.4571
+  val_dice      : 0.6942
+  val_iou       : 0.5317
+  val_acc       : 0.8118
+  val_acc_pixel : 0.9984
+  val_hd95      : 26.4393
+  lr            : 0.00017071
+  grad_norm     : inf
+  enc_ct_s1_gamma: 0.315881
+  enc_ct_s2_gamma: 0.370546
+  enc_ct_s3_gamma: 0.307420
+  enc_ct_s4_gamma: 0.304265
+  enc_pet_s1_gamma: 0.169173
+  enc_pet_s2_gamma: 0.352079
+  enc_pet_s3_gamma: 0.226636
+  enc_pet_s4_gamma: 0.150452
+----------------------------------------------------------------
