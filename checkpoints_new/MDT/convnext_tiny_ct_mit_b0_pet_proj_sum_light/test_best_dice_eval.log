@@ -12,13 +12,14 @@
   ← 数据增强: cipa
   ← CT/PET归一化: cipa
 [+] Teacher_CT_ConvNeXt_Encoder: Loading local weights from /root/autodl-tmp/mkd-main/new-train/pretrained/convnext_tiny/pytorch_model.bin
-[+] Teacher_CT_ConvNeXt_Encoder loaded params: 178, skipped: 4
-[+] Teacher_CT_ConvNeXt_Encoder skipped examples: ['convnext.stem_weight', 'convnext.stem_bias', 'classifier.weight', 'classifier.bias']
-[+] Teacher_CT_ConvNeXt_Encoder load status: _IncompatibleKeys(missing_keys=['model.embeddings.patch_embeddings.weight', 'model.embeddings.patch_embeddings.bias'], unexpected_keys=[])
+[+] Teacher_CT_ConvNeXt_Encoder loaded params: 180, skipped: 2
+[+] Teacher_CT_ConvNeXt_Encoder skipped examples: ['classifier.weight', 'classifier.bias']
+[+] Teacher_CT_ConvNeXt_Encoder load status: <All keys matched successfully>
 [+] Teacher_PET_MiT_Encoder: Loading local weights from /root/autodl-tmp/mkd-main/new-train/pretrained/mit-b0/pytorch_model.bin
 [+] Teacher_PET_MiT_Encoder loaded params: 192, skipped: 2
 [+] Teacher_PET_MiT_Encoder skipped examples: ['classifier.weight', 'classifier.bias']
 [+] Teacher_PET_MiT_Encoder load status: <All keys matched successfully>
+[TEST] checkpoint load status for model: missing=0, unexpected=0
 [TEST] loaded checkpoint epoch: 21
 [VIS] saving 16 diagnostics to: /root/autodl-tmp/mkd-main/new-train/checkpoints_new/MDT/convnext_tiny_ct_mit_b0_pet_proj_sum_light/vis_test_best_dice
 [vis_teacher] saved 16 diagnostics to /root/autodl-tmp/mkd-main/new-train/checkpoints_new/MDT/convnext_tiny_ct_mit_b0_pet_proj_sum_light/vis_test_best_dice

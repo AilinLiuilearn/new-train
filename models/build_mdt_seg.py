@@ -5,6 +5,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import timm
 
+from models.cmrm import CMRMSumFusion
+from models.ladfm import PETCTFusionPipeline
+from models.mpa_bioclip import MPABioCLIPSumFusion, get_bioclip_text_feature
+from models.cudm_text_fusion import AlignedCUDMTextFusion
+
 try:
     from transformers import SegformerConfig, SegformerModel, ConvNextConfig, ConvNextModel
 except ImportError:
@@ -27,9 +32,12 @@ def _map_convnext_hf_to_timm_key(key):
     if not key.startswith('convnext.'):
         return None
     key = key[len('convnext.'):]
-    if key == 'stem_weight':
+    # HuggingFace ConvNeXt names -> timm ConvNeXt names.
+    # We keep this mapping explicit so pretrained weights load against the
+    # timm features_only backbone with the same stem/stage naming.
+    if key in ('stem_weight', 'embeddings.patch_embeddings.weight'):
         return 'stem_0.weight'
-    if key == 'stem_bias':
+    if key in ('stem_bias', 'embeddings.patch_embeddings.bias'):
         return 'stem_0.bias'
     if key == 'embeddings.layernorm.weight':
         return 'stem_1.weight'
@@ -106,12 +114,9 @@ def _sanitize_state_dict(state_dict):
         for prefix in ('module.', 'backbone.', 'visual.'):
             if nk.startswith(prefix):
                 nk = nk[len(prefix):]
-        if nk.startswith('convnext.encoder.'):
-            nk = nk[len('convnext.encoder.'):]
-        nk = nk.replace('stages.', 'stages_')
-        nk = nk.replace('stem.', 'stem_')
-        nk = nk.replace('embeddings.patch_embeddings.', 'stem_')
-        nk = nk.replace('encoder.stages.', 'stages_')
+        # Do not rewrite ConvNeXt/Swin/MiT semantic names here. The matcher below
+        # needs the original key form so model-specific mapping functions such as
+        # _map_convnext_hf_to_timm_key can convert it correctly.
         cleaned[nk] = v
     return cleaned
 
@@ -159,9 +164,14 @@ def load_local_weights_safe(model, path, name='Encoder'):
     for k, v in state_dict.items():
         matched_key = None
         mapped_key = _map_convnext_hf_to_timm_key(k)
-        if mapped_key is not None and mapped_key in model_state and model_state[mapped_key].shape == v.shape:
-            matched_key = mapped_key
-        else:
+        mapped_candidates = []
+        if mapped_key is not None:
+            mapped_candidates.extend([mapped_key, f'model.{mapped_key}'])
+        for cand in mapped_candidates:
+            if cand in model_state and model_state[cand].shape == v.shape:
+                matched_key = cand
+                break
+        if matched_key is None:
             for cand in _state_key_candidates(k):
                 if cand in model_state and model_state[cand].shape == v.shape:
                     matched_key = cand
@@ -272,7 +282,12 @@ class SegformerFeatureBackbone(nn.Module):
             self._last_adc_mac_features = {}
             self._last_adc_mac_weights = {}
             outputs = self.model(pixel_values=x, output_hidden_states=True, return_dict=True)
-            return list(outputs.hidden_states)
+            hidden_states = list(outputs.hidden_states or [])
+            if len(hidden_states) >= 5:
+                return hidden_states[1:5]
+            if len(hidden_states) == 4:
+                return hidden_states
+            raise ValueError(f'Segformer encoder must output 4 stage features, got {len(hidden_states)}')
 
         encoder = self.model.encoder
         hidden_states = x
@@ -297,6 +312,8 @@ class SegformerFeatureBackbone(nn.Module):
                 self._last_adc_mac_features[f'stage{stage_idx + 1}'] = stage_feature.detach().cpu()
             features.append(stage_feature)
             hidden_states = stage_feature
+        if len(features) != 4:
+            raise ValueError(f'Segformer encoder must output 4 stage features, got {len(features)}')
         return features
 
 
@@ -346,210 +363,6 @@ class ConvBNAct(nn.Module):
 
     def forward(self, x):
         return self.block(x)
-
-
-class ChannelAttention(nn.Module):
-    def __init__(self, channels, reduction=16):
-        super().__init__()
-        mid = max(channels // reduction, 8)
-        self.fc = nn.Sequential(
-            nn.Linear(channels, mid, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(mid, channels, bias=False),
-        )
-
-    def forward(self, x):
-        b, c, _, _ = x.shape
-        avg = x.mean(dim=(2, 3))
-        mx = x.amax(dim=(2, 3))
-        w = torch.sigmoid(self.fc(avg) + self.fc(mx))
-        return x * w.view(b, c, 1, 1)
-
-
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size=7):
-        super().__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
-
-    def forward(self, x):
-        desc = torch.cat([x.mean(dim=1, keepdim=True), x.amax(dim=1, keepdim=True)], dim=1)
-        return x * torch.sigmoid(self.conv(desc))
-
-
-class CBAM(nn.Module):
-    def __init__(self, channels, reduction=16, spatial_kernel=7):
-        super().__init__()
-        self.ca = ChannelAttention(channels, reduction)
-        self.sa = SpatialAttention(spatial_kernel)
-
-    def forward(self, x):
-        return self.sa(self.ca(x))
-
-
-class LightASPP(nn.Module):
-    """Lightweight ASPP for multi-scale context at the bottleneck."""
-
-    def __init__(self, in_channels, out_channels, dilations=(1, 6, 12)):
-        super().__init__()
-        branch_ch = out_channels // len(dilations)
-        self.branches = nn.ModuleList([
-            ConvBNAct(in_channels, branch_ch, kernel_size=3 if d > 1 else 1, dilation=d)
-            for d in dilations
-        ])
-        self.gap = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            ConvBNAct(in_channels, branch_ch, kernel_size=1),
-        )
-        total_ch = branch_ch * (len(dilations) + 1)
-        self.fuse = ConvBNAct(total_ch, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        outs = [br(x) for br in self.branches]
-        gap = self.gap(x)
-        gap = F.interpolate(gap, size=x.shape[-2:], mode='bilinear', align_corners=False)
-        outs.append(gap)
-        return self.fuse(torch.cat(outs, dim=1))
-
-
-class SESkip(nn.Module):
-    """Squeeze-and-Excitation gate on skip connections to recalibrate channels."""
-
-    def __init__(self, channels, reduction=16):
-        super().__init__()
-        mid = max(channels // reduction, 8)
-        self.se = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(channels, mid, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(mid, channels, bias=False),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x):
-        b, c, _, _ = x.shape
-        return x * self.se(x).view(b, c, 1, 1)
-
-
-class AttentionUNetDecoder(nn.Module):
-    """UNet decoder with CBAM attention, lightweight ASPP bottleneck, and SE-gated skips."""
-
-    def __init__(self, encoder_channels, out_channels=1, decoder_channels=(512, 256, 128, 64)):
-        super().__init__()
-        c1, c2, c3, c4 = encoder_channels
-        d4, d3, d2, d1 = decoder_channels
-
-        self.bottleneck = LightASPP(c4, d4, dilations=(1, 6, 12))
-
-        self.skip3 = nn.Sequential(ConvBNAct(c3, d3, kernel_size=1), SESkip(d3))
-        self.skip2 = nn.Sequential(ConvBNAct(c2, d2, kernel_size=1), SESkip(d2))
-        self.skip1 = nn.Sequential(ConvBNAct(c1, d1, kernel_size=1), SESkip(d1))
-
-        self.fuse3 = nn.Sequential(ConvBNAct(d4 + d3, d3), ConvBNAct(d3, d3), CBAM(d3))
-        self.fuse2 = nn.Sequential(ConvBNAct(d3 + d2, d2), ConvBNAct(d2, d2), CBAM(d2))
-        self.fuse1 = nn.Sequential(ConvBNAct(d2 + d1, d1), ConvBNAct(d1, d1), CBAM(d1))
-
-        self.head4 = nn.Conv2d(d4, out_channels, 1)
-        self.head3 = nn.Conv2d(d3, out_channels, 1)
-        self.head2 = nn.Conv2d(d2, out_channels, 1)
-        self.head1 = nn.Conv2d(d1, out_channels, 1)
-
-    @staticmethod
-    def _up(x, ref):
-        return F.interpolate(x, size=ref.shape[-2:], mode='bilinear', align_corners=False)
-
-    @staticmethod
-    def _up_size(x, size):
-        return F.interpolate(x, size=size, mode='bilinear', align_corners=False)
-
-    def forward(self, features, target_size):
-        x1, x2, x3, x4 = features
-
-        d4 = self.bottleneck(x4)
-
-        s3 = self.skip3(x3)
-        d3 = self.fuse3(torch.cat([self._up(d4, s3), s3], dim=1))
-
-        s2 = self.skip2(x2)
-        d2 = self.fuse2(torch.cat([self._up(d3, s2), s2], dim=1))
-
-        s1 = self.skip1(x1)
-        d1 = self.fuse1(torch.cat([self._up(d2, s1), s1], dim=1))
-
-        p1 = self._up_size(self.head1(d1), target_size)
-        p2 = self._up_size(self.head2(d2), target_size)
-        p3 = self._up_size(self.head3(d3), target_size)
-        p4 = self._up_size(self.head4(d4), target_size)
-        return {'preds': [p1, p2, p3, p4], 'pred': p1}
-
-
-class TextGuidedCrossAttentionBlock(nn.Module):
-    def __init__(self, channels, text_dim=512, num_text_tokens=4, num_heads=4, pool_size=8):
-        super().__init__()
-        self.channels = channels
-        self.num_text_tokens = num_text_tokens
-        self.pool_size = pool_size
-        self.text_project = nn.Sequential(
-            nn.Linear(text_dim, num_text_tokens * channels, bias=False),
-            nn.GELU(),
-            nn.LayerNorm(num_text_tokens * channels),
-        )
-        self.vis_norm = nn.LayerNorm(channels)
-        self.txt_norm = nn.LayerNorm(channels)
-        self.txt_update_norm = nn.LayerNorm(channels)
-        self.vis_to_txt = nn.MultiheadAttention(
-            embed_dim=channels,
-            num_heads=num_heads,
-            batch_first=True,
-        )
-        self.txt_to_vis = nn.MultiheadAttention(
-            embed_dim=channels,
-            num_heads=num_heads,
-            batch_first=True,
-        )
-        self.channel_gate = nn.Sequential(
-            nn.Linear(channels, channels, bias=False),
-            nn.Sigmoid(),
-        )
-        self.spatial_gate = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, 1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.GELU(),
-            nn.Conv2d(channels, 1, 1, bias=True),
-            nn.Sigmoid(),
-        )
-        self.scale = nn.Parameter(torch.tensor(0.01))
-
-    def _text_tokens(self, text_code):
-        b = text_code.shape[0]
-        return self.text_project(text_code).view(b, self.num_text_tokens, self.channels)
-
-    def forward(self, x, text_code):
-        b, c, h, w = x.shape
-        visual = x.flatten(2).transpose(1, 2)
-        txt = self._text_tokens(text_code)
-
-        pooled = F.adaptive_avg_pool2d(x, output_size=(min(self.pool_size, h), min(self.pool_size, w)))
-        pooled = pooled.flatten(2).transpose(1, 2)
-        txt_delta, _ = self.vis_to_txt(
-            query=self.txt_norm(txt),
-            key=self.vis_norm(pooled),
-            value=pooled,
-        )
-        txt = txt + self.scale * self.txt_update_norm(txt_delta)
-
-        visual_delta, _ = self.txt_to_vis(
-            query=self.vis_norm(visual),
-            key=self.txt_norm(txt),
-            value=txt,
-        )
-        guided = visual + self.scale * visual_delta
-        guided = guided.transpose(1, 2).view(b, c, h, w)
-
-        txt_desc = txt.mean(dim=1)
-        channel = self.channel_gate(txt_desc).view(b, c, 1, 1)
-        spatial = self.spatial_gate(torch.cat([x, guided], dim=1))
-        return x + self.scale * guided * channel * spatial
 
 
 class LightConcatUNetDecoder(nn.Module):
@@ -609,158 +422,15 @@ class LightConcatUNetDecoder(nn.Module):
         return {'preds': [p1, p2, p3, p4], 'pred': p1}
 
 
-class NnUNetConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.InstanceNorm2d(out_channels, affine=True),
-            nn.LeakyReLU(0.01, inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.InstanceNorm2d(out_channels, affine=True),
-            nn.LeakyReLU(0.01, inplace=True),
-        )
-
-    def forward(self, x):
-        return self.block(x)
-
-
-class NnUNetUpBlock(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels):
-        super().__init__()
-        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
-        self.conv = NnUNetConvBlock(out_channels + skip_channels, out_channels)
-
-    def forward(self, x, skip):
-        x = self.up(x)
-        if x.shape[-2:] != skip.shape[-2:]:
-            x = F.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
-        return self.conv(torch.cat([x, skip], dim=1))
-
-
-class NnUNetDecoder(nn.Module):
-    def __init__(self, encoder_channels, out_channels=1, decoder_channels=(512, 256, 128, 64, 32)):
-        super().__init__()
-        c1, c2, c3, c4 = encoder_channels
-        d4, d3, d2, d1, d0 = decoder_channels
-
-        self.bottleneck = NnUNetConvBlock(c4, d4)
-        self.up3 = NnUNetUpBlock(d4, c3, d3)
-        self.up2 = NnUNetUpBlock(d3, c2, d2)
-        self.up1 = NnUNetUpBlock(d2, c1, d1)
-        self.up0 = nn.ConvTranspose2d(d1, d0, kernel_size=2, stride=2)
-        self.up_full = nn.ConvTranspose2d(d0, d0, kernel_size=2, stride=2)
-        self.final_conv = NnUNetConvBlock(d0, d0)
-
-        self.head3 = nn.Conv2d(d3, out_channels, kernel_size=1)
-        self.head2 = nn.Conv2d(d2, out_channels, kernel_size=1)
-        self.head1 = nn.Conv2d(d1, out_channels, kernel_size=1)
-        self.head0 = nn.Conv2d(d0, out_channels, kernel_size=1)
-
-    @staticmethod
-    def _upsample_size(x, size):
-        return F.interpolate(x, size=size, mode='bilinear', align_corners=False)
-
-    def forward(self, features, target_size):
-        x1, x2, x3, x4 = features
-
-        d4 = self.bottleneck(x4)
-        d3 = self.up3(d4, x3)
-        d2 = self.up2(d3, x2)
-        d1 = self.up1(d2, x1)
-        d0 = self.up0(d1)
-        d0 = self.up_full(d0)
-        if d0.shape[-2:] != target_size:
-            d0 = self._upsample_size(d0, target_size)
-        d0 = self.final_conv(d0)
-
-        p0 = self.head0(d0)
-        p1 = self.head1(d1)
-        p2 = self.head2(d2)
-        p3 = self.head3(d3)
-        return {'preds': [p0, p1, p2, p3], 'pred': p0}
-
-
-class TextGuidedLightConcatUNetDecoder(nn.Module):
-    def __init__(self, encoder_channels, out_channels=1, decoder_channels=(512, 256, 128, 64), text_dim=512):
-        super().__init__()
-        from models.cudm_text_fusion import FixedPromptEmbedding, TUMOR_PROMPT
-
-        c1, c2, c3, c4 = encoder_channels
-        d4, d3, d2, d1 = decoder_channels
-        self.text_encoder = FixedPromptEmbedding(prompt=TUMOR_PROMPT)
-
-        self.proj4 = ConvBNAct(c4, d4, kernel_size=1)
-        self.proj3 = ConvBNAct(c3, d3, kernel_size=1)
-        self.proj2 = ConvBNAct(c2, d2, kernel_size=1)
-        self.proj1 = ConvBNAct(c1, d1, kernel_size=1)
-
-        self.tg4 = TextGuidedCrossAttentionBlock(d4, text_dim=text_dim, num_text_tokens=4, num_heads=8, pool_size=8)
-        self.tg3 = TextGuidedCrossAttentionBlock(d3, text_dim=text_dim, num_text_tokens=4, num_heads=4, pool_size=8)
-        self.tg2 = TextGuidedCrossAttentionBlock(d2, text_dim=text_dim, num_text_tokens=4, num_heads=4, pool_size=8)
-        self.tg1 = TextGuidedCrossAttentionBlock(d1, text_dim=text_dim, num_text_tokens=4, num_heads=2, pool_size=8)
-
-        self.fuse3 = nn.Sequential(
-            ConvBNAct(d4 + d3, d3),
-            ConvBNAct(d3, d3),
-        )
-        self.fuse2 = nn.Sequential(
-            ConvBNAct(d3 + d2, d2),
-            ConvBNAct(d2, d2),
-        )
-        self.fuse1 = nn.Sequential(
-            ConvBNAct(d2 + d1, d1),
-            ConvBNAct(d1, d1),
-        )
-
-        self.head4 = nn.Conv2d(d4, out_channels, 1)
-        self.head3 = nn.Conv2d(d3, out_channels, 1)
-        self.head2 = nn.Conv2d(d2, out_channels, 1)
-        self.head1 = nn.Conv2d(d1, out_channels, 1)
-
-    @staticmethod
-    def _upsample_to(x, ref):
-        return F.interpolate(x, size=ref.shape[-2:], mode='bilinear', align_corners=False)
-
-    @staticmethod
-    def _upsample_size(x, size):
-        return F.interpolate(x, size=size, mode='bilinear', align_corners=False)
-
-    def forward(self, features, target_size):
-        x1, x2, x3, x4 = features
-        b = x1.shape[0]
-        text_code = self.text_encoder(b, x1.device)
-
-        d4 = self.tg4(self.proj4(x4), text_code)
-        s3 = self.proj3(x3)
-        d3 = self.fuse3(torch.cat([self._upsample_to(d4, s3), s3], dim=1))
-        d3 = self.tg3(d3, text_code)
-
-        s2 = self.proj2(x2)
-        d2 = self.fuse2(torch.cat([self._upsample_to(d3, s2), s2], dim=1))
-        d2 = self.tg2(d2, text_code)
-
-        s1 = self.proj1(x1)
-        d1 = self.fuse1(torch.cat([self._upsample_to(d2, s1), s1], dim=1))
-        d1 = self.tg1(d1, text_code)
-
-        p1 = self._upsample_size(self.head1(d1), target_size)
-        p2 = self._upsample_size(self.head2(d2), target_size)
-        p3 = self._upsample_size(self.head3(d3), target_size)
-        p4 = self._upsample_size(self.head4(d4), target_size)
-        return {'preds': [p1, p2, p3, p4], 'pred': p1}
-
-
 class ConvNextFeatureBackbone(nn.Module):
     def __init__(self, variant='convnext_tiny', in_channels=3):
         super().__init__()
         variant = _normalize_backbone_name(variant)
         convnext_settings = {
-            'convnext_tiny': dict(hidden_sizes=[96, 192, 384, 768]),
+            'convnext_tiny': dict(depths=[3, 3, 9, 3], hidden_sizes=[96, 192, 384, 768]),
         }
         if variant not in convnext_settings:
-            raise ValueError(f'Unsupported ConvNeXt variant: {variant}')
-
+            raise ValueError(f'Unsupported HuggingFace ConvNeXt variant: {variant}')
         if ConvNextConfig is None or ConvNextModel is None:
             raise ImportError(
                 'HuggingFace ConvNeXt backbone requires transformers. Install it with: pip install transformers'
@@ -768,13 +438,13 @@ class ConvNextFeatureBackbone(nn.Module):
         settings = convnext_settings[variant]
         config = ConvNextConfig(
             num_channels=in_channels,
-            depths=[3, 3, 9, 3],
+            depths=settings['depths'],
             hidden_sizes=settings['hidden_sizes'],
             patch_size=4,
             out_features=['stage1', 'stage2', 'stage3', 'stage4'],
         )
         self.model = ConvNextModel(config)
-        self.feature_info = SimpleFeatureInfo(settings['hidden_sizes'])
+        self.feature_info = SimpleFeatureInfo(config.hidden_sizes)
 
     def forward(self, x):
         outputs = self.model(pixel_values=x, output_hidden_states=True, return_dict=True)
@@ -816,7 +486,11 @@ class HeterogeneousDualBackboneUNet(nn.Module):
     def __init__(self, ct_backbone='convnext_tiny', pet_backbone='mit_b0',
                  ct_pretrained_path=None, pet_pretrained_path=None,
                  in_channels=3, out_channels=1, decoder_type='light', fusion_channels=None,
-                 use_adc_mac=False):
+                 fusion_type='project_sum', use_adc_mac=False,
+                 bioclip_model_path=None,
+                 bioclip_text_tower_path='/root/autodl-tmp/mkd-main/new-train/pretrained/biomedbert_text_tower',
+                 bioclip_text='focal abnormal metabolic lung lesion on PET-CT scan',
+                 cudm_text_mode='dual', cudm_text_heads=8):
         super().__init__()
         ct_backbone = _normalize_backbone_name(ct_backbone)
         pet_backbone = _normalize_backbone_name(pet_backbone)
@@ -824,7 +498,7 @@ class HeterogeneousDualBackboneUNet(nn.Module):
         self.ct_backbone = ct_backbone
         self.pet_backbone = pet_backbone
         self.decoder_type = decoder_type
-        self.fusion_type = 'project_sum'
+        self.fusion_type = fusion_type
         self.use_tcpm = False
         self.use_adc_mac = use_adc_mac and pet_backbone == 'mit_b1'
         if use_adc_mac and pet_backbone != 'mit_b1':
@@ -842,18 +516,47 @@ class HeterogeneousDualBackboneUNet(nn.Module):
         if fusion_channels is None:
             fusion_channels = pet_channels
         fusion_channels = tuple(int(ch) for ch in fusion_channels)
-        self.fusion = AdditiveProjectionFusion(ct_channels, pet_channels, fusion_channels)
-
-        if decoder_type == 'light':
-            self.decoder = LightConcatUNetDecoder(fusion_channels, out_channels=out_channels)
-        elif decoder_type == 'nnunet':
-            self.decoder = NnUNetDecoder(fusion_channels, out_channels=out_channels)
-        elif decoder_type == 'text_guided_light':
-            self.decoder = TextGuidedLightConcatUNetDecoder(fusion_channels, out_channels=out_channels)
-        elif decoder_type == 'attention':
-            self.decoder = AttentionUNetDecoder(fusion_channels, out_channels=out_channels)
+        if fusion_type == 'project_sum':
+            self.fusion = AdditiveProjectionFusion(ct_channels, pet_channels, fusion_channels)
+        elif fusion_type == 'cmrm_sum':
+            self.fusion = CMRMSumFusion(ct_channels, pet_channels, fusion_channels)
+        elif fusion_type in ('cmrm_ladfm', 'petct_cmrm_ladfm'):
+            self.fusion = PETCTFusionPipeline(ct_channels, pet_channels, fusion_channels)
+        elif fusion_type in ('mpa_bioclip_sum', 'bcg_pa_sum'):
+            if not bioclip_model_path:
+                raise ValueError('fusion_type=mpa_bioclip_sum/bcg_pa_sum requires --bioclip_model_path.')
+            print(f'[+] BCG-PA: Encoding text prompt from {bioclip_model_path}')
+            print(f'[+] BCG-PA: Using local text tower {bioclip_text_tower_path}')
+            text_feat = get_bioclip_text_feature(
+                bioclip_model_path,
+                bioclip_text,
+                text_tower_path=bioclip_text_tower_path,
+            )
+            print(f'[+] BCG-PA text feature shape: {tuple(text_feat.shape)}')
+            self.fusion = MPABioCLIPSumFusion(ct_channels, pet_channels, fusion_channels, text_feat)
+        elif fusion_type == 'aligned_cudm_text':
+            print(f'[+] Aligned-CUDM-Text v2: Using local mean-pooled text tower {bioclip_text_tower_path}')
+            print(f'[+] Aligned-CUDM-Text v2 prompt: {bioclip_text}')
+            print(f'[+] Aligned-CUDM-Text v2 mode={cudm_text_mode} heads={cudm_text_heads}')
+            self.fusion = AlignedCUDMTextFusion(
+                ct_channels,
+                pet_channels,
+                fusion_channels,
+                prompt=bioclip_text,
+                text_tower_path=bioclip_text_tower_path,
+                num_heads=cudm_text_heads,
+                module_mode=cudm_text_mode,
+            )
         else:
-            raise ValueError(f'Unsupported decoder_type: {decoder_type}')
+            raise ValueError(
+                f'Unsupported fusion_type: {fusion_type}. '
+                'Supported for hetero_convnext_mit: project_sum, cmrm_sum, cmrm_ladfm, '
+                'mpa_bioclip_sum, bcg_pa_sum, aligned_cudm_text.'
+            )
+
+        if decoder_type != 'light':
+            raise ValueError(f'Unsupported decoder_type: {decoder_type}. Clean baseline only supports light.')
+        self.decoder = LightConcatUNetDecoder(fusion_channels, out_channels=out_channels)
 
     @staticmethod
     def _to_3ch(x):
@@ -866,10 +569,25 @@ class HeterogeneousDualBackboneUNet(nn.Module):
         pet = self._to_3ch(pet)
         ct_feats = self.enc_ct(ct)
         pet_feats = self.enc_pet(pet)
-        fused_feats = self.fusion(ct_feats, pet_feats)
+        if len(ct_feats) != 4 or len(pet_feats) != 4:
+            raise ValueError(
+                f'Heterogeneous encoders must output 4 stages, got '
+                f'CT={len(ct_feats)} PET={len(pet_feats)}'
+            )
+        fusion_out = self.fusion(ct_feats, pet_feats)
+        fusion_aux = None
+        if isinstance(fusion_out, tuple):
+            fused_feats, fusion_aux = fusion_out
+        else:
+            fused_feats = fusion_out
+        if len(fused_feats) != 4:
+            raise ValueError(f'Heterogeneous fusion must output 4 stages, got {len(fused_feats)}')
         if target_size is None:
             target_size = ct.shape[-2:]
-        return self.decoder(fused_feats, target_size)
+        outputs = self.decoder(fused_feats, target_size)
+        if fusion_aux is not None and isinstance(outputs, dict):
+            outputs['fusion_aux'] = fusion_aux
+        return outputs
 
     def set_epoch(self, epoch):
         return None
@@ -877,6 +595,8 @@ class HeterogeneousDualBackboneUNet(nn.Module):
     def set_adc_mac_visuals(self, enabled):
         if hasattr(self.enc_pet, 'save_adc_mac_visuals'):
             self.enc_pet.save_adc_mac_visuals = bool(enabled)
+        if self.fusion is not None and hasattr(self.fusion, 'set_visuals'):
+            self.fusion.set_visuals(bool(enabled))
 
     def get_adc_mac_visuals(self):
         visuals = {}
@@ -888,6 +608,8 @@ class HeterogeneousDualBackboneUNet(nn.Module):
         return visuals
 
     def get_fusion_visuals(self):
+        if self.fusion is not None and hasattr(self.fusion, 'get_fusion_visuals'):
+            return self.fusion.get_fusion_visuals()
         return {}
 
 
@@ -919,67 +641,16 @@ class DualBackboneUNet(nn.Module):
             self.decoder = LightConcatUNetDecoder(enc_channels, out_channels=out_channels)
         elif decoder_type == 'nnunet':
             self.decoder = NnUNetDecoder(enc_channels, out_channels=out_channels)
-        elif decoder_type == 'text_guided_light':
-            self.decoder = TextGuidedLightConcatUNetDecoder(enc_channels, out_channels=out_channels)
         elif decoder_type == 'attention':
             self.decoder = AttentionUNetDecoder(enc_channels, out_channels=out_channels)
         else:
             raise ValueError(f'Unsupported decoder_type: {decoder_type}')
 
-        fusion_type = 'cudm_text' if fusion_type == 'auto' and use_tcpm else fusion_type
-        fusion_type = 'sum' if fusion_type == 'auto' else fusion_type
+        fusion_type = 'edl_stage' if fusion_type == 'auto' else fusion_type
         self.fusion_type = fusion_type
 
-        if fusion_type == 'cudm_text':
-            from models.cudm_text_fusion import MultiStageCUDMTextFusion
-            self.fusion = MultiStageCUDMTextFusion(enc_channels)
-        elif fusion_type == 'pet_window_wavelet':
-            from models.pet_window_wavelet_fusion import MultiStagePETWindowWaveletFusion
-            self.fusion = MultiStagePETWindowWaveletFusion(
-                enc_channels,
-                window_sizes=tuple(wavelet_window_sizes),
-                heads_per_stage=tuple(wavelet_heads),
-                attn_ratio=wavelet_attn_ratio,
-                wavelet_ratio=wavelet_conv_ratio,
-                sr_ratios=tuple(wavelet_sr_ratios),
-            )
-        elif fusion_type == 'fnet_sparse':
-            from models.fnet_sparse_fusion import MultiStageFNetSparseFusion
-            self.fusion = MultiStageFNetSparseFusion(
-                enc_channels,
-                hidden_ratio=fnet_sparse_hidden_ratio,
-                max_hidden=fnet_sparse_max_hidden,
-                n_iter=fnet_sparse_iters,
-                init_gamma=fnet_sparse_init_gamma,
-            )
-        elif fusion_type == 'heccm_all':
-            from models.heccm_fusion import MultiStageHECCMFusion
-            self.fusion = MultiStageHECCMFusion(
-                enc_channels,
-                num_classes=2,
-                window_sizes=(16, 8, 8, 4),
-                embed_dim=16,
-                num_heads=2,
-                init_gamma=0.01,
-            )
-        elif fusion_type in ('edl_gcm_plus', 'edl_gcm_plus_ct'):
-            from models.edl_gcm_plus_fusion import EDLGCMPlusBottleneckFusion
-            self.fusion = EDLGCMPlusBottleneckFusion(
-                enc_channels,
-                num_groups=8,
-                init_gamma=0.01,
-                shallow_mode='ct' if fusion_type == 'edl_gcm_plus_ct' else 'sum',
-            )
-        elif fusion_type == 'edl_spmc_s3':
-            from models.edl_spmc_stage3_fusion import EDLSPMCStage3Fusion
-            self.fusion = EDLSPMCStage3Fusion(enc_channels, init_gamma=0.01)
-        elif fusion_type in ('spgc_s12', 'spgc_s12_edl_spmc_s3'):
-            from models.spgc_fusion import SPGCFusion
-            self.fusion = SPGCFusion(
-                enc_channels,
-                init_gamma=0.01,
-                use_stage3_spmc=fusion_type == 'spgc_s12_edl_spmc_s3',
-            )
+        if fusion_type == 'edl_stage':
+            self.fusion = EDLStageFusion(enc_channels, enc_channels, enc_channels)
         elif fusion_type == 'concat':
             self.fusion = nn.ModuleList([
                 nn.Conv2d(ch * 2, ch, kernel_size=1, bias=False)
@@ -1064,7 +735,13 @@ def build_mdt_seg_teacher(config):
             out_channels=1,
             decoder_type=getattr(config, 'decoder_type', 'light'),
             fusion_channels=getattr(config, 'fusion_channels', None),
+            fusion_type=getattr(config, 'fusion_type', 'project_sum'),
             use_adc_mac=getattr(config, 'use_adc_mac', False),
+            bioclip_model_path=getattr(config, 'bioclip_model_path', None),
+            bioclip_text_tower_path=getattr(config, 'bioclip_text_tower_path', '/root/autodl-tmp/mkd-main/new-train/pretrained/biomedbert_text_tower'),
+            bioclip_text=getattr(config, 'bioclip_text', 'focal abnormal metabolic lung lesion on PET-CT scan'),
+            cudm_text_mode=getattr(config, 'cudm_text_mode', 'dual'),
+            cudm_text_heads=getattr(config, 'cudm_text_heads', 8),
         )
         return dict(model=model)
 
@@ -1076,15 +753,6 @@ def build_mdt_seg_teacher(config):
         use_tcpm=getattr(config, 'use_tcpm', False),
         decoder_type=getattr(config, 'decoder_type', 'attention'),
         fusion_type=getattr(config, 'fusion_type', 'auto'),
-        wavelet_window_sizes=getattr(config, 'wavelet_window_sizes', (8, 8, 4, 4)),
-        wavelet_heads=getattr(config, 'wavelet_heads', (1, 2, 4, 8)),
-        wavelet_sr_ratios=getattr(config, 'wavelet_sr_ratios', (4, 4, 2, 1)),
-        wavelet_attn_ratio=getattr(config, 'wavelet_attn_ratio', 0.25),
-        wavelet_conv_ratio=getattr(config, 'wavelet_conv_ratio', 0.25),
-        fnet_sparse_hidden_ratio=getattr(config, 'fnet_sparse_hidden_ratio', 0.25),
-        fnet_sparse_max_hidden=getattr(config, 'fnet_sparse_max_hidden', 64),
-        fnet_sparse_iters=getattr(config, 'fnet_sparse_iters', 2),
-        fnet_sparse_init_gamma=getattr(config, 'fnet_sparse_init_gamma', 0.1),
         use_adc_mac=getattr(config, 'use_adc_mac', False),
     )
     return dict(model=model)

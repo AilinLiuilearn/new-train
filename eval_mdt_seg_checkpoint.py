@@ -87,7 +87,18 @@ def main():
     ckpt = torch.load(ckpt_path, map_location="cpu")
     for key, model in task.networks.items():
         if key in ckpt:
-            task.load_model_state_dict(model, ckpt[key], strict=False)
+            load_msg = task.load_model_state_dict(model, ckpt[key], strict=False)
+            missing = list(getattr(load_msg, "missing_keys", []))
+            unexpected = list(getattr(load_msg, "unexpected_keys", []))
+            print(
+                f"[TEST] checkpoint load status for {key}: "
+                f"missing={len(missing)}, unexpected={len(unexpected)}",
+                flush=True,
+            )
+            if missing:
+                print(f"[TEST] checkpoint missing examples for {key}: {missing[:12]}", flush=True)
+            if unexpected:
+                print(f"[TEST] checkpoint unexpected examples for {key}: {unexpected[:12]}", flush=True)
 
     print(f"[TEST] loaded checkpoint epoch: {ckpt.get('epoch', 'NA')}", flush=True)
 
