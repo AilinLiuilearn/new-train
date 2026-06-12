@@ -25,7 +25,7 @@ class SegMDTConfig(ConfigBase):
         p = argparse.ArgumentParser("Model", add_help=False)
         p.add_argument("--backbone", type=str, default="pvt_v2_b1")
         p.add_argument("--pretrained_path", type=str, default=None)
-        p.add_argument("--model_arch", type=str, default="dual", choices=("dual", "hetero_convnext_mit"), help="dual: original homogeneous encoders; hetero_convnext_mit: CT ConvNeXt + PET MiT with projection-sum fusion.")
+        p.add_argument("--model_arch", type=str, default="dual", choices=("dual", "hetero_convnext_mit"), help="dual: original homogeneous baseline; hetero_convnext_mit: CT ConvNeXt + PET MiT with 4-stage EDL fusion.")
         p.add_argument("--ct_backbone", type=str, default="convnext_tiny")
         p.add_argument("--pet_backbone", type=str, default="mit_b0")
         p.add_argument("--ct_pretrained_path", type=str, default=None)
@@ -36,19 +36,15 @@ class SegMDTConfig(ConfigBase):
             "--fusion_type",
             type=str,
             default="auto",
-            choices=("auto", "sum", "concat", "cudm_text", "pet_window_wavelet", "fnet_sparse", "heccm_all", "edl_gcm_plus", "edl_gcm_plus_ct", "edl_spmc_s3", "spgc_s12", "spgc_s12_edl_spmc_s3"),
-            help="Feature fusion: auto keeps legacy use_tcpm behavior; spgc variants use sum-preserving shallow PET calibration.",
+            choices=("auto", "sum", "concat", "edl_stage", "project_sum", "cmrm_sum", "cmrm_ladfm", "petct_cmrm_ladfm", "mpa_bioclip_sum", "bcg_pa_sum","aligned_cudm_text"),
+            help="Feature fusion type. Heterogeneous model supports project_sum, cmrm_sum, cmrm_ladfm/petct_cmrm_ladfm, mpa_bioclip_sum, bcg_pa_sum; homogeneous baseline supports auto/edl_stage, sum, concat.",
         )
-        p.add_argument("--fnet_sparse_hidden_ratio", type=float, default=0.25)
-        p.add_argument("--fnet_sparse_max_hidden", type=int, default=64)
-        p.add_argument("--fnet_sparse_iters", type=int, default=2)
-        p.add_argument("--fnet_sparse_init_gamma", type=float, default=0.1)
-        p.add_argument("--wavelet_window_sizes", type=int, nargs="+", default=[8, 8, 4, 4])
-        p.add_argument("--wavelet_heads", type=int, nargs="+", default=[1, 2, 4, 8])
-        p.add_argument("--wavelet_sr_ratios", type=int, nargs="+", default=[4, 4, 2, 1])
-        p.add_argument("--wavelet_attn_ratio", type=float, default=0.25)
-        p.add_argument("--wavelet_conv_ratio", type=float, default=0.25)
-        p.add_argument("--decoder_type", type=str, default="attention", choices=("attention", "light", "nnunet", "text_guided_light"))
+        p.add_argument("--bioclip_model_path", type=str, default="/root/autodl-tmp/mkd-main/new-train/pretrained/biomedclip_model", help="Local BiomedCLIP OpenCLIP config/weight path for MPA-BioCLIP text prompt encoding.")
+        p.add_argument("--bioclip_text_tower_path", type=str, default="/root/autodl-tmp/mkd-main/new-train/pretrained/biomedbert_text_tower", help="Local HuggingFace BiomedBERT text tower path used by BiomedCLIP.")
+        p.add_argument("--bioclip_text", type=str, default="focal abnormal metabolic lung lesion on PET-CT scan", help="Text prompt encoded by BiomedCLIP/BiomedBERT for text-guided fusion.")
+        p.add_argument("--cudm_text_mode", type=str, default="dual", choices=("extractor_only", "text_only", "dual"), help="Aligned-CUDM-Text module combination: Module I only, Module II only, or both.")
+        p.add_argument("--cudm_text_heads", type=int, default=8, help="Requested attention heads for BCG-PA text fusion; automatically reduced by gcd with stage channels.")
+        p.add_argument("--decoder_type", type=str, default="attention", choices=("attention", "light", "nnunet"))
         p.add_argument("--use_adc_mac", type=str2bool, default=False, help="Insert ADC-MAC between MiT-B1 stages for CT/PET encoders.")
         p.add_argument("--freeze_non_adc", type=str2bool, default=False, help="Freeze all parameters except ADC-MAC modules for warm validation.")
         return p

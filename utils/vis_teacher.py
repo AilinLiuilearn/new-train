@@ -202,6 +202,33 @@ def _extract_fusion_panels(model, sample_idx):
         return []
 
     panels = []
+    mpa_stage_names = [f'mpa_s{i}' for i in range(1, 5)]
+    if any(stage_name in visuals for stage_name in mpa_stage_names):
+        ordered_keys = (
+            'ct_encoder', 'pet_encoder', 'ct_text_modulated', 'pet_text_modulated',
+            'consensus', 'enhance_gate', 'correct_gate',
+        )
+        title_map = {
+            'ct_encoder': 'CT Encoder',
+            'pet_encoder': 'PET Encoder',
+            'ct_text_modulated': 'CT BCG-PA',
+            'pet_text_modulated': 'PET BCG-PA',
+            'consensus': 'Consensus',
+            'enhance_gate': 'Enhance Gate',
+            'correct_gate': 'Correct Gate',
+        }
+        for stage_name in mpa_stage_names:
+            if stage_name not in visuals:
+                continue
+            stage = visuals[stage_name]
+            for key in ordered_keys:
+                val = stage.get(key) if isinstance(stage, dict) else None
+                if not isinstance(val, torch.Tensor) or val.dim() < 3:
+                    continue
+                cmap = 'viridis' if key.startswith('ct') else 'inferno'
+                panels.append((f'{stage_name.upper()} {title_map[key]}', _tensor_map(val, sample_idx), cmap))
+        return panels
+
     for stage_name in ('fuse1', 'fuse2', 'fuse3', 'fuse4'):
         if stage_name not in visuals:
             continue

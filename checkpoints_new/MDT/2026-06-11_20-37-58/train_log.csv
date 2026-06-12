@@ -1,0 +1,2 @@
+epoch,train_loss,val_loss,val_dice,val_iou,val_acc,val_acc_pixel,val_hd95,lr,grad_norm
+1,1.3445,1.2128,0.5491,0.3785,0.8936,0.9963,44.3639,0.00002667,1.568839

@@ -1,271 +1,270 @@
 # -*- coding: utf-8 -*-
-"""CUDM text-gated fusion module for PET-CT feature fusion.
+"""AlignedCUDMTextFusion v2: explicit disentanglement + BCG-PA text fusion.
 
-The module follows a clean three-step design:
-1. CUDM: disentangle common anatomical background and unique lesion residuals.
-2. Text-gated Query: use a fixed BiomedCLIP text prior to clean tumor features.
-3. Lightweight attention: clean Query attends to tumor-feature Key/Value.
+Selectable module modes:
+    extractor_only: Module I only, no text cross-attention fusion.
+    text_only:     Module II only, using aligned CT/PET as pseudo specific branches.
+    dual:          Module I + Module II, full design.
 """
-
-import json
+import math
 import os
-import tempfile
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
-
-try:
-    import open_clip
-except ImportError as e:
-    open_clip = None
-    _OPEN_CLIP_ERROR = e
-
-LOCAL_BIOMEDCLIP_DIR = "/root/autodl-tmp/mkd-main/new-train/pretrained/biomedclip_model"
-LOCAL_BIOMEDBERT_TEXT_TOWER_DIR = "/root/autodl-tmp/mkd-main/new-train/pretrained/biomedbert_text_tower"
-BIOMEDCLIP_MODEL = "biomedclip_local"
-BIOMEDCLIP_WEIGHTS = os.path.join(LOCAL_BIOMEDCLIP_DIR, "open_clip_pytorch_model.bin")
-
-TUMOR_PROMPT = (
-    "A focal bright tumor hotspot with abnormal metabolic activity "
-    "and clear lesion boundary."
-)
 
 
-def _register_local_biomedclip_config():
-    src_config = os.path.join(LOCAL_BIOMEDCLIP_DIR, "open_clip_config.json")
-    if not os.path.exists(src_config):
-        raise FileNotFoundError(f"BiomedCLIP config not found: {src_config}")
-    with open(src_config, "r") as f:
-        cfg = json.load(f)
-    cfg["model_cfg"]["text_cfg"]["hf_model_name"] = LOCAL_BIOMEDBERT_TEXT_TOWER_DIR
-    cfg["model_cfg"]["text_cfg"]["hf_tokenizer_name"] = LOCAL_BIOMEDBERT_TEXT_TOWER_DIR
-    cfg_dir = os.path.join(tempfile.gettempdir(), "open_clip_local_biomedclip")
-    os.makedirs(cfg_dir, exist_ok=True)
-    dst = os.path.join(cfg_dir, f"{BIOMEDCLIP_MODEL}.json")
-    with open(dst, "w") as f:
-        json.dump(cfg["model_cfg"], f)
-    open_clip.add_model_config(cfg_dir)
+def _load_local_text_feature(text_tower_path: str, prompt: str, hidden_size: int = 768) -> torch.Tensor:
+    tower_dir = Path(text_tower_path).expanduser().resolve()
+    os.environ.setdefault('TRANSFORMERS_OFFLINE', '1')
+    os.environ.setdefault('HF_HUB_OFFLINE', '1')
+    try:
+        from transformers import AutoTokenizer, AutoModel
+        tokenizer = AutoTokenizer.from_pretrained(str(tower_dir), local_files_only=True)
+        bert = AutoModel.from_pretrained(str(tower_dir), local_files_only=True)
+        bert.eval()
+        enc = tokenizer([prompt], padding='max_length', truncation=True, max_length=256, return_tensors='pt')
+        with torch.no_grad():
+            out = bert(**enc)
+            mask = enc['attention_mask'].unsqueeze(-1).float()
+            feat = (out.last_hidden_state * mask).sum(1) / mask.sum(1).clamp_min(1.0)
+            feat = F.normalize(feat, dim=-1)
+        print(f'[+] Aligned-CUDM-Text v2: text feature shape {tuple(feat.shape)}')
+        return feat.cpu()
+    except Exception as exc:
+        print(f'[!] Aligned-CUDM-Text v2: failed to load text tower ({exc}), using random init.')
+        rand = torch.randn(1, hidden_size)
+        return F.normalize(rand, dim=-1)
 
 
-@torch.no_grad()
-def _encode_prompt(prompt):
-    if open_clip is None:
-        raise ImportError("pip install open_clip_torch") from _OPEN_CLIP_ERROR
-    _register_local_biomedclip_config()
-    model, _, _ = open_clip.create_model_and_transforms(
-        BIOMEDCLIP_MODEL,
-        pretrained=BIOMEDCLIP_WEIGHTS,
-        pretrained_hf=False,
-    )
-    tokenizer = open_clip.get_tokenizer(BIOMEDCLIP_MODEL)
-    model.eval()
-    tokens = tokenizer([prompt])
-    text = model.encode_text(tokens).float()
-    text = F.normalize(text, dim=-1).cpu()
-    del model
-    return text
-
-
-class FixedPromptEmbedding(nn.Module):
-    def __init__(self, prompt=TUMOR_PROMPT):
+class ConvBN(nn.Module):
+    def __init__(self, in_ch, out_ch, k=1, stride=1, groups=1, dilation=1):
         super().__init__()
-        safe_name = "cudm_tumor_prompt_embedding.pt"
-        cache_path = os.path.join(LOCAL_BIOMEDCLIP_DIR, safe_name)
-        if os.path.exists(cache_path):
-            text_code = torch.load(cache_path, map_location="cpu")
+        padding = (k // 2) * dilation
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, k, stride=stride, padding=padding,
+                      groups=groups, dilation=dilation, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class ExplicitDisentangledTumorExtractor(nn.Module):
+    """Module I: explicit Common / CT-specific / PET-specific disentanglement."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        c = channels
+        mid = max(1, c // 2)
+        squeeze = max(1, c // 4)
+
+        self.common_encoder = nn.Sequential(
+            ConvBN(c * 2, c, k=5),
+            ConvBN(c, c, k=3),
+            ConvBN(c, c, k=1),
+        )
+        self.common_channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c, squeeze, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(squeeze, c, 1), nn.Sigmoid(),
+        )
+
+        self.ct_diff_encoder = nn.Sequential(
+            ConvBN(c * 2, c, k=1),
+            ConvBN(c, mid, k=3, dilation=2),
+            nn.Conv2d(mid, 1, 1), nn.Sigmoid(),
+        )
+        self.ct_specific_transform = nn.Sequential(ConvBN(c, c, k=3), ConvBN(c, c, k=1))
+
+        self.pet_diff_encoder = nn.Sequential(
+            ConvBN(c * 2, c, k=1),
+            ConvBN(c, mid, k=3, dilation=2),
+            nn.Conv2d(mid, 1, 1), nn.Sigmoid(),
+        )
+        self.pet_specific_transform = nn.Sequential(ConvBN(c, c, k=3), ConvBN(c, c, k=1))
+
+    def forward(self, ct, pet):
+        b, c, h, w = ct.shape
+        concat = torch.cat([ct, pet], dim=1)
+
+        common_raw = self.common_encoder(concat)
+        ch_gate = self.common_channel_gate(common_raw)
+        common = common_raw * ch_gate
+
+        ct_saliency = self.ct_diff_encoder(concat)
+        pet_saliency = self.pet_diff_encoder(concat)
+        ct_specific = self.ct_specific_transform(ct) * ct_saliency
+        pet_specific = self.pet_specific_transform(pet) * pet_saliency
+
+        common_flat = common.reshape(b, c, -1)
+        ct_flat = ct_specific.reshape(b, c, -1)
+        pet_flat = pet_specific.reshape(b, c, -1)
+        common_energy = common_flat.pow(2).sum(dim=2, keepdim=True).clamp_min(1e-6)
+        ct_proj = (ct_flat * common_flat).sum(dim=2, keepdim=True) / common_energy
+        pet_proj = (pet_flat * common_flat).sum(dim=2, keepdim=True) / common_energy
+        ct_specific = (ct_flat - ct_proj * common_flat).reshape(b, c, h, w)
+        pet_specific = (pet_flat - pet_proj * common_flat).reshape(b, c, h, w)
+
+        aux = {
+            'common_channel_gate': ch_gate.detach(),
+            'ct_diff_saliency': ct_saliency.detach(),
+            'pet_diff_saliency': pet_saliency.detach(),
+            'ortho_residual': (ct_proj.abs().mean() + pet_proj.abs().mean()).detach(),
+        }
+        return common, ct_specific, pet_specific, aux
+
+
+class BCGPATextGuidedFusion(nn.Module):
+    """Module II: bidirectional cross-attention, FiLM and semantic 3-way gates."""
+
+    def __init__(self, channels: int, text_dim: int, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        c = channels
+        num_heads = max(1, math.gcd(c, int(num_heads)))
+        self.img_proj = nn.Conv2d(c, c, 1)
+        self.text_proj_q = nn.Linear(text_dim, c)
+        self.text_proj_kv = nn.Linear(text_dim, c)
+        self.text_to_img_attn = nn.MultiheadAttention(c, num_heads, dropout=dropout, batch_first=True)
+        self.img_to_text_attn = nn.MultiheadAttention(c, num_heads, dropout=dropout, batch_first=True)
+        self.film = nn.Sequential(nn.Linear(text_dim, c * 2), nn.LayerNorm(c * 2))
+        self.gate = nn.Sequential(ConvBN(c * 4, c, k=1), nn.Conv2d(c, 3, 1), nn.Softmax(dim=1))
+        self.out_proj = nn.Sequential(ConvBN(c, c, k=1), nn.Dropout2d(dropout))
+
+    def forward(self, common, ct_specific, pet_specific, text_feat):
+        b, c, h, w = common.shape
+        text_feat = text_feat.to(dtype=common.dtype, device=common.device)
+        if text_feat.size(0) == 1 and b > 1:
+            text_feat = text_feat.expand(b, -1)
+
+        img_seq = self.img_proj(common).reshape(b, c, h * w).permute(0, 2, 1)
+        text_q = self.text_proj_q(text_feat).unsqueeze(1)
+        text_kv = self.text_proj_kv(text_feat).unsqueeze(1)
+
+        _, text_to_img_w = self.text_to_img_attn(
+            text_q, img_seq, img_seq, need_weights=True, average_attn_weights=True
+        )
+        pixel_enhanced, _ = self.img_to_text_attn(img_seq, text_kv, text_kv)
+        pixel_enhanced = pixel_enhanced.permute(0, 2, 1).reshape(b, c, h, w)
+        text_attn_map = text_to_img_w.reshape(b, 1, h, w)
+
+        gamma, beta = self.film(text_feat).chunk(2, dim=-1)
+        gamma = gamma.reshape(b, c, 1, 1)
+        beta = beta.reshape(b, c, 1, 1)
+        common_modulated = common * (1 + torch.tanh(gamma)) + torch.tanh(beta)
+
+        gates = self.gate(torch.cat([common_modulated, ct_specific, pet_specific, pixel_enhanced], dim=1))
+        fused = gates[:, 0:1] * common_modulated + gates[:, 1:2] * ct_specific + gates[:, 2:3] * pet_specific
+        out = self.out_proj(fused)
+        aux = {
+            'text_pixel_attn_map': text_attn_map.detach(),
+            'fusion_gates': gates.detach(),
+            'film_gamma': gamma.detach(),
+            'film_beta': beta.detach(),
+        }
+        return out, aux
+
+
+class AlignedCUDMTextBlock(nn.Module):
+    def __init__(self, ct_channels, pet_channels, out_channels, text_feat,
+                 num_heads=8, dropout=0.1, module_mode='dual'):
+        super().__init__()
+        if module_mode not in ('extractor_only', 'text_only', 'dual'):
+            raise ValueError(f'Unsupported module_mode={module_mode}')
+        text_dim = int(text_feat.shape[-1])
+        self.module_mode = module_mode
+        self.ct_proj = nn.Sequential(
+            nn.Conv2d(ct_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True),
+        )
+        self.pet_proj = nn.Sequential(
+            nn.Conv2d(pet_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True),
+        )
+        self.extractor = ExplicitDisentangledTumorExtractor(out_channels) if module_mode in ('extractor_only', 'dual') else None
+        self.fusion_block = BCGPATextGuidedFusion(out_channels, text_dim, num_heads=num_heads, dropout=dropout) if module_mode in ('text_only', 'dual') else None
+        self.register_buffer('text_embed', text_feat.float())
+        self.res_scale = nn.Parameter(torch.zeros(1))
+        self.cache_visuals = False
+        self._last_visuals = {}
+
+    def forward(self, ct_feat, pet_feat):
+        if self.cache_visuals:
+            self._last_visuals = {'ct_encoder': ct_feat.detach().cpu(), 'pet_encoder': pet_feat.detach().cpu()}
+
+        ct = self.ct_proj(ct_feat)
+        pet = self.pet_proj(pet_feat)
+        if pet.shape[-2:] != ct.shape[-2:]:
+            pet = F.interpolate(pet, size=ct.shape[-2:], mode='bilinear', align_corners=False)
+        base = (ct + pet) * 0.5
+
+        aux = {}
+        if self.module_mode == 'text_only':
+            common, ct_tumor, pet_tumor = base, ct, pet
         else:
-            text_code = _encode_prompt(prompt)
-            torch.save(text_code, cache_path)
-        self.register_buffer("text_code", text_code.float(), persistent=True)
+            common, ct_tumor, pet_tumor, extract_aux = self.extractor(ct, pet)
+            aux.update(extract_aux)
 
-    def forward(self, batch_size, device):
-        return self.text_code.to(device).expand(batch_size, -1)
+        if self.module_mode == 'extractor_only':
+            fused_delta = common + 0.5 * (ct_tumor + pet_tumor)
+        else:
+            fused_delta, fusion_aux = self.fusion_block(common, ct_tumor, pet_tumor, self.text_embed)
+            aux.update(fusion_aux)
+
+        fused = base + torch.tanh(self.res_scale) * (fused_delta - base)
+        if self.cache_visuals:
+            self._last_visuals.update({
+                'ct_aligned': ct.detach().cpu(),
+                'pet_aligned': pet.detach().cpu(),
+                'common': common.detach().cpu(),
+                'ct_tumor': ct_tumor.detach().cpu(),
+                'pet_tumor': pet_tumor.detach().cpu(),
+                'fused': fused.detach().cpu(),
+            })
+            for key in ('ct_diff_saliency', 'pet_diff_saliency', 'text_pixel_attn_map', 'fusion_gates'):
+                if key in aux and isinstance(aux[key], torch.Tensor):
+                    self._last_visuals[key] = aux[key].detach().cpu()
+        return fused, aux
 
 
-class LayerNorm2d(nn.Module):
-    def __init__(self, channels):
+class AlignedCUDMTextFusion(nn.Module):
+    def __init__(self, ct_channels, pet_channels, out_channels,
+                 prompt='focal abnormal metabolic lung lesion on PET-CT scan',
+                 text_tower_path='/root/autodl-tmp/mkd-main/new-train/pretrained/biomedbert_text_tower',
+                 num_heads=8, dropout=0.1, module_mode='dual'):
         super().__init__()
-        self.norm = nn.LayerNorm(channels)
-
-    def forward(self, x):
-        return self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
-
-
-class LiteFFN(nn.Module):
-    def __init__(self, channels, expansion=0.25):
-        super().__init__()
-        hidden = max(8, int(channels * expansion))
-        self.net = nn.Sequential(
-            nn.Conv2d(channels, hidden, 1, bias=False),
-            nn.BatchNorm2d(hidden),
-            nn.GELU(),
-            nn.Conv2d(hidden, hidden, 3, padding=1, groups=hidden, bias=False),
-            nn.BatchNorm2d(hidden),
-            nn.GELU(),
-            nn.Conv2d(hidden, channels, 1, bias=False),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class LiteChannelAttention(nn.Module):
-    """Restormer-style transposed channel attention with QKV + softmax."""
-
-    def __init__(self, channels, heads=4, attn_ratio=0.125):
-        super().__init__()
-        self.heads = heads
-        attn_c = max(heads, int(channels * attn_ratio))
-        attn_c = max(heads, (attn_c // heads) * heads)
-        self.temperature = nn.Parameter(torch.ones(heads, 1, 1))
-        self.q = nn.Conv2d(channels, attn_c, 1, bias=False)
-        self.kv = nn.Conv2d(channels, attn_c * 2, 1, bias=False)
-        self.q_dw = nn.Conv2d(attn_c, attn_c, 3, padding=1, groups=attn_c, bias=False)
-        self.kv_dw = nn.Conv2d(attn_c * 2, attn_c * 2, 3, padding=1, groups=attn_c * 2, bias=False)
-        self.proj = nn.Conv2d(attn_c, channels, 1, bias=False)
-        self.scale = nn.Parameter(torch.tensor(0.5))
-
-    def forward(self, query, kv_feature):
-        _, _, h, w = query.shape
-        q = self.q_dw(self.q(query))
-        k, v = self.kv_dw(self.kv(kv_feature)).chunk(2, dim=1)
-        q = rearrange(q, "b (hd c) h w -> b hd c (h w)", hd=self.heads)
-        k = rearrange(k, "b (hd c) h w -> b hd c (h w)", hd=self.heads)
-        v = rearrange(v, "b (hd c) h w -> b hd c (h w)", hd=self.heads)
-        q = F.normalize(q, dim=-1)
-        k = F.normalize(k, dim=-1)
-        attn = F.softmax((q @ k.transpose(-2, -1)) * self.temperature, dim=-1)
-        out = attn @ v
-        out = rearrange(out * self.scale, "b hd c (h w) -> b (hd c) h w", hd=self.heads, h=h, w=w)
-        return self.proj(out)
-
-
-class TextGuidedChannelAttention(nn.Module):
-    """Text-guided channel attention for cleaning tumor query features."""
-
-    def __init__(self, channels, text_dim=512, reduction=8):
-        super().__init__()
-        hidden = max(8, channels // reduction)
-        self.text_proj = nn.Sequential(
-            nn.Linear(text_dim, hidden, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, channels, bias=False),
-        )
-        self.visual_proj = nn.Sequential(
-            nn.Linear(channels * 2, hidden, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, channels, bias=False),
-        )
-        self.fusion = nn.Sequential(
-            nn.Linear(channels * 4, hidden, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, channels, bias=False),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, tumor_feature, text_code):
-        b, c, _, _ = tumor_feature.shape
-        avg_desc = tumor_feature.mean(dim=(2, 3))
-        max_desc = tumor_feature.amax(dim=(2, 3))
-        visual = self.visual_proj(torch.cat([avg_desc, max_desc], dim=1))
-        text = self.text_proj(text_code)
-        interaction = visual * text
-        difference = torch.abs(visual - text)
-        gate = self.fusion(torch.cat([visual, text, interaction, difference], dim=1))
-        return tumor_feature * gate.view(b, c, 1, 1), gate
-
-
-class MutualGate(nn.Module):
-    """Estimate commonality via mutual channel gating between two modalities."""
-
-    def __init__(self, channels):
-        super().__init__()
-        hidden = max(8, channels // 4)
-        self.ct_squeeze = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, hidden, 1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, channels, 1, bias=False),
-        )
-        self.pet_squeeze = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, hidden, 1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, channels, 1, bias=False),
-        )
-        self.spatial = nn.Sequential(
-            nn.Conv2d(channels, channels, 5, padding=2, groups=channels, bias=False),
-            nn.BatchNorm2d(channels),
-        )
-
-    def forward(self, ct_feature, pet_feature):
-        ct_w = torch.sigmoid(self.pet_squeeze(pet_feature))
-        pet_w = torch.sigmoid(self.ct_squeeze(ct_feature))
-        mutual = ct_feature * ct_w + pet_feature * pet_w
-        common = self.spatial(mutual)
-        return common
-
-
-
-class CUDMTextGate(nn.Module):
-    """Commonality-Uniqueness Disentanglement with text-gated attention."""
-
-    def __init__(self, channels, heads=4, text_dim=512, attn_ratio=0.125):
-        super().__init__()
-        self.mutual_gate = MutualGate(channels)
-        self.unique_fuse = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, 1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.GELU(),
-        )
-        self.tgca = TextGuidedChannelAttention(
-            channels, text_dim=text_dim, reduction=8,
-        )
-        self.nq = LayerNorm2d(channels)
-        self.nkv = LayerNorm2d(channels)
-        self.nf = LayerNorm2d(channels)
-        self.attn = LiteChannelAttention(channels, heads=heads, attn_ratio=attn_ratio)
-        self.ffn = LiteFFN(channels, expansion=0.25)
-        self.out_gate = nn.Parameter(torch.tensor(0.5))
-
-    def forward(self, pet_feature, ct_feature, text_code):
-        common = self.mutual_gate(ct_feature, pet_feature)
-        unique_pet = pet_feature - common
-        unique_ct = ct_feature - common
-        tumor = self.unique_fuse(torch.cat([unique_pet, unique_ct], dim=1))
-
-        clean_query, _ = self.tgca(tumor, text_code)
-
-        attn_out = self.attn(self.nq(clean_query), self.nkv(tumor))
-        enhanced = attn_out + self.ffn(self.nf(attn_out))
-
-        base = pet_feature + ct_feature
-        gate = torch.sigmoid(self.out_gate)
-        out = base * (1.0 - gate) + (base + enhanced) * gate
-        return out, {"common": common, "tumor": tumor}
-
-
-class MultiStageCUDMTextFusion(nn.Module):
-    """Apply CUDMTextGate to all encoder stages."""
-
-    def __init__(self, encoder_channels, text_dim=512, heads_per_stage=(1, 2, 4, 8)):
-        super().__init__()
-        self.text_encoder = FixedPromptEmbedding(prompt=TUMOR_PROMPT)
-        self.stages = nn.ModuleList([
-            CUDMTextGate(channels=ch, heads=head, text_dim=text_dim, attn_ratio=0.125)
-            for ch, head in zip(encoder_channels, heads_per_stage)
+        if not (len(ct_channels) == len(pet_channels) == len(out_channels)):
+            raise ValueError('ct_channels, pet_channels and out_channels must have equal length.')
+        text_feat = _load_local_text_feature(text_tower_path, prompt)
+        self.blocks = nn.ModuleList([
+            AlignedCUDMTextBlock(ct_ch, pet_ch, out_ch, text_feat,
+                                 num_heads=num_heads, dropout=dropout, module_mode=module_mode)
+            for ct_ch, pet_ch, out_ch in zip(ct_channels, pet_channels, out_channels)
         ])
+        self.cache_visuals = False
+        self.module_mode = module_mode
+
+    def set_visuals(self, enabled: bool):
+        self.cache_visuals = bool(enabled)
+        for blk in self.blocks:
+            blk.cache_visuals = self.cache_visuals
+            if self.cache_visuals:
+                blk._last_visuals = {}
+
+    def get_fusion_visuals(self):
+        visuals = {}
+        for idx, blk in enumerate(self.blocks, start=1):
+            if blk._last_visuals:
+                visuals[f'cudm_s{idx}'] = dict(blk._last_visuals)
+        return visuals
 
     def forward(self, ct_feats, pet_feats):
-        b = ct_feats[0].shape[0]
-        device = ct_feats[0].device
-        text_code = self.text_encoder(b, device)
-        fused = []
-        aux = []
-        for stage, ct_f, pet_f in zip(self.stages, ct_feats, pet_feats):
-            out, stage_aux = stage(pet_f, ct_f, text_code)
-            fused.append(out)
-            aux.append(stage_aux)
-        return fused, aux
+        fused_list, aux_list = [], []
+        for blk, ct_f, pet_f in zip(self.blocks, ct_feats, pet_feats):
+            fused, aux = blk(ct_f, pet_f)
+            fused_list.append(fused)
+            aux_list.append(aux)
+        return fused_list, aux_list
