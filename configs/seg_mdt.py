@@ -36,7 +36,7 @@ class SegMDTConfig(ConfigBase):
             "--fusion_type",
             type=str,
             default="mpa_bioclip_sum",
-            choices=("auto", "sum", "project_sum", "mpa_bioclip_sum", "bcg_pa_sum"),
+            choices=("auto", "sum", "project_sum", "mpa_bioclip_sum", "bcg_pa_sum", "mpa_bioclip_no_text_sum"),
             help="Feature fusion type. Heterogeneous model supports project_sum and mpa_bioclip_sum/bcg_pa_sum; homogeneous baseline supports auto/sum.",
         )
         p.add_argument("--bioclip_model_path", type=str, default="/root/autodl-tmp/mkd-main/new-train/pretrained/biomedclip_model", help="Local BiomedCLIP OpenCLIP config/weight path for MPA-BioCLIP text prompt encoding.")

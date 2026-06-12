@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import timm
 
 from models.mpa_bioclip import MPABioCLIPSumFusion, get_bioclip_text_feature
+from models.mpa_bioclip_no_text import MPABioCLIPNoTextSumFusion
 
 try:
     from transformers import SegformerConfig, SegformerModel, ConvNextConfig, ConvNextModel
@@ -433,12 +434,15 @@ class HeterogeneousDualBackboneUNet(nn.Module):
                 bioclip_text,
                 text_tower_path=bioclip_text_tower_path,
             )
-            print(f'[+] MPA-BioCLIP/BCG-PA text feature shape: {tuple(text_feat.shape)}')
+            print(f'[+] BCG-PA text feature shape: {tuple(text_feat.shape)}')
             self.fusion = MPABioCLIPSumFusion(ct_channels, pet_channels, fusion_channels, text_feat)
+        elif fusion_type == 'mpa_bioclip_no_text_sum':
+            print('[+] MPA-BioCLIP-NoText: using visual-only ablation (no text prompt injection)')
+            self.fusion = MPABioCLIPNoTextSumFusion(ct_channels, pet_channels, fusion_channels)
         else:
             raise ValueError(
                 f'Unsupported fusion_type: {fusion_type}. '
-                'Supported for hetero_convnext_mit: project_sum, mpa_bioclip_sum, bcg_pa_sum.'
+                'Supported for hetero_convnext_mit: project_sum, mpa_bioclip_sum, bcg_pa_sum, mpa_bioclip_no_text_sum.'
             )
 
         if decoder_type != 'light':
