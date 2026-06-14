@@ -1,0 +1,200 @@
+Training Log
+================================================================
+Epoch 1
+  train_loss    : 1.3528
+  val_loss      : 1.2286
+  val_dice      : 0.5639
+  val_iou       : 0.3926
+  val_acc       : 0.9060
+  val_acc_pixel : 0.9964
+  val_hd95      : 45.7998
+  lr            : 0.00002667
+  grad_norm     : inf
+----------------------------------------------------------------
+Epoch 2
+  train_loss    : 1.1434
+  val_loss      : 1.0577
+  val_dice      : 0.5428
+  val_iou       : 0.3725
+  val_acc       : 0.9249
+  val_acc_pixel : 0.9959
+  val_hd95      : 41.5427
+  lr            : 0.00005333
+  grad_norm     : 0.650995
+----------------------------------------------------------------
+Epoch 3
+  train_loss    : 0.9543
+  val_loss      : 0.8459
+  val_dice      : 0.6709
+  val_iou       : 0.5048
+  val_acc       : 0.8567
+  val_acc_pixel : 0.9980
+  val_hd95      : 30.4856
+  lr            : 0.00008000
+  grad_norm     : inf
+----------------------------------------------------------------
+Epoch 4
+  train_loss    : 0.6978
+  val_loss      : 0.6343
+  val_dice      : 0.6747
+  val_iou       : 0.5091
+  val_acc       : 0.8592
+  val_acc_pixel : 0.9980
+  val_hd95      : 32.7673
+  lr            : 0.00007987
+  grad_norm     : inf
+----------------------------------------------------------------
+Epoch 5
+  train_loss    : 0.4728
+  val_loss      : 0.5067
+  val_dice      : 0.6800
+  val_iou       : 0.5152
+  val_acc       : 0.8336
+  val_acc_pixel : 0.9982
+  val_hd95      : 29.9151
+  lr            : 0.00007949
+  grad_norm     : 1.218751
+----------------------------------------------------------------
+Epoch 6
+  train_loss    : 0.3604
+  val_loss      : 0.4731
+  val_dice      : 0.7078
+  val_iou       : 0.5477
+  val_acc       : 0.8278
+  val_acc_pixel : 0.9984
+  val_hd95      : 28.8862
+  lr            : 0.00007887
+  grad_norm     : inf
+----------------------------------------------------------------
+Epoch 7
+  train_loss    : 0.3143
+  val_loss      : 0.4614
+  val_dice      : 0.7135
+  val_iou       : 0.5546
+  val_acc       : 0.8339
+  val_acc_pixel : 0.9985
+  val_hd95      : 27.6994
+  lr            : 0.00007799
+  grad_norm     : 1.629718
+----------------------------------------------------------------
+Epoch 8
+  train_loss    : 0.2900
+  val_loss      : 0.4584
+  val_dice      : 0.7210
+  val_iou       : 0.5638
+  val_acc       : 0.8381
+  val_acc_pixel : 0.9985
+  val_hd95      : 28.3945
+  lr            : 0.00007688
+  grad_norm     : inf
+----------------------------------------------------------------
+Epoch 9
+  train_loss    : 0.2694
+  val_loss      : 0.4545
+  val_dice      : 0.7255
+  val_iou       : 0.5693
+  val_acc       : 0.8367
+  val_acc_pixel : 0.9985
+  val_hd95      : 26.8692
+  lr            : 0.00007553
+  grad_norm     : 1.533269
+----------------------------------------------------------------
+Epoch 10
+  train_loss    : 0.2586
+  val_loss      : 0.4634
+  val_dice      : 0.7170
+  val_iou       : 0.5588
+  val_acc       : 0.8214
+  val_acc_pixel : 0.9985
+  val_hd95      : 27.0313
+  lr            : 0.00007396
+  grad_norm     : 1.617655
+----------------------------------------------------------------
+Epoch 11
+  train_loss    : 0.2500
+  val_loss      : 0.4704
+  val_dice      : 0.7047
+  val_iou       : 0.5441
+  val_acc       : 0.8077
+  val_acc_pixel : 0.9985
+  val_hd95      : 26.9469
+  lr            : 0.00007217
+  grad_norm     : inf
+----------------------------------------------------------------
+Epoch 12
+  train_loss    : 0.2431
+  val_loss      : 0.4698
+  val_dice      : 0.7039
+  val_iou       : 0.5431
+  val_acc       : 0.7982
+  val_acc_pixel : 0.9986
+  val_hd95      : 25.7609
+  lr            : 0.00007018
+  grad_norm     : 1.629997
+----------------------------------------------------------------
+Epoch 13
+  train_loss    : 0.2355
+  val_loss      : 0.4597
+  val_dice      : 0.7116
+  val_iou       : 0.5524
+  val_acc       : 0.8178
+  val_acc_pixel : 0.9985
+  val_hd95      : 25.2431
+  lr            : 0.00006800
+  grad_norm     : inf
+----------------------------------------------------------------
+Epoch 14
+  train_loss    : 0.2303
+  val_loss      : 0.4688
+  val_dice      : 0.7160
+  val_iou       : 0.5577
+  val_acc       : 0.8164
+  val_acc_pixel : 0.9986
+  val_hd95      : 26.5557
+  lr            : 0.00006564
+  grad_norm     : 1.450631
+----------------------------------------------------------------
+Epoch 15
+  train_loss    : 0.2251
+  val_loss      : 0.4653
+  val_dice      : 0.7153
+  val_iou       : 0.5568
+  val_acc       : 0.8155
+  val_acc_pixel : 0.9986
+  val_hd95      : 25.9715
+  lr            : 0.00006312
+  grad_norm     : 1.196790
+----------------------------------------------------------------
+Epoch 16
+  train_loss    : 0.2203
+  val_loss      : 0.4697
+  val_dice      : 0.7172
+  val_iou       : 0.5591
+  val_acc       : 0.8123
+  val_acc_pixel : 0.9986
+  val_hd95      : 26.1845
+  lr            : 0.00006046
+  grad_norm     : 1.336105
+----------------------------------------------------------------
+Epoch 17
+  train_loss    : 0.2163
+  val_loss      : 0.4539
+  val_dice      : 0.7205
+  val_iou       : 0.5632
+  val_acc       : 0.8210
+  val_acc_pixel : 0.9986
+  val_hd95      : 26.3615
+  lr            : 0.00005766
+  grad_norm     : 1.170570
+----------------------------------------------------------------
+Epoch 18
+  train_loss    : 0.2131
+  val_loss      : 0.4642
+  val_dice      : 0.7265
+  val_iou       : 0.5705
+  val_acc       : 0.8242
+  val_acc_pixel : 0.9986
+  val_hd95      : 26.3668
+  lr            : 0.00005475
+  grad_norm     : inf
+----------------------------------------------------------------

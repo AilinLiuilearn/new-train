@@ -67,6 +67,22 @@ def _prepare_env(config):
 
 def _build_loaders(config):
     dataset_mod = _load_dataset_module()
+    if getattr(config, 'use_textproxy_loader', False):
+        return dataset_mod.get_pclt20k_loaders_textproxy_aligned(
+            config.root,
+            config.image_size_2d,
+            config.batch_size,
+            config.num_workers,
+            config.random_state,
+            pin_memory=getattr(config, 'pin_memory', True),
+            aug_mode=getattr(config, 'aug_mode', 'cipa'),
+            norm_mode=getattr(config, 'norm_mode', 'cipa'),
+            train_list=getattr(config, 'train_list', 'train_orgian.txt'),
+            val_list=getattr(config, 'val_list', 'test.txt'),
+            test_list=getattr(config, 'test_list', 'test.txt'),
+            pet_drop_prob=getattr(config, 'pet_drop_prob', 0.4),
+            eval_missing_pet=getattr(config, 'eval_missing_pet', False),
+        )
     if getattr(config, 'cipa_aligned', False):
         return dataset_mod.get_pclt20k_loaders_cipa_aligned(
             config.root,
@@ -77,6 +93,9 @@ def _build_loaders(config):
             pin_memory=getattr(config, 'pin_memory', True),
             aug_mode=getattr(config, 'aug_mode', 'cipa'),
             norm_mode=getattr(config, 'norm_mode', 'imagenet'),
+            train_split_file=getattr(config, 'train_split_file', 'train.txt'),
+            val_split_file=getattr(config, 'val_split_file', 'val.txt'),
+            test_split_file=getattr(config, 'test_split_file', 'test.txt'),
         )
     return dataset_mod.get_pclt20k_loaders(
         config.root,

@@ -7,7 +7,22 @@ from utils.optimization import get_optimizer
 from utils.seg_losses import BCEDiceLoss
 
 
-def _forward(nets, ct, pet, target_size):
+def mask_to_boundary(mask):
+    if mask.dim() == 3:
+        mask = mask.unsqueeze(1)
+    mask = (mask > 0.5).float()
+    kernel = torch.ones((1, 1, 3, 3), dtype=mask.dtype, device=mask.device)
+    neighbor_sum = F.conv2d(mask, kernel, padding=1)
+    boundary = ((neighbor_sum > 0) & (neighbor_sum < 9)).float()
+    return boundary
+
+
+def _forward(nets, ct, pet, target_size, pet_available=None):
+    if pet_available is not None:
+        try:
+            return nets['model'](ct, pet, pet_available=pet_available, target_size=target_size)
+        except TypeError:
+            return nets['model'](ct, pet, target_size=target_size)
     return nets['model'](ct, pet, target_size=target_size)
 
 
@@ -55,6 +70,8 @@ class MDTSegTeacher:
 
     def _select_main_pred(self, outputs):
         if isinstance(outputs, dict):
+            if 'logits' in outputs:
+                return outputs['logits']
             if 'pred' in outputs:
                 return outputs['pred']
             preds = outputs.get('preds')
@@ -182,9 +199,18 @@ class MDTSegTeacher:
         loss_seg, pred, loss_stats = self._compute_segmentation_loss(outputs, mask)
         loss_cudm, cudm_stats = self._compute_cudm_disentangle_loss(outputs, mask)
         loss_fnet, fnet_stats = self._compute_fnet_sparse_aux_loss(outputs, mask)
-        loss_total = loss_seg + loss_cudm + loss_fnet
+        loss_boundary = mask.new_tensor(0.0)
+        boundary_weight = float(getattr(self.config, 'boundary_loss_weight', 0.0))
+        if boundary_weight > 0 and isinstance(outputs, dict) and outputs.get('boundary_logits') is not None:
+            boundary_logits = outputs['boundary_logits']
+            boundary_target = mask_to_boundary(mask)
+            if boundary_logits.shape[-2:] != boundary_target.shape[-2:]:
+                boundary_logits = F.interpolate(boundary_logits, size=boundary_target.shape[-2:], mode='bilinear', align_corners=False)
+            loss_boundary = F.binary_cross_entropy_with_logits(boundary_logits, boundary_target)
+        loss_total = loss_seg + loss_cudm + loss_fnet + boundary_weight * loss_boundary
         loss_dict = {
             'loss_seg': loss_seg.detach(),
+            'loss_boundary': loss_boundary.detach(),
             'loss_cudm': loss_cudm.detach(),
             'loss_fnet': loss_fnet.detach(),
             'loss_total': loss_total.detach(),
@@ -198,7 +224,10 @@ class MDTSegTeacher:
         ct = batch['ct'].float().to(self.device)
         pet = batch['pet'].float().to(self.device)
         mask = batch['mask'].float().to(self.device)
-        outputs = _forward(self.networks, ct, pet, mask.shape[-2:])
+        pet_available = batch.get('pet_available')
+        if pet_available is not None:
+            pet_available = pet_available.to(self.device)
+        outputs = _forward(self.networks, ct, pet, mask.shape[-2:], pet_available=pet_available)
         loss, pred, loss_dict = self._compute_total_loss(outputs, mask)
         return loss, pred, mask, loss_dict
 
@@ -214,7 +243,16 @@ class MDTSegTeacher:
             ct = batch['ct'].float().to(self.device)
             pet = batch['pet'].float().to(self.device)
             mask = batch['mask'].float().to(self.device)
-            outputs = eval_model(ct, pet, target_size=mask.shape[-2:])
+            pet_available = batch.get('pet_available')
+            if pet_available is not None:
+                pet_available = pet_available.to(self.device)
+            if pet_available is not None:
+                try:
+                    outputs = eval_model(ct, pet, pet_available=pet_available, target_size=mask.shape[-2:])
+                except TypeError:
+                    outputs = eval_model(ct, pet, target_size=mask.shape[-2:])
+            else:
+                outputs = eval_model(ct, pet, target_size=mask.shape[-2:])
             pred = self._select_main_pred(outputs)
             loss_seg, _ = self.loss_seg(pred, mask)
             total_loss += loss_seg.item() * ct.size(0)
