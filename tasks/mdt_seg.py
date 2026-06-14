@@ -232,13 +232,17 @@ class MDTSegTeacher:
         return loss, pred, mask, loss_dict
 
     @torch.no_grad()
-    def evaluate(self, loader, threshold=None):
+    def evaluate(self, loader, threshold=None, force_missing_pet=False, tag="val"):
         eval_model = self.networks['model']
         eval_model.eval()
         th = threshold or getattr(self.config, 'eval_threshold', 0.5)
+        mode = 'missing' if force_missing_pet else 'full'
+        print(f'[evaluate] tag={tag} mode={mode}')
         m = SegmentationMetricsCIPA(threshold=th).to(self.device)
         m.reset()
         total_loss, n = 0.0, 0
+        gate_sum = {'pet_gate_mean': 0.0, 'text_gate_mean': 0.0, 'prior_gate_mean': 0.0}
+        gate_n = 0
         for batch in loader:
             ct = batch['ct'].float().to(self.device)
             pet = batch['pet'].float().to(self.device)
@@ -246,22 +250,32 @@ class MDTSegTeacher:
             pet_available = batch.get('pet_available')
             if pet_available is not None:
                 pet_available = pet_available.to(self.device)
-            if pet_available is not None:
-                try:
-                    outputs = eval_model(ct, pet, pet_available=pet_available, target_size=mask.shape[-2:])
-                except TypeError:
-                    outputs = eval_model(ct, pet, target_size=mask.shape[-2:])
-            else:
-                outputs = eval_model(ct, pet, target_size=mask.shape[-2:])
+            if force_missing_pet:
+                pet = torch.zeros_like(pet)
+                pet_available = torch.zeros(ct.shape[0], device=self.device, dtype=torch.float32)
+            outputs = _forward(self.networks, ct, pet, mask.shape[-2:], pet_available=pet_available)
             pred = self._select_main_pred(outputs)
             loss_seg, _ = self.loss_seg(pred, mask)
             total_loss += loss_seg.item() * ct.size(0)
             n += ct.size(0)
             m.update(pred, mask)
+            if isinstance(outputs, dict) and isinstance(outputs.get('aux'), dict):
+                aux = outputs['aux']
+                for key in gate_sum:
+                    val = aux.get(key)
+                    if torch.is_tensor(val):
+                        gate_sum[key] += float(val.detach().mean().cpu())
+                    elif val is not None:
+                        gate_sum[key] += float(val)
+                gate_n += 1
         for v in self.networks.values():
             v.train()
         out = m.compute()
         out['total_loss'] = total_loss / max(n, 1)
+        if gate_n > 0:
+            out['pet_gate_mean'] = gate_sum['pet_gate_mean'] / gate_n
+            out['text_gate_mean'] = gate_sum['text_gate_mean'] / gate_n
+            out['prior_gate_mean'] = gate_sum['prior_gate_mean'] / gate_n
         return out
 
     def _unwrap(self, model):

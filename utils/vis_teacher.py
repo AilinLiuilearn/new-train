@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 
 @torch.no_grad()
-def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshold=0.5):
+def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshold=0.5, force_missing_pet=False, mode='full'):
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -25,20 +25,36 @@ def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshol
         ct = batch['ct'].float().to(task.device)
         pet = batch['pet'].float().to(task.device)
         mask = batch['mask'].float().to(task.device)
+        pet_available = batch.get('pet_available')
+        if pet_available is not None:
+            pet_available = pet_available.to(task.device)
+        if force_missing_pet:
+            pet = torch.zeros_like(pet)
+            pet_available = torch.zeros(ct.shape[0], device=task.device, dtype=torch.float32)
         model = task.networks['model']
         if hasattr(model, 'set_adc_mac_visuals'):
             model.set_adc_mac_visuals(True)
-        outputs = model(ct, pet, target_size=mask.shape[-2:])
+        try:
+            outputs = model(ct, pet, pet_available=pet_available, target_size=mask.shape[-2:])
+        except TypeError:
+            outputs = model(ct, pet, target_size=mask.shape[-2:])
         if hasattr(model, 'set_adc_mac_visuals'):
             model.set_adc_mac_visuals(False)
-        logit = outputs['preds'] if isinstance(outputs, dict) else outputs
-        if isinstance(logit, (list, tuple)):
-            logit = logit[0]
+        if isinstance(outputs, dict) and 'logits' in outputs:
+            logit = outputs['logits']
+        else:
+            logit = outputs['preds'] if isinstance(outputs, dict) else outputs
+            if isinstance(logit, (list, tuple)):
+                logit = logit[0]
+        boundary_prob = None
+        if isinstance(outputs, dict) and isinstance(outputs.get('boundary_logits'), torch.Tensor):
+            boundary_prob = torch.sigmoid(outputs['boundary_logits']).squeeze(1).cpu().numpy()
 
         prob = torch.sigmoid(logit).squeeze(1).cpu().numpy()
         gt = mask.squeeze(1).cpu().numpy()
         ct_np = ct.cpu().numpy()
         pet_np = pet.cpu().numpy()
+        pet_av_np = pet_available.detach().cpu().numpy() if pet_available is not None else np.ones(ct_np.shape[0])
 
         for i in range(ct_np.shape[0]):
             if saved >= num_samples:
@@ -49,6 +65,13 @@ def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshol
             prob_img = prob[i]
             gt_img = (gt[i] > 0.5).astype(np.float32)
             pred_bin = (prob_img > threshold).astype(np.float32)
+            gt_boundary = _mask_to_boundary_np(gt_img)
+            pred_boundary = _mask_to_boundary_np(pred_bin) if boundary_prob is None else (boundary_prob[i] > threshold).astype(np.float32)
+            dice_i = _dice_np(pred_bin, gt_img)
+            iou_i = _iou_np(pred_bin, gt_img)
+            case_id = _batch_item(batch, 'case_id', i, default=f'case{saved:03d}')
+            slice_id = _batch_item(batch, 'slice_id', i, default=f'slice{saved:03d}')
+            pet_av = int(float(pet_av_np[i])) if i < len(pet_av_np) else 1
 
             tp = np.logical_and(gt_img > 0.5, pred_bin > 0.5)
             fn = np.logical_and(gt_img > 0.5, pred_bin < 0.5)
@@ -69,15 +92,15 @@ def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshol
 
             panels = [
                 ('CT', ct_img, 'gray'),
-                ('PET', pet_img, 'inferno'),
-                ('Confidence', prob_img, 'jet'),
-                ('GT Overlay', gt_overlay, None),
+                (f'PET ({mode})', pet_img, 'inferno'),
+                ('GT Mask', gt_img, 'gray'),
+                ('Pred Mask', pred_bin, 'gray'),
+                ('Pred Prob', prob_img, 'jet'),
+                ('GT Boundary', gt_boundary, 'gray'),
+                ('Pred Boundary', pred_boundary, 'gray'),
                 ('Pred Overlay', pred_overlay, None),
                 ('GT vs Pred', compare_overlay, None),
-                ('GT Mask', gt_binary, None),
-                ('Pred Mask', pred_binary, None),
-                ('FN/FP/TP', error_map, None),
-                ('Zoomed Error', zoom_error, None),
+                (f'{case_id}\n{slice_id}\nmode={mode} pet={pet_av}\nDice={dice_i:.3f} IoU={iou_i:.3f}', np.ones_like(ct_img), 'gray'),
             ]
             panels.extend(cudm_panels)
             panels.extend(adc_mac_panels)
@@ -99,8 +122,12 @@ def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshol
             for ax in axes.flat[len(panels):]:
                 ax.axis('off')
 
+            fig.suptitle(f'case={case_id} slice={slice_id} mode={mode} pet_available={pet_av} Dice={dice_i:.4f} IoU={iou_i:.4f}', fontsize=14)
             plt.tight_layout()
-            plt.savefig(os.path.join(out_dir, f'diagnostic_{saved:03d}.png'), dpi=160)
+            safe_case = str(case_id).replace('/', '-').replace(' ', '_')
+            safe_slice = str(slice_id).replace('/', '-').replace(' ', '_')
+            fname = f'diagnostic_{saved:03d}_{safe_case}_{safe_slice}_{mode}_pet{pet_av}_dice{dice_i:.3f}_iou{iou_i:.3f}.png'
+            plt.savefig(os.path.join(out_dir, fname), dpi=160)
             plt.close(fig)
             saved += 1
 
@@ -108,6 +135,43 @@ def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshol
             break
 
     print(f'[vis_teacher] saved {saved} diagnostics to {out_dir}')
+
+
+def _batch_item(batch, key, idx, default=''):
+    val = batch.get(key) if isinstance(batch, dict) else None
+    if val is None:
+        return default
+    if isinstance(val, (list, tuple)):
+        return val[idx] if idx < len(val) else default
+    try:
+        return val[idx]
+    except Exception:
+        return val
+
+
+def _mask_to_boundary_np(mask):
+    mask = (mask > 0.5).astype(np.float32)
+    padded = np.pad(mask, ((1, 1), (1, 1)), mode='constant')
+    neighbor = np.zeros_like(mask, dtype=np.float32)
+    for dy in range(3):
+        for dx in range(3):
+            neighbor += padded[dy:dy + mask.shape[0], dx:dx + mask.shape[1]]
+    return np.logical_and(neighbor > 0, neighbor < 9).astype(np.float32)
+
+
+def _dice_np(pred, gt, eps=1e-6):
+    pred = pred > 0.5
+    gt = gt > 0.5
+    inter = np.logical_and(pred, gt).sum()
+    return float((2 * inter + eps) / (pred.sum() + gt.sum() + eps))
+
+
+def _iou_np(pred, gt, eps=1e-6):
+    pred = pred > 0.5
+    gt = gt > 0.5
+    inter = np.logical_and(pred, gt).sum()
+    union = np.logical_or(pred, gt).sum()
+    return float((inter + eps) / (union + eps))
 
 
 def _extract_adc_mac_panels(model, sample_idx, target_size, ct_img, pet_img):
