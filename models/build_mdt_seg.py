@@ -301,12 +301,37 @@ def _get_backbone_out_indices(backbone):
     raise ValueError(f'Unsupported backbone: {backbone}. Supported: pvt_v2_b1, mit_b0, mit_b1, convnext_tiny, convnext_nano.')
 
 
+class FallbackFeatureBackbone(nn.Module):
+    def __init__(self, in_channels=3, channels=(32, 64, 160, 256)):
+        super().__init__()
+        self.feature_info = SimpleFeatureInfo(channels)
+        self.stem = ConvBNAct(in_channels, channels[0], kernel_size=3, stride=2)
+        self.stage1 = ConvBNAct(channels[0], channels[0], kernel_size=3, stride=2)
+        self.stage2 = ConvBNAct(channels[0], channels[1], kernel_size=3, stride=2)
+        self.stage3 = ConvBNAct(channels[1], channels[2], kernel_size=3, stride=2)
+        self.stage4 = ConvBNAct(channels[2], channels[3], kernel_size=3, stride=2)
+
+    def forward(self, x):
+        x = self.stem(x)
+        f1 = self.stage1(x)
+        f2 = self.stage2(f1)
+        f3 = self.stage3(f2)
+        f4 = self.stage4(f3)
+        return [f1, f2, f3, f4]
+
+
 def create_feature_backbone(backbone, in_channels=3):
     backbone = _normalize_backbone_name(backbone)
     if backbone in ('mit_b0', 'mit_b1'):
+        if SegformerConfig is None or SegformerModel is None:
+            return FallbackFeatureBackbone(in_channels=in_channels, channels=(32, 64, 160, 256) if backbone == 'mit_b0' else (64, 128, 320, 512))
         return SegformerFeatureBackbone(backbone, in_channels=in_channels)
     if backbone == 'convnext_tiny':
+        if ConvNextConfig is None or ConvNextModel is None:
+            return FallbackFeatureBackbone(in_channels=in_channels, channels=(96, 192, 384, 768))
         return ConvNextFeatureBackbone(backbone, in_channels=in_channels)
+    if timm is None:
+        return FallbackFeatureBackbone(in_channels=in_channels)
     return timm.create_model(
         backbone,
         pretrained=False,
@@ -538,7 +563,25 @@ class DualBackboneUNet(nn.Module):
 
 
 def build_mdt_seg_teacher(config):
-    if getattr(config, 'model_arch', 'dual') == 'hetero_convnext_mit':
+    model_arch = getattr(config, 'model_arch', 'dual')
+    if model_arch == 'pamc_text_proxy':
+        from models.pamc_text_proxy_unet import PAMCTextProxyUNet
+        model = PAMCTextProxyUNet(
+            ct_backbone=getattr(config, 'ct_backbone', 'convnext_tiny'),
+            pet_backbone=getattr(config, 'pet_backbone', 'mit_b0'),
+            ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
+            pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
+            decoder_type=getattr(config, 'decoder_type', 'light'),
+            text_embed_dim=getattr(config, 'text_embed_dim', 256),
+            in_channels=3,
+            out_channels=1,
+            use_meddino=getattr(config, 'use_meddino', True),
+            meddino_ckpt=getattr(config, 'meddino_ckpt', None),
+            use_lapa=getattr(config, 'use_lapa', True),
+        )
+        return dict(model=model)
+
+    if model_arch == 'hetero_convnext_mit':
         model = HeterogeneousDualBackboneUNet(
             ct_backbone=getattr(config, 'ct_backbone', 'convnext_tiny'),
             pet_backbone=getattr(config, 'pet_backbone', 'mit_b0'),

@@ -2,22 +2,41 @@
 import os
 import random
 
-import cv2
 import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
-from utils.image_augmentation import (
-    randomHorizontalFlip,
-    randomShiftScaleRotate,
-    randomVerticalFlip,
-    randomcrop,
-    randomcrop_lesion_center,
-    elasticTransform,
-    randomBrightnessContrast,
-    randomGaussianNoise,
-    randomGaussianBlur,
-)
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
+try:
+    from utils.image_augmentation import (
+        randomHorizontalFlip,
+        randomShiftScaleRotate,
+        randomVerticalFlip,
+        randomcrop,
+        randomcrop_lesion_center,
+        elasticTransform,
+        randomBrightnessContrast,
+        randomGaussianNoise,
+        randomGaussianBlur,
+    )
+except Exception:
+    def _noop(img, mask, *args, **kwargs):
+        return img, mask
+
+    randomHorizontalFlip = _noop
+    randomShiftScaleRotate = _noop
+    randomVerticalFlip = _noop
+    randomcrop = _noop
+    randomcrop_lesion_center = _noop
+    elasticTransform = _noop
+    randomBrightnessContrast = _noop
+    randomGaussianNoise = _noop
+    randomGaussianBlur = _noop
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
@@ -151,6 +170,22 @@ def _normalize_pet_slice(pet_uint8):
     return pet[None, ...]
 
 
+def _imread_grayscale(path):
+    if cv2 is not None:
+        return cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if path is None or not os.path.isfile(path):
+        return None
+    return np.array(Image.open(path).convert('L'))
+
+
+def _resize_gray(img, size, nearest=False):
+    if cv2 is not None:
+        interpolation = cv2.INTER_NEAREST if nearest else cv2.INTER_LINEAR
+        return cv2.resize(img, (size, size), interpolation=interpolation)
+    mode = Image.Resampling.NEAREST if nearest else Image.Resampling.BILINEAR
+    return np.array(Image.fromarray(img).resize((size, size), mode))
+
+
 class PCLT20KSegDataset(Dataset):
     def __init__(self, records, image_size=512, train=False, pet_available_list=None, random_state=2023, aug_mode='cipa', norm_mode='imagenet'):
         self.records = records
@@ -167,15 +202,15 @@ class PCLT20KSegDataset(Dataset):
     def _load_image(self, path, fallback=None):
         if path is None:
             return np.zeros_like(fallback)
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        img = _imread_grayscale(path)
         return img if img is not None else np.zeros_like(fallback)
 
     def _resize(self, ct, pet, mask):
         if ct.shape[:2] == (self.image_size, self.image_size):
             return ct, pet, mask
-        ct = cv2.resize(ct, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
-        pet = cv2.resize(pet, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
-        mask = cv2.resize(mask, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
+        ct = _resize_gray(ct, self.image_size, nearest=False)
+        pet = _resize_gray(pet, self.image_size, nearest=False)
+        mask = _resize_gray(mask, self.image_size, nearest=True)
         return ct, pet, mask
 
     def _augment(self, img, mask):
@@ -206,8 +241,8 @@ class PCLT20KSegDataset(Dataset):
 
     def __getitem__(self, idx):
         record = self.records[idx]
-        ct = cv2.imread(record['ct_path'], cv2.IMREAD_GRAYSCALE)
-        mask = cv2.imread(record['mask_path'], cv2.IMREAD_GRAYSCALE)
+        ct = _imread_grayscale(record['ct_path'])
+        mask = _imread_grayscale(record['mask_path'])
         assert ct is not None and mask is not None
         pet = self._load_image(record['pet_path'], fallback=ct)
 
@@ -241,6 +276,80 @@ class PCLT20KSegDataset(Dataset):
         }
 
 
+class PCLT20KTextProxyAlignedDataset(PCLT20KSegDataset):
+    """CIPA-aligned PET/CT segmentation dataset with training-time PET modality dropout.
+
+    This class intentionally keeps the same resize/augmentation/normalization style as
+    PCLT20KSegDataset, but returns explicit 1-channel CT/PET tensors and metadata for
+    text-proxy PET-missing experiments.
+    """
+
+    def __init__(self, records, image_size=512, train=False, pet_drop_prob=0.0, eval_missing_pet=False, random_state=2023, aug_mode='cipa', norm_mode='imagenet'):
+        super().__init__(
+            records,
+            image_size=image_size,
+            train=train,
+            pet_available_list=[r['pet_path'] is not None for r in records],
+            random_state=random_state,
+            aug_mode=aug_mode,
+            norm_mode=norm_mode,
+        )
+        self.pet_drop_prob = float(pet_drop_prob)
+        self.eval_missing_pet = bool(eval_missing_pet)
+
+    def __getitem__(self, idx):
+        record = self.records[idx]
+        ct = _imread_grayscale(record['ct_path'])
+        mask = _imread_grayscale(record['mask_path'])
+        assert ct is not None and mask is not None
+        pet = self._load_image(record['pet_path'], fallback=ct)
+
+        ct, pet, mask = self._resize(ct, pet, mask)
+        img = np.stack([pet, ct], axis=-1)
+        img, mask = self._augment(img, mask)
+
+        img = img.astype(np.float32).transpose(2, 0, 1)
+        mask = (mask.astype(np.float32) / 255.0)
+        if mask.ndim == 2:
+            mask = mask[None, ...]
+        else:
+            mask = mask.transpose(2, 0, 1)
+        mask = (mask >= 0.5).astype(np.float32)
+
+        pet_ch = _normalize_pet_slice(img[0])
+        ct_ch = _normalize_ct_slice(img[1])
+        if self.norm_mode == 'cipa':
+            ct_out = ct_ch * 3.2 - 1.6
+            pet_out = pet_ch * 3.2 - 1.6
+        else:
+            ct_out = ct_ch
+            pet_out = pet_ch
+
+        pet_available = 1 if record['pet_path'] is not None else 0
+        if self.train and random.random() < self.pet_drop_prob:
+            pet_out = np.zeros_like(pet_out, dtype=np.float32)
+            pet_available = 0
+        elif (not self.train) and self.eval_missing_pet:
+            pet_out = np.zeros_like(pet_out, dtype=np.float32)
+            pet_available = 0
+
+        image = np.concatenate([pet_out, ct_out], axis=0)
+        image_id = record.get('image_id', str(idx))
+        parts = image_id.split('_')
+        slice_id = parts[-1] if len(parts) > 1 else image_id
+
+        return {
+            'image': torch.tensor(image, dtype=torch.float32),
+            'ct': torch.tensor(ct_out, dtype=torch.float32),
+            'pet': torch.tensor(pet_out, dtype=torch.float32),
+            'mask': torch.tensor(mask, dtype=torch.float32),
+            'pet_available': torch.tensor(pet_available, dtype=torch.long),
+            'case_id': record.get('case_id', parts[0] if parts else ''),
+            'slice_id': slice_id,
+            'idx': idx,
+        }
+
+
 def _seed_worker(worker_id):
     worker_seed = torch.initial_seed() % (2 ** 32)
     np.random.seed(worker_seed)
@@ -262,10 +371,10 @@ def _make_loader(dataset, batch_size, num_workers, shuffle, drop_last, seed, pin
     )
 
 
-def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_workers=4, random_state=2023, pin_memory=True, aug_mode='cipa', norm_mode='imagenet'):
-    train_ids = _read_list(os.path.join(root, 'train.txt'))
-    val_ids = _read_list(os.path.join(root, 'val.txt'))
-    test_ids = _read_list(os.path.join(root, 'test.txt'))
+def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_workers=4, random_state=2023, pin_memory=True, aug_mode='cipa', norm_mode='imagenet', train_split_file='train.txt', val_split_file='val.txt', test_split_file='test.txt'):
+    train_ids = _read_list(os.path.join(root, train_split_file))
+    val_ids = _read_list(os.path.join(root, val_split_file))
+    test_ids = _read_list(os.path.join(root, test_split_file))
     if train_ids is None or val_ids is None or test_ids is None:
         raise FileNotFoundError(f'未找到 train.txt、val.txt 或 test.txt，请确认数据路径: {root}')
 
@@ -290,6 +399,78 @@ def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_wor
     )
     val_ds = PCLT20KSegDataset(val_records, image_size=image_size, train=False, aug_mode='none', norm_mode=norm_mode)
     test_ds = PCLT20KSegDataset(test_records, image_size=image_size, train=False, aug_mode='none', norm_mode=norm_mode)
+    return (
+        _make_loader(train_ds, batch_size, num_workers, True, True, random_state + 11, pin_memory=pin_memory),
+        _make_loader(val_ds, batch_size, num_workers, False, False, random_state + 17, pin_memory=pin_memory),
+        _make_loader(test_ds, batch_size, num_workers, False, False, random_state + 23, pin_memory=pin_memory),
+    )
+
+
+def _resolve_textproxy_train_list(root, train_list):
+    candidates = [train_list]
+    if train_list != 'train_orgian.txt':
+        candidates.append('train_orgian.txt')
+    candidates.append('train_original.txt')
+    seen = []
+    for name in candidates:
+        if name in seen:
+            continue
+        seen.append(name)
+        path = os.path.join(root, name)
+        ids = _read_list(path)
+        if ids is not None:
+            return name, ids
+    raise FileNotFoundError(
+        f'未找到训练划分文件。已尝试: {", ".join(seen)}；数据路径: {root}'
+    )
+
+
+def get_pclt20k_loaders_textproxy_aligned(root, image_size=512, batch_size=8, num_workers=4, random_state=2023, pin_memory=True, aug_mode='cipa', norm_mode='cipa', train_list='train_orgian.txt', val_list='test.txt', test_list='test.txt', pet_drop_prob=0.4, eval_missing_pet=False):
+    used_train_list, train_ids = _resolve_textproxy_train_list(root, train_list)
+    val_ids = _read_list(os.path.join(root, val_list))
+    test_ids = _read_list(os.path.join(root, test_list))
+    if val_ids is None or test_ids is None:
+        raise FileNotFoundError(f'未找到验证/测试划分文件: val={val_list}, test={test_list}；数据路径: {root}')
+
+    train_records = _records_from_ids(root, train_ids)
+    val_records = _records_from_ids(root, val_ids)
+    test_records = _records_from_ids(root, test_ids)
+    train_records = [r for r in train_records if r['pet_path'] is not None]
+
+    print(f'[TextProxy-CIPA对齐] 训练: {len(train_records)}  验证: {len(val_records)}  测试: {len(test_records)}')
+    print(f'  ← 使用划分: train={used_train_list}, val={val_list}, test={test_list}')
+    print(f'  ← 数据增强: {aug_mode}')
+    print(f'  ← CT/PET归一化: {norm_mode}')
+    print(f'  ← PET modality dropout: pet_drop_prob={pet_drop_prob}')
+    print(f'  ← eval_missing_pet={eval_missing_pet}')
+
+    train_ds = PCLT20KTextProxyAlignedDataset(
+        train_records,
+        image_size=image_size,
+        train=True,
+        pet_drop_prob=pet_drop_prob,
+        random_state=random_state,
+        aug_mode=aug_mode,
+        norm_mode=norm_mode,
+    )
+    val_ds = PCLT20KTextProxyAlignedDataset(
+        val_records,
+        image_size=image_size,
+        train=False,
+        eval_missing_pet=eval_missing_pet,
+        random_state=random_state,
+        aug_mode='none',
+        norm_mode=norm_mode,
+    )
+    test_ds = PCLT20KTextProxyAlignedDataset(
+        test_records,
+        image_size=image_size,
+        train=False,
+        eval_missing_pet=eval_missing_pet,
+        random_state=random_state,
+        aug_mode='none',
+        norm_mode=norm_mode,
+    )
     return (
         _make_loader(train_ds, batch_size, num_workers, True, True, random_state + 11, pin_memory=pin_memory),
         _make_loader(val_ds, batch_size, num_workers, False, False, random_state + 17, pin_memory=pin_memory),
