@@ -152,7 +152,7 @@ def main():
     g0 = _prepare_env(config)
 
     print(f'GPU={g0} backbone={config.backbone} single_modality={getattr(config, "single_modality", False)}')
-    print(f'lr={config.learning_rate} wd={config.weight_decay} bs={config.batch_size}')
+    print(f'lr={config.learning_rate} wd={config.weight_decay} bs={config.batch_size} boundary_w={getattr(config, "boundary_loss_weight", 0.0)}')
 
     _save_config(config)
     train_loader, val_loader, test_loader = _build_loaders(config)
@@ -187,7 +187,7 @@ def main():
     patience = getattr(config, 'early_stop_patience', 15)
 
     for epoch in range(1, config.epochs + 1):
-        tloss, tn = 0.0, 0
+        tloss, tseg, tboundary, tn = 0.0, 0.0, 0.0, 0
         grad_norm_sum, grad_norm_steps = 0.0, 0
         model_for_epoch = _unwrap_model(task.networks.get('model'))
         if hasattr(model_for_epoch, 'set_epoch'):
@@ -229,18 +229,32 @@ def main():
             if task.scheduler and stepped:
                 task.scheduler.step()
 
-            tloss += loss.item() * accum_iter
+            step_loss = loss.item() * accum_iter
+            step_seg = float(loss_dict.get('loss_seg', torch.tensor(0.0)).item())
+            step_boundary = float(loss_dict.get('loss_boundary', torch.tensor(0.0)).item())
+            tloss += step_loss
+            tseg += step_seg
+            tboundary += step_boundary
             tn += 1
             if (i + 1) % 50 == 0:
                 curr_lr = task.optimizer.param_groups[0]['lr']
                 print(
                     f'  Ep{epoch}[{i + 1}/{spe}] '
-                    f'loss={loss.item() * accum_iter:.4f} '
-                    f'seg={loss_dict["loss_seg"].item():.4f} '
+                    f'loss={step_loss:.4f} '
+                    f'seg={step_seg:.4f} '
+                    f'boundary={step_boundary:.4f} '
+                    f'total={float(loss_dict.get("loss_total", loss.detach()).item()):.4f} '
                     f'lr={curr_lr:.6f}'
                 )
 
-        val_m = task.evaluate(val_loader)
+        if getattr(config, 'eval_missing_pet', False):
+            val_full = task.evaluate(val_loader, tag='val_full', force_missing_pet=False)
+            val_missing = task.evaluate(val_loader, tag='val_missing', force_missing_pet=True)
+            val_m = val_full
+        else:
+            val_full = task.evaluate(val_loader, tag='val_full', force_missing_pet=False)
+            val_missing = None
+            val_m = val_full
         avg_grad_norm = grad_norm_sum / max(grad_norm_steps, 1)
         curr_lr = task.optimizer.param_groups[0]['lr']
         gamma_metrics = _collect_adc_gamma(task)
@@ -256,8 +270,24 @@ def main():
         gamma_text = ''
         if gamma_metrics:
             gamma_text = ' ' + ' '.join(f'{k}={v:.4f}' for k, v in gamma_metrics.items())
-        print('Epoch {} loss={:.4f} Dice={:.4f} IoU={:.4f} HD95={:.2f} lr={:.6f} grad={:.4f}{}'.format(
-            epoch, tloss / max(tn, 1), val_m['dice'], val_m['iou'], val_m['hd95'], curr_lr, avg_grad_norm, gamma_text))
+        gate_text = 'g_pet={:.4f} g_txt={:.4f} g_prior={:.4f}'.format(
+            val_full.get('pet_gate_mean', 0.0), val_full.get('text_gate_mean', 0.0), val_full.get('prior_gate_mean', 0.0)
+        )
+        if val_missing is not None:
+            print(
+                f'Epoch {epoch}\n'
+                f'train_loss={tloss / max(tn, 1):.4f} train_seg={tseg / max(tn, 1):.4f} train_boundary={tboundary / max(tn, 1):.4f}\n'
+                f'val_full: Dice={val_full["dice"]:.4f} IoU={val_full["iou"]:.4f} Acc={val_full["acc"]:.4f} HD95={val_full["hd95"]:.2f}\n'
+                f'val_missing: Dice={val_missing["dice"]:.4f} IoU={val_missing["iou"]:.4f} Acc={val_missing["acc"]:.4f} HD95={val_missing["hd95"]:.2f}\n'
+                f'{gate_text} lr={curr_lr:.6f} grad={avg_grad_norm:.4f} best_dice={best_dice:.4f} best_hd95={best_hd95:.2f} boundary_w={getattr(config, "boundary_loss_weight", 0.0):.3f}{gamma_text}'
+            )
+        else:
+            print(
+                f'Epoch {epoch}\n'
+                f'train_loss={tloss / max(tn, 1):.4f} train_seg={tseg / max(tn, 1):.4f} train_boundary={tboundary / max(tn, 1):.4f}\n'
+                f'val_full: Dice={val_full["dice"]:.4f} IoU={val_full["iou"]:.4f} Acc={val_full["acc"]:.4f} HD95={val_full["hd95"]:.2f}\n'
+                f'{gate_text} lr={curr_lr:.6f} grad={avg_grad_norm:.4f} best_dice={best_dice:.4f} best_hd95={best_hd95:.2f} boundary_w={getattr(config, "boundary_loss_weight", 0.0):.3f}{gamma_text}'
+            )
 
         if getattr(config, 'vis_every_epoch', False):
             save_segmentation_diagnostics(
@@ -266,7 +296,19 @@ def main():
                 out_dir=os.path.join(config.checkpoint_dir, 'vis_epochs', f'epoch_{epoch:03d}'),
                 num_samples=max(1, int(getattr(config, 'vis_epoch_samples', 2))),
                 threshold=getattr(config, 'eval_threshold', 0.5),
+                force_missing_pet=False,
+                mode='full',
             )
+            if getattr(config, 'eval_missing_pet', False):
+                save_segmentation_diagnostics(
+                    task=task,
+                    loader=val_loader,
+                    out_dir=os.path.join(config.checkpoint_dir, 'vis_epochs', f'epoch_{epoch:03d}_missing'),
+                    num_samples=max(1, int(getattr(config, 'vis_epoch_samples', 2))),
+                    threshold=getattr(config, 'eval_threshold', 0.5),
+                    force_missing_pet=True,
+                    mode='missing',
+                )
 
         if val_m['dice'] > best_dice:
             best_dice, best_dice_epoch, no_improve = val_m['dice'], epoch, 0
@@ -295,29 +337,57 @@ def main():
     best_hd95_path = os.path.join(config.checkpoint_dir, 'ckpt.best_hd95.pth.tar')
 
     _load_checkpoint(best_dice_path)
-    test_m_dice = task.evaluate(test_loader)
-    print('\n=== TEST(best_dice) Dice={:.4f} IoU={:.4f} Acc={:.4f} HD95={:.2f} ==='.format(
-        test_m_dice['dice'], test_m_dice['iou'], test_m_dice['acc'], test_m_dice['hd95']))
+    test_m_dice_full = task.evaluate(test_loader, tag='test_best_dice_full', force_missing_pet=False)
+    test_m_dice_missing = task.evaluate(test_loader, tag='test_best_dice_missing', force_missing_pet=True)
+    print('\n=== TEST(best_dice, full PET) Dice={:.4f} IoU={:.4f} Acc={:.4f} HD95={:.2f} ==='.format(
+        test_m_dice_full['dice'], test_m_dice_full['iou'], test_m_dice_full['acc'], test_m_dice_full['hd95']))
+    print('=== TEST(best_dice, missing PET) Dice={:.4f} IoU={:.4f} Acc={:.4f} HD95={:.2f} ==='.format(
+        test_m_dice_missing['dice'], test_m_dice_missing['iou'], test_m_dice_missing['acc'], test_m_dice_missing['hd95']))
 
     save_segmentation_diagnostics(
         task=task,
         loader=test_loader,
-        out_dir=os.path.join(config.checkpoint_dir, 'vis_best_dice'),
+        out_dir=os.path.join(config.checkpoint_dir, 'vis_best_dice_full'),
         num_samples=min(8, config.batch_size),
         threshold=getattr(config, 'eval_threshold', 0.5),
+        force_missing_pet=False,
+        mode='full',
+    )
+    save_segmentation_diagnostics(
+        task=task,
+        loader=test_loader,
+        out_dir=os.path.join(config.checkpoint_dir, 'vis_best_dice_missing'),
+        num_samples=min(8, config.batch_size),
+        threshold=getattr(config, 'eval_threshold', 0.5),
+        force_missing_pet=True,
+        mode='missing',
     )
 
     _load_checkpoint(best_hd95_path)
-    test_m_hd95 = task.evaluate(test_loader)
-    print('=== TEST(best_hd95) Dice={:.4f} IoU={:.4f} Acc={:.4f} HD95={:.2f} ==='.format(
-        test_m_hd95['dice'], test_m_hd95['iou'], test_m_hd95['acc'], test_m_hd95['hd95']))
+    test_m_hd95_full = task.evaluate(test_loader, tag='test_best_hd95_full', force_missing_pet=False)
+    test_m_hd95_missing = task.evaluate(test_loader, tag='test_best_hd95_missing', force_missing_pet=True)
+    print('=== TEST(best_hd95, full PET) Dice={:.4f} IoU={:.4f} Acc={:.4f} HD95={:.2f} ==='.format(
+        test_m_hd95_full['dice'], test_m_hd95_full['iou'], test_m_hd95_full['acc'], test_m_hd95_full['hd95']))
+    print('=== TEST(best_hd95, missing PET) Dice={:.4f} IoU={:.4f} Acc={:.4f} HD95={:.2f} ==='.format(
+        test_m_hd95_missing['dice'], test_m_hd95_missing['iou'], test_m_hd95_missing['acc'], test_m_hd95_missing['hd95']))
 
     save_segmentation_diagnostics(
         task=task,
         loader=test_loader,
-        out_dir=os.path.join(config.checkpoint_dir, 'vis_best_hd95'),
+        out_dir=os.path.join(config.checkpoint_dir, 'vis_best_hd95_full'),
         num_samples=min(8, config.batch_size),
         threshold=getattr(config, 'eval_threshold', 0.5),
+        force_missing_pet=False,
+        mode='full',
+    )
+    save_segmentation_diagnostics(
+        task=task,
+        loader=test_loader,
+        out_dir=os.path.join(config.checkpoint_dir, 'vis_best_hd95_missing'),
+        num_samples=min(8, config.batch_size),
+        threshold=getattr(config, 'eval_threshold', 0.5),
+        force_missing_pet=True,
+        mode='missing',
     )
 
 

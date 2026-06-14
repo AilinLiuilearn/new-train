@@ -37,7 +37,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--model_arch", type=str, default="pamc_text_proxy", choices=("dual", "hetero_convnext_mit", "pamc_text_proxy"), help="dual: homogeneous sum baseline; hetero_convnext_mit: CT ConvNeXt + PET MiT with MPA-BioCLIP fusion; pamc_text_proxy: CT ConvNeXt + PET MiT + placeholder prior + TPPC.")
         p.add_argument("--text_embed_dim", type=int, default=256)
         p.add_argument("--use_meddino", type=str2bool, default=True)
-        p.add_argument("--meddino_ckpt", type=str, default=None)
+        p.add_argument("--meddino_ckpt", type=str, default="/root/autodl-tmp/mkd-main/new-train/pretrained/MedDinov3/model.pth")
         p.add_argument("--use_lapa", type=str2bool, default=True)
         p.add_argument("--ct_backbone", type=str, default="convnext_tiny")
         p.add_argument("--pet_backbone", type=str, default="mit_b0")
@@ -91,6 +91,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--pos_weight", type=float, default=None)
         p.add_argument("--deep_supervision", type=str2bool, default=False)
         p.add_argument("--deep_supervision_weights", type=float, nargs="+", default=[0.5, 0.25, 0.125, 0.125])
+        p.add_argument("--boundary_loss_weight", type=float, default=0.2)
         p.add_argument("--lr_flat_ratio", type=float, default=0.3)
         return p
 

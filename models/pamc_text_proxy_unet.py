@@ -44,10 +44,10 @@ class PAMCTextProxyUNet(nn.Module):
         self.fusion = TextGuidedCorrectionFusion()
         self.decoder = LightConcatUNetDecoder(ct_channels, out_channels=out_channels)
         self.boundary_head = nn.Sequential(
-            nn.Conv2d(ct_channels[0], ct_channels[0] // 2, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(ct_channels[0] // 2),
+            nn.Conv2d(ct_channels[0], max(8, ct_channels[0] // 2), kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(max(8, ct_channels[0] // 2)),
             nn.ReLU(inplace=True),
-            nn.Conv2d(ct_channels[0] // 2, 1, kernel_size=1),
+            nn.Conv2d(max(8, ct_channels[0] // 2), 1, kernel_size=1),
         )
 
         if ct_pretrained_path:
