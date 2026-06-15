@@ -211,9 +211,16 @@ class FrozenMedDINOv3Encoder(nn.Module):
         with torch.no_grad():
             ct = self._to_3ch(ct)
             feats = self.encoder(ct)
-            shapes = [tuple(f.shape) for f in feats]
+            safe_feats = []
+            for i, feat in enumerate(feats):
+                feat = torch.nan_to_num(feat, nan=0.0, posinf=1e4, neginf=-1e4)
+                feat = torch.clamp(feat, -1e4, 1e4)
+                if not torch.isfinite(feat).all():
+                    raise RuntimeError(f'[NaN/Inf] prior_feats[{i}] contains invalid values')
+                safe_feats.append(feat)
+            shapes = [tuple(f.shape) for f in safe_feats]
             if self._last_feature_shapes != shapes:
                 mode = 'placeholder' if self.is_placeholder else 'real'
                 print(f'[MedDINOv3:{mode}] feature shapes: {shapes}')
                 self._last_feature_shapes = shapes
-            return feats
+            return safe_feats

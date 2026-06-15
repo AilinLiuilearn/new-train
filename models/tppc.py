@@ -25,11 +25,19 @@ class TextGuidedPseudoPETCorrection(nn.Module):
 
     def forward(self, enhanced_ct_feats, text_embed):
         text_feats = []
-        for feat, gb_mlp, conv in zip(enhanced_ct_feats, self.gamma_beta_mlps, self.dw_pw_convs):
+        if text_embed is not None and not torch.isfinite(text_embed).all():
+            raise RuntimeError('[NaN/Inf] text_embed contains invalid values')
+        for idx, (feat, gb_mlp, conv) in enumerate(zip(enhanced_ct_feats, self.gamma_beta_mlps, self.dw_pw_convs)):
+            if not torch.isfinite(feat).all():
+                raise RuntimeError(f'[NaN/Inf] enhanced_ct_feats[{idx}] contains invalid values')
             gb = gb_mlp(text_embed)
             gamma, beta = torch.chunk(gb, 2, dim=1)
             gamma = gamma.unsqueeze(-1).unsqueeze(-1)
             beta = beta.unsqueeze(-1).unsqueeze(-1)
             x = gamma * feat + beta
-            text_feats.append(conv(x))
+            out = conv(torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4))
+            out = torch.nan_to_num(out, nan=0.0, posinf=1e4, neginf=-1e4)
+            if not torch.isfinite(out).all():
+                raise RuntimeError(f'[NaN/Inf] text_feats[{idx}] contains invalid values')
+            text_feats.append(out)
         return text_feats

@@ -102,11 +102,17 @@ def main():
 
     g0 = _prepare_env(config)
 
-    print(
-        f"GPU={g0} backbone={config.backbone} "
-        f"single_modality={config.single_modality} decoder=light"
-    )
-    print(f"lr={config.learning_rate} wd={config.weight_decay} bs={config.batch_size}")
+    print(f'GPU={g0}')
+    print(f'single_modality={config.single_modality}')
+    print(f'backbone={config.backbone}')
+    print(f'aug_mode={getattr(config, "aug_mode", None)}')
+    print(f'norm_mode={getattr(config, "norm_mode", None)}')
+    print(f'image_size_2d={config.image_size_2d}')
+    print(f'batch_size={config.batch_size}')
+    print(f'accumulation_steps={config.accumulation_steps}')
+    print(f'mixed_precision={config.mixed_precision}')
+    print(f'train_pet_drop_prob={getattr(config, "train_pet_drop_prob", None)}')
+    print(f'lr={config.learning_rate} wd={config.weight_decay} decoder=light')
 
     _save_config(config)
     train_loader, val_loader, test_loader = _build_loaders(config)

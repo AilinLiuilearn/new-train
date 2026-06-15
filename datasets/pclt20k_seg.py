@@ -316,19 +316,18 @@ class PCLT20KTextProxyAlignedDataset(PCLT20KSegDataset):
 
         pet_ch = _normalize_pet_slice(img[0])
         ct_ch = _normalize_ct_slice(img[1])
-        if self.norm_mode == 'cipa':
-            ct_out = ct_ch * 3.2 - 1.6
-            pet_out = pet_ch * 3.2 - 1.6
-        else:
-            ct_out = ct_ch
-            pet_out = pet_ch
+        normalize_rgb = _normalize_cipa_rgb if self.norm_mode == 'cipa' else _normalize_rgb
+        ct_rgb = normalize_rgb(ct_ch)
+        pet_rgb = normalize_rgb(pet_ch)
 
         pet_available = 1 if record['pet_path'] is not None else 0
         if self.train and random.random() < self.pet_drop_prob:
-            pet_out = np.zeros_like(pet_out, dtype=np.float32)
+            pet_rgb = np.zeros_like(pet_rgb, dtype=np.float32)
             pet_available = 0
 
-        image = np.concatenate([pet_out, ct_out], axis=0)
+        image = np.concatenate([pet_rgb[:1], ct_rgb[:1]], axis=0)
+        ct_out = ct_rgb
+        pet_out = pet_rgb
         image_id = record.get('image_id', str(idx))
         parts = image_id.split('_')
         slice_id = parts[-1] if len(parts) > 1 else image_id
@@ -432,11 +431,16 @@ def get_pclt20k_loaders_textproxy_aligned(root, image_size=512, batch_size=8, nu
     test_records = _records_from_ids(root, test_ids)
     train_records = [r for r in train_records if r['pet_path'] is not None]
 
-    print(f'[TextProxy-CIPA对齐] 训练: {len(train_records)}  验证: {len(val_records)}  测试: {len(test_records)}')
-    print(f'  ← 使用划分: train={used_train_list}, val={val_list}, test={test_list}')
-    print(f'  ← 数据增强: {aug_mode}')
+    print('[TextProxy-CIPA对齐]')
+    print(f'训练: {len(train_records)} ({used_train_list})')
+    print(f'验证: {len(val_records)} ({val_list})')
+    print(f'测试: {len(test_records)} ({test_list})')
+    print('')
+    print('  ← preprocess_style: cipa_aligned')
+    print(f'  ← train_aug: {aug_mode}')
+    print('  ← val/test_aug: none')
     print(f'  ← CT/PET归一化: {norm_mode}')
-    print(f'  ← train PET modality dropout: pet_drop_prob={pet_drop_prob}')
+    print(f'  ← train PET modality dropout: {pet_drop_prob}')
     print('  ← val/test return real PET; missing-mode eval is controlled by task.evaluate()')
 
     train_ds = PCLT20KTextProxyAlignedDataset(

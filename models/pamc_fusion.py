@@ -33,10 +33,13 @@ class PlaceholderPriorAdapter(nn.Module):
         enhanced = []
         prior_feats = []
         for i, (feat, prior_conv, spatial_gate, alpha) in enumerate(zip(ct_feats, self.prior_convs, self.spatial_gates, self.alpha)):
+            feat = torch.nan_to_num(feat, nan=0.0, posinf=1e4, neginf=-1e4)
             prior = prior_conv(feat)
+            prior = torch.nan_to_num(prior, nan=0.0, posinf=1e4, neginf=-1e4)
             gate = spatial_gate(torch.cat([feat, prior], dim=1))
             prior_gate = 1.0 if prior_gates is None else prior_gates[i]
-            enhanced.append(feat + alpha * prior_gate * gate * prior)
+            enhanced_feat = feat + alpha * prior_gate * gate * prior
+            enhanced.append(torch.nan_to_num(enhanced_feat, nan=0.0, posinf=1e4, neginf=-1e4))
             prior_feats.append(prior)
         return enhanced, prior_feats
 
@@ -55,10 +58,13 @@ class TextGuidedCorrectionFusion(nn.Module):
         pet_gate_means = []
         text_gate_means = []
         for fact, dpet, dtxt, gpet, gtxt in zip(enhanced_ct_feats, pet_feats, text_feats, pet_gates, text_gates):
+            fact = torch.nan_to_num(fact, nan=0.0, posinf=1e4, neginf=-1e4)
+            dpet = torch.nan_to_num(dpet, nan=0.0, posinf=1e4, neginf=-1e4)
+            dtxt = torch.nan_to_num(dtxt, nan=0.0, posinf=1e4, neginf=-1e4)
             out = fact + m * gpet * dpet + (1.0 - m) * gtxt * dtxt
             if self.text_in_full_mode:
                 out = out + m * self.full_text_weight * gtxt * dtxt
-            fused.append(out)
+            fused.append(torch.nan_to_num(out, nan=0.0, posinf=1e4, neginf=-1e4))
             pet_gate_means.append(gpet.mean())
             text_gate_means.append(gtxt.mean())
         aux = {

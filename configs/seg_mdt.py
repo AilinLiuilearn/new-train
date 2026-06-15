@@ -8,7 +8,7 @@ class SegMDTConfig(ConfigBase):
     @staticmethod
     def data_parser():
         p = argparse.ArgumentParser("Data", add_help=False)
-        p.add_argument("--root", type=str, default="../data/PCLT20K")
+        p.add_argument("--root", type=str, default="/root/autodl-tmp/data/PCLT20K")
         p.add_argument("--random_state", type=int, default=2023)
         p.add_argument("--val_ratio", type=float, default=0.1)
         p.add_argument("--use_case_split", type=str2bool, default=True)
@@ -17,21 +17,21 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--test_split_file", type=str, default="test.txt")
         p.add_argument("--cipa_aligned", type=str2bool, default=True)
         p.add_argument("--use_textproxy_loader", type=str2bool, default=True)
-        p.add_argument("--train_list", type=str, default="train_orgian.txt")
+        p.add_argument("--train_list", type=str, default="train_orgiinal.txt")
         p.add_argument("--val_list", type=str, default="test.txt")
         p.add_argument("--test_list", type=str, default="test.txt")
-        p.add_argument("--train_pet_drop_prob", type=float, default=0.4)
+        p.add_argument("--train_pet_drop_prob", type=float, default=0.)
         p.add_argument("--pet_drop_prob", type=float, default=None, help="Deprecated alias. Use --train_pet_drop_prob.")
         p.add_argument("--eval_full_pet", type=str2bool, default=True)
         p.add_argument("--eval_fixed_missing_pet", type=str2bool, default=True)
         p.add_argument("--eval_random_missing_pet", type=str2bool, default=True)
-        p.add_argument("--eval_random_pet_drop_prob", type=float, default=0.4)
+        p.add_argument("--eval_random_pet_drop_prob", type=float, default=0.3)
         p.add_argument("--eval_random_missing_seed", type=int, default=2026)
         p.add_argument("--eval_missing_pet", type=str2bool, default=None, help="Deprecated alias for --eval_fixed_missing_pet.")
         p.add_argument("--image_size_2d", type=int, default=512)
         p.add_argument("--num_workers", type=int, default=4)
         p.add_argument("--pin_memory", type=str2bool, default=True)
-        p.add_argument("--aug_mode", type=str, default="none", choices=("cipa", "light", "none"))
+        p.add_argument("--aug_mode", type=str, default="cipa", choices=("cipa", "light", "none"))
         p.add_argument("--norm_mode", type=str, default="cipa", choices=("imagenet", "cipa"))
         return p
 
@@ -42,12 +42,13 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--pretrained_path", type=str, default=None)
         p.add_argument("--model_arch", type=str, default="pamc_text_proxy", choices=("dual", "hetero_convnext_mit", "pamc_text_proxy"), help="dual: homogeneous sum baseline; hetero_convnext_mit: CT ConvNeXt + PET MiT with MPA-BioCLIP fusion; pamc_text_proxy: CT ConvNeXt + PET MiT + placeholder prior + TPPC.")
         p.add_argument("--text_embed_dim", type=int, default=256)
-        p.add_argument("--use_meddino", type=str2bool, default=True)
+        p.add_argument("--use_meddino", type=str2bool, default=False)
         p.add_argument("--meddino_ckpt", type=str, default="/root/autodl-tmp/mkd-main/new-train/pretrained/MedDinov3/model.pth")
-        p.add_argument("--use_lapa", type=str2bool, default=True)
-        p.add_argument("--use_text_proxy", type=str2bool, default=True)
+        p.add_argument("--use_lapa", type=str2bool, default=False)
+        p.add_argument("--use_text_proxy", type=str2bool, default=False)
         p.add_argument("--text_in_full_mode", type=str2bool, default=False)
         p.add_argument("--full_text_weight", type=float, default=0.0)
+        p.add_argument("--lapa_norm", type=str, default="gn", choices=("bn", "gn", "none"))
         p.add_argument("--ct_backbone", type=str, default="convnext_tiny")
         p.add_argument("--pet_backbone", type=str, default="mit_b0")
         p.add_argument("--ct_pretrained_path", type=str, default=None)
@@ -57,7 +58,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument(
             "--fusion_type",
             type=str,
-            default="mpa_bioclip_sum",
+            default="project_sum",
             choices=("auto", "sum", "project_sum", "mpa_bioclip_sum", "bcg_pa_sum", "mpa_bioclip_no_text_sum"),
             help="Feature fusion type. Heterogeneous model supports project_sum and mpa_bioclip_sum/bcg_pa_sum; homogeneous baseline supports auto/sum.",
         )
@@ -81,11 +82,12 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--cosine_warmup", type=int, default=2)
         p.add_argument("--cosine_min_lr", type=float, default=1e-6)
         p.add_argument("--mixed_precision", type=str2bool, default=True)
+        p.add_argument("--nan_safe_mode", type=str2bool, default=True)
         p.add_argument("--vis_every_epoch", type=str2bool, default=True)
         p.add_argument("--vis_epoch_samples", type=int, default=2)
         p.add_argument("--early_stop_patience", type=int, default=15)
         p.add_argument("--eval_threshold", type=float, default=0.5)
-        p.add_argument("--grad_clip", type=float, default=0.5)
+        p.add_argument("--grad_clip", type=float, default=5.0)
         p.add_argument("--lr_find_start", type=float, default=1e-7)
         p.add_argument("--lr_find_end", type=float, default=1e-2)
         p.add_argument("--lr_find_num_iter", type=int, default=200)

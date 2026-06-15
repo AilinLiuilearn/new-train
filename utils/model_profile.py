@@ -39,7 +39,7 @@ def _count_module_params(module):
     return total, trainable, total - trainable
 
 
-def print_baseline_profile(networks, config, image_size=None, tag='teacher_baseline'):
+def print_baseline_profile(networks, config, image_size=None, tag='MODEL PROFILE'):
     image_size = image_size or getattr(config, 'image_size_2d', 512)
     device = torch.device('cuda', int(config.gpus[0])) if torch.cuda.is_available() else torch.device('cpu')
 

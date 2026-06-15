@@ -10,6 +10,20 @@ from models.text_controller import TextModalityController
 from models.tppc import TextGuidedPseudoPETCorrection
 
 
+def _check_tensor(name, x):
+    if torch.is_tensor(x) and not torch.isfinite(x).all():
+        raise RuntimeError(f'[NaN/Inf] {name} contains invalid values')
+
+
+def _check_tensor_list(name, xs):
+    for i, x in enumerate(xs):
+        _check_tensor(f'{name}[{i}]', x)
+
+
+def _sanitize(x):
+    return torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+
+
 class PAMCTextProxyUNet(nn.Module):
     def __init__(
         self,
@@ -27,6 +41,7 @@ class PAMCTextProxyUNet(nn.Module):
         use_text_proxy=True,
         text_in_full_mode=False,
         full_text_weight=0.0,
+        lapa_norm='gn',
         **kwargs,
     ):
         super().__init__()
@@ -44,7 +59,7 @@ class PAMCTextProxyUNet(nn.Module):
         pet_channels = self.enc_pet.feature_info.channels()
         self.text_controller = TextModalityController(ct_channels, embed_dim=self.text_embed_dim) if self.use_text_proxy else None
         self.meddino = FrozenMedDINOv3Encoder(ckpt_path=meddino_ckpt, use_placeholder_if_missing=True, out_channels=ct_channels) if self.use_meddino else None
-        self.lapa = LAPA(ct_channels, prior_channels=ct_channels) if self.use_lapa and self.meddino is not None else nn.Identity()
+        self.lapa = LAPA(ct_channels, prior_channels=ct_channels, norm=lapa_norm) if self.use_lapa and self.meddino is not None else nn.Identity()
         self.pet_proj = nn.ModuleList([ConvBNAct(pin, cout, kernel_size=1) for pin, cout in zip(pet_channels, ct_channels)])
         self.tppc = TextGuidedPseudoPETCorrection(ct_channels, embed_dim=self.text_embed_dim) if self.use_text_proxy else None
         self.fusion = TextGuidedCorrectionFusion(text_in_full_mode=self.text_in_full_mode, full_text_weight=self.full_text_weight)
@@ -77,7 +92,10 @@ class PAMCTextProxyUNet(nn.Module):
         ct = self._to_3ch(ct)
         pet = self._to_3ch(pet)
         ct_feats = self.enc_ct(ct)
+        _check_tensor_list('ct_feats', ct_feats)
         prior_feats = self.meddino(ct) if self.meddino is not None else None
+        if prior_feats is not None:
+            _check_tensor_list('prior_feats', prior_feats)
         if self.text_controller is not None:
             controller_out = self.text_controller(pet_available)
             text_embed = controller_out['text_embed']
@@ -94,18 +112,24 @@ class PAMCTextProxyUNet(nn.Module):
             enhanced_ct_feats = self.lapa(ct_feats, prior_feats, prior_gates=prior_gates)
         else:
             enhanced_ct_feats = ct_feats
+        _check_tensor_list('enhanced_ct_feats', enhanced_ct_feats)
 
         pet_feats_raw = self.enc_pet(pet)
+        _check_tensor_list('pet_feats_raw', pet_feats_raw)
         pet_feats = []
         for feat, proj, ref in zip(pet_feats_raw, self.pet_proj, enhanced_ct_feats):
             aligned = proj(feat)
             if aligned.shape[-2:] != ref.shape[-2:]:
                 aligned = F.interpolate(aligned, size=ref.shape[-2:], mode='bilinear', align_corners=False)
-            pet_feats.append(aligned)
+            pet_feats.append(_sanitize(aligned))
+        _check_tensor_list('pet_feats', pet_feats)
+        if text_embed is not None:
+            _check_tensor('text_feats_embed', text_embed)
         if self.tppc is not None:
             text_feats = self.tppc(enhanced_ct_feats, text_embed)
         else:
             text_feats = [torch.zeros_like(feat) for feat in enhanced_ct_feats]
+        _check_tensor_list('text_feats', text_feats)
         fused_feats, fusion_aux = self.fusion(
             enhanced_ct_feats,
             pet_feats,
@@ -114,12 +138,17 @@ class PAMCTextProxyUNet(nn.Module):
             text_gates,
             pet_available,
         )
+        _check_tensor_list('fused_feats', fused_feats)
         decoder_out = self.decoder(fused_feats, target_size)
-        logits = decoder_out['pred']
+        logits = _sanitize(decoder_out['pred'])
+        decoder_out['pred'] = logits
+        _check_tensor('logits', logits)
         boundary_feat = fused_feats[0]
         boundary_logits = self.boundary_head(boundary_feat)
         if boundary_logits.shape[-2:] != target_size:
             boundary_logits = F.interpolate(boundary_logits, size=target_size, mode='bilinear', align_corners=False)
+        boundary_logits = _sanitize(boundary_logits)
+        _check_tensor('boundary_logits', boundary_logits)
         prior_gate_mean = torch.stack([g.mean() for g in prior_gates]).mean() if prior_gates is not None else logits.new_tensor(0.0)
         decoder_out.update({
             'logits': logits,

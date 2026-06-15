@@ -578,9 +578,10 @@ def build_mdt_seg_teacher(config):
             use_meddino=getattr(config, 'use_meddino', True),
             meddino_ckpt=getattr(config, 'meddino_ckpt', None),
             use_lapa=getattr(config, 'use_lapa', True),
-            use_text_proxy=getattr(config, 'use_text_proxy', True),
+            use_text_proxy=getattr(config, 'use_text_proxy', False),
             text_in_full_mode=getattr(config, 'text_in_full_mode', False),
             full_text_weight=getattr(config, 'full_text_weight', 0.0),
+            lapa_norm=getattr(config, 'lapa_norm', 'gn'),
         )
         return dict(model=model)
 

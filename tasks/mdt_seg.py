@@ -26,6 +26,15 @@ def _forward(nets, ct, pet, target_size, pet_available=None):
     return nets['model'](ct, pet, target_size=target_size)
 
 
+def _is_finite_tensor(x):
+    return torch.is_tensor(x) and torch.isfinite(x).all()
+
+
+def _check_finite(name, x):
+    if torch.is_tensor(x) and not torch.isfinite(x).all():
+        raise RuntimeError(f'[NaN/Inf] {name} contains invalid values')
+
+
 class MDTSegTeacher:
     def __init__(self, networks, config):
         self.networks = {k: v for k, v in networks.items() if v is not None}
@@ -201,13 +210,19 @@ class MDTSegTeacher:
         loss_fnet, fnet_stats = self._compute_fnet_sparse_aux_loss(outputs, mask)
         loss_boundary = mask.new_tensor(0.0)
         boundary_weight = float(getattr(self.config, 'boundary_loss_weight', 0.0))
+        boundary_logits = None
         if boundary_weight > 0 and isinstance(outputs, dict) and outputs.get('boundary_logits') is not None:
             boundary_logits = outputs['boundary_logits']
+            _check_finite('boundary_logits', boundary_logits)
             boundary_target = mask_to_boundary(mask)
             if boundary_logits.shape[-2:] != boundary_target.shape[-2:]:
                 boundary_logits = F.interpolate(boundary_logits, size=boundary_target.shape[-2:], mode='bilinear', align_corners=False)
             loss_boundary = F.binary_cross_entropy_with_logits(boundary_logits, boundary_target)
+        _check_finite('pred', pred)
+        _check_finite('loss_seg', loss_seg)
+        _check_finite('loss_boundary', loss_boundary)
         loss_total = loss_seg + loss_cudm + loss_fnet + boundary_weight * loss_boundary
+        _check_finite('loss_total', loss_total)
         loss_dict = {
             'loss_seg': loss_seg.detach(),
             'loss_boundary': loss_boundary.detach(),
@@ -228,7 +243,15 @@ class MDTSegTeacher:
         if pet_available is not None:
             pet_available = pet_available.to(self.device)
         outputs = _forward(self.networks, ct, pet, mask.shape[-2:], pet_available=pet_available)
+        pred = self._select_main_pred(outputs)
+        boundary_logits = outputs.get('boundary_logits') if isinstance(outputs, dict) else None
+        _check_finite('pred', pred)
+        if boundary_logits is not None:
+            _check_finite('boundary_logits', boundary_logits)
         loss, pred, loss_dict = self._compute_total_loss(outputs, mask)
+        _check_finite('loss_seg', loss_dict.get('loss_seg', loss))
+        _check_finite('loss_boundary', loss_dict.get('loss_boundary', loss))
+        _check_finite('loss_total', loss_dict.get('loss_total', loss))
         return loss, pred, mask, loss_dict
 
     @torch.no_grad()
