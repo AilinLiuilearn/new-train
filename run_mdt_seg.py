@@ -150,8 +150,28 @@ def main():
     config.task = 'MDT_Teacher'
     g0 = _prepare_env(config)
 
-    print(f'GPU={g0} backbone={config.backbone} single_modality={getattr(config, "single_modality", False)}')
-    print(f'lr={config.learning_rate} wd={config.weight_decay} bs={config.batch_size} boundary_w={getattr(config, "boundary_loss_weight", 0.0)}')
+    print(f'GPU={g0}')
+    print(f'model_arch={config.model_arch}')
+    print(f'single_modality={getattr(config, "single_modality", False)}')
+    print(f'ct_backbone={getattr(config, "ct_backbone", None)}')
+    print(f'pet_backbone={getattr(config, "pet_backbone", None)}')
+    print(f'fusion_type={getattr(config, "fusion_type", None)}')
+    print(f'use_meddino={getattr(config, "use_meddino", False)}')
+    print(f'use_lapa={getattr(config, "use_lapa", False)}')
+    print(f'use_text_proxy={getattr(config, "use_text_proxy", False)}')
+    print(f'text_in_full_mode={getattr(config, "text_in_full_mode", False)}')
+    print(f'aug_mode={getattr(config, "aug_mode", None)}')
+    print(f'norm_mode={getattr(config, "norm_mode", None)}')
+    print(f'image_size_2d={config.image_size_2d}')
+    print(f'batch_size={config.batch_size}')
+    print(f'accumulation_steps={config.accumulation_steps}')
+    print(f'mixed_precision={config.mixed_precision}')
+    print(f'train_pet_drop_prob={getattr(config, "train_pet_drop_prob", None)}')
+    print(f'lr={config.learning_rate} wd={config.weight_decay} boundary_w={getattr(config, "boundary_loss_weight", 0.0)}')
+    if getattr(config, 'use_meddino', False) and getattr(config, 'use_lapa', False) and getattr(config, 'mixed_precision', False):
+        print('[Hint] real MedDINO + LAPA may be numerically unstable in AMP mode.')
+        print('Recommended first smoke run:')
+        print('  --mixed_precision false --batch_size 2 --train_pet_drop_prob 0.0')
 
     _save_config(config)
     train_loader, val_loader, test_loader = _build_loaders(config)
@@ -178,8 +198,8 @@ def main():
     gamma_headers = _adc_gamma_headers(config)
     init_train_log(log_path, extra_headers=gamma_headers)
 
-    grad_clip = getattr(config, 'grad_clip', 0.5)
-    clip_params = [p for net in task.networks.values() for p in net.parameters()]
+    grad_clip = getattr(config, 'grad_clip', 5.0)
+    clip_params = [p for net in task.networks.values() for p in net.parameters() if p.requires_grad]
     best_dice, best_dice_epoch = -1.0, 0
     best_hd95, best_hd95_epoch = float('inf'), 0
     no_improve = 0
@@ -187,7 +207,7 @@ def main():
 
     for epoch in range(1, config.epochs + 1):
         tloss, tseg, tboundary, tn = 0.0, 0.0, 0.0, 0
-        grad_norm_sum, grad_norm_steps = 0.0, 0
+        grad_norm_sum, grad_norm_steps, grad_clip_count = 0.0, 0, 0
         model_for_epoch = _unwrap_model(task.networks.get('model'))
         if hasattr(model_for_epoch, 'set_epoch'):
             model_for_epoch.set_epoch(epoch)
@@ -196,9 +216,16 @@ def main():
 
         for i, batch in enumerate(train_loader):
             stepped = False
-            with torch.cuda.amp.autocast(enabled=config.mixed_precision):
-                loss, _, _, loss_dict = task.train_step(batch)
-                loss = loss / accum_iter
+            try:
+                with torch.cuda.amp.autocast(enabled=config.mixed_precision):
+                    loss, _, _, loss_dict = task.train_step(batch)
+                    loss = loss / accum_iter
+            except RuntimeError as exc:
+                if '[NaN/Inf]' in str(exc) or 'nan' in str(exc).lower() or 'inf' in str(exc).lower():
+                    print(f'[NaN Guard] skip epoch={epoch} batch={i + 1}/{spe}: {exc}')
+                    task.optimizer.zero_grad(set_to_none=True)
+                    continue
+                raise
 
             if task.scaler:
                 task.scaler.scale(loss).backward()
@@ -208,6 +235,8 @@ def main():
                         total_norm = torch.nn.utils.clip_grad_norm_(clip_params, float('inf'))
                         grad_norm_sum += float(total_norm)
                         grad_norm_steps += 1
+                        if float(total_norm) > float(grad_clip):
+                            grad_clip_count += 1
                         torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
                     task.scaler.step(task.optimizer)
                     task.scaler.update()
@@ -293,7 +322,7 @@ def main():
             f'train_loss={tloss / max(tn, 1):.4f} train_seg={tseg / max(tn, 1):.4f} train_boundary={tboundary / max(tn, 1):.4f}\n'
             + '\n'.join(val_lines) + '\n'
             f'{gate_text} train_pet_drop_prob={getattr(config, "train_pet_drop_prob", 0.0):.3f} eval_random_pet_drop_prob={getattr(config, "eval_random_pet_drop_prob", 0.0):.3f} '
-            f'lr={curr_lr:.6f} grad={avg_grad_norm:.4f} best_dice={best_dice:.4f} best_hd95={best_hd95:.2f} boundary_w={getattr(config, "boundary_loss_weight", 0.0):.3f}{gamma_text}'
+            f'lr={curr_lr:.6f} grad_norm={avg_grad_norm:.4f} grad_clipped_steps={grad_clip_count}/{grad_norm_steps} best_dice={best_dice:.4f} best_hd95={best_hd95:.2f} boundary_w={getattr(config, "boundary_loss_weight", 0.0):.3f}{gamma_text}'
         )
 
         if getattr(config, 'vis_every_epoch', False):
