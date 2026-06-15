@@ -42,6 +42,11 @@ class PlaceholderPriorAdapter(nn.Module):
 
 
 class TextGuidedCorrectionFusion(nn.Module):
+    def __init__(self, text_in_full_mode=False, full_text_weight=0.0):
+        super().__init__()
+        self.text_in_full_mode = bool(text_in_full_mode)
+        self.full_text_weight = float(full_text_weight)
+
     def forward(self, enhanced_ct_feats, pet_feats, text_feats, pet_gates, text_gates, pet_available):
         if pet_available.dim() > 1:
             pet_available = pet_available.view(-1)
@@ -50,7 +55,10 @@ class TextGuidedCorrectionFusion(nn.Module):
         pet_gate_means = []
         text_gate_means = []
         for fact, dpet, dtxt, gpet, gtxt in zip(enhanced_ct_feats, pet_feats, text_feats, pet_gates, text_gates):
-            fused.append(fact + m * gpet * dpet + (1.0 - m) * gtxt * dtxt)
+            out = fact + m * gpet * dpet + (1.0 - m) * gtxt * dtxt
+            if self.text_in_full_mode:
+                out = out + m * self.full_text_weight * gtxt * dtxt
+            fused.append(out)
             pet_gate_means.append(gpet.mean())
             text_gate_means.append(gtxt.mean())
         aux = {

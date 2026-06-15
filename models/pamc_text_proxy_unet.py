@@ -24,6 +24,9 @@ class PAMCTextProxyUNet(nn.Module):
         use_meddino=True,
         meddino_ckpt=None,
         use_lapa=True,
+        use_text_proxy=True,
+        text_in_full_mode=False,
+        full_text_weight=0.0,
         **kwargs,
     ):
         super().__init__()
@@ -32,16 +35,19 @@ class PAMCTextProxyUNet(nn.Module):
         self.text_embed_dim = int(text_embed_dim)
         self.use_meddino = bool(use_meddino)
         self.use_lapa = bool(use_lapa)
+        self.use_text_proxy = bool(use_text_proxy)
+        self.text_in_full_mode = bool(text_in_full_mode)
+        self.full_text_weight = float(full_text_weight)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
         ct_channels = self.enc_ct.feature_info.channels()
         pet_channels = self.enc_pet.feature_info.channels()
-        self.text_controller = TextModalityController(ct_channels, embed_dim=self.text_embed_dim)
-        self.meddino = FrozenMedDINOv3Encoder(ckpt_path=meddino_ckpt, use_placeholder_if_missing=True, out_channels=ct_channels)
-        self.lapa = LAPA(ct_channels, prior_channels=ct_channels) if self.use_lapa else nn.Identity()
+        self.text_controller = TextModalityController(ct_channels, embed_dim=self.text_embed_dim) if self.use_text_proxy else None
+        self.meddino = FrozenMedDINOv3Encoder(ckpt_path=meddino_ckpt, use_placeholder_if_missing=True, out_channels=ct_channels) if self.use_meddino else None
+        self.lapa = LAPA(ct_channels, prior_channels=ct_channels) if self.use_lapa and self.meddino is not None else nn.Identity()
         self.pet_proj = nn.ModuleList([ConvBNAct(pin, cout, kernel_size=1) for pin, cout in zip(pet_channels, ct_channels)])
-        self.tppc = TextGuidedPseudoPETCorrection(ct_channels, embed_dim=self.text_embed_dim)
-        self.fusion = TextGuidedCorrectionFusion()
+        self.tppc = TextGuidedPseudoPETCorrection(ct_channels, embed_dim=self.text_embed_dim) if self.use_text_proxy else None
+        self.fusion = TextGuidedCorrectionFusion(text_in_full_mode=self.text_in_full_mode, full_text_weight=self.full_text_weight)
         self.decoder = LightConcatUNetDecoder(ct_channels, out_channels=out_channels)
         self.boundary_head = nn.Sequential(
             nn.Conv2d(ct_channels[0], max(8, ct_channels[0] // 2), kernel_size=3, padding=1, bias=False),
@@ -71,14 +77,20 @@ class PAMCTextProxyUNet(nn.Module):
         ct = self._to_3ch(ct)
         pet = self._to_3ch(pet)
         ct_feats = self.enc_ct(ct)
-        prior_feats = self.meddino(ct)
-        controller_out = self.text_controller(pet_available)
-        text_embed = controller_out['text_embed']
-        prior_gates = controller_out['prior_gates']
-        pet_gates = controller_out['pet_gates']
-        text_gates = controller_out['text_gates']
+        prior_feats = self.meddino(ct) if self.meddino is not None else None
+        if self.text_controller is not None:
+            controller_out = self.text_controller(pet_available)
+            text_embed = controller_out['text_embed']
+            prior_gates = controller_out['prior_gates']
+            pet_gates = controller_out['pet_gates']
+            text_gates = controller_out['text_gates']
+        else:
+            text_embed = None
+            prior_gates = None
+            pet_gates = [torch.ones(ct_feat.shape[0], ct_feat.shape[1], 1, 1, device=ct_feat.device, dtype=ct_feat.dtype) for ct_feat in ct_feats]
+            text_gates = [torch.zeros_like(gate) for gate in pet_gates]
 
-        if self.use_lapa:
+        if self.use_lapa and prior_feats is not None:
             enhanced_ct_feats = self.lapa(ct_feats, prior_feats, prior_gates=prior_gates)
         else:
             enhanced_ct_feats = ct_feats
@@ -90,7 +102,10 @@ class PAMCTextProxyUNet(nn.Module):
             if aligned.shape[-2:] != ref.shape[-2:]:
                 aligned = F.interpolate(aligned, size=ref.shape[-2:], mode='bilinear', align_corners=False)
             pet_feats.append(aligned)
-        text_feats = self.tppc(enhanced_ct_feats, text_embed)
+        if self.tppc is not None:
+            text_feats = self.tppc(enhanced_ct_feats, text_embed)
+        else:
+            text_feats = [torch.zeros_like(feat) for feat in enhanced_ct_feats]
         fused_feats, fusion_aux = self.fusion(
             enhanced_ct_feats,
             pet_feats,
@@ -105,7 +120,7 @@ class PAMCTextProxyUNet(nn.Module):
         boundary_logits = self.boundary_head(boundary_feat)
         if boundary_logits.shape[-2:] != target_size:
             boundary_logits = F.interpolate(boundary_logits, size=target_size, mode='bilinear', align_corners=False)
-        prior_gate_mean = torch.stack([g.mean() for g in prior_gates]).mean()
+        prior_gate_mean = torch.stack([g.mean() for g in prior_gates]).mean() if prior_gates is not None else logits.new_tensor(0.0)
         decoder_out.update({
             'logits': logits,
             'boundary_logits': boundary_logits,

@@ -31,13 +31,35 @@ def _get_flops_params_gm(model_wrapper, input_args):
         return None, params_m
 
 
+def _count_module_params(module):
+    if module is None:
+        return 0, 0, 0
+    total = sum(p.numel() for p in module.parameters())
+    trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+    return total, trainable, total - trainable
+
+
 def print_baseline_profile(networks, config, image_size=None, tag='teacher_baseline'):
     image_size = image_size or getattr(config, 'image_size_2d', 512)
-    device = torch.device('cuda', int(config.gpus[0]))
+    device = torch.device('cuda', int(config.gpus[0])) if torch.cuda.is_available() else torch.device('cpu')
 
-    params_m = count_params_m(networks)
+    model = networks.get('model')
+    total, trainable, frozen = _count_module_params(model)
+    print_trainable_only = bool(getattr(config, 'print_trainable_only', True))
+    headline = trainable if print_trainable_only else total
+    print('\n================ MODEL PROFILE ================')
+    print(f'HEADLINE PARAMS ({"trainable" if print_trainable_only else "total"}): {headline / 1e6:.2f}M')
+    print(f'TOTAL PARAMS: {total / 1e6:.2f}M')
+    print(f'TRAINABLE PARAMS: {trainable / 1e6:.2f}M')
+    print(f'FROZEN PARAMS: {frozen / 1e6:.2f}M')
+    for name in ('enc_ct', 'enc_pet', 'meddino', 'lapa', 'text_controller', 'tppc', 'decoder', 'boundary_head'):
+        module = getattr(model, name, None) if model is not None else None
+        mt, mtr, mf = _count_module_params(module)
+        if module is not None:
+            print(f'{name}: total={mt / 1e6:.2f}M trainable={mtr / 1e6:.2f}M frozen={mf / 1e6:.2f}M')
+    print('==============================================')
+
     flops_g = None
-
     try:
         nets_copy = {k: copy.deepcopy(v) for k, v in networks.items()}
         wrapper = BaselineTeacherWrapper(nets_copy).to(device).eval()
@@ -46,12 +68,12 @@ def print_baseline_profile(networks, config, image_size=None, tag='teacher_basel
         with torch.no_grad():
             flops_g, _ = _get_flops_params_gm(wrapper, (ct, pet))
         del wrapper, nets_copy
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     except Exception as e:
         print(f'  [profile] FLOPs 统计失败: {e}')
-
     if flops_g is not None:
-        print(f'[{tag}] Params: {params_m:.2f}M  FLOPs: {flops_g:.2f}G')
+        print(f'[{tag}] FLOPs: {flops_g:.2f}G')
     else:
-        print(f'[{tag}] Params: {params_m:.2f}M  (FLOPs 需 thop: pip install thop)')
-    return params_m, flops_g
+        print(f'[{tag}] FLOPs 需 thop: pip install thop')
+    return total / 1e6, flops_g

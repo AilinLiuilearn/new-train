@@ -9,7 +9,18 @@ import torch.nn.functional as F
 
 
 @torch.no_grad()
-def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshold=0.5, force_missing_pet=False, mode='full'):
+def save_segmentation_diagnostics(
+    task,
+    loader,
+    out_dir,
+    num_samples=8,
+    threshold=0.5,
+    force_missing_pet=None,
+    mode='full',
+    eval_mode=None,
+    random_pet_drop_prob=0.0,
+    random_seed=2026,
+):
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -20,17 +31,30 @@ def save_segmentation_diagnostics(task, loader, out_dir, num_samples=8, threshol
 
     os.makedirs(out_dir, exist_ok=True)
     saved = 0
+    eval_mode = eval_mode or ('fixed_missing' if force_missing_pet else mode)
+    mode = eval_mode
 
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader):
         ct = batch['ct'].float().to(task.device)
         pet = batch['pet'].float().to(task.device)
         mask = batch['mask'].float().to(task.device)
         pet_available = batch.get('pet_available')
         if pet_available is not None:
-            pet_available = pet_available.to(task.device)
-        if force_missing_pet:
+            pet_available = pet_available.float().to(task.device)
+        else:
+            pet_available = torch.ones(ct.shape[0], device=task.device, dtype=torch.float32)
+        if force_missing_pet is not None:
+            eval_mode = 'fixed_missing' if force_missing_pet else 'full'
+            mode = eval_mode
+        if eval_mode == 'fixed_missing':
             pet = torch.zeros_like(pet)
             pet_available = torch.zeros(ct.shape[0], device=task.device, dtype=torch.float32)
+        elif eval_mode == 'random_missing':
+            g = torch.Generator(device=pet.device)
+            g.manual_seed(int(random_seed) + int(batch_idx))
+            keep = (torch.rand(ct.shape[0], generator=g, device=pet.device) > float(random_pet_drop_prob)).float()
+            pet = pet * keep.view(-1, 1, 1, 1)
+            pet_available = keep
         model = task.networks['model']
         if hasattr(model, 'set_adc_mac_visuals'):
             model.set_adc_mac_visuals(True)

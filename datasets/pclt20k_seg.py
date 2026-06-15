@@ -279,12 +279,11 @@ class PCLT20KSegDataset(Dataset):
 class PCLT20KTextProxyAlignedDataset(PCLT20KSegDataset):
     """CIPA-aligned PET/CT segmentation dataset with training-time PET modality dropout.
 
-    This class intentionally keeps the same resize/augmentation/normalization style as
-    PCLT20KSegDataset, but returns explicit 1-channel CT/PET tensors and metadata for
-    text-proxy PET-missing experiments.
+    Validation/test always return real PET. Missing-modality evaluation is handled
+    centrally in task.evaluate() for reproducibility.
     """
 
-    def __init__(self, records, image_size=512, train=False, pet_drop_prob=0.0, eval_missing_pet=False, random_state=2023, aug_mode='cipa', norm_mode='imagenet'):
+    def __init__(self, records, image_size=512, train=False, pet_drop_prob=0.0, random_state=2023, aug_mode='cipa', norm_mode='imagenet'):
         super().__init__(
             records,
             image_size=image_size,
@@ -295,7 +294,6 @@ class PCLT20KTextProxyAlignedDataset(PCLT20KSegDataset):
             norm_mode=norm_mode,
         )
         self.pet_drop_prob = float(pet_drop_prob)
-        self.eval_missing_pet = bool(eval_missing_pet)
 
     def __getitem__(self, idx):
         record = self.records[idx]
@@ -327,9 +325,6 @@ class PCLT20KTextProxyAlignedDataset(PCLT20KSegDataset):
 
         pet_available = 1 if record['pet_path'] is not None else 0
         if self.train and random.random() < self.pet_drop_prob:
-            pet_out = np.zeros_like(pet_out, dtype=np.float32)
-            pet_available = 0
-        elif (not self.train) and self.eval_missing_pet:
             pet_out = np.zeros_like(pet_out, dtype=np.float32)
             pet_available = 0
 
@@ -425,7 +420,7 @@ def _resolve_textproxy_train_list(root, train_list):
     )
 
 
-def get_pclt20k_loaders_textproxy_aligned(root, image_size=512, batch_size=8, num_workers=4, random_state=2023, pin_memory=True, aug_mode='cipa', norm_mode='cipa', train_list='train_orgian.txt', val_list='test.txt', test_list='test.txt', pet_drop_prob=0.4, eval_missing_pet=False):
+def get_pclt20k_loaders_textproxy_aligned(root, image_size=512, batch_size=8, num_workers=4, random_state=2023, pin_memory=True, aug_mode='none', norm_mode='cipa', train_list='train_orgian.txt', val_list='test.txt', test_list='test.txt', pet_drop_prob=0.4):
     used_train_list, train_ids = _resolve_textproxy_train_list(root, train_list)
     val_ids = _read_list(os.path.join(root, val_list))
     test_ids = _read_list(os.path.join(root, test_list))
@@ -441,8 +436,8 @@ def get_pclt20k_loaders_textproxy_aligned(root, image_size=512, batch_size=8, nu
     print(f'  ← 使用划分: train={used_train_list}, val={val_list}, test={test_list}')
     print(f'  ← 数据增强: {aug_mode}')
     print(f'  ← CT/PET归一化: {norm_mode}')
-    print(f'  ← PET modality dropout: pet_drop_prob={pet_drop_prob}')
-    print(f'  ← eval_missing_pet={eval_missing_pet}')
+    print(f'  ← train PET modality dropout: pet_drop_prob={pet_drop_prob}')
+    print('  ← val/test return real PET; missing-mode eval is controlled by task.evaluate()')
 
     train_ds = PCLT20KTextProxyAlignedDataset(
         train_records,
@@ -457,7 +452,6 @@ def get_pclt20k_loaders_textproxy_aligned(root, image_size=512, batch_size=8, nu
         val_records,
         image_size=image_size,
         train=False,
-        eval_missing_pet=eval_missing_pet,
         random_state=random_state,
         aug_mode='none',
         norm_mode=norm_mode,
@@ -466,7 +460,6 @@ def get_pclt20k_loaders_textproxy_aligned(root, image_size=512, batch_size=8, nu
         test_records,
         image_size=image_size,
         train=False,
-        eval_missing_pet=eval_missing_pet,
         random_state=random_state,
         aug_mode='none',
         norm_mode=norm_mode,

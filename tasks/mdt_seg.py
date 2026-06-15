@@ -232,27 +232,38 @@ class MDTSegTeacher:
         return loss, pred, mask, loss_dict
 
     @torch.no_grad()
-    def evaluate(self, loader, threshold=None, force_missing_pet=False, tag="val"):
+    def evaluate(self, loader, threshold=None, eval_mode="full", random_pet_drop_prob=0.0, random_seed=2026, tag="val", force_missing_pet=None):
         eval_model = self.networks['model']
         eval_model.eval()
         th = threshold or getattr(self.config, 'eval_threshold', 0.5)
-        mode = 'missing' if force_missing_pet else 'full'
-        print(f'[evaluate] tag={tag} mode={mode}')
+        if force_missing_pet is not None:
+            eval_mode = 'fixed_missing' if force_missing_pet else 'full'
+        if eval_mode not in ('full', 'fixed_missing', 'random_missing'):
+            raise ValueError(f'Unsupported eval_mode={eval_mode}')
+        print(f'[evaluate] tag={tag} mode={eval_mode}')
         m = SegmentationMetricsCIPA(threshold=th).to(self.device)
         m.reset()
         total_loss, n = 0.0, 0
         gate_sum = {'pet_gate_mean': 0.0, 'text_gate_mean': 0.0, 'prior_gate_mean': 0.0}
         gate_n = 0
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader):
             ct = batch['ct'].float().to(self.device)
             pet = batch['pet'].float().to(self.device)
             mask = batch['mask'].float().to(self.device)
             pet_available = batch.get('pet_available')
             if pet_available is not None:
-                pet_available = pet_available.to(self.device)
-            if force_missing_pet:
+                pet_available = pet_available.float().to(self.device)
+            else:
+                pet_available = torch.ones(ct.shape[0], device=self.device, dtype=torch.float32)
+            if eval_mode == 'fixed_missing':
                 pet = torch.zeros_like(pet)
                 pet_available = torch.zeros(ct.shape[0], device=self.device, dtype=torch.float32)
+            elif eval_mode == 'random_missing':
+                g = torch.Generator(device=pet.device)
+                g.manual_seed(int(random_seed) + int(batch_idx))
+                keep = (torch.rand(ct.shape[0], generator=g, device=pet.device) > float(random_pet_drop_prob)).float()
+                pet = pet * keep.view(-1, 1, 1, 1)
+                pet_available = keep
             outputs = _forward(self.networks, ct, pet, mask.shape[-2:], pet_available=pet_available)
             pred = self._select_main_pred(outputs)
             loss_seg, _ = self.loss_seg(pred, mask)
