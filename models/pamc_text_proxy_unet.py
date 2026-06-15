@@ -42,6 +42,7 @@ class PAMCTextProxyUNet(nn.Module):
         text_in_full_mode=False,
         full_text_weight=0.0,
         lapa_norm='gn',
+        text_proxy_scale=0.1,
         **kwargs,
     ):
         super().__init__()
@@ -62,7 +63,11 @@ class PAMCTextProxyUNet(nn.Module):
         self.lapa = LAPA(ct_channels, prior_channels=ct_channels, norm=lapa_norm) if self.use_lapa and self.meddino is not None else nn.Identity()
         self.pet_proj = nn.ModuleList([ConvBNAct(pin, cout, kernel_size=1) for pin, cout in zip(pet_channels, ct_channels)])
         self.tppc = TextGuidedPseudoPETCorrection(ct_channels, embed_dim=self.text_embed_dim) if self.use_text_proxy else None
-        self.fusion = TextGuidedCorrectionFusion(text_in_full_mode=self.text_in_full_mode, full_text_weight=self.full_text_weight)
+        self.fusion = TextGuidedCorrectionFusion(
+            text_in_full_mode=self.text_in_full_mode,
+            full_text_weight=self.full_text_weight,
+            text_proxy_scale=text_proxy_scale,
+        )
         self.decoder = LightConcatUNetDecoder(ct_channels, out_channels=out_channels)
         self.boundary_head = nn.Sequential(
             nn.Conv2d(ct_channels[0], max(8, ct_channels[0] // 2), kernel_size=3, padding=1, bias=False),
@@ -84,9 +89,13 @@ class PAMCTextProxyUNet(nn.Module):
             return x.repeat(1, 3, 1, 1)
         return x
 
+    def set_text_proxy_scale(self, scale):
+        self.fusion.text_proxy_scale = float(scale)
+
     def forward(self, ct, pet, pet_available=None, target_size=None):
         if pet_available is None:
             pet_available = torch.ones(ct.shape[0], device=ct.device, dtype=ct.dtype)
+        pet_available = pet_available.float()
         if target_size is None:
             target_size = ct.shape[-2:]
         ct = self._to_3ch(ct)

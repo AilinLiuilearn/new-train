@@ -6,11 +6,12 @@ class TextModalityController(nn.Module):
     def __init__(self, channels, embed_dim=256):
         super().__init__()
         self.embed_dim = int(embed_dim)
-        self.embedding_available = nn.Parameter(torch.randn(self.embed_dim) * 0.02)
-        self.embedding_missing = nn.Parameter(torch.randn(self.embed_dim) * 0.02)
+        self.embedding_available = nn.Parameter(torch.randn(self.embed_dim) * 1e-3)
+        self.embedding_missing = nn.Parameter(torch.randn(self.embed_dim) * 1e-3)
         self.prior_mlps = nn.ModuleList([self._make_gate_mlp(c) for c in channels])
         self.pet_mlps = nn.ModuleList([self._make_gate_mlp(c) for c in channels])
         self.text_mlps = nn.ModuleList([self._make_gate_mlp(c) for c in channels])
+        self._init_conservative_gates()
 
     def _make_gate_mlp(self, out_channels):
         return nn.Sequential(
@@ -19,6 +20,13 @@ class TextModalityController(nn.Module):
             nn.Linear(self.embed_dim, out_channels),
             nn.Sigmoid(),
         )
+
+    def _init_conservative_gates(self):
+        for mlps in (self.prior_mlps, self.pet_mlps, self.text_mlps):
+            for mlp in mlps:
+                last = mlp[-2]
+                nn.init.zeros_(last.weight)
+                nn.init.zeros_(last.bias)
 
     def forward(self, pet_available):
         if pet_available.dim() > 1:
