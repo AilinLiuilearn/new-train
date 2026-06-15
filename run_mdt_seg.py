@@ -80,8 +80,7 @@ def _build_loaders(config):
             train_list=getattr(config, 'train_list', 'train_orgian.txt'),
             val_list=getattr(config, 'val_list', 'test.txt'),
             test_list=getattr(config, 'test_list', 'test.txt'),
-            pet_drop_prob=getattr(config, 'pet_drop_prob', 0.4),
-            eval_missing_pet=getattr(config, 'eval_missing_pet', False),
+            pet_drop_prob=getattr(config, 'train_pet_drop_prob', None) if getattr(config, 'train_pet_drop_prob', None) is not None else getattr(config, 'pet_drop_prob', 0.4),
         )
     if getattr(config, 'cipa_aligned', False):
         return dataset_mod.get_pclt20k_loaders_cipa_aligned(
@@ -247,14 +246,25 @@ def main():
                     f'lr={curr_lr:.6f}'
                 )
 
-        if getattr(config, 'eval_missing_pet', False):
-            val_full = task.evaluate(val_loader, tag='val_full', force_missing_pet=False)
-            val_missing = task.evaluate(val_loader, tag='val_missing', force_missing_pet=True)
-            val_m = val_full
-        else:
-            val_full = task.evaluate(val_loader, tag='val_full', force_missing_pet=False)
-            val_missing = None
-            val_m = val_full
+        val_results = {}
+        if getattr(config, 'eval_full_pet', True):
+            val_results['full'] = task.evaluate(val_loader, eval_mode='full', tag='val_full')
+        if getattr(config, 'eval_fixed_missing_pet', True):
+            val_results['fixed_missing'] = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_fixed_missing')
+        if getattr(config, 'eval_random_missing_pet', True):
+            val_results['random_missing'] = task.evaluate(
+                val_loader,
+                eval_mode='random_missing',
+                random_pet_drop_prob=getattr(config, 'eval_random_pet_drop_prob', 0.4),
+                random_seed=getattr(config, 'eval_random_missing_seed', 2026),
+                tag='val_random_missing',
+            )
+        if not val_results:
+            val_results['full'] = task.evaluate(val_loader, eval_mode='full', tag='val_full')
+        val_full = val_results.get('full') or next(iter(val_results.values()))
+        val_fixed_missing = val_results.get('fixed_missing')
+        val_random_missing = val_results.get('random_missing')
+        val_m = val_full
         avg_grad_norm = grad_norm_sum / max(grad_norm_steps, 1)
         curr_lr = task.optimizer.param_groups[0]['lr']
         gamma_metrics = _collect_adc_gamma(task)
@@ -273,41 +283,31 @@ def main():
         gate_text = 'g_pet={:.4f} g_txt={:.4f} g_prior={:.4f}'.format(
             val_full.get('pet_gate_mean', 0.0), val_full.get('text_gate_mean', 0.0), val_full.get('prior_gate_mean', 0.0)
         )
-        if val_missing is not None:
-            print(
-                f'Epoch {epoch}\n'
-                f'train_loss={tloss / max(tn, 1):.4f} train_seg={tseg / max(tn, 1):.4f} train_boundary={tboundary / max(tn, 1):.4f}\n'
-                f'val_full: Dice={val_full["dice"]:.4f} IoU={val_full["iou"]:.4f} Acc={val_full["acc"]:.4f} HD95={val_full["hd95"]:.2f}\n'
-                f'val_missing: Dice={val_missing["dice"]:.4f} IoU={val_missing["iou"]:.4f} Acc={val_missing["acc"]:.4f} HD95={val_missing["hd95"]:.2f}\n'
-                f'{gate_text} lr={curr_lr:.6f} grad={avg_grad_norm:.4f} best_dice={best_dice:.4f} best_hd95={best_hd95:.2f} boundary_w={getattr(config, "boundary_loss_weight", 0.0):.3f}{gamma_text}'
-            )
-        else:
-            print(
-                f'Epoch {epoch}\n'
-                f'train_loss={tloss / max(tn, 1):.4f} train_seg={tseg / max(tn, 1):.4f} train_boundary={tboundary / max(tn, 1):.4f}\n'
-                f'val_full: Dice={val_full["dice"]:.4f} IoU={val_full["iou"]:.4f} Acc={val_full["acc"]:.4f} HD95={val_full["hd95"]:.2f}\n'
-                f'{gate_text} lr={curr_lr:.6f} grad={avg_grad_norm:.4f} best_dice={best_dice:.4f} best_hd95={best_hd95:.2f} boundary_w={getattr(config, "boundary_loss_weight", 0.0):.3f}{gamma_text}'
-            )
+        val_lines = []
+        for mode_name, metrics in (('val_full', val_full), ('val_fixed_missing', val_fixed_missing), ('val_random_missing', val_random_missing)):
+            if metrics is None:
+                continue
+            val_lines.append(f'{mode_name}: Dice={metrics["dice"]:.4f} IoU={metrics["iou"]:.4f} Acc={metrics["acc"]:.4f} HD95={metrics["hd95"]:.2f}')
+        print(
+            f'Epoch {epoch}\n'
+            f'train_loss={tloss / max(tn, 1):.4f} train_seg={tseg / max(tn, 1):.4f} train_boundary={tboundary / max(tn, 1):.4f}\n'
+            + '\n'.join(val_lines) + '\n'
+            f'{gate_text} train_pet_drop_prob={getattr(config, "train_pet_drop_prob", 0.0):.3f} eval_random_pet_drop_prob={getattr(config, "eval_random_pet_drop_prob", 0.0):.3f} '
+            f'lr={curr_lr:.6f} grad={avg_grad_norm:.4f} best_dice={best_dice:.4f} best_hd95={best_hd95:.2f} boundary_w={getattr(config, "boundary_loss_weight", 0.0):.3f}{gamma_text}'
+        )
 
         if getattr(config, 'vis_every_epoch', False):
-            save_segmentation_diagnostics(
-                task=task,
-                loader=val_loader,
-                out_dir=os.path.join(config.checkpoint_dir, 'vis_epochs', f'epoch_{epoch:03d}'),
-                num_samples=max(1, int(getattr(config, 'vis_epoch_samples', 2))),
-                threshold=getattr(config, 'eval_threshold', 0.5),
-                force_missing_pet=False,
-                mode='full',
-            )
-            if getattr(config, 'eval_missing_pet', False):
+            for eval_mode in val_results.keys():
                 save_segmentation_diagnostics(
                     task=task,
                     loader=val_loader,
-                    out_dir=os.path.join(config.checkpoint_dir, 'vis_epochs', f'epoch_{epoch:03d}_missing'),
+                    out_dir=os.path.join(config.checkpoint_dir, f'vis_val_{eval_mode}', f'epoch_{epoch:03d}'),
                     num_samples=max(1, int(getattr(config, 'vis_epoch_samples', 2))),
                     threshold=getattr(config, 'eval_threshold', 0.5),
-                    force_missing_pet=True,
-                    mode='missing',
+                    eval_mode=eval_mode,
+                    random_pet_drop_prob=getattr(config, 'eval_random_pet_drop_prob', 0.4),
+                    random_seed=getattr(config, 'eval_random_missing_seed', 2026),
+                    mode=eval_mode,
                 )
 
         if val_m['dice'] > best_dice:
@@ -337,58 +337,62 @@ def main():
     best_hd95_path = os.path.join(config.checkpoint_dir, 'ckpt.best_hd95.pth.tar')
 
     _load_checkpoint(best_dice_path)
-    test_m_dice_full = task.evaluate(test_loader, tag='test_best_dice_full', force_missing_pet=False)
-    test_m_dice_missing = task.evaluate(test_loader, tag='test_best_dice_missing', force_missing_pet=True)
-    print('\n=== TEST(best_dice, full PET) Dice={:.4f} IoU={:.4f} Acc={:.4f} HD95={:.2f} ==='.format(
-        test_m_dice_full['dice'], test_m_dice_full['iou'], test_m_dice_full['acc'], test_m_dice_full['hd95']))
-    print('=== TEST(best_dice, missing PET) Dice={:.4f} IoU={:.4f} Acc={:.4f} HD95={:.2f} ==='.format(
-        test_m_dice_missing['dice'], test_m_dice_missing['iou'], test_m_dice_missing['acc'], test_m_dice_missing['hd95']))
-
-    save_segmentation_diagnostics(
-        task=task,
-        loader=test_loader,
-        out_dir=os.path.join(config.checkpoint_dir, 'vis_best_dice_full'),
-        num_samples=min(8, config.batch_size),
-        threshold=getattr(config, 'eval_threshold', 0.5),
-        force_missing_pet=False,
-        mode='full',
-    )
-    save_segmentation_diagnostics(
-        task=task,
-        loader=test_loader,
-        out_dir=os.path.join(config.checkpoint_dir, 'vis_best_dice_missing'),
-        num_samples=min(8, config.batch_size),
-        threshold=getattr(config, 'eval_threshold', 0.5),
-        force_missing_pet=True,
-        mode='missing',
-    )
+    test_results = {}
+    if getattr(config, 'eval_full_pet', True):
+        test_results['full'] = task.evaluate(test_loader, eval_mode='full', tag='test_best_dice_full')
+    if getattr(config, 'eval_fixed_missing_pet', True):
+        test_results['fixed_missing'] = task.evaluate(test_loader, eval_mode='fixed_missing', tag='test_best_dice_fixed_missing')
+    if getattr(config, 'eval_random_missing_pet', True):
+        test_results['random_missing'] = task.evaluate(
+            test_loader,
+            eval_mode='random_missing',
+            random_pet_drop_prob=getattr(config, 'eval_random_pet_drop_prob', 0.4),
+            random_seed=getattr(config, 'eval_random_missing_seed', 2026),
+            tag='test_best_dice_random_missing',
+        )
+    for mode_name, metrics in test_results.items():
+        print(f'=== TEST(best_dice, {mode_name}) Dice={metrics["dice"]:.4f} IoU={metrics["iou"]:.4f} Acc={metrics["acc"]:.4f} HD95={metrics["hd95"]:.2f} ===')
+    for mode_name in test_results.keys():
+        save_segmentation_diagnostics(
+            task=task,
+            loader=test_loader,
+            out_dir=os.path.join(config.checkpoint_dir, f'vis_test_{mode_name}'),
+            num_samples=min(8, config.batch_size),
+            threshold=getattr(config, 'eval_threshold', 0.5),
+            eval_mode=mode_name,
+            random_pet_drop_prob=getattr(config, 'eval_random_pet_drop_prob', 0.4),
+            random_seed=getattr(config, 'eval_random_missing_seed', 2026),
+            mode=mode_name,
+        )
 
     _load_checkpoint(best_hd95_path)
-    test_m_hd95_full = task.evaluate(test_loader, tag='test_best_hd95_full', force_missing_pet=False)
-    test_m_hd95_missing = task.evaluate(test_loader, tag='test_best_hd95_missing', force_missing_pet=True)
-    print('=== TEST(best_hd95, full PET) Dice={:.4f} IoU={:.4f} Acc={:.4f} HD95={:.2f} ==='.format(
-        test_m_hd95_full['dice'], test_m_hd95_full['iou'], test_m_hd95_full['acc'], test_m_hd95_full['hd95']))
-    print('=== TEST(best_hd95, missing PET) Dice={:.4f} IoU={:.4f} Acc={:.4f} HD95={:.2f} ==='.format(
-        test_m_hd95_missing['dice'], test_m_hd95_missing['iou'], test_m_hd95_missing['acc'], test_m_hd95_missing['hd95']))
-
-    save_segmentation_diagnostics(
-        task=task,
-        loader=test_loader,
-        out_dir=os.path.join(config.checkpoint_dir, 'vis_best_hd95_full'),
-        num_samples=min(8, config.batch_size),
-        threshold=getattr(config, 'eval_threshold', 0.5),
-        force_missing_pet=False,
-        mode='full',
-    )
-    save_segmentation_diagnostics(
-        task=task,
-        loader=test_loader,
-        out_dir=os.path.join(config.checkpoint_dir, 'vis_best_hd95_missing'),
-        num_samples=min(8, config.batch_size),
-        threshold=getattr(config, 'eval_threshold', 0.5),
-        force_missing_pet=True,
-        mode='missing',
-    )
+    test_results = {}
+    if getattr(config, 'eval_full_pet', True):
+        test_results['full'] = task.evaluate(test_loader, eval_mode='full', tag='test_best_hd95_full')
+    if getattr(config, 'eval_fixed_missing_pet', True):
+        test_results['fixed_missing'] = task.evaluate(test_loader, eval_mode='fixed_missing', tag='test_best_hd95_fixed_missing')
+    if getattr(config, 'eval_random_missing_pet', True):
+        test_results['random_missing'] = task.evaluate(
+            test_loader,
+            eval_mode='random_missing',
+            random_pet_drop_prob=getattr(config, 'eval_random_pet_drop_prob', 0.4),
+            random_seed=getattr(config, 'eval_random_missing_seed', 2026),
+            tag='test_best_hd95_random_missing',
+        )
+    for mode_name, metrics in test_results.items():
+        print(f'=== TEST(best_hd95, {mode_name}) Dice={metrics["dice"]:.4f} IoU={metrics["iou"]:.4f} Acc={metrics["acc"]:.4f} HD95={metrics["hd95"]:.2f} ===')
+    for mode_name in test_results.keys():
+        save_segmentation_diagnostics(
+            task=task,
+            loader=test_loader,
+            out_dir=os.path.join(config.checkpoint_dir, f'vis_test_{mode_name}'),
+            num_samples=min(8, config.batch_size),
+            threshold=getattr(config, 'eval_threshold', 0.5),
+            eval_mode=mode_name,
+            random_pet_drop_prob=getattr(config, 'eval_random_pet_drop_prob', 0.4),
+            random_seed=getattr(config, 'eval_random_missing_seed', 2026),
+            mode=mode_name,
+        )
 
 
 if __name__ == '__main__':

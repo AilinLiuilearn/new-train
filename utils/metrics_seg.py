@@ -43,15 +43,54 @@ def _hd95_scipy(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
     return float(np.percentile(d, 95))
 
 
+def _hd95_numpy_fallback(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
+    pred = pred_bin.astype(bool)
+    gt = gt_bin.astype(bool)
+    if pred.sum() == 0 and gt.sum() == 0:
+        return 0.0
+    if pred.sum() == 0 or gt.sum() == 0:
+        return float(np.sqrt(pred.shape[0] ** 2 + pred.shape[1] ** 2))
+
+    def _border_coords(mask):
+        padded = np.pad(mask.astype(np.uint8), ((1, 1), (1, 1)), mode='constant')
+        neighbor = np.zeros_like(mask, dtype=np.uint8)
+        for dy in range(3):
+            for dx in range(3):
+                neighbor += padded[dy:dy + mask.shape[0], dx:dx + mask.shape[1]]
+        border = mask & (neighbor < 9)
+        coords = np.argwhere(border)
+        if coords.size == 0:
+            coords = np.argwhere(mask)
+        return coords.astype(np.float32)
+
+    cp = _border_coords(pred)
+    cg = _border_coords(gt)
+    if cp.size == 0 or cg.size == 0:
+        return float(np.sqrt(pred.shape[0] ** 2 + pred.shape[1] ** 2))
+    # Chunked all-pairs distance to avoid excessive memory on large contours.
+    dists = []
+    chunk = 1024
+    for start in range(0, cp.shape[0], chunk):
+        diff = cp[start:start + chunk, None, :] - cg[None, :, :]
+        dists.append(np.sqrt((diff ** 2).sum(axis=2)).min(axis=1))
+    for start in range(0, cg.shape[0], chunk):
+        diff = cg[start:start + chunk, None, :] - cp[None, :, :]
+        dists.append(np.sqrt((diff ** 2).sum(axis=2)).min(axis=1))
+    return float(np.percentile(np.concatenate(dists), 95))
+
+
 def compute_hd95_pair(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
-    """单张 2D 二值图 HD95；优先 medpy，否则 scipy。"""
+    """单张 2D 二值图 HD95；优先 medpy，其次 scipy，最后 numpy fallback。"""
     pred_bin = pred_bin.astype(bool)
     gt_bin = gt_bin.astype(bool)
     try:
         from medpy.metric.binary import hd95 as medpy_hd95
         return float(medpy_hd95(pred_bin.astype(np.uint8), gt_bin.astype(np.uint8)))
     except Exception:
-        return _hd95_scipy(pred_bin, gt_bin)
+        try:
+            return _hd95_scipy(pred_bin, gt_bin)
+        except Exception:
+            return _hd95_numpy_fallback(pred_bin, gt_bin)
 
 
 def _compute_metrics_from_counts(tp, fp, fn, tn):

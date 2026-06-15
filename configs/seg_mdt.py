@@ -16,17 +16,23 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--val_split_file", type=str, default="val.txt")
         p.add_argument("--test_split_file", type=str, default="test.txt")
         p.add_argument("--cipa_aligned", type=str2bool, default=True)
-        p.add_argument("--use_textproxy_loader", type=str2bool, default=False)
+        p.add_argument("--use_textproxy_loader", type=str2bool, default=True)
         p.add_argument("--train_list", type=str, default="train_orgian.txt")
         p.add_argument("--val_list", type=str, default="test.txt")
         p.add_argument("--test_list", type=str, default="test.txt")
-        p.add_argument("--pet_drop_prob", type=float, default=0.4)
-        p.add_argument("--eval_missing_pet", type=str2bool, default=True)
+        p.add_argument("--train_pet_drop_prob", type=float, default=0.4)
+        p.add_argument("--pet_drop_prob", type=float, default=None, help="Deprecated alias. Use --train_pet_drop_prob.")
+        p.add_argument("--eval_full_pet", type=str2bool, default=True)
+        p.add_argument("--eval_fixed_missing_pet", type=str2bool, default=True)
+        p.add_argument("--eval_random_missing_pet", type=str2bool, default=True)
+        p.add_argument("--eval_random_pet_drop_prob", type=float, default=0.4)
+        p.add_argument("--eval_random_missing_seed", type=int, default=2026)
+        p.add_argument("--eval_missing_pet", type=str2bool, default=None, help="Deprecated alias for --eval_fixed_missing_pet.")
         p.add_argument("--image_size_2d", type=int, default=512)
         p.add_argument("--num_workers", type=int, default=4)
         p.add_argument("--pin_memory", type=str2bool, default=True)
-        p.add_argument("--aug_mode", type=str, default="cipa", choices=("cipa", "light", "none"))
-        p.add_argument("--norm_mode", type=str, default="imagenet", choices=("imagenet", "cipa"))
+        p.add_argument("--aug_mode", type=str, default="none", choices=("cipa", "light", "none"))
+        p.add_argument("--norm_mode", type=str, default="cipa", choices=("imagenet", "cipa"))
         return p
 
     @staticmethod
@@ -39,6 +45,9 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--use_meddino", type=str2bool, default=True)
         p.add_argument("--meddino_ckpt", type=str, default="/root/autodl-tmp/mkd-main/new-train/pretrained/MedDinov3/model.pth")
         p.add_argument("--use_lapa", type=str2bool, default=True)
+        p.add_argument("--use_text_proxy", type=str2bool, default=True)
+        p.add_argument("--text_in_full_mode", type=str2bool, default=False)
+        p.add_argument("--full_text_weight", type=float, default=0.0)
         p.add_argument("--ct_backbone", type=str, default="convnext_tiny")
         p.add_argument("--pet_backbone", type=str, default="mit_b0")
         p.add_argument("--ct_pretrained_path", type=str, default=None)
@@ -56,6 +65,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--bioclip_text_tower_path", type=str, default="/root/autodl-tmp/mkd-main/new-train/pretrained/biomedbert_text_tower", help="Local HuggingFace BiomedBERT text tower path used by BiomedCLIP.")
         p.add_argument("--bioclip_text", type=str, default="focal abnormal metabolic lung lesion on PET-CT scan", help="Text prompt encoded by BiomedCLIP/BiomedBERT for text-guided fusion.")
         p.add_argument("--decoder_type", type=str, default="light", choices=("light",))
+        p.add_argument("--print_trainable_only", type=str2bool, default=True)
         return p
 
     @staticmethod
