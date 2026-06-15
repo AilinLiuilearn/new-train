@@ -582,6 +582,7 @@ def build_mdt_seg_teacher(config):
             text_in_full_mode=getattr(config, 'text_in_full_mode', False),
             full_text_weight=getattr(config, 'full_text_weight', 0.0),
             lapa_norm=getattr(config, 'lapa_norm', 'gn'),
+            text_proxy_scale=getattr(config, 'text_proxy_scale', 0.1),
         )
         return dict(model=model)
 

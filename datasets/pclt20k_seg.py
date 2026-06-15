@@ -295,6 +295,9 @@ class PCLT20KTextProxyAlignedDataset(PCLT20KSegDataset):
         )
         self.pet_drop_prob = float(pet_drop_prob)
 
+    def set_pet_drop_prob(self, pet_drop_prob):
+        self.pet_drop_prob = float(pet_drop_prob)
+
     def __getitem__(self, idx):
         record = self.records[idx]
         ct = _imread_grayscale(record['ct_path'])

@@ -20,8 +20,20 @@ class TextGuidedPseudoPETCorrection(nn.Module):
                 nn.Conv2d(c, c, 1, bias=False),
                 nn.BatchNorm2d(c),
                 nn.ReLU(inplace=True),
+                nn.Conv2d(c, c, 1, bias=True),
             ) for c in channels
         ])
+        self._init_conservative()
+
+    def _init_conservative(self):
+        for mlp in self.gamma_beta_mlps:
+            last = mlp[-1]
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+        for conv in self.dw_pw_convs:
+            last = conv[-1]
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
 
     def forward(self, enhanced_ct_feats, text_embed):
         text_feats = []

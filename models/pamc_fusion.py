@@ -45,10 +45,11 @@ class PlaceholderPriorAdapter(nn.Module):
 
 
 class TextGuidedCorrectionFusion(nn.Module):
-    def __init__(self, text_in_full_mode=False, full_text_weight=0.0):
+    def __init__(self, text_in_full_mode=False, full_text_weight=0.0, text_proxy_scale=0.1):
         super().__init__()
         self.text_in_full_mode = bool(text_in_full_mode)
         self.full_text_weight = float(full_text_weight)
+        self.text_proxy_scale = float(text_proxy_scale)
 
     def forward(self, enhanced_ct_feats, pet_feats, text_feats, pet_gates, text_gates, pet_available):
         if pet_available.dim() > 1:
@@ -61,9 +62,9 @@ class TextGuidedCorrectionFusion(nn.Module):
             fact = torch.nan_to_num(fact, nan=0.0, posinf=1e4, neginf=-1e4)
             dpet = torch.nan_to_num(dpet, nan=0.0, posinf=1e4, neginf=-1e4)
             dtxt = torch.nan_to_num(dtxt, nan=0.0, posinf=1e4, neginf=-1e4)
-            out = fact + m * gpet * dpet + (1.0 - m) * gtxt * dtxt
+            out = fact + m * gpet * dpet + self.text_proxy_scale * ((1.0 - m) * gtxt * dtxt)
             if self.text_in_full_mode:
-                out = out + m * self.full_text_weight * gtxt * dtxt
+                out = out + self.text_proxy_scale * (m * self.full_text_weight * gtxt * dtxt)
             fused.append(torch.nan_to_num(out, nan=0.0, posinf=1e4, neginf=-1e4))
             pet_gate_means.append(gpet.mean())
             text_gate_means.append(gtxt.mean())

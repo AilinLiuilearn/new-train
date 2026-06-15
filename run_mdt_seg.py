@@ -140,6 +140,92 @@ def _adc_gamma_headers(config):
     return [f'{branch}_s{stage}_gamma' for branch in ('enc_ct', 'enc_pet') for stage in range(1, 5)]
 
 
+def _grad_finite_and_norm(trainable_params):
+    all_finite = True
+    sq_sum = 0.0
+    for p in trainable_params:
+        if p.grad is None:
+            continue
+        grad = p.grad.detach()
+        if not torch.isfinite(grad).all():
+            all_finite = False
+            break
+        sq_sum += float(torch.sum(grad.float() ** 2).detach().cpu())
+    return all_finite, math.sqrt(sq_sum)
+
+
+def _module_grad_status(model):
+    module_names = ('enc_ct', 'enc_pet', 'lapa', 'text_controller', 'tppc', 'decoder', 'boundary_head')
+    status = {}
+    first_bad = None
+    for name in module_names:
+        module = getattr(model, name, None)
+        if module is None:
+            status[name] = 'missing'
+            continue
+        has_grad = False
+        finite = True
+        max_abs = 0.0
+        for p in module.parameters():
+            if p.grad is None:
+                continue
+            has_grad = True
+            grad = p.grad.detach()
+            if not torch.isfinite(grad).all():
+                finite = False
+                break
+            max_abs = max(max_abs, float(grad.float().abs().max().detach().cpu()))
+        if not has_grad:
+            status[name] = 'no_grad'
+        elif finite:
+            status[name] = f'finite|max={max_abs:.4g}'
+        else:
+            status[name] = 'non_finite'
+            if first_bad is None:
+                first_bad = name
+    return first_bad, status
+
+
+def _curriculum_value(epoch, enabled, start, final, warmup_epochs):
+    if not enabled:
+        return float(final)
+    warmup_epochs = max(1, int(warmup_epochs))
+    if epoch >= warmup_epochs + 1:
+        return float(final)
+    progress = max(0.0, min(1.0, float(epoch - 1) / float(warmup_epochs)))
+    return float(start) + (float(final) - float(start)) * progress
+
+
+def _set_train_pet_drop_prob(train_loader, prob):
+    dataset = getattr(train_loader, 'dataset', None)
+    if hasattr(dataset, 'set_pet_drop_prob'):
+        dataset.set_pet_drop_prob(prob)
+    elif hasattr(dataset, 'pet_drop_prob'):
+        dataset.pet_drop_prob = float(prob)
+
+
+def _set_text_proxy_scale(task, scale):
+    model = _unwrap_model(task.networks.get('model'))
+    if hasattr(model, 'set_text_proxy_scale'):
+        model.set_text_proxy_scale(scale)
+    elif hasattr(model, 'fusion') and hasattr(model.fusion, 'text_proxy_scale'):
+        model.fusion.text_proxy_scale = float(scale)
+
+
+def _print_nan_diagnostics(exc, task, batch, epoch, batch_idx, spe, lr, grad_norm=None):
+    print(f'[NaN Guard] module_hit={exc} epoch={epoch} batch={batch_idx + 1}/{spe} lr={lr:.8g} grad_norm={grad_norm if grad_norm is not None else "NA"}')
+    if 'ct_feats[0]' in str(exc):
+        ct = batch.get('ct')
+        if torch.is_tensor(ct):
+            ctf = ct.detach().float()
+            print(f'[NaN Guard] input CT stats: min={float(ctf.min()):.6g} max={float(ctf.max()):.6g} mean={float(ctf.mean()):.6g}')
+        model = _unwrap_model(task.networks.get('model'))
+        enc_ct = getattr(model, 'enc_ct', None)
+        first_param = next(enc_ct.parameters(), None) if enc_ct is not None else None
+        if first_param is not None:
+            print(f'[NaN Guard] enc_ct first param finite={bool(torch.isfinite(first_param.detach()).all())}')
+
+
 def main():
     if os.path.dirname(os.path.abspath(__file__)) != os.getcwd():
         os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -167,7 +253,21 @@ def main():
     print(f'accumulation_steps={config.accumulation_steps}')
     print(f'mixed_precision={config.mixed_precision}')
     print(f'train_pet_drop_prob={getattr(config, "train_pet_drop_prob", None)}')
-    print(f'lr={config.learning_rate} wd={config.weight_decay} boundary_w={getattr(config, "boundary_loss_weight", 0.0)}')
+    print(f'dropout_curriculum={getattr(config, "dropout_curriculum", True)}')
+    print(f'dropout_warmup_epochs={getattr(config, "dropout_warmup_epochs", 10)}')
+    print(f'dropout_start_prob={getattr(config, "dropout_start_prob", 0.0)}')
+    print(f'dropout_final_prob={getattr(config, "dropout_final_prob", 0.4)}')
+    print(f'lr={config.learning_rate}')
+    print(f'text_proxy_scale={getattr(config, "text_proxy_scale", 0.1)}')
+    print(f'text_proxy_warmup_epochs={getattr(config, "text_proxy_warmup_epochs", 10)}')
+    print(f'text_proxy_scale_start={getattr(config, "text_proxy_scale_start", 0.0)}')
+    print(f'text_proxy_scale_final={getattr(config, "text_proxy_scale_final", 0.1)}')
+    print(f'grad_clip={getattr(config, "grad_clip", 5.0)}')
+    print(f'wd={config.weight_decay} boundary_w={getattr(config, "boundary_loss_weight", 0.0)}')
+    if getattr(config, 'use_meddino', False) and getattr(config, 'use_lapa', False) and getattr(config, 'use_text_proxy', False) and float(getattr(config, 'train_pet_drop_prob', 0.0) or 0.0) > 0:
+        print('[Hint] text-proxy + MedDINO + LAPA + PET dropout is a hard setting.')
+        print('Recommended stable config:')
+        print('  --lr 2e-5 --mixed_precision false --batch_size 16 --accumulation_steps 1')
     if getattr(config, 'use_meddino', False) and getattr(config, 'use_lapa', False) and getattr(config, 'mixed_precision', False):
         print('[Hint] real MedDINO + LAPA may be numerically unstable in AMP mode.')
         print('Recommended first smoke run:')
@@ -208,11 +308,31 @@ def main():
     for epoch in range(1, config.epochs + 1):
         tloss, tseg, tboundary, tn = 0.0, 0.0, 0.0, 0
         grad_norm_sum, grad_norm_steps, grad_clip_count = 0.0, 0, 0
+        first_bad_module_counter = {k: 0 for k in ('enc_ct', 'enc_pet', 'lapa', 'text_controller', 'tppc', 'decoder', 'boundary_head')}
+        effective_train_pet_drop_prob = _curriculum_value(
+            epoch,
+            getattr(config, 'dropout_curriculum', True),
+            getattr(config, 'dropout_start_prob', 0.0),
+            getattr(config, 'dropout_final_prob', getattr(config, 'train_pet_drop_prob', 0.0)),
+            getattr(config, 'dropout_warmup_epochs', 10),
+        )
+        if not getattr(config, 'dropout_curriculum', True):
+            effective_train_pet_drop_prob = float(getattr(config, 'train_pet_drop_prob', 0.0) or 0.0)
+        effective_text_proxy_scale = _curriculum_value(
+            epoch,
+            True,
+            getattr(config, 'text_proxy_scale_start', 0.0),
+            getattr(config, 'text_proxy_scale', 0.1) if getattr(config, 'text_proxy_scale_final', None) is None else getattr(config, 'text_proxy_scale_final'),
+            getattr(config, 'text_proxy_warmup_epochs', 10),
+        )
+        _set_train_pet_drop_prob(train_loader, effective_train_pet_drop_prob)
+        _set_text_proxy_scale(task, effective_text_proxy_scale)
         model_for_epoch = _unwrap_model(task.networks.get('model'))
         if hasattr(model_for_epoch, 'set_epoch'):
             model_for_epoch.set_epoch(epoch)
         task.set_epoch(epoch)
         task.optimizer.zero_grad()
+        print(f'[Epoch {epoch}] effective_train_pet_drop_prob={effective_train_pet_drop_prob:.4f} effective_text_proxy_scale={effective_text_proxy_scale:.4f}')
 
         for i, batch in enumerate(train_loader):
             stepped = False
@@ -222,7 +342,7 @@ def main():
                     loss = loss / accum_iter
             except RuntimeError as exc:
                 if '[NaN/Inf]' in str(exc) or 'nan' in str(exc).lower() or 'inf' in str(exc).lower():
-                    print(f'[NaN Guard] skip epoch={epoch} batch={i + 1}/{spe}: {exc}')
+                    _print_nan_diagnostics(exc, task, batch, epoch, i, spe, task.optimizer.param_groups[0]['lr'])
                     task.optimizer.zero_grad(set_to_none=True)
                     continue
                 raise
@@ -230,28 +350,49 @@ def main():
             if task.scaler:
                 task.scaler.scale(loss).backward()
                 if (i + 1) % accum_iter == 0 or (i + 1) == spe:
+                    task.scaler.unscale_(task.optimizer)
+                    all_finite, total_norm = _grad_finite_and_norm(clip_params)
+                    if not all_finite:
+                        first_bad_module, module_status = _module_grad_status(model_for_epoch)
+                        if first_bad_module in first_bad_module_counter:
+                            first_bad_module_counter[first_bad_module] += 1
+                        print(f'[Grad Guard] epoch={epoch} batch={i + 1}/{spe}')
+                        print(f'[Grad Guard] first bad module: {first_bad_module or "unknown"}')
+                        print(f'[Grad Guard] module_grad_status={module_status}')
+                        task.optimizer.zero_grad(set_to_none=True)
+                        task.scaler.update()
+                        continue
+                    grad_norm_sum += float(total_norm)
+                    grad_norm_steps += 1
                     if grad_clip > 0:
-                        task.scaler.unscale_(task.optimizer)
-                        total_norm = torch.nn.utils.clip_grad_norm_(clip_params, float('inf'))
-                        grad_norm_sum += float(total_norm)
-                        grad_norm_steps += 1
-                        if float(total_norm) > float(grad_clip):
+                        if total_norm > grad_clip:
                             grad_clip_count += 1
                         torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
                     task.scaler.step(task.optimizer)
                     task.scaler.update()
-                    task.optimizer.zero_grad()
+                    task.optimizer.zero_grad(set_to_none=True)
                     stepped = True
             else:
                 loss.backward()
                 if (i + 1) % accum_iter == 0 or (i + 1) == spe:
+                    all_finite, total_norm = _grad_finite_and_norm(clip_params)
+                    if not all_finite:
+                        first_bad_module, module_status = _module_grad_status(model_for_epoch)
+                        if first_bad_module in first_bad_module_counter:
+                            first_bad_module_counter[first_bad_module] += 1
+                        print(f'[Grad Guard] epoch={epoch} batch={i + 1}/{spe}')
+                        print(f'[Grad Guard] first bad module: {first_bad_module or "unknown"}')
+                        print(f'[Grad Guard] module_grad_status={module_status}')
+                        task.optimizer.zero_grad(set_to_none=True)
+                        continue
+                    grad_norm_sum += float(total_norm)
+                    grad_norm_steps += 1
                     if grad_clip > 0:
-                        total_norm = torch.nn.utils.clip_grad_norm_(clip_params, float('inf'))
-                        grad_norm_sum += float(total_norm)
-                        grad_norm_steps += 1
+                        if total_norm > grad_clip:
+                            grad_clip_count += 1
                         torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
                     task.optimizer.step()
-                    task.optimizer.zero_grad()
+                    task.optimizer.zero_grad(set_to_none=True)
                     stepped = True
 
             if task.scheduler and stepped:
@@ -260,6 +401,11 @@ def main():
             step_loss = loss.item() * accum_iter
             step_seg = float(loss_dict.get('loss_seg', torch.tensor(0.0)).item())
             step_boundary = float(loss_dict.get('loss_boundary', torch.tensor(0.0)).item())
+            curr_lr = task.optimizer.param_groups[0]['lr']
+            if (not torch.isfinite(torch.tensor(step_loss))) or (not torch.isfinite(torch.tensor(step_seg))) or (not torch.isfinite(torch.tensor(step_boundary))):
+                _print_nan_diagnostics(RuntimeError('non-finite loss stats'), task, batch, epoch, i, spe, curr_lr, grad_norm=grad_norm_sum / max(grad_norm_steps, 1) if grad_norm_steps > 0 else None)
+                task.optimizer.zero_grad(set_to_none=True)
+                continue
             tloss += step_loss
             tseg += step_seg
             tboundary += step_boundary
@@ -321,8 +467,11 @@ def main():
             f'Epoch {epoch}\n'
             f'train_loss={tloss / max(tn, 1):.4f} train_seg={tseg / max(tn, 1):.4f} train_boundary={tboundary / max(tn, 1):.4f}\n'
             + '\n'.join(val_lines) + '\n'
-            f'{gate_text} train_pet_drop_prob={getattr(config, "train_pet_drop_prob", 0.0):.3f} eval_random_pet_drop_prob={getattr(config, "eval_random_pet_drop_prob", 0.0):.3f} '
-            f'lr={curr_lr:.6f} grad_norm={avg_grad_norm:.4f} grad_clipped_steps={grad_clip_count}/{grad_norm_steps} best_dice={best_dice:.4f} best_hd95={best_hd95:.2f} boundary_w={getattr(config, "boundary_loss_weight", 0.0):.3f}{gamma_text}'
+            f'{gate_text} train_pet_drop_prob={getattr(config, "train_pet_drop_prob", 0.0):.3f} effective_train_pet_drop_prob={effective_train_pet_drop_prob:.3f} '
+            f'effective_text_proxy_scale={effective_text_proxy_scale:.4f} eval_random_pet_drop_prob={getattr(config, "eval_random_pet_drop_prob", 0.0):.3f} '
+            f'lr={curr_lr:.6f} grad_norm={avg_grad_norm:.4f} grad_clipped_steps={grad_clip_count}/{grad_norm_steps} '
+            f'grad_guard_skipped_steps={sum(first_bad_module_counter.values())} first_bad_module_counter={first_bad_module_counter} '
+            f'best_dice={best_dice:.4f} best_hd95={best_hd95:.2f} boundary_w={getattr(config, "boundary_loss_weight", 0.0):.3f}{gamma_text}'
         )
 
         if getattr(config, 'vis_every_epoch', False):
