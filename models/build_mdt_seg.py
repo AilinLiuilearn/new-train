@@ -2,11 +2,7 @@ import os
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import timm
-
-from models.mpa_bioclip import MPABioCLIPSumFusion, get_bioclip_text_feature
-from models.mpa_bioclip_no_text import MPABioCLIPNoTextSumFusion
 
 try:
     from transformers import SegformerConfig, SegformerModel, ConvNextConfig, ConvNextModel
@@ -115,12 +111,14 @@ def _sanitize_state_dict(state_dict):
 
 def load_local_weights_safe(model, path, name='Encoder'):
     if not path:
-        print(f'[-] {name}: No pretrained path provided. Training from scratch.')
+        print(f'[-] {name}: pretrained path not provided; training from scratch')
         return
     if not os.path.exists(path):
-        print(f'[-] {name}: Path not found {path}. Training from scratch.')
+        print(f'[-] {name}: pretrained path not found: {path}; training from scratch')
         return
+    source_path = path
     if os.path.isdir(path):
+        print(f'[+] {name}: pretrained path is a directory: {path}')
         found = False
         for cand in ('pytorch_model.bin', 'model.safetensors',
                      'mit_b0.pth', 'mit_b0.bin', 'mit_b0.pt',
@@ -136,9 +134,12 @@ def load_local_weights_safe(model, path, name='Encoder'):
                 found = True
                 break
         if not found:
-            print(f'[-] {name}: No supported weight file found in {path}. Training from scratch.')
+            print(f'[-] {name}: no supported weight file found under {path}; training from scratch')
             return
-    print(f'[+] {name}: Loading local weights from {path}')
+        print(f'[+] {name}: resolved weight file {path}')
+    else:
+        print(f'[+] {name}: pretrained file {path}')
+    print(f'[+] {name}: loading local weights from {path}')
     if str(path).endswith('.safetensors'):
         from safetensors.torch import load_file
         state_dict = load_file(path, device='cpu')
@@ -175,11 +176,32 @@ def load_local_weights_safe(model, path, name='Encoder'):
             loadable[matched_key] = v
         else:
             skipped.append(k)
-    msg = model.load_state_dict(loadable, strict=False)
-    print(f'[+] {name} loaded params: {len(loadable)}, skipped: {len(skipped)}')
-    if skipped:
-        print(f'[+] {name} skipped examples: {skipped[:8]}')
-    print(f'[+] {name} load status: {msg}')
+    model_total = len(model_state)
+    ckpt_total = len(state_dict)
+    if loadable:
+        msg = model.load_state_dict(loadable, strict=False)
+        loaded_tensors = len(loadable)
+        loaded_elements = sum(v.numel() for v in loadable.values())
+        skipped_tensors = len(skipped)
+        skipped_elements = sum(v.numel() for k, v in state_dict.items() if k in skipped and torch.is_tensor(v))
+        print(f'[PRETRAIN] {name}: success=True')
+        print(f'[PRETRAIN] {name}: source={source_path}')
+        print(f'[PRETRAIN] {name}: weight_file={path}')
+        print(f'[PRETRAIN] {name}: checkpoint_tensors={ckpt_total}, model_tensors={model_total}')
+        print(f'[PRETRAIN] {name}: loaded_tensors={loaded_tensors}, loaded_elements={loaded_elements}')
+        print(f'[PRETRAIN] {name}: skipped_tensors={skipped_tensors}, skipped_elements={skipped_elements}')
+        print(f'[PRETRAIN] {name}: missing_after_load={len(msg.missing_keys)}, unexpected_after_load={len(msg.unexpected_keys)}')
+        if skipped:
+            print(f'[PRETRAIN] {name}: skipped_examples={skipped[:8]}')
+    else:
+        print(f'[PRETRAIN] {name}: success=False')
+        print(f'[PRETRAIN] {name}: source={source_path}')
+        print(f'[PRETRAIN] {name}: weight_file={path}')
+        print(f'[PRETRAIN] {name}: checkpoint_tensors={ckpt_total}, model_tensors={model_total}')
+        print(f'[PRETRAIN] {name}: loaded_tensors=0, skipped_tensors={len(skipped)}')
+        if skipped:
+            print(f'[PRETRAIN] {name}: skipped_examples={skipped[:8]}')
+        print(f'[-] {name}: no compatible tensors were loaded; training this encoder from scratch')
 
 
 def _normalize_backbone_name(backbone):
@@ -251,6 +273,7 @@ class SegformerFeatureBackbone(nn.Module):
         )
         self.model = SegformerModel(config)
         self.feature_info = SimpleFeatureInfo(config.hidden_sizes)
+        self._pretrained_path = None
 
     def forward(self, x):
         outputs = self.model(pixel_values=x, output_hidden_states=True, return_dict=True)
@@ -283,6 +306,7 @@ class ConvNextFeatureBackbone(nn.Module):
         )
         self.model = ConvNextModel(config)
         self.feature_info = SimpleFeatureInfo(config.hidden_sizes)
+        self._pretrained_path = None
 
     def forward(self, x):
         outputs = self.model(pixel_values=x, output_hidden_states=True, return_dict=True)
@@ -356,259 +380,206 @@ class ConvBNAct(nn.Module):
         return self.block(x)
 
 
-class LightConcatUNetDecoder(nn.Module):
-    def __init__(self, encoder_channels, out_channels=1, decoder_channels=(512, 256, 128, 64)):
-        super().__init__()
-        c1, c2, c3, c4 = encoder_channels
-        d4, d3, d2, d1 = decoder_channels
-        self.proj4 = ConvBNAct(c4, d4, kernel_size=1)
-        self.proj3 = ConvBNAct(c3, d3, kernel_size=1)
-        self.proj2 = ConvBNAct(c2, d2, kernel_size=1)
-        self.proj1 = ConvBNAct(c1, d1, kernel_size=1)
-        self.fuse3 = nn.Sequential(ConvBNAct(d4 + d3, d3), ConvBNAct(d3, d3))
-        self.fuse2 = nn.Sequential(ConvBNAct(d3 + d2, d2), ConvBNAct(d2, d2))
-        self.fuse1 = nn.Sequential(ConvBNAct(d2 + d1, d1), ConvBNAct(d1, d1))
-        self.head4 = nn.Conv2d(d4, out_channels, 1)
-        self.head3 = nn.Conv2d(d3, out_channels, 1)
-        self.head2 = nn.Conv2d(d2, out_channels, 1)
-        self.head1 = nn.Conv2d(d1, out_channels, 1)
-
-    @staticmethod
-    def _upsample_to(x, ref):
-        return F.interpolate(x, size=ref.shape[-2:], mode='bilinear', align_corners=False)
-
-    @staticmethod
-    def _upsample_size(x, size):
-        return F.interpolate(x, size=size, mode='bilinear', align_corners=False)
-
-    def forward(self, features, target_size):
-        x1, x2, x3, x4 = features
-        d4 = self.proj4(x4)
-        s3 = self.proj3(x3)
-        d3 = self.fuse3(torch.cat([self._upsample_to(d4, s3), s3], dim=1))
-        s2 = self.proj2(x2)
-        d2 = self.fuse2(torch.cat([self._upsample_to(d3, s2), s2], dim=1))
-        s1 = self.proj1(x1)
-        d1 = self.fuse1(torch.cat([self._upsample_to(d2, s1), s1], dim=1))
-        p1 = self._upsample_size(self.head1(d1), target_size)
-        p2 = self._upsample_size(self.head2(d2), target_size)
-        p3 = self._upsample_size(self.head3(d3), target_size)
-        p4 = self._upsample_size(self.head4(d4), target_size)
-        return {'preds': [p1, p2, p3, p4], 'pred': p1}
+from models.simmlm_dmome_fusion import (
+    DEFAULT_HYBRID_CONCAT_STAGES,
+    DEFAULT_HYBRID_DMOME_STAGES,
+    DEFAULT_PRIOR_GATE_STAGES,
+    VALID_PRIOR_GATE_STAGES,
+)
 
 
-class AdditiveProjectionFusion(nn.Module):
-    def __init__(self, ct_channels, pet_channels, out_channels):
-        super().__init__()
-        if not (len(ct_channels) == len(pet_channels) == len(out_channels)):
-            raise ValueError('ct_channels, pet_channels and out_channels must have the same length.')
-        self.ct_proj = nn.ModuleList([ConvBNAct(cin, cout, kernel_size=1) for cin, cout in zip(ct_channels, out_channels)])
-        self.pet_proj = nn.ModuleList([ConvBNAct(cin, cout, kernel_size=1) for cin, cout in zip(pet_channels, out_channels)])
-
-    def forward(self, ct_feats, pet_feats):
-        fused = []
-        for ct_proj, pet_proj, ct_feat, pet_feat in zip(self.ct_proj, self.pet_proj, ct_feats, pet_feats):
-            ct_aligned = ct_proj(ct_feat)
-            pet_aligned = pet_proj(pet_feat)
-            if pet_aligned.shape[-2:] != ct_aligned.shape[-2:]:
-                pet_aligned = F.interpolate(pet_aligned, size=ct_aligned.shape[-2:], mode='bilinear', align_corners=False)
-            fused.append(ct_aligned + pet_aligned)
-        return fused
+def _parse_stage_list(stages, default, name):
+    if isinstance(stages, str):
+        stages = tuple(int(x.strip()) for x in stages.split(',') if x.strip())
+    else:
+        stages = tuple(int(s) for s in (stages or default))
+    invalid = [s for s in stages if s not in VALID_PRIOR_GATE_STAGES]
+    if invalid:
+        raise ValueError(
+            f'Invalid {name}={stages}. '
+            f'Use comma-separated indices from {sorted(VALID_PRIOR_GATE_STAGES)}.'
+        )
+    return stages
 
 
-class HeterogeneousDualBackboneUNet(nn.Module):
-    def __init__(self, ct_backbone='convnext_tiny', pet_backbone='mit_b0',
-                 ct_pretrained_path=None, pet_pretrained_path=None,
-                 in_channels=3, out_channels=1, decoder_type='light', fusion_channels=None,
-                 fusion_type='mpa_bioclip_sum', bioclip_model_path=None,
-                 bioclip_text_tower_path='/root/autodl-tmp/mkd-main/new-train/pretrained/biomedbert_text_tower',
-                 bioclip_text='focal abnormal metabolic lung lesion on PET-CT scan'):
-        super().__init__()
-        ct_backbone = _normalize_backbone_name(ct_backbone)
-        pet_backbone = _normalize_backbone_name(pet_backbone)
-        self.backbone = f'{ct_backbone}+{pet_backbone}'
-        self.ct_backbone = ct_backbone
-        self.pet_backbone = pet_backbone
-        self.decoder_type = decoder_type
-        self.fusion_type = fusion_type
-        self.use_tcpm = False
-        self.use_adc_mac = False
-
-        self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
-        self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
-        if ct_pretrained_path:
-            load_local_weights_safe(self.enc_ct, ct_pretrained_path, name='Teacher_CT_ConvNeXt_Encoder')
-        if pet_pretrained_path:
-            load_local_weights_safe(self.enc_pet, pet_pretrained_path, name='Teacher_PET_MiT_Encoder')
-
-        ct_channels = self.enc_ct.feature_info.channels()
-        pet_channels = self.enc_pet.feature_info.channels()
-        if fusion_channels is None:
-            fusion_channels = pet_channels
-        fusion_channels = tuple(int(ch) for ch in fusion_channels)
-
-        if fusion_type == 'project_sum':
-            self.fusion = AdditiveProjectionFusion(ct_channels, pet_channels, fusion_channels)
-        elif fusion_type in ('mpa_bioclip_sum', 'bcg_pa_sum'):
-            if not bioclip_model_path:
-                raise ValueError('fusion_type=mpa_bioclip_sum/bcg_pa_sum requires --bioclip_model_path.')
-            print(f'[+] MPA-BioCLIP/BCG-PA: Encoding text prompt from {bioclip_model_path}')
-            print(f'[+] MPA-BioCLIP/BCG-PA: Using local text tower {bioclip_text_tower_path}')
-            text_feat = get_bioclip_text_feature(
-                bioclip_model_path,
-                bioclip_text,
-                text_tower_path=bioclip_text_tower_path,
-            )
-            print(f'[+] BCG-PA text feature shape: {tuple(text_feat.shape)}')
-            self.fusion = MPABioCLIPSumFusion(ct_channels, pet_channels, fusion_channels, text_feat)
-        elif fusion_type == 'mpa_bioclip_no_text_sum':
-            print('[+] MPA-BioCLIP-NoText: using visual-only ablation (no text prompt injection)')
-            self.fusion = MPABioCLIPNoTextSumFusion(ct_channels, pet_channels, fusion_channels)
-        else:
-            raise ValueError(
-                f'Unsupported fusion_type: {fusion_type}. '
-                'Supported for hetero_convnext_mit: project_sum, mpa_bioclip_sum, bcg_pa_sum, mpa_bioclip_no_text_sum.'
-            )
-
-        if decoder_type != 'light':
-            raise ValueError(f'Unsupported decoder_type: {decoder_type}. The cleaned hetero model only supports light.')
-        self.decoder = LightConcatUNetDecoder(fusion_channels, out_channels=out_channels)
-
-    @staticmethod
-    def _to_3ch(x):
-        if x.shape[1] == 1:
-            return x.repeat(1, 3, 1, 1)
-        return x
-
-    def forward(self, ct, pet, target_size=None):
-        ct = self._to_3ch(ct)
-        pet = self._to_3ch(pet)
-        ct_feats = self.enc_ct(ct)
-        pet_feats = self.enc_pet(pet)
-        if len(ct_feats) != 4 or len(pet_feats) != 4:
-            raise ValueError(f'Heterogeneous encoders must output 4 stages, got CT={len(ct_feats)} PET={len(pet_feats)}')
-        fused_feats = self.fusion(ct_feats, pet_feats)
-        if len(fused_feats) != 4:
-            raise ValueError(f'Heterogeneous fusion must output 4 stages, got {len(fused_feats)}')
-        if target_size is None:
-            target_size = ct.shape[-2:]
-        return self.decoder(fused_feats, target_size)
-
-    def set_epoch(self, epoch):
-        return None
-
-    def set_adc_mac_visuals(self, enabled):
-        if self.fusion is not None and hasattr(self.fusion, 'set_visuals'):
-            self.fusion.set_visuals(bool(enabled))
-
-    def get_adc_mac_visuals(self):
-        return {}
-
-    def get_fusion_visuals(self):
-        if self.fusion is not None and hasattr(self.fusion, 'get_fusion_visuals'):
-            return self.fusion.get_fusion_visuals()
-        return {}
+def _parse_prior_gate_stages(config):
+    stages = getattr(config, 'prior_gate_stages', DEFAULT_PRIOR_GATE_STAGES)
+    if isinstance(stages, str) and stages.strip().lower() in ('all', '1,2,3,4', '1-4'):
+        return DEFAULT_PRIOR_GATE_STAGES
+    return _parse_stage_list(stages, DEFAULT_PRIOR_GATE_STAGES, 'prior_gate_stages')
 
 
-class DualBackboneUNet(nn.Module):
-    def __init__(self, backbone='pvt_v2_b1', pretrained_path=None,
-                 in_channels=3, out_channels=1, use_tcpm=False, decoder_type='light',
-                 fusion_type='sum', use_adc_mac=False):
-        super().__init__()
-        backbone = _normalize_backbone_name(backbone)
-        self.backbone = backbone
-        self.use_tcpm = False
-        self.decoder_type = decoder_type
-        self.use_adc_mac = False
-        self.enc_ct = create_feature_backbone(backbone, in_channels=in_channels)
-        self.enc_pet = create_feature_backbone(backbone, in_channels=in_channels)
-        if pretrained_path:
-            load_local_weights_safe(self.enc_ct, pretrained_path, name='Teacher_CT_Encoder')
-            load_local_weights_safe(self.enc_pet, pretrained_path, name='Teacher_PET_Encoder')
-        enc_channels = self.enc_ct.feature_info.channels()
-        if decoder_type != 'light':
-            raise ValueError(f'Unsupported decoder_type: {decoder_type}. The cleaned dual baseline only supports light.')
-        self.decoder = LightConcatUNetDecoder(enc_channels, out_channels=out_channels)
-        self.fusion_type = fusion_type
-        if fusion_type not in ('sum', 'auto'):
-            raise ValueError(f'Unsupported fusion_type for cleaned dual baseline: {fusion_type}. Supported: sum, auto.')
+def _parse_hybrid_concat_stages(config):
+    return _parse_stage_list(
+        getattr(config, 'hybrid_concat_stages', DEFAULT_HYBRID_CONCAT_STAGES),
+        DEFAULT_HYBRID_CONCAT_STAGES,
+        'hybrid_concat_stages',
+    )
 
-    @staticmethod
-    def _to_3ch(x):
-        if x.shape[1] == 1:
-            return x.repeat(1, 3, 1, 1)
-        return x
 
-    def forward(self, ct, pet, target_size=None):
-        ct = self._to_3ch(ct)
-        pet = self._to_3ch(pet)
-        ct_feats = self.enc_ct(ct)
-        pet_feats = self.enc_pet(pet)
-        fused_feats = [c + p for c, p in zip(ct_feats, pet_feats)]
-        if target_size is None:
-            target_size = ct.shape[-2:]
-        return self.decoder(fused_feats, target_size)
+def _parse_hybrid_dmome_stages(config):
+    return _parse_stage_list(
+        getattr(config, 'hybrid_dmome_stages', DEFAULT_HYBRID_DMOME_STAGES),
+        DEFAULT_HYBRID_DMOME_STAGES,
+        'hybrid_dmome_stages',
+    )
 
-    def set_epoch(self, epoch):
-        return None
 
-    def set_adc_mac_visuals(self, enabled):
-        return None
-
-    def get_adc_mac_visuals(self):
-        return {}
-
-    def get_fusion_visuals(self):
-        return {}
+def _resolve_use_channel_prior_gate(config):
+    fusion_type = getattr(config, 'fusion_type', 'concat_conv')
+    if fusion_type == 'dmome_channel_prior_gate':
+        return True
+    if fusion_type == 'dmome_prior_gate':
+        raise ValueError(
+            'fusion_type=dmome_prior_gate (spatial mask) is removed. '
+            'Use fusion_type=dmome_channel_prior_gate instead.'
+        )
+    return bool(getattr(config, 'use_channel_prior_gate', False))
 
 
 def build_mdt_seg_teacher(config):
-    model_arch = getattr(config, 'model_arch', 'dual')
-    if model_arch == 'pamc_text_proxy':
-        from models.pamc_text_proxy_unet import PAMCTextProxyUNet
-        model = PAMCTextProxyUNet(
+    model_arch = getattr(config, 'model_arch', 'petct_baseline')
+    if model_arch == 'a1_pet_prompt_ct':
+        from models.pet_prompted_ct_decoder import PETPromptedCTSegmentation
+        model = PETPromptedCTSegmentation(
             ct_backbone=getattr(config, 'ct_backbone', 'convnext_tiny'),
-            pet_backbone=getattr(config, 'pet_backbone', 'mit_b0'),
             ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
-            pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
-            decoder_type=getattr(config, 'decoder_type', 'light'),
-            text_embed_dim=getattr(config, 'text_embed_dim', 256),
-            in_channels=3,
+            dinov3_model_name=getattr(config, 'dinov3_model_name', 'vit_small_patch16_dinov3'),
+            dinov3_pretrained_path=getattr(config, 'dinov3_pretrained_path', None),
             out_channels=1,
-            use_meddino=getattr(config, 'use_meddino', True),
-            meddino_ckpt=getattr(config, 'meddino_ckpt', None),
-            use_lapa=getattr(config, 'use_lapa', True),
-            use_text_proxy=getattr(config, 'use_text_proxy', False),
-            text_in_full_mode=getattr(config, 'text_in_full_mode', False),
-            full_text_weight=getattr(config, 'full_text_weight', 0.0),
-            lapa_norm=getattr(config, 'lapa_norm', 'gn'),
-            text_proxy_scale=getattr(config, 'text_proxy_scale', 0.1),
+            use_deep_supervision=_resolve_use_deep_supervision(config),
+            pet_prompt_base_channels=getattr(config, 'pet_prompt_base_channels', 256),
+        )
+        print(
+            f'[A1] PET-Prompted CT Decoder: ct_backbone={getattr(config, "ct_backbone", "convnext_tiny")} '
+            f'dinov3={getattr(config, "dinov3_model_name", "vit_small_patch16_dinov3")} '
+            f'deep_supervision={_resolve_use_deep_supervision(config)}'
         )
         return dict(model=model)
-
-    if model_arch == 'hetero_convnext_mit':
-        model = HeterogeneousDualBackboneUNet(
+    if model_arch == 'ct_lap_hgl':
+        from models.ct_lap_hgl_seg import CTLapHGLSegmentation
+        pet_channels = getattr(config, 'pet_prior_channels', [64, 128, 256, 512])
+        if isinstance(pet_channels, str):
+            pet_channels = tuple(int(x) for x in pet_channels.split(','))
+        else:
+            pet_channels = tuple(int(x) for x in pet_channels)
+        model = CTLapHGLSegmentation(
             ct_backbone=getattr(config, 'ct_backbone', 'convnext_tiny'),
-            pet_backbone=getattr(config, 'pet_backbone', 'mit_b0'),
             ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
-            pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
             in_channels=3,
             out_channels=1,
-            decoder_type=getattr(config, 'decoder_type', 'light'),
-            fusion_channels=getattr(config, 'fusion_channels', None),
-            fusion_type=getattr(config, 'fusion_type', 'mpa_bioclip_sum'),
-            bioclip_model_path=getattr(config, 'bioclip_model_path', None),
-            bioclip_text_tower_path=getattr(config, 'bioclip_text_tower_path', '/root/autodl-tmp/mkd-main/new-train/pretrained/biomedbert_text_tower'),
-            bioclip_text=getattr(config, 'bioclip_text', 'focal abnormal metabolic lung lesion on PET-CT scan'),
+            use_deep_supervision=_resolve_use_deep_supervision(config),
+            pet_prior_type=getattr(config, 'pet_prior_type', 'lap_hgl'),
+            pet_prior_size=getattr(config, 'pet_prior_size', 'lite'),
+            pet_prior_c4_channels=getattr(config, 'pet_prior_c4_channels', 512),
+            pet_prior_mid_channels=getattr(config, 'pet_prior_mid_channels', 32),
+            pet_channels=pet_channels,
+            pet_fuse_mid_channels=getattr(config, 'pet_fuse_mid_channels', 128),
+            pet_gn_groups=getattr(config, 'pet_gn_groups', 8),
+        )
+        print(
+            f'[ct_lap_hgl] ct_backbone={getattr(config, "ct_backbone", "convnext_tiny")} '
+            f'pet_prior_type={getattr(config, "pet_prior_type", "lap_hgl")} '
+            f'pet_prior_size={getattr(config, "pet_prior_size", "lite")} '
+            f'deep_supervision={_resolve_use_deep_supervision(config)}'
         )
         return dict(model=model)
-
-    model = DualBackboneUNet(
-        backbone=getattr(config, 'backbone', 'pvt_v2_b1'),
-        pretrained_path=getattr(config, 'pretrained_path', None),
+    if model_arch == 'pet_mrp_gsa':
+        from models.ct_pet_mrp_gsa_seg import CTPETMRPGSASegmentation, parse_pet_mrp_stages
+        use_pet_mrp_gsa = bool(getattr(config, 'use_pet_mrp_gsa', True))
+        pet_mrp_stages = getattr(config, 'pet_mrp_stages', 'all')
+        model = CTPETMRPGSASegmentation(
+            ct_backbone=getattr(config, 'ct_backbone', 'convnext_tiny'),
+            ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
+            in_channels=3,
+            out_channels=1,
+            use_deep_supervision=_resolve_use_deep_supervision(config),
+            use_pet_mrp_gsa=use_pet_mrp_gsa,
+            pet_mrp_stages=pet_mrp_stages,
+        )
+        active = parse_pet_mrp_stages(pet_mrp_stages if use_pet_mrp_gsa else 'none')
+        print(
+            f'[pet_mrp_gsa] ct_backbone={getattr(config, "ct_backbone", "convnext_tiny")} '
+            f'use_pet_mrp_gsa={use_pet_mrp_gsa} pet_mrp_stages={pet_mrp_stages} '
+            f'active_stage_indices={active} deep_supervision={_resolve_use_deep_supervision(config)}'
+        )
+        return dict(model=model)
+    if model_arch == 'mafd_net':
+        from models.mafd_net import MAFDNet
+        model = MAFDNet(
+            img_channels=3,
+            num_classes=1,
+            encoder_name=getattr(config, 'encoder_name', getattr(config, 'ct_backbone', 'mit_b1')),
+            pretrained=getattr(config, 'pretrained', True),
+            freq_method=getattr(config, 'freq_method', 'fft'),
+            use_pet_proxy=getattr(config, 'use_pet_proxy', True),
+            proxy_loss_weight=getattr(config, 'proxy_loss_weight', 0.05),
+            consistency_loss_weight=getattr(config, 'consistency_loss_weight', 0.0),
+            ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
+            pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
+            use_deep_supervision=_resolve_use_deep_supervision(config),
+        )
+        print(
+            f'[MAFDNet] encoder={getattr(config, "encoder_name", getattr(config, "ct_backbone", "mit_b1"))} '
+            f'freq_method={getattr(config, "freq_method", "fft")} '
+            f'use_pet_proxy={getattr(config, "use_pet_proxy", True)} '
+            f'proxy_loss_weight={getattr(config, "proxy_loss_weight", 0.05)}'
+        )
+        return dict(model=model)
+    if model_arch != 'petct_baseline':
+        raise ValueError(
+            f'Unsupported model_arch={model_arch}. '
+            'Use petct_baseline, mafd_net, a1_pet_prompt_ct, ct_lap_hgl, or pet_mrp_gsa.'
+        )
+    from models.baseline_petct_unet import PETCTBaselineUNet
+    use_channel_prior_gate = _resolve_use_channel_prior_gate(config)
+    fusion_type = getattr(config, 'fusion_type', 'concat_conv')
+    hybrid_concat_stages = _parse_hybrid_concat_stages(config)
+    hybrid_dmome_stages = _parse_hybrid_dmome_stages(config)
+    model = PETCTBaselineUNet(
+        ct_backbone=getattr(config, 'ct_backbone', 'mit_b1'),
+        pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
+        ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
+        pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
         in_channels=3,
         out_channels=1,
-        decoder_type=getattr(config, 'decoder_type', 'light'),
-        fusion_type=getattr(config, 'fusion_type', 'sum'),
+        fusion_type=fusion_type,
+        dmome_expert_reduction=getattr(config, 'dmome_expert_reduction', 4),
+        dmome_use_status_token=getattr(config, 'dmome_use_status_token', True),
+        dmome_temperature=getattr(config, 'dmome_temperature', 1.0),
+        dmome_init_ct_bias=getattr(config, 'dmome_init_ct_bias', 0.0),
+        dmome_output_proj=getattr(config, 'dmome_output_proj', False),
+        dmome_norm_groups=getattr(config, 'dmome_norm_groups', 8),
+        use_channel_prior_gate=use_channel_prior_gate,
+        prior_gate_stages=_parse_prior_gate_stages(config),
+        hybrid_concat_stages=hybrid_concat_stages,
+        hybrid_dmome_stages=hybrid_dmome_stages,
+        use_deep_supervision=_resolve_use_deep_supervision(config),
     )
+    if fusion_type == 'hybrid_concat_dmome':
+        print(
+            f'[hybrid_fusion] concat_conv stages={hybrid_concat_stages}; '
+            f'plain DMoME stages={hybrid_dmome_stages} (no text prior)'
+        )
+    if use_channel_prior_gate:
+        from models.biomedclip_text_encoder import encode_modality_prior_texts
+        model_dir = getattr(
+            config,
+            'biomedclip_model_path',
+            '/root/autodl-tmp/mkd-main/new-train/pretrained/biomedclip_model',
+        )
+        print(f'[channel_prior_gate] Encoding modality prior texts with BioMedCLIP from {model_dir}')
+        text_embeds = encode_modality_prior_texts(model_dir=model_dir, device='cpu')
+        model.set_modality_prior_text_embeds(text_embeds)
+        prior_stages = _parse_prior_gate_stages(config)
+        print(
+            f'[channel_prior_gate] Cached modality text embeds: shape={tuple(text_embeds.shape)}; '
+            f'stages={prior_stages}; channel residual prior (alpha_max=0.20, init≈0.02)'
+        )
     return dict(model=model)
+
+
+def _resolve_use_deep_supervision(config):
+    if getattr(config, 'use_deep_supervision', False):
+        return True
+    return bool(getattr(config, 'deep_supervision', False))

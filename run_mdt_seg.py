@@ -13,7 +13,7 @@ import torch
 
 from configs.seg_mdt import SegMDTConfig
 from models.build_mdt_seg import build_mdt_seg_teacher
-from tasks.mdt_seg import MDTSegTeacher
+from tasks.mdt_seg import MDTSegTeacher, _use_deep_supervision
 from utils.model_profile import print_baseline_profile
 from utils.optimization import get_cosine_scheduler
 from utils.train_logger import append_epoch_log, init_train_log
@@ -67,7 +67,7 @@ def _prepare_env(config):
 
 def _build_loaders(config):
     dataset_mod = _load_dataset_module()
-    if getattr(config, 'use_textproxy_loader', False):
+    if getattr(config, 'use_aligned_loader', False):
         return dataset_mod.get_pclt20k_loaders_textproxy_aligned(
             config.root,
             config.image_size_2d,
@@ -80,7 +80,7 @@ def _build_loaders(config):
             train_list=getattr(config, 'train_list', 'train_orgian.txt'),
             val_list=getattr(config, 'val_list', 'test.txt'),
             test_list=getattr(config, 'test_list', 'test.txt'),
-            pet_drop_prob=getattr(config, 'train_pet_drop_prob', None) if getattr(config, 'train_pet_drop_prob', None) is not None else getattr(config, 'pet_drop_prob', 0.4),
+            pet_drop_prob=getattr(config, 'train_pet_drop_prob', 0.0),
         )
     if getattr(config, 'cipa_aligned', False):
         return dataset_mod.get_pclt20k_loaders_cipa_aligned(
@@ -134,6 +134,46 @@ def _collect_adc_gamma(task):
     return gammas
 
 
+def _deep_supervision_log_headers(config):
+    if not _use_deep_supervision(config):
+        return []
+    return [
+        'use_deep_supervision',
+        'loss_main',
+        'loss_aux_d2',
+        'loss_aux_d3',
+        'loss_aux_d4',
+        'ds_weight_main',
+        'ds_weight_d2',
+        'ds_weight_d3',
+        'ds_weight_d4',
+    ]
+
+
+_DEEP_SUPERVISION_LOG_KEYS = [
+    'use_deep_supervision',
+    'loss_main',
+    'loss_aux_d2',
+    'loss_aux_d3',
+    'loss_aux_d4',
+    'ds_weight_main',
+    'ds_weight_d2',
+    'ds_weight_d3',
+    'ds_weight_d4',
+]
+
+
+def _collect_deep_supervision_metrics(loss_dict):
+    metrics = {}
+    for key in _DEEP_SUPERVISION_LOG_KEYS:
+        val = loss_dict.get(key)
+        if torch.is_tensor(val):
+            metrics[key] = float(val.detach().cpu())
+        elif val is not None:
+            metrics[key] = float(val)
+    return metrics
+
+
 def _adc_gamma_headers(config):
     if not getattr(config, 'use_adc_mac', False):
         return []
@@ -155,7 +195,7 @@ def _grad_finite_and_norm(trainable_params):
 
 
 def _module_grad_status(model):
-    module_names = ('enc_ct', 'enc_pet', 'lapa', 'text_controller', 'tppc', 'decoder', 'boundary_head')
+    module_names = ('enc_ct', 'enc_pet', 'pet_proj', 'decoder', 'boundary_head')
     status = {}
     first_bad = None
     for name in module_names:
@@ -204,14 +244,6 @@ def _set_train_pet_drop_prob(train_loader, prob):
         dataset.pet_drop_prob = float(prob)
 
 
-def _set_text_proxy_scale(task, scale):
-    model = _unwrap_model(task.networks.get('model'))
-    if hasattr(model, 'set_text_proxy_scale'):
-        model.set_text_proxy_scale(scale)
-    elif hasattr(model, 'fusion') and hasattr(model.fusion, 'text_proxy_scale'):
-        model.fusion.text_proxy_scale = float(scale)
-
-
 def _print_nan_diagnostics(exc, task, batch, epoch, batch_idx, spe, lr, grad_norm=None):
     print(f'[NaN Guard] module_hit={exc} epoch={epoch} batch={batch_idx + 1}/{spe} lr={lr:.8g} grad_norm={grad_norm if grad_norm is not None else "NA"}')
     if 'ct_feats[0]' in str(exc):
@@ -234,6 +266,11 @@ def main():
 
     config = SegMDTConfig.parse_arguments()
     config.task = 'MDT_Teacher'
+    if getattr(config, 'model_arch', '') == 'pet_mrp_gsa':
+        config.eval_full_pet = True
+        config.eval_fixed_missing_pet = False
+        config.eval_random_missing_pet = False
+        print('[pet_mrp_gsa] validation restricted to full PET only')
     g0 = _prepare_env(config)
 
     print(f'GPU={g0}')
@@ -242,37 +279,30 @@ def main():
     print(f'ct_backbone={getattr(config, "ct_backbone", None)}')
     print(f'pet_backbone={getattr(config, "pet_backbone", None)}')
     print(f'fusion_type={getattr(config, "fusion_type", None)}')
-    print(f'use_meddino={getattr(config, "use_meddino", False)}')
-    print(f'use_lapa={getattr(config, "use_lapa", False)}')
-    print(f'use_text_proxy={getattr(config, "use_text_proxy", False)}')
-    print(f'text_in_full_mode={getattr(config, "text_in_full_mode", False)}')
+    if getattr(config, 'fusion_type', '') == 'hybrid_concat_dmome':
+        print(f'hybrid_concat_stages={getattr(config, "hybrid_concat_stages", None)}')
+        print(f'hybrid_dmome_stages={getattr(config, "hybrid_dmome_stages", None)}')
+    if getattr(config, 'fusion_type', '') == 'dmome_channel_prior_gate' or getattr(config, 'use_channel_prior_gate', False):
+        print(f'prior_gate_stages={getattr(config, "prior_gate_stages", None)}')
+    if getattr(config, 'model_arch', '') == 'pet_mrp_gsa':
+        print(f'use_pet_mrp_gsa={getattr(config, "use_pet_mrp_gsa", True)}')
+        print(f'pet_mrp_stages={getattr(config, "pet_mrp_stages", "all")}')
+    if getattr(config, 'model_arch', '') == 'mafd_net':
+        print(f'freq_method={getattr(config, "freq_method", "fft")}')
+        print(f'use_pet_proxy={getattr(config, "use_pet_proxy", True)}')
+        print(f'proxy_loss_weight={getattr(config, "proxy_loss_weight", 0.05)}')
+    print(f'use_deep_supervision={_use_deep_supervision(config)}')
+    print(f'train_pet_drop_prob={getattr(config, "train_pet_drop_prob", 0.0)}')
+    print(f'eval_full_pet={getattr(config, "eval_full_pet", True)} eval_fixed_missing_pet={getattr(config, "eval_fixed_missing_pet", False)} eval_random_missing_pet={getattr(config, "eval_random_missing_pet", False)}')
     print(f'aug_mode={getattr(config, "aug_mode", None)}')
     print(f'norm_mode={getattr(config, "norm_mode", None)}')
     print(f'image_size_2d={config.image_size_2d}')
     print(f'batch_size={config.batch_size}')
     print(f'accumulation_steps={config.accumulation_steps}')
     print(f'mixed_precision={config.mixed_precision}')
-    print(f'train_pet_drop_prob={getattr(config, "train_pet_drop_prob", None)}')
-    print(f'dropout_curriculum={getattr(config, "dropout_curriculum", True)}')
-    print(f'dropout_warmup_epochs={getattr(config, "dropout_warmup_epochs", 10)}')
-    print(f'dropout_start_prob={getattr(config, "dropout_start_prob", 0.0)}')
-    print(f'dropout_final_prob={getattr(config, "dropout_final_prob", 0.4)}')
     print(f'lr={config.learning_rate}')
-    print(f'text_proxy_scale={getattr(config, "text_proxy_scale", 0.1)}')
-    print(f'text_proxy_warmup_epochs={getattr(config, "text_proxy_warmup_epochs", 10)}')
-    print(f'text_proxy_scale_start={getattr(config, "text_proxy_scale_start", 0.0)}')
-    print(f'text_proxy_scale_final={getattr(config, "text_proxy_scale_final", 0.1)}')
     print(f'grad_clip={getattr(config, "grad_clip", 5.0)}')
     print(f'wd={config.weight_decay} boundary_w={getattr(config, "boundary_loss_weight", 0.0)}')
-    if getattr(config, 'use_meddino', False) and getattr(config, 'use_lapa', False) and getattr(config, 'use_text_proxy', False) and float(getattr(config, 'train_pet_drop_prob', 0.0) or 0.0) > 0:
-        print('[Hint] text-proxy + MedDINO + LAPA + PET dropout is a hard setting.')
-        print('Recommended stable config:')
-        print('  --lr 2e-5 --mixed_precision false --batch_size 16 --accumulation_steps 1')
-    if getattr(config, 'use_meddino', False) and getattr(config, 'use_lapa', False) and getattr(config, 'mixed_precision', False):
-        print('[Hint] real MedDINO + LAPA may be numerically unstable in AMP mode.')
-        print('Recommended first smoke run:')
-        print('  --mixed_precision false --batch_size 2 --train_pet_drop_prob 0.0')
-
     _save_config(config)
     train_loader, val_loader, test_loader = _build_loaders(config)
 
@@ -296,10 +326,11 @@ def main():
 
     log_path = os.path.join(config.checkpoint_dir, 'train_log.csv')
     gamma_headers = _adc_gamma_headers(config)
-    init_train_log(log_path, extra_headers=gamma_headers)
+    ds_headers = _deep_supervision_log_headers(config)
+    init_train_log(log_path, extra_headers=gamma_headers + ds_headers)
 
     grad_clip = getattr(config, 'grad_clip', 5.0)
-    clip_params = [p for net in task.networks.values() for p in net.parameters() if p.requires_grad]
+    clip_params = task.trainable_parameters()
     best_dice, best_dice_epoch = -1.0, 0
     best_hd95, best_hd95_epoch = float('inf'), 0
     no_improve = 0
@@ -307,32 +338,18 @@ def main():
 
     for epoch in range(1, config.epochs + 1):
         tloss, tseg, tboundary, tn = 0.0, 0.0, 0.0, 0
+        ds_metric_sum = {k: 0.0 for k in _deep_supervision_log_headers(config)}
+        ds_metric_steps = 0
         grad_norm_sum, grad_norm_steps, grad_clip_count = 0.0, 0, 0
-        first_bad_module_counter = {k: 0 for k in ('enc_ct', 'enc_pet', 'lapa', 'text_controller', 'tppc', 'decoder', 'boundary_head')}
-        effective_train_pet_drop_prob = _curriculum_value(
-            epoch,
-            getattr(config, 'dropout_curriculum', True),
-            getattr(config, 'dropout_start_prob', 0.0),
-            getattr(config, 'dropout_final_prob', getattr(config, 'train_pet_drop_prob', 0.0)),
-            getattr(config, 'dropout_warmup_epochs', 10),
-        )
-        if not getattr(config, 'dropout_curriculum', True):
-            effective_train_pet_drop_prob = float(getattr(config, 'train_pet_drop_prob', 0.0) or 0.0)
-        effective_text_proxy_scale = _curriculum_value(
-            epoch,
-            True,
-            getattr(config, 'text_proxy_scale_start', 0.0),
-            getattr(config, 'text_proxy_scale', 0.1) if getattr(config, 'text_proxy_scale_final', None) is None else getattr(config, 'text_proxy_scale_final'),
-            getattr(config, 'text_proxy_warmup_epochs', 10),
-        )
-        _set_train_pet_drop_prob(train_loader, effective_train_pet_drop_prob)
-        _set_text_proxy_scale(task, effective_text_proxy_scale)
+        first_bad_module_counter = {k: 0 for k in ('enc_ct', 'enc_pet', 'pet_proj', 'decoder', 'boundary_head')}
+        train_pet_drop_prob = float(getattr(config, 'train_pet_drop_prob', 0.0))
+        _set_train_pet_drop_prob(train_loader, train_pet_drop_prob)
         model_for_epoch = _unwrap_model(task.networks.get('model'))
         if hasattr(model_for_epoch, 'set_epoch'):
             model_for_epoch.set_epoch(epoch)
         task.set_epoch(epoch)
         task.optimizer.zero_grad()
-        print(f'[Epoch {epoch}] effective_train_pet_drop_prob={effective_train_pet_drop_prob:.4f} effective_text_proxy_scale={effective_text_proxy_scale:.4f}')
+        print(f'[Epoch {epoch}] train PET dropout prob={train_pet_drop_prob:.3f}')
 
         for i, batch in enumerate(train_loader):
             stepped = False
@@ -410,6 +427,12 @@ def main():
             tseg += step_seg
             tboundary += step_boundary
             tn += 1
+            if ds_metric_sum:
+                batch_ds = _collect_deep_supervision_metrics(loss_dict)
+                for key in ds_metric_sum:
+                    if key in batch_ds:
+                        ds_metric_sum[key] += batch_ds[key]
+                ds_metric_steps += 1
             if (i + 1) % 50 == 0:
                 curr_lr = task.optimizer.param_groups[0]['lr']
                 print(
@@ -424,25 +447,26 @@ def main():
         val_results = {}
         if getattr(config, 'eval_full_pet', True):
             val_results['full'] = task.evaluate(val_loader, eval_mode='full', tag='val_full')
-        if getattr(config, 'eval_fixed_missing_pet', True):
+        if getattr(config, 'eval_fixed_missing_pet', False):
             val_results['fixed_missing'] = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_fixed_missing')
-        if getattr(config, 'eval_random_missing_pet', True):
+        if getattr(config, 'eval_random_missing_pet', False):
             val_results['random_missing'] = task.evaluate(
                 val_loader,
                 eval_mode='random_missing',
                 random_pet_drop_prob=getattr(config, 'eval_random_pet_drop_prob', 0.4),
-                random_seed=getattr(config, 'eval_random_missing_seed', 2026),
+                random_seed=2026 + epoch,
                 tag='val_random_missing',
             )
         if not val_results:
             val_results['full'] = task.evaluate(val_loader, eval_mode='full', tag='val_full')
-        val_full = val_results.get('full') or next(iter(val_results.values()))
-        val_fixed_missing = val_results.get('fixed_missing')
-        val_random_missing = val_results.get('random_missing')
+        val_full = val_results.get('full', next(iter(val_results.values())))
         val_m = val_full
         avg_grad_norm = grad_norm_sum / max(grad_norm_steps, 1)
         curr_lr = task.optimizer.param_groups[0]['lr']
         gamma_metrics = _collect_adc_gamma(task)
+        ds_metrics = {}
+        if ds_metric_sum and ds_metric_steps > 0:
+            ds_metrics = {k: v / ds_metric_steps for k, v in ds_metric_sum.items()}
         append_epoch_log(
             log_path,
             epoch,
@@ -450,25 +474,21 @@ def main():
             val_m,
             lr=curr_lr,
             grad_norm=avg_grad_norm,
-            extra_metrics=gamma_metrics,
+            extra_metrics={**gamma_metrics, **ds_metrics},
         )
         gamma_text = ''
         if gamma_metrics:
             gamma_text = ' ' + ' '.join(f'{k}={v:.4f}' for k, v in gamma_metrics.items())
-        gate_text = 'g_pet={:.4f} g_txt={:.4f} g_prior={:.4f}'.format(
-            val_full.get('pet_gate_mean', 0.0), val_full.get('text_gate_mean', 0.0), val_full.get('prior_gate_mean', 0.0)
-        )
         val_lines = []
-        for mode_name, metrics in (('val_full', val_full), ('val_fixed_missing', val_fixed_missing), ('val_random_missing', val_random_missing)):
-            if metrics is None:
-                continue
-            val_lines.append(f'{mode_name}: Dice={metrics["dice"]:.4f} IoU={metrics["iou"]:.4f} Acc={metrics["acc"]:.4f} HD95={metrics["hd95"]:.2f}')
+        for mode_name, metrics in val_results.items():
+            val_lines.append(
+                f'val_{mode_name}: Dice={metrics["dice"]:.4f} IoU={metrics["iou"]:.4f} Acc={metrics["acc"]:.4f} HD95={metrics["hd95"]:.2f}'
+            )
         print(
             f'Epoch {epoch}\n'
             f'train_loss={tloss / max(tn, 1):.4f} train_seg={tseg / max(tn, 1):.4f} train_boundary={tboundary / max(tn, 1):.4f}\n'
             + '\n'.join(val_lines) + '\n'
-            f'{gate_text} train_pet_drop_prob={getattr(config, "train_pet_drop_prob", 0.0):.3f} effective_train_pet_drop_prob={effective_train_pet_drop_prob:.3f} '
-            f'effective_text_proxy_scale={effective_text_proxy_scale:.4f} eval_random_pet_drop_prob={getattr(config, "eval_random_pet_drop_prob", 0.0):.3f} '
+            f'full PET-CT training/evaluation '
             f'lr={curr_lr:.6f} grad_norm={avg_grad_norm:.4f} grad_clipped_steps={grad_clip_count}/{grad_norm_steps} '
             f'grad_guard_skipped_steps={sum(first_bad_module_counter.values())} first_bad_module_counter={first_bad_module_counter} '
             f'best_dice={best_dice:.4f} best_hd95={best_hd95:.2f} boundary_w={getattr(config, "boundary_loss_weight", 0.0):.3f}{gamma_text}'
@@ -483,8 +503,8 @@ def main():
                     num_samples=max(1, int(getattr(config, 'vis_epoch_samples', 2))),
                     threshold=getattr(config, 'eval_threshold', 0.5),
                     eval_mode=eval_mode,
-                    random_pet_drop_prob=getattr(config, 'eval_random_pet_drop_prob', 0.4),
-                    random_seed=getattr(config, 'eval_random_missing_seed', 2026),
+                    random_pet_drop_prob=0.0,
+                    random_seed=2026,
                     mode=eval_mode,
                 )
 
@@ -511,23 +531,29 @@ def main():
             if k in ckpt:
                 task.load_model_state_dict(v, ckpt[k], strict=False)
 
+    def _evaluate_enabled_modes(loader, prefix):
+        results = {}
+        if getattr(config, 'eval_full_pet', True):
+            results['full'] = task.evaluate(loader, eval_mode='full', tag=f'{prefix}_full')
+        if getattr(config, 'eval_fixed_missing_pet', False):
+            results['fixed_missing'] = task.evaluate(loader, eval_mode='fixed_missing', tag=f'{prefix}_fixed_missing')
+        if getattr(config, 'eval_random_missing_pet', False):
+            results['random_missing'] = task.evaluate(
+                loader,
+                eval_mode='random_missing',
+                random_pet_drop_prob=getattr(config, 'eval_random_pet_drop_prob', 0.4),
+                random_seed=2026,
+                tag=f'{prefix}_random_missing',
+            )
+        if not results:
+            results['full'] = task.evaluate(loader, eval_mode='full', tag=f'{prefix}_full')
+        return results
+
     best_dice_path = os.path.join(config.checkpoint_dir, 'ckpt.best_dice.pth.tar')
     best_hd95_path = os.path.join(config.checkpoint_dir, 'ckpt.best_hd95.pth.tar')
 
     _load_checkpoint(best_dice_path)
-    test_results = {}
-    if getattr(config, 'eval_full_pet', True):
-        test_results['full'] = task.evaluate(test_loader, eval_mode='full', tag='test_best_dice_full')
-    if getattr(config, 'eval_fixed_missing_pet', True):
-        test_results['fixed_missing'] = task.evaluate(test_loader, eval_mode='fixed_missing', tag='test_best_dice_fixed_missing')
-    if getattr(config, 'eval_random_missing_pet', True):
-        test_results['random_missing'] = task.evaluate(
-            test_loader,
-            eval_mode='random_missing',
-            random_pet_drop_prob=getattr(config, 'eval_random_pet_drop_prob', 0.4),
-            random_seed=getattr(config, 'eval_random_missing_seed', 2026),
-            tag='test_best_dice_random_missing',
-        )
+    test_results = _evaluate_enabled_modes(test_loader, 'test_best_dice')
     for mode_name, metrics in test_results.items():
         print(f'=== TEST(best_dice, {mode_name}) Dice={metrics["dice"]:.4f} IoU={metrics["iou"]:.4f} Acc={metrics["acc"]:.4f} HD95={metrics["hd95"]:.2f} ===')
     for mode_name in test_results.keys():
@@ -538,25 +564,13 @@ def main():
             num_samples=min(8, config.batch_size),
             threshold=getattr(config, 'eval_threshold', 0.5),
             eval_mode=mode_name,
-            random_pet_drop_prob=getattr(config, 'eval_random_pet_drop_prob', 0.4),
-            random_seed=getattr(config, 'eval_random_missing_seed', 2026),
+            random_pet_drop_prob=0.0,
+            random_seed=2026,
             mode=mode_name,
         )
 
     _load_checkpoint(best_hd95_path)
-    test_results = {}
-    if getattr(config, 'eval_full_pet', True):
-        test_results['full'] = task.evaluate(test_loader, eval_mode='full', tag='test_best_hd95_full')
-    if getattr(config, 'eval_fixed_missing_pet', True):
-        test_results['fixed_missing'] = task.evaluate(test_loader, eval_mode='fixed_missing', tag='test_best_hd95_fixed_missing')
-    if getattr(config, 'eval_random_missing_pet', True):
-        test_results['random_missing'] = task.evaluate(
-            test_loader,
-            eval_mode='random_missing',
-            random_pet_drop_prob=getattr(config, 'eval_random_pet_drop_prob', 0.4),
-            random_seed=getattr(config, 'eval_random_missing_seed', 2026),
-            tag='test_best_hd95_random_missing',
-        )
+    test_results = _evaluate_enabled_modes(test_loader, 'test_best_hd95')
     for mode_name, metrics in test_results.items():
         print(f'=== TEST(best_hd95, {mode_name}) Dice={metrics["dice"]:.4f} IoU={metrics["iou"]:.4f} Acc={metrics["acc"]:.4f} HD95={metrics["hd95"]:.2f} ===')
     for mode_name in test_results.keys():
@@ -567,8 +581,8 @@ def main():
             num_samples=min(8, config.batch_size),
             threshold=getattr(config, 'eval_threshold', 0.5),
             eval_mode=mode_name,
-            random_pet_drop_prob=getattr(config, 'eval_random_pet_drop_prob', 0.4),
-            random_seed=getattr(config, 'eval_random_missing_seed', 2026),
+            random_pet_drop_prob=0.0,
+            random_seed=2026,
             mode=mode_name,
         )
 

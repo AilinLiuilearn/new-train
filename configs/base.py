@@ -32,9 +32,12 @@ class ConfigBase(object):
             attrs.update(kwargs)
         for k, v in attrs.items():
             setattr(self, k, v)
-        if not hasattr(self, 'hash'):
-            self.hash = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self._ensure_hash()
         self._task = "MDT"
+
+    def _ensure_hash(self):
+        if not getattr(self, 'hash', None):
+            self.hash = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     @classmethod
     def parse_arguments(cls):
@@ -49,6 +52,7 @@ class ConfigBase(object):
         parser = argparse.ArgumentParser(add_help=True, parents=parents, fromfile_prefix_chars='@')
         config = cls()
         parser.parse_args(namespace=config)
+        config._ensure_hash()
         return config
 
     @classmethod
@@ -117,6 +121,7 @@ class ConfigBase(object):
     def logging_parser():
         parser = argparse.ArgumentParser("Logging", add_help=False)
         parser.add_argument('--checkpoint_root', type=str, default='./checkpoints_new/')
+        parser.add_argument('--hash', type=str, default=None, help='Run id for checkpoint dir: checkpoint_root/MDT/<hash>/. Default: timestamp.')
         parser.add_argument('--save_every', type=int, default=5)
         parser.add_argument('--enable_wandb', type=str2bool, default=False)
         return parser

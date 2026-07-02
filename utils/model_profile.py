@@ -52,7 +52,7 @@ def print_baseline_profile(networks, config, image_size=None, tag='MODEL PROFILE
     print(f'TOTAL PARAMS: {total / 1e6:.2f}M')
     print(f'TRAINABLE PARAMS: {trainable / 1e6:.2f}M')
     print(f'FROZEN PARAMS: {frozen / 1e6:.2f}M')
-    for name in ('enc_ct', 'enc_pet', 'meddino', 'lapa', 'text_controller', 'tppc', 'decoder', 'boundary_head'):
+    for name in ('enc_ct', 'enc_pet', 'pet_guides', 'fusion', 'stage_fusion', 'decoder', 'boundary_head'):
         module = getattr(model, name, None) if model is not None else None
         mt, mtr, mf = _count_module_params(module)
         if module is not None:

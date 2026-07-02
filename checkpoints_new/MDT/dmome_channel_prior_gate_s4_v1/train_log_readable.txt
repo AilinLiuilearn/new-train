@@ -1,0 +1,182 @@
+Training Log
+================================================================
+Epoch 1
+  train_loss    : 1.3445
+  val_loss      : 1.2749
+  val_dice      : 0.4635
+  val_iou       : 0.3017
+  val_acc       : 0.9276
+  val_acc_pixel : 0.9944
+  val_hd95      : 48.0112
+  lr            : 0.00002662
+  grad_norm     : 1.483673
+  use_deep_supervision: 1.000000
+  loss_main    : 1.401173
+  loss_aux_d2  : 1.325172
+  loss_aux_d3  : 1.210176
+  loss_aux_d4  : 1.237018
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+----------------------------------------------------------------
+Epoch 2
+  train_loss    : 1.0854
+  val_loss      : 1.0967
+  val_dice      : 0.6499
+  val_iou       : 0.4814
+  val_acc       : 0.9316
+  val_acc_pixel : 0.9974
+  val_hd95      : 26.3621
+  lr            : 0.00005328
+  grad_norm     : 0.638369
+  use_deep_supervision: 1.000000
+  loss_main    : 1.185238
+  loss_aux_d2  : 1.069686
+  loss_aux_d3  : 0.865992
+  loss_aux_d4  : 0.787729
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+----------------------------------------------------------------
+Epoch 3
+  train_loss    : 0.8376
+  val_loss      : 0.8275
+  val_dice      : 0.7012
+  val_iou       : 0.5398
+  val_acc       : 0.9123
+  val_acc_pixel : 0.9980
+  val_hd95      : 24.2701
+  lr            : 0.00007995
+  grad_norm     : 0.679981
+  use_deep_supervision: 1.000000
+  loss_main    : 0.989984
+  loss_aux_d2  : 0.762859
+  loss_aux_d3  : 0.516521
+  loss_aux_d4  : 0.560388
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+----------------------------------------------------------------
+Epoch 4
+  train_loss    : 0.5739
+  val_loss      : 0.5193
+  val_dice      : 0.7242
+  val_iou       : 0.5676
+  val_acc       : 0.9131
+  val_acc_pixel : 0.9982
+  val_hd95      : 20.9533
+  lr            : 0.00007987
+  grad_norm     : 0.984185
+  use_deep_supervision: 1.000000
+  loss_main    : 0.673373
+  loss_aux_d2  : 0.458304
+  loss_aux_d3  : 0.436372
+  loss_aux_d4  : 0.515891
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+----------------------------------------------------------------
+Epoch 5
+  train_loss    : 0.4272
+  val_loss      : 0.3961
+  val_dice      : 0.7710
+  val_iou       : 0.6273
+  val_acc       : 0.8844
+  val_acc_pixel : 0.9987
+  val_hd95      : 20.0647
+  lr            : 0.00007948
+  grad_norm     : 1.132234
+  use_deep_supervision: 1.000000
+  loss_main    : 0.441488
+  loss_aux_d2  : 0.389118
+  loss_aux_d3  : 0.412914
+  loss_aux_d4  : 0.493403
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+----------------------------------------------------------------
+Epoch 6
+  train_loss    : 0.3831
+  val_loss      : 0.3759
+  val_dice      : 0.7627
+  val_iou       : 0.6165
+  val_acc       : 0.8831
+  val_acc_pixel : 0.9987
+  val_hd95      : 18.5269
+  lr            : 0.00007884
+  grad_norm     : 1.215531
+  use_deep_supervision: 1.000000
+  loss_main    : 0.373606
+  loss_aux_d2  : 0.368983
+  loss_aux_d3  : 0.400416
+  loss_aux_d4  : 0.480691
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+----------------------------------------------------------------
+Epoch 7
+  train_loss    : 0.3643
+  val_loss      : 0.3771
+  val_dice      : 0.7513
+  val_iou       : 0.6016
+  val_acc       : 0.8633
+  val_acc_pixel : 0.9986
+  val_hd95      : 20.7213
+  lr            : 0.00007794
+  grad_norm     : 1.265698
+  use_deep_supervision: 1.000000
+  loss_main    : 0.349180
+  loss_aux_d2  : 0.355756
+  loss_aux_d3  : 0.389189
+  loss_aux_d4  : 0.469977
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+----------------------------------------------------------------
+Epoch 8
+  train_loss    : 0.3500
+  val_loss      : 0.3921
+  val_dice      : 0.7449
+  val_iou       : 0.5935
+  val_acc       : 0.8475
+  val_acc_pixel : 0.9987
+  val_hd95      : 18.0655
+  lr            : 0.00007680
+  grad_norm     : 1.233971
+  use_deep_supervision: 1.000000
+  loss_main    : 0.332617
+  loss_aux_d2  : 0.343216
+  loss_aux_d3  : 0.378045
+  loss_aux_d4  : 0.460012
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+----------------------------------------------------------------
+Epoch 9
+  train_loss    : 0.3435
+  val_loss      : 0.3775
+  val_dice      : 0.7491
+  val_iou       : 0.5989
+  val_acc       : 0.8490
+  val_acc_pixel : 0.9987
+  val_hd95      : 19.0960
+  lr            : 0.00007542
+  grad_norm     : 1.292862
+  use_deep_supervision: 1.000000
+  loss_main    : 0.324810
+  loss_aux_d2  : 0.337531
+  loss_aux_d3  : 0.373737
+  loss_aux_d4  : 0.456648
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+----------------------------------------------------------------

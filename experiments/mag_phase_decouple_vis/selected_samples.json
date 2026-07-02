@@ -1,0 +1,49 @@
+{
+  "samples": [
+    {
+      "index": 0,
+      "image_id": "0186_017",
+      "figure": "00_0186_017_mag_phase.png",
+      "ct_mag_corr": -0.44842061517986953,
+      "ct_phase_corr": 0.13797372163477784,
+      "pet_mag_corr": -0.19292894029234708,
+      "pet_phase_corr": 0.039557945461298254
+    },
+    {
+      "index": 1,
+      "image_id": "0201_015",
+      "figure": "01_0201_015_mag_phase.png",
+      "ct_mag_corr": -0.5268562605253054,
+      "ct_phase_corr": 0.14863720783172066,
+      "pet_mag_corr": -0.35149626190353883,
+      "pet_phase_corr": 0.041288786203544
+    },
+    {
+      "index": 2,
+      "image_id": "0126_045",
+      "figure": "02_0126_045_mag_phase.png",
+      "ct_mag_corr": -0.49132772117738516,
+      "ct_phase_corr": 0.14198163808911904,
+      "pet_mag_corr": -0.18871878992696048,
+      "pet_phase_corr": 0.033020720950554555
+    },
+    {
+      "index": 3,
+      "image_id": "0418_075",
+      "figure": "03_0418_075_mag_phase.png",
+      "ct_mag_corr": -0.4745165584640002,
+      "ct_phase_corr": 0.13192104385093256,
+      "pet_mag_corr": -0.22141917354357407,
+      "pet_phase_corr": 0.044041212900754835
+    },
+    {
+      "index": 4,
+      "image_id": "0592_049",
+      "figure": "04_0592_049_mag_phase.png",
+      "ct_mag_corr": -0.5578411681878667,
+      "ct_phase_corr": 0.13306688591743535,
+      "pet_mag_corr": -0.20514967869488826,
+      "pet_phase_corr": 0.046944309899614727
+    }
+  ]
+}

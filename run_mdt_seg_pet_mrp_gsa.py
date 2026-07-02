@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Single-modality CT/PET baseline using MiT-B1 encoder and UNetStyleDecoder."""
+"""PET-MRP-GSA training: full PET only (no missing-PET / random-missing validation)."""
 
 import math
 import os
@@ -8,37 +8,46 @@ import sys
 import torch
 
 from configs.seg_mdt import SegMDTConfig
-from models.baseline_petct_unet import SingleModalityBaselineUNet
-from run_mdt_seg import _build_loaders, _prepare_env, _save_config
-from tasks.mdt_seg import MDTSegTeacher
+from models.build_mdt_seg import build_mdt_seg_teacher
+from models.pet_mrp_gsa import PET_MRP_GSA_LOG_KEYS
+from run_mdt_seg import (
+    _build_loaders,
+    _collect_deep_supervision_metrics,
+    _deep_supervision_log_headers,
+    _grad_finite_and_norm,
+    _prepare_env,
+    _save_config,
+)
+from tasks.mdt_seg import MDTSegTeacher, _use_deep_supervision
 from utils.model_profile import print_baseline_profile
 from utils.optimization import get_cosine_scheduler
 from utils.train_logger import append_epoch_log, init_train_log
 from utils.vis_teacher import save_segmentation_diagnostics
 
 
-class SingleModalitySegConfig(SegMDTConfig):
+class PETMRPGSASegConfig(SegMDTConfig):
     @staticmethod
     def model_parser():
         parser = SegMDTConfig.model_parser()
-        parser.add_argument('--single_modality', type=str, default='ct', choices=('ct', 'pet'))
+        parser.set_defaults(
+            model_arch='pet_mrp_gsa',
+            ct_backbone='convnext_tiny',
+            use_pet_mrp_gsa=True,
+            pet_mrp_stages='all',
+            use_deep_supervision=True,
+        )
         return parser
 
 
-def build_single_modality_teacher(config):
-    if config.single_modality == 'ct':
-        backbone = getattr(config, 'ct_backbone', None) or getattr(config, 'backbone', 'mit_b1')
-        pretrained_path = getattr(config, 'ct_pretrained_path', None) or getattr(config, 'pretrained_path', None)
-    else:
-        backbone = getattr(config, 'pet_backbone', None) or getattr(config, 'backbone', 'mit_b1')
-        pretrained_path = getattr(config, 'pet_pretrained_path', None) or getattr(config, 'pretrained_path', None)
-    model = SingleModalityBaselineUNet(
-        backbone=backbone,
-        pretrained_path=pretrained_path,
-        modality=config.single_modality,
-        out_channels=1,
-    )
-    return {'model': model}
+def _collect_pet_mrp_metrics(source):
+    metrics = {}
+    for key in PET_MRP_GSA_LOG_KEYS:
+        val = source.get(key)
+        if torch.is_tensor(val):
+            metrics[key] = float(val.detach().cpu())
+        elif val is not None:
+            metrics[key] = float(val)
+    return metrics
 
 
 def main():
@@ -48,25 +57,30 @@ def main():
     sys.path.insert(0, os.getcwd())
     sys.modules.pop('datasets', None)
 
-    config = SingleModalitySegConfig.parse_arguments()
+    config = PETMRPGSASegConfig.parse_arguments()
     config.task = 'MDT_Teacher'
-    config.model_arch = f'{config.single_modality}_baseline'
-    config.fusion_type = config.single_modality
+    config.model_arch = 'pet_mrp_gsa'
+    config.train_pet_drop_prob = 0.0
+    config.eval_full_pet = True
+    config.eval_fixed_missing_pet = False
+    config.eval_random_missing_pet = False
+
     g0 = _prepare_env(config)
 
     print(f'GPU={g0}')
-    print(f'single_modality={config.single_modality}')
+    print(f'model_arch={config.model_arch}')
     print(f'ct_backbone={getattr(config, "ct_backbone", None)}')
-    print(f'pet_backbone={getattr(config, "pet_backbone", None)}')
+    print(f'use_pet_mrp_gsa={getattr(config, "use_pet_mrp_gsa", True)}')
+    print(f'pet_mrp_stages={getattr(config, "pet_mrp_stages", "all")}')
+    print(f'use_deep_supervision={_use_deep_supervision(config)}')
+    print('[eval] full PET only (fixed_missing/random_missing disabled)')
     print(f'image_size_2d={config.image_size_2d}')
     print(f'batch_size={config.batch_size}')
-    print(f'accumulation_steps={config.accumulation_steps}')
-    print(f'mixed_precision={config.mixed_precision}')
     print(f'lr={config.learning_rate} wd={config.weight_decay}')
 
     _save_config(config)
     train_loader, val_loader, test_loader = _build_loaders(config)
-    networks = build_single_modality_teacher(config)
+    networks = build_mdt_seg_teacher(config)
 
     print('\n' + '=' * 30 + ' MODEL PROFILE ' + '=' * 30)
     print_baseline_profile(networks, config)
@@ -86,7 +100,8 @@ def main():
     )
 
     log_path = os.path.join(config.checkpoint_dir, 'train_log.csv')
-    init_train_log(log_path)
+    extra_headers = _deep_supervision_log_headers(config) + list(PET_MRP_GSA_LOG_KEYS)
+    init_train_log(log_path, extra_headers=extra_headers)
     grad_clip = getattr(config, 'grad_clip', 5.0)
     clip_params = task.trainable_parameters()
     best_dice = -1.0
@@ -95,6 +110,8 @@ def main():
 
     for epoch in range(1, config.epochs + 1):
         tloss, tn = 0.0, 0
+        ds_metric_sum = {k: 0.0 for k in _deep_supervision_log_headers(config)}
+        metric_steps = 0
         task.set_epoch(epoch)
         task.optimizer.zero_grad()
 
@@ -126,9 +143,16 @@ def main():
 
             if task.scheduler and stepped:
                 task.scheduler.step()
+
             step_loss = loss.item() * accum_iter
             tloss += step_loss
             tn += 1
+            batch_ds = _collect_deep_supervision_metrics(loss_dict)
+            if batch_ds:
+                metric_steps += 1
+                for key, value in batch_ds.items():
+                    ds_metric_sum[key] = ds_metric_sum.get(key, 0.0) + value
+
             if (i + 1) % 20 == 0 or (i + 1) == 1 or (i + 1) == spe:
                 seg_loss = float(loss_dict.get('loss_seg', torch.tensor(0.0)).detach().cpu())
                 curr_lr = task.optimizer.param_groups[0]['lr']
@@ -137,13 +161,28 @@ def main():
                     flush=True,
                 )
 
-        print(f'[Epoch {epoch}] evaluating full input...', flush=True)
+        print(f'[Epoch {epoch}] evaluating full PET...', flush=True)
         val_full = task.evaluate(val_loader, eval_mode='full', tag='val_full')
-        append_epoch_log(log_path, epoch, tloss / max(tn, 1), val_full, lr=task.optimizer.param_groups[0]['lr'])
+        _, grad_norm = _grad_finite_and_norm(clip_params)
+        extra_metrics = _collect_pet_mrp_metrics(val_full)
+        if metric_steps > 0:
+            for key, total in ds_metric_sum.items():
+                extra_metrics[key] = total / metric_steps
+        extra_metrics['grad_norm'] = grad_norm
+        append_epoch_log(
+            log_path,
+            epoch,
+            tloss / max(tn, 1),
+            val_full,
+            lr=task.optimizer.param_groups[0]['lr'],
+            grad_norm=grad_norm,
+            extra_metrics=extra_metrics,
+        )
         print(
             f'Epoch {epoch}\n'
             f'train_loss={tloss / max(tn, 1):.4f}\n'
-            f'val_full: Dice={val_full["dice"]:.4f} IoU={val_full["iou"]:.4f} HD95={val_full["hd95"]:.2f}',
+            f'val_full: Dice={val_full["dice"]:.4f} IoU={val_full["iou"]:.4f} '
+            f'Acc={val_full["acc"]:.4f} HD95={val_full["hd95"]:.2f}',
             flush=True,
         )
 
@@ -168,9 +207,13 @@ def main():
             print(f'Early stopping at epoch {epoch}')
             break
 
-    print('[TEST] evaluating full input...', flush=True)
+    print('[TEST] evaluating full PET...', flush=True)
     test_full = task.evaluate(test_loader, eval_mode='full', tag='test_full')
-    print(f'[TEST full] {test_full}', flush=True)
+    print(
+        f'[TEST full] Dice={test_full["dice"]:.4f} IoU={test_full["iou"]:.4f} '
+        f'Acc={test_full["acc"]:.4f} HD95={test_full["hd95"]:.2f}',
+        flush=True,
+    )
 
 
 if __name__ == '__main__':

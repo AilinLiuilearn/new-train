@@ -1,0 +1,39 @@
+{
+  "checkpoint": "/root/autodl-tmp/mkd-main/new-train/checkpoints_new/MDT/pet_mrp_gsa_all_v1/ckpt.best_dice.pth.tar",
+  "results": {
+    "test": {
+      "dice": 0.7725746432315497,
+      "iou": 0.6294269863102505,
+      "acc": 0.8630327176406355,
+      "acc_pixel": 0.998797166120388,
+      "sensitivity": 0.726500365118145,
+      "specificity": 0.999565070163126,
+      "precision": 0.8248886559589407,
+      "f1": 0.7725746432315497,
+      "hd95": 21.835132117165614,
+      "total_loss": 0.39841478967962407,
+      "pet_gate_mean": 0.0,
+      "prior_gate_mean": 0.0,
+      "pet_mrp_gsa_enabled": 1.0,
+      "pet_mrp_prior_skipped": 0.0,
+      "pet_mrp_active_stages": 4.0
+    },
+    "val": {
+      "dice": 0.7725746432315497,
+      "iou": 0.6294269863102505,
+      "acc": 0.8630327176406355,
+      "acc_pixel": 0.998797166120388,
+      "sensitivity": 0.726500365118145,
+      "specificity": 0.999565070163126,
+      "precision": 0.8248886559589407,
+      "f1": 0.7725746432315497,
+      "hd95": 21.835132117165614,
+      "total_loss": 0.39841478967962407,
+      "pet_gate_mean": 0.0,
+      "prior_gate_mean": 0.0,
+      "pet_mrp_gsa_enabled": 1.0,
+      "pet_mrp_prior_skipped": 0.0,
+      "pet_mrp_active_stages": 4.0
+    }
+  }
+}

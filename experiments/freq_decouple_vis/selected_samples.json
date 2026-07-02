@@ -1,0 +1,66 @@
+{
+  "cutoff_ratio": 0.12,
+  "sigma_scale": 1.0,
+  "samples": [
+    {
+      "index": 0,
+      "image_id": "0201_015",
+      "case_id": "0201",
+      "slice_id": "015",
+      "ct_low_energy": 0.9748573275099407,
+      "ct_high_energy": 0.025142672490059317,
+      "pet_low_energy": 0.9660710687763648,
+      "pet_high_energy": 0.03392893122363516,
+      "lesion_pixels": null,
+      "figure": "00_0201_015_freq_decouple.png"
+    },
+    {
+      "index": 1,
+      "image_id": "0186_017",
+      "case_id": "0186",
+      "slice_id": "017",
+      "ct_low_energy": 0.973338566712191,
+      "ct_high_energy": 0.026661433287809008,
+      "pet_low_energy": 0.9716879374451768,
+      "pet_high_energy": 0.02831206255482308,
+      "lesion_pixels": null,
+      "figure": "01_0186_017_freq_decouple.png"
+    },
+    {
+      "index": 2,
+      "image_id": "0126_045",
+      "case_id": "0126",
+      "slice_id": "045",
+      "ct_low_energy": 0.9697063311517424,
+      "ct_high_energy": 0.030293668848257623,
+      "pet_low_energy": 0.9771004285403941,
+      "pet_high_energy": 0.022899571459605816,
+      "lesion_pixels": null,
+      "figure": "02_0126_045_freq_decouple.png"
+    },
+    {
+      "index": 3,
+      "image_id": "0418_075",
+      "case_id": "0418",
+      "slice_id": "075",
+      "ct_low_energy": 0.9731306144101026,
+      "ct_high_energy": 0.02686938558989732,
+      "pet_low_energy": 0.9755595275942467,
+      "pet_high_energy": 0.02444047240575319,
+      "lesion_pixels": null,
+      "figure": "03_0418_075_freq_decouple.png"
+    },
+    {
+      "index": 4,
+      "image_id": "0592_049",
+      "case_id": "0592",
+      "slice_id": "049",
+      "ct_low_energy": 0.9732452468258836,
+      "ct_high_energy": 0.026754753174116446,
+      "pet_low_energy": 0.9846666417502639,
+      "pet_high_energy": 0.015333358249736195,
+      "lesion_pixels": null,
+      "figure": "04_0592_049_freq_decouple.png"
+    }
+  ]
+}
