@@ -1,0 +1,19 @@
+{
+  "checkpoint": "/root/autodl-tmp/mkd-main/new-train/checkpoints_new/MDT/ct_convnext_tiny_ds_v1/ckpt.best_dice.pth.tar",
+  "results": {
+    "test": {
+      "dice": 0.7617378140975865,
+      "iou": 0.6151668223175624,
+      "acc": 0.8527301555058191,
+      "acc_pixel": 0.9987582061794621,
+      "sensitivity": 0.7058761483191043,
+      "specificity": 0.9995841626925338,
+      "precision": 0.8272008834981851,
+      "f1": 0.7617378140975866,
+      "hd95": 22.879995213894674,
+      "total_loss": 0.4055087705550069,
+      "pet_gate_mean": 0.0,
+      "prior_gate_mean": 0.0
+    }
+  }
+}

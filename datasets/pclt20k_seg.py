@@ -187,14 +187,18 @@ def _resize_gray(img, size, nearest=False):
 
 
 class PCLT20KSegDataset(Dataset):
-    def __init__(self, records, image_size=512, train=False, pet_available_list=None, random_state=2023, aug_mode='cipa', norm_mode='imagenet'):
+    def __init__(self, records, image_size=512, train=False, pet_available_list=None, random_state=2023, aug_mode='cipa', norm_mode='imagenet', pet_drop_prob=0.0):
         self.records = records
         self.image_size = image_size
         self.train = train
         self.aug_mode = aug_mode
         self.norm_mode = norm_mode
         self.rng = random.Random(random_state)
+        self.pet_drop_prob = float(pet_drop_prob)
         self.pet_available = list(pet_available_list) if pet_available_list is not None else [r['pet_path'] is not None for r in records]
+
+    def set_pet_drop_prob(self, pet_drop_prob):
+        self.pet_drop_prob = float(pet_drop_prob)
 
     def __len__(self):
         return len(self.records)
@@ -262,7 +266,10 @@ class PCLT20KSegDataset(Dataset):
         ct_ch = _normalize_ct_slice(img[1])
         normalize_rgb = _normalize_cipa_rgb if self.norm_mode == 'cipa' else _normalize_rgb
         ct_rgb = normalize_rgb(ct_ch)
-        if self.pet_available[idx]:
+        pet_available = 1 if self.pet_available[idx] else 0
+        if self.train and pet_available == 1 and self.pet_drop_prob > 0 and random.random() < self.pet_drop_prob:
+            pet_available = 0
+        if pet_available:
             pet_rgb = normalize_rgb(pet_ch)
         else:
             pet_rgb = np.zeros((3, self.image_size, self.image_size), dtype=np.float32)
@@ -271,7 +278,7 @@ class PCLT20KSegDataset(Dataset):
             'ct': torch.tensor(ct_rgb, dtype=torch.float32),
             'pet': torch.tensor(pet_rgb, dtype=torch.float32),
             'mask': torch.tensor(mask, dtype=torch.float32),
-            'pet_available': self.pet_available[idx],
+            'pet_available': torch.tensor(pet_available, dtype=torch.long),
             'idx': idx,
         }
 
@@ -393,6 +400,7 @@ def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_wor
         random_state=random_state,
         aug_mode=aug_mode,
         norm_mode=norm_mode,
+        pet_drop_prob=0.0,
     )
     val_ds = PCLT20KSegDataset(val_records, image_size=image_size, train=False, aug_mode='none', norm_mode=norm_mode)
     test_ds = PCLT20KSegDataset(test_records, image_size=image_size, train=False, aug_mode='none', norm_mode=norm_mode)

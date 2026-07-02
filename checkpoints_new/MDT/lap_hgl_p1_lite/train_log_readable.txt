@@ -1,0 +1,682 @@
+Training Log
+================================================================
+Epoch 1
+  train_loss    : 1.3821
+  val_loss      : 1.2644
+  val_dice      : 0.5301
+  val_iou       : 0.3607
+  val_acc       : 0.8987
+  val_acc_pixel : 0.9960
+  val_hd95      : 50.8824
+  lr            : 0.00002667
+  grad_norm     : 0.000000
+  use_deep_supervision: 1.000000
+  loss_main    : 1.409155
+  loss_aux_d2  : 1.375639
+  loss_aux_d3  : 1.325847
+  loss_aux_d4  : 1.303353
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+  pet_beta     : 0.011363
+  pet_spatial_mean: 0.541977
+  pet_spatial_std: 0.317514
+  pet_modulation_delta_abs_mean: 0.005985
+  down1_alpha  : 0.002492
+  down2_alpha  : -0.002564
+  down3_alpha  : -0.006550
+  down1_x_hp_abs_mean: 0.027579
+  down1_x_lap_abs_mean: 0.007400
+  down1_x_hh_mean: 0.090696
+  down1_high_gate_mean: 0.492137
+  down2_x_hp_abs_mean: 0.049645
+  down2_x_lap_abs_mean: 0.012525
+  down2_x_hh_mean: 0.123451
+  down2_high_gate_mean: 0.513057
+  down3_x_hp_abs_mean: 0.089999
+  down3_x_lap_abs_mean: 0.018006
+  down3_x_hh_mean: 0.145943
+  down3_high_gate_mean: 0.505133
+  grad_norm    : 0.000000
+----------------------------------------------------------------
+Epoch 2
+  train_loss    : 1.1027
+  val_loss      : 1.0877
+  val_dice      : 0.7062
+  val_iou       : 0.5458
+  val_acc       : 0.9232
+  val_acc_pixel : 0.9980
+  val_hd95      : 30.2700
+  lr            : 0.00005333
+  grad_norm     : 0.000000
+  use_deep_supervision: 1.000000
+  loss_main    : 1.171519
+  loss_aux_d2  : 1.090363
+  loss_aux_d3  : 0.974560
+  loss_aux_d4  : 0.858209
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+  pet_beta     : 0.038554
+  pet_spatial_mean: 0.715090
+  pet_spatial_std: 0.263481
+  pet_modulation_delta_abs_mean: 0.027925
+  down1_alpha  : -0.000458
+  down2_alpha  : -0.030918
+  down3_alpha  : -0.036420
+  down1_x_hp_abs_mean: 0.028626
+  down1_x_lap_abs_mean: 0.007690
+  down1_x_hh_mean: 0.089348
+  down1_high_gate_mean: 0.492348
+  down2_x_hp_abs_mean: 0.049869
+  down2_x_lap_abs_mean: 0.012423
+  down2_x_hh_mean: 0.111332
+  down2_high_gate_mean: 0.519840
+  down3_x_hp_abs_mean: 0.090156
+  down3_x_lap_abs_mean: 0.018260
+  down3_x_hh_mean: 0.125071
+  down3_high_gate_mean: 0.524988
+  grad_norm    : 0.000000
+----------------------------------------------------------------
+Epoch 3
+  train_loss    : 0.8423
+  val_loss      : 0.8076
+  val_dice      : 0.7065
+  val_iou       : 0.5462
+  val_acc       : 0.8427
+  val_acc_pixel : 0.9984
+  val_hd95      : 26.7838
+  lr            : 0.00008000
+  grad_norm     : 0.000000
+  use_deep_supervision: 1.000000
+  loss_main    : 0.960075
+  loss_aux_d2  : 0.793287
+  loss_aux_d3  : 0.600158
+  loss_aux_d4  : 0.580831
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+  pet_beta     : 0.101617
+  pet_spatial_mean: 0.604332
+  pet_spatial_std: 0.281994
+  pet_modulation_delta_abs_mean: 0.063103
+  down1_alpha  : -0.000094
+  down2_alpha  : -0.056984
+  down3_alpha  : -0.050672
+  down1_x_hp_abs_mean: 0.027781
+  down1_x_lap_abs_mean: 0.007337
+  down1_x_hh_mean: 0.091493
+  down1_high_gate_mean: 0.490076
+  down2_x_hp_abs_mean: 0.050143
+  down2_x_lap_abs_mean: 0.012067
+  down2_x_hh_mean: 0.104200
+  down2_high_gate_mean: 0.519301
+  down3_x_hp_abs_mean: 0.091465
+  down3_x_lap_abs_mean: 0.018331
+  down3_x_hh_mean: 0.126017
+  down3_high_gate_mean: 0.534467
+  grad_norm    : 0.000000
+----------------------------------------------------------------
+Epoch 4
+  train_loss    : 0.5358
+  val_loss      : 0.4639
+  val_dice      : 0.7138
+  val_iou       : 0.5549
+  val_acc       : 0.8774
+  val_acc_pixel : 0.9983
+  val_hd95      : 24.3002
+  lr            : 0.00007987
+  grad_norm     : 0.000000
+  use_deep_supervision: 1.000000
+  loss_main    : 0.603768
+  loss_aux_d2  : 0.452641
+  loss_aux_d3  : 0.439330
+  loss_aux_d4  : 0.517664
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+  pet_beta     : 0.144223
+  pet_spatial_mean: 0.803229
+  pet_spatial_std: 0.197106
+  pet_modulation_delta_abs_mean: 0.152860
+  down1_alpha  : 0.000690
+  down2_alpha  : -0.068004
+  down3_alpha  : -0.053995
+  down1_x_hp_abs_mean: 0.028110
+  down1_x_lap_abs_mean: 0.007396
+  down1_x_hh_mean: 0.091642
+  down1_high_gate_mean: 0.487658
+  down2_x_hp_abs_mean: 0.050892
+  down2_x_lap_abs_mean: 0.012376
+  down2_x_hh_mean: 0.102175
+  down2_high_gate_mean: 0.517317
+  down3_x_hp_abs_mean: 0.093892
+  down3_x_lap_abs_mean: 0.018864
+  down3_x_hh_mean: 0.116982
+  down3_high_gate_mean: 0.522579
+  grad_norm    : 0.000000
+----------------------------------------------------------------
+Epoch 5
+  train_loss    : 0.3936
+  val_loss      : 0.4151
+  val_dice      : 0.7348
+  val_iou       : 0.5808
+  val_acc       : 0.8601
+  val_acc_pixel : 0.9985
+  val_hd95      : 21.8102
+  lr            : 0.00007948
+  grad_norm     : 0.000000
+  use_deep_supervision: 1.000000
+  loss_main    : 0.390803
+  loss_aux_d2  : 0.371536
+  loss_aux_d3  : 0.402099
+  loss_aux_d4  : 0.487756
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+  pet_beta     : 0.178253
+  pet_spatial_mean: 0.918490
+  pet_spatial_std: 0.146040
+  pet_modulation_delta_abs_mean: 0.244114
+  down1_alpha  : 0.000630
+  down2_alpha  : -0.073087
+  down3_alpha  : -0.057137
+  down1_x_hp_abs_mean: 0.029021
+  down1_x_lap_abs_mean: 0.007705
+  down1_x_hh_mean: 0.093476
+  down1_high_gate_mean: 0.487295
+  down2_x_hp_abs_mean: 0.053017
+  down2_x_lap_abs_mean: 0.012753
+  down2_x_hh_mean: 0.106053
+  down2_high_gate_mean: 0.516593
+  down3_x_hp_abs_mean: 0.097545
+  down3_x_lap_abs_mean: 0.019508
+  down3_x_hh_mean: 0.120285
+  down3_high_gate_mean: 0.521139
+  grad_norm    : 0.000000
+----------------------------------------------------------------
+Epoch 6
+  train_loss    : 0.3523
+  val_loss      : 0.4064
+  val_dice      : 0.7363
+  val_iou       : 0.5827
+  val_acc       : 0.8338
+  val_acc_pixel : 0.9987
+  val_hd95      : 23.1425
+  lr            : 0.00007884
+  grad_norm     : 0.000000
+  use_deep_supervision: 1.000000
+  loss_main    : 0.335928
+  loss_aux_d2  : 0.342338
+  loss_aux_d3  : 0.378846
+  loss_aux_d4  : 0.470121
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+  pet_beta     : 0.193497
+  pet_spatial_mean: 0.919106
+  pet_spatial_std: 0.150333
+  pet_modulation_delta_abs_mean: 0.267334
+  down1_alpha  : -0.000163
+  down2_alpha  : -0.076126
+  down3_alpha  : -0.059209
+  down1_x_hp_abs_mean: 0.030137
+  down1_x_lap_abs_mean: 0.008185
+  down1_x_hh_mean: 0.093474
+  down1_high_gate_mean: 0.487426
+  down2_x_hp_abs_mean: 0.056667
+  down2_x_lap_abs_mean: 0.013980
+  down2_x_hh_mean: 0.110739
+  down2_high_gate_mean: 0.517711
+  down3_x_hp_abs_mean: 0.101688
+  down3_x_lap_abs_mean: 0.021053
+  down3_x_hh_mean: 0.121188
+  down3_high_gate_mean: 0.522018
+  grad_norm    : 0.000000
+----------------------------------------------------------------
+Epoch 7
+  train_loss    : 0.3329
+  val_loss      : 0.3942
+  val_dice      : 0.7422
+  val_iou       : 0.5901
+  val_acc       : 0.8477
+  val_acc_pixel : 0.9986
+  val_hd95      : 23.3372
+  lr            : 0.00007794
+  grad_norm     : 0.000000
+  use_deep_supervision: 1.000000
+  loss_main    : 0.313434
+  loss_aux_d2  : 0.325596
+  loss_aux_d3  : 0.364477
+  loss_aux_d4  : 0.455097
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+  pet_beta     : 0.203311
+  pet_spatial_mean: 0.907231
+  pet_spatial_std: 0.157619
+  pet_modulation_delta_abs_mean: 0.304483
+  down1_alpha  : 0.002786
+  down2_alpha  : -0.080371
+  down3_alpha  : -0.061217
+  down1_x_hp_abs_mean: 0.029602
+  down1_x_lap_abs_mean: 0.008047
+  down1_x_hh_mean: 0.093406
+  down1_high_gate_mean: 0.489306
+  down2_x_hp_abs_mean: 0.055217
+  down2_x_lap_abs_mean: 0.013472
+  down2_x_hh_mean: 0.112070
+  down2_high_gate_mean: 0.517417
+  down3_x_hp_abs_mean: 0.100242
+  down3_x_lap_abs_mean: 0.020828
+  down3_x_hh_mean: 0.124800
+  down3_high_gate_mean: 0.525841
+  grad_norm    : 0.000000
+----------------------------------------------------------------
+Epoch 8
+  train_loss    : 0.3194
+  val_loss      : 0.3874
+  val_dice      : 0.7514
+  val_iou       : 0.6017
+  val_acc       : 0.8505
+  val_acc_pixel : 0.9987
+  val_hd95      : 20.6243
+  lr            : 0.00007680
+  grad_norm     : 0.000000
+  use_deep_supervision: 1.000000
+  loss_main    : 0.298363
+  loss_aux_d2  : 0.313018
+  loss_aux_d3  : 0.353182
+  loss_aux_d4  : 0.445510
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+  pet_beta     : 0.211104
+  pet_spatial_mean: 0.917096
+  pet_spatial_std: 0.145851
+  pet_modulation_delta_abs_mean: 0.337798
+  down1_alpha  : 0.002317
+  down2_alpha  : -0.081196
+  down3_alpha  : -0.062260
+  down1_x_hp_abs_mean: 0.028441
+  down1_x_lap_abs_mean: 0.007699
+  down1_x_hh_mean: 0.095280
+  down1_high_gate_mean: 0.488785
+  down2_x_hp_abs_mean: 0.052233
+  down2_x_lap_abs_mean: 0.012372
+  down2_x_hh_mean: 0.116549
+  down2_high_gate_mean: 0.519566
+  down3_x_hp_abs_mean: 0.097968
+  down3_x_lap_abs_mean: 0.019848
+  down3_x_hh_mean: 0.132009
+  down3_high_gate_mean: 0.525360
+  grad_norm    : 0.000000
+----------------------------------------------------------------
+Epoch 9
+  train_loss    : 0.3078
+  val_loss      : 0.4013
+  val_dice      : 0.7493
+  val_iou       : 0.5992
+  val_acc       : 0.8377
+  val_acc_pixel : 0.9987
+  val_hd95      : 20.2484
+  lr            : 0.00007542
+  grad_norm     : 0.000000
+  use_deep_supervision: 1.000000
+  loss_main    : 0.285596
+  loss_aux_d2  : 0.301811
+  loss_aux_d3  : 0.344551
+  loss_aux_d4  : 0.435991
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+  pet_beta     : 0.215003
+  pet_spatial_mean: 0.922239
+  pet_spatial_std: 0.145344
+  pet_modulation_delta_abs_mean: 0.353769
+  down1_alpha  : 0.006556
+  down2_alpha  : -0.083690
+  down3_alpha  : -0.061698
+  down1_x_hp_abs_mean: 0.029056
+  down1_x_lap_abs_mean: 0.007922
+  down1_x_hh_mean: 0.094280
+  down1_high_gate_mean: 0.490426
+  down2_x_hp_abs_mean: 0.052499
+  down2_x_lap_abs_mean: 0.012297
+  down2_x_hh_mean: 0.110996
+  down2_high_gate_mean: 0.515778
+  down3_x_hp_abs_mean: 0.095067
+  down3_x_lap_abs_mean: 0.019405
+  down3_x_hh_mean: 0.125430
+  down3_high_gate_mean: 0.528490
+  grad_norm    : 0.000000
+----------------------------------------------------------------
+Epoch 10
+  train_loss    : 0.2994
+  val_loss      : 0.3913
+  val_dice      : 0.7572
+  val_iou       : 0.6092
+  val_acc       : 0.8596
+  val_acc_pixel : 0.9987
+  val_hd95      : 21.9317
+  lr            : 0.00007381
+  grad_norm     : 0.000000
+  use_deep_supervision: 1.000000
+  loss_main    : 0.276658
+  loss_aux_d2  : 0.293786
+  loss_aux_d3  : 0.336890
+  loss_aux_d4  : 0.429514
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+  pet_beta     : 0.220058
+  pet_spatial_mean: 0.897453
+  pet_spatial_std: 0.157533
+  pet_modulation_delta_abs_mean: 0.368807
+  down1_alpha  : 0.011134
+  down2_alpha  : -0.086064
+  down3_alpha  : -0.063535
+  down1_x_hp_abs_mean: 0.029182
+  down1_x_lap_abs_mean: 0.007923
+  down1_x_hh_mean: 0.094260
+  down1_high_gate_mean: 0.491386
+  down2_x_hp_abs_mean: 0.052292
+  down2_x_lap_abs_mean: 0.011999
+  down2_x_hh_mean: 0.110462
+  down2_high_gate_mean: 0.515373
+  down3_x_hp_abs_mean: 0.095093
+  down3_x_lap_abs_mean: 0.018780
+  down3_x_hh_mean: 0.122509
+  down3_high_gate_mean: 0.526197
+  grad_norm    : 0.000000
+----------------------------------------------------------------
+Epoch 11
+  train_loss    : 0.2906
+  val_loss      : 0.4131
+  val_dice      : 0.7526
+  val_iou       : 0.6033
+  val_acc       : 0.8458
+  val_acc_pixel : 0.9987
+  val_hd95      : 22.9412
+  lr            : 0.00007198
+  grad_norm     : 0.000000
+  use_deep_supervision: 1.000000
+  loss_main    : 0.267115
+  loss_aux_d2  : 0.285030
+  loss_aux_d3  : 0.329720
+  loss_aux_d4  : 0.422780
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+  pet_beta     : 0.223951
+  pet_spatial_mean: 0.911258
+  pet_spatial_std: 0.165405
+  pet_modulation_delta_abs_mean: 0.373858
+  down1_alpha  : 0.016589
+  down2_alpha  : -0.089534
+  down3_alpha  : -0.064551
+  down1_x_hp_abs_mean: 0.028730
+  down1_x_lap_abs_mean: 0.007773
+  down1_x_hh_mean: 0.093679
+  down1_high_gate_mean: 0.496816
+  down2_x_hp_abs_mean: 0.052032
+  down2_x_lap_abs_mean: 0.011823
+  down2_x_hh_mean: 0.112194
+  down2_high_gate_mean: 0.515467
+  down3_x_hp_abs_mean: 0.093447
+  down3_x_lap_abs_mean: 0.018411
+  down3_x_hh_mean: 0.125232
+  down3_high_gate_mean: 0.525419
+  grad_norm    : 0.000000
+----------------------------------------------------------------
+Epoch 12
+  train_loss    : 0.2838
+  val_loss      : 0.4089
+  val_dice      : 0.7547
+  val_iou       : 0.6061
+  val_acc       : 0.8400
+  val_acc_pixel : 0.9988
+  val_hd95      : 20.9441
+  lr            : 0.00006994
+  grad_norm     : 0.000000
+  use_deep_supervision: 1.000000
+  loss_main    : 0.259980
+  loss_aux_d2  : 0.278431
+  loss_aux_d3  : 0.323230
+  loss_aux_d4  : 0.417376
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+  pet_beta     : 0.227183
+  pet_spatial_mean: 0.902691
+  pet_spatial_std: 0.154522
+  pet_modulation_delta_abs_mean: 0.378812
+  down1_alpha  : 0.018530
+  down2_alpha  : -0.089098
+  down3_alpha  : -0.065162
+  down1_x_hp_abs_mean: 0.029399
+  down1_x_lap_abs_mean: 0.008014
+  down1_x_hh_mean: 0.093992
+  down1_high_gate_mean: 0.496997
+  down2_x_hp_abs_mean: 0.052983
+  down2_x_lap_abs_mean: 0.012225
+  down2_x_hh_mean: 0.109742
+  down2_high_gate_mean: 0.512972
+  down3_x_hp_abs_mean: 0.094710
+  down3_x_lap_abs_mean: 0.018921
+  down3_x_hh_mean: 0.124549
+  down3_high_gate_mean: 0.527128
+  grad_norm    : 0.000000
+----------------------------------------------------------------
+Epoch 13
+  train_loss    : 0.2756
+  val_loss      : 0.4240
+  val_dice      : 0.7305
+  val_iou       : 0.5754
+  val_acc       : 0.8133
+  val_acc_pixel : 0.9987
+  val_hd95      : 22.1228
+  lr            : 0.00006771
+  grad_norm     : 0.000000
+  use_deep_supervision: 1.000000
+  loss_main    : 0.251269
+  loss_aux_d2  : 0.270200
+  loss_aux_d3  : 0.316061
+  loss_aux_d4  : 0.410590
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+  pet_beta     : 0.230559
+  pet_spatial_mean: 0.909373
+  pet_spatial_std: 0.147308
+  pet_modulation_delta_abs_mean: 0.384587
+  down1_alpha  : 0.022737
+  down2_alpha  : -0.091156
+  down3_alpha  : -0.066311
+  down1_x_hp_abs_mean: 0.029392
+  down1_x_lap_abs_mean: 0.008035
+  down1_x_hh_mean: 0.093297
+  down1_high_gate_mean: 0.500202
+  down2_x_hp_abs_mean: 0.055055
+  down2_x_lap_abs_mean: 0.012806
+  down2_x_hh_mean: 0.111483
+  down2_high_gate_mean: 0.513272
+  down3_x_hp_abs_mean: 0.095978
+  down3_x_lap_abs_mean: 0.019449
+  down3_x_hh_mean: 0.119189
+  down3_high_gate_mean: 0.521430
+  grad_norm    : 0.000000
+----------------------------------------------------------------
+Epoch 14
+  train_loss    : 0.2716
+  val_loss      : 0.3984
+  val_dice      : 0.7567
+  val_iou       : 0.6087
+  val_acc       : 0.8451
+  val_acc_pixel : 0.9988
+  val_hd95      : 20.7868
+  lr            : 0.00006530
+  grad_norm     : 0.000000
+  use_deep_supervision: 1.000000
+  loss_main    : 0.247191
+  loss_aux_d2  : 0.266200
+  loss_aux_d3  : 0.312255
+  loss_aux_d4  : 0.407177
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+  pet_beta     : 0.233492
+  pet_spatial_mean: 0.897655
+  pet_spatial_std: 0.165968
+  pet_modulation_delta_abs_mean: 0.385620
+  down1_alpha  : 0.027509
+  down2_alpha  : -0.091886
+  down3_alpha  : -0.066491
+  down1_x_hp_abs_mean: 0.030999
+  down1_x_lap_abs_mean: 0.008578
+  down1_x_hh_mean: 0.092631
+  down1_high_gate_mean: 0.502988
+  down2_x_hp_abs_mean: 0.056589
+  down2_x_lap_abs_mean: 0.013562
+  down2_x_hh_mean: 0.110908
+  down2_high_gate_mean: 0.513931
+  down3_x_hp_abs_mean: 0.097979
+  down3_x_lap_abs_mean: 0.019933
+  down3_x_hh_mean: 0.122110
+  down3_high_gate_mean: 0.526780
+  grad_norm    : 0.000000
+----------------------------------------------------------------
+Epoch 15
+  train_loss    : 0.2656
+  val_loss      : 0.4036
+  val_dice      : 0.7578
+  val_iou       : 0.6101
+  val_acc       : 0.8420
+  val_acc_pixel : 0.9988
+  val_hd95      : 21.4490
+  lr            : 0.00006272
+  grad_norm     : 0.000000
+  use_deep_supervision: 1.000000
+  loss_main    : 0.240721
+  loss_aux_d2  : 0.260361
+  loss_aux_d3  : 0.307059
+  loss_aux_d4  : 0.401994
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+  pet_beta     : 0.235921
+  pet_spatial_mean: 0.880381
+  pet_spatial_std: 0.148140
+  pet_modulation_delta_abs_mean: 0.390630
+  down1_alpha  : 0.027413
+  down2_alpha  : -0.093985
+  down3_alpha  : -0.067428
+  down1_x_hp_abs_mean: 0.029359
+  down1_x_lap_abs_mean: 0.008114
+  down1_x_hh_mean: 0.091453
+  down1_high_gate_mean: 0.501402
+  down2_x_hp_abs_mean: 0.055200
+  down2_x_lap_abs_mean: 0.013050
+  down2_x_hh_mean: 0.116294
+  down2_high_gate_mean: 0.514083
+  down3_x_hp_abs_mean: 0.097455
+  down3_x_lap_abs_mean: 0.020023
+  down3_x_hh_mean: 0.126588
+  down3_high_gate_mean: 0.526454
+  grad_norm    : 0.000000
+----------------------------------------------------------------
+Epoch 16
+  train_loss    : 0.2609
+  val_loss      : 0.3956
+  val_dice      : 0.7611
+  val_iou       : 0.6143
+  val_acc       : 0.8472
+  val_acc_pixel : 0.9988
+  val_hd95      : 21.3464
+  lr            : 0.00006000
+  grad_norm     : 0.000000
+  use_deep_supervision: 1.000000
+  loss_main    : 0.235678
+  loss_aux_d2  : 0.255777
+  loss_aux_d3  : 0.303647
+  loss_aux_d4  : 0.398285
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+  pet_beta     : 0.237722
+  pet_spatial_mean: 0.888926
+  pet_spatial_std: 0.150924
+  pet_modulation_delta_abs_mean: 0.391959
+  down1_alpha  : 0.028183
+  down2_alpha  : -0.095233
+  down3_alpha  : -0.069061
+  down1_x_hp_abs_mean: 0.028507
+  down1_x_lap_abs_mean: 0.007800
+  down1_x_hh_mean: 0.092674
+  down1_high_gate_mean: 0.499845
+  down2_x_hp_abs_mean: 0.053850
+  down2_x_lap_abs_mean: 0.012530
+  down2_x_hh_mean: 0.118517
+  down2_high_gate_mean: 0.513531
+  down3_x_hp_abs_mean: 0.095680
+  down3_x_lap_abs_mean: 0.019299
+  down3_x_hh_mean: 0.122445
+  down3_high_gate_mean: 0.524259
+  grad_norm    : 0.000000
+----------------------------------------------------------------
+Epoch 17
+  train_loss    : 0.2570
+  val_loss      : 0.4101
+  val_dice      : 0.7593
+  val_iou       : 0.6120
+  val_acc       : 0.8468
+  val_acc_pixel : 0.9988
+  val_hd95      : 21.4606
+  lr            : 0.00005715
+  grad_norm     : 0.000000
+  use_deep_supervision: 1.000000
+  loss_main    : 0.231548
+  loss_aux_d2  : 0.251810
+  loss_aux_d3  : 0.299813
+  loss_aux_d4  : 0.395406
+  ds_weight_main: 0.533333
+  ds_weight_d2 : 0.266667
+  ds_weight_d3 : 0.133333
+  ds_weight_d4 : 0.066667
+  pet_beta     : 0.240547
+  pet_spatial_mean: 0.893702
+  pet_spatial_std: 0.157991
+  pet_modulation_delta_abs_mean: 0.412097
+  down1_alpha  : 0.033270
+  down2_alpha  : -0.095336
+  down3_alpha  : -0.069028
+  down1_x_hp_abs_mean: 0.028578
+  down1_x_lap_abs_mean: 0.007803
+  down1_x_hh_mean: 0.093051
+  down1_high_gate_mean: 0.507341
+  down2_x_hp_abs_mean: 0.055046
+  down2_x_lap_abs_mean: 0.012813
+  down2_x_hh_mean: 0.115902
+  down2_high_gate_mean: 0.515414
+  down3_x_hp_abs_mean: 0.095255
+  down3_x_lap_abs_mean: 0.019407
+  down3_x_hh_mean: 0.119476
+  down3_high_gate_mean: 0.528539
+  grad_norm    : 0.000000
+----------------------------------------------------------------
