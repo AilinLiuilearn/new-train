@@ -127,7 +127,8 @@ def load_local_weights_safe(model, path, name='Encoder'):
                      'mit-b1.pth', 'mit-b1.bin', 'mit-b1.pt',
                      'pvt_v2_b1.pth', 'pvt_v2_b1.bin', 'pvt_v2_b1.pt',
                      'convnext_tiny.pth', 'convnext_tiny.bin', 'convnext_tiny.pt',
-                     'convnext_nano.pth', 'convnext_nano.bin', 'convnext_nano.pt'):
+                     'convnext_nano.pth', 'convnext_nano.bin', 'convnext_nano.pt',
+                     'convnextv2_nano.pth', 'convnextv2_nano.bin', 'convnextv2_nano.pt'):
             full = os.path.join(path, cand)
             if os.path.exists(full):
                 path = full
@@ -216,6 +217,8 @@ def _normalize_backbone_name(backbone):
         'convnext-t': 'convnext_tiny',
         'convnext-tiny': 'convnext_tiny',
         'convnext_t': 'convnext_tiny',
+        'convnextv2-nano': 'convnextv2_nano',
+        'convnext_v2_nano': 'convnextv2_nano',
         'pvt-b1': 'pvt_v2_b1',
         'pvt_b1': 'pvt_v2_b1',
     }
@@ -320,9 +323,12 @@ def _get_backbone_out_indices(backbone):
     backbone = _normalize_backbone_name(backbone)
     if backbone in ('pvt_v2_b1', 'mit_b0', 'mit_b1'):
         return (0, 1, 2, 3)
-    if backbone in ('convnext_tiny', 'convnext_nano'):
+    if backbone in ('convnext_tiny', 'convnext_nano', 'convnextv2_nano', 'convnextv2_atto', 'convnextv2_femto', 'convnextv2_pico'):
         return (0, 1, 2, 3)
-    raise ValueError(f'Unsupported backbone: {backbone}. Supported: pvt_v2_b1, mit_b0, mit_b1, convnext_tiny, convnext_nano.')
+    raise ValueError(
+        f'Unsupported backbone: {backbone}. '
+        'Supported: pvt_v2_b1, mit_b0, mit_b1, convnext_tiny, convnext_nano, convnextv2_nano.'
+    )
 
 
 class FallbackFeatureBackbone(nn.Module):
@@ -438,145 +444,30 @@ def _resolve_use_channel_prior_gate(config):
 
 
 def build_mdt_seg_teacher(config):
-    model_arch = getattr(config, 'model_arch', 'petct_baseline')
-    if model_arch == 'a1_pet_prompt_ct':
-        from models.pet_prompted_ct_decoder import PETPromptedCTSegmentation
-        model = PETPromptedCTSegmentation(
-            ct_backbone=getattr(config, 'ct_backbone', 'convnext_tiny'),
-            ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
-            dinov3_model_name=getattr(config, 'dinov3_model_name', 'vit_small_patch16_dinov3'),
-            dinov3_pretrained_path=getattr(config, 'dinov3_pretrained_path', None),
-            out_channels=1,
-            use_deep_supervision=_resolve_use_deep_supervision(config),
-            pet_prompt_base_channels=getattr(config, 'pet_prompt_base_channels', 256),
-        )
-        print(
-            f'[A1] PET-Prompted CT Decoder: ct_backbone={getattr(config, "ct_backbone", "convnext_tiny")} '
-            f'dinov3={getattr(config, "dinov3_model_name", "vit_small_patch16_dinov3")} '
-            f'deep_supervision={_resolve_use_deep_supervision(config)}'
-        )
-        return dict(model=model)
-    if model_arch == 'ct_lap_hgl':
-        from models.ct_lap_hgl_seg import CTLapHGLSegmentation
-        pet_channels = getattr(config, 'pet_prior_channels', [64, 128, 256, 512])
-        if isinstance(pet_channels, str):
-            pet_channels = tuple(int(x) for x in pet_channels.split(','))
-        else:
-            pet_channels = tuple(int(x) for x in pet_channels)
-        model = CTLapHGLSegmentation(
-            ct_backbone=getattr(config, 'ct_backbone', 'convnext_tiny'),
-            ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
-            in_channels=3,
-            out_channels=1,
-            use_deep_supervision=_resolve_use_deep_supervision(config),
-            pet_prior_type=getattr(config, 'pet_prior_type', 'lap_hgl'),
-            pet_prior_size=getattr(config, 'pet_prior_size', 'lite'),
-            pet_prior_c4_channels=getattr(config, 'pet_prior_c4_channels', 512),
-            pet_prior_mid_channels=getattr(config, 'pet_prior_mid_channels', 32),
-            pet_channels=pet_channels,
-            pet_fuse_mid_channels=getattr(config, 'pet_fuse_mid_channels', 128),
-            pet_gn_groups=getattr(config, 'pet_gn_groups', 8),
-        )
-        print(
-            f'[ct_lap_hgl] ct_backbone={getattr(config, "ct_backbone", "convnext_tiny")} '
-            f'pet_prior_type={getattr(config, "pet_prior_type", "lap_hgl")} '
-            f'pet_prior_size={getattr(config, "pet_prior_size", "lite")} '
-            f'deep_supervision={_resolve_use_deep_supervision(config)}'
-        )
-        return dict(model=model)
-    if model_arch == 'pet_mrp_gsa':
-        from models.ct_pet_mrp_gsa_seg import CTPETMRPGSASegmentation, parse_pet_mrp_stages
-        use_pet_mrp_gsa = bool(getattr(config, 'use_pet_mrp_gsa', True))
-        pet_mrp_stages = getattr(config, 'pet_mrp_stages', 'all')
-        model = CTPETMRPGSASegmentation(
-            ct_backbone=getattr(config, 'ct_backbone', 'convnext_tiny'),
-            ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
-            in_channels=3,
-            out_channels=1,
-            use_deep_supervision=_resolve_use_deep_supervision(config),
-            use_pet_mrp_gsa=use_pet_mrp_gsa,
-            pet_mrp_stages=pet_mrp_stages,
-        )
-        active = parse_pet_mrp_stages(pet_mrp_stages if use_pet_mrp_gsa else 'none')
-        print(
-            f'[pet_mrp_gsa] ct_backbone={getattr(config, "ct_backbone", "convnext_tiny")} '
-            f'use_pet_mrp_gsa={use_pet_mrp_gsa} pet_mrp_stages={pet_mrp_stages} '
-            f'active_stage_indices={active} deep_supervision={_resolve_use_deep_supervision(config)}'
-        )
-        return dict(model=model)
-    if model_arch == 'mafd_net':
-        from models.mafd_net import MAFDNet
-        model = MAFDNet(
-            img_channels=3,
-            num_classes=1,
-            encoder_name=getattr(config, 'encoder_name', getattr(config, 'ct_backbone', 'mit_b1')),
-            pretrained=getattr(config, 'pretrained', True),
-            freq_method=getattr(config, 'freq_method', 'fft'),
-            use_pet_proxy=getattr(config, 'use_pet_proxy', True),
-            proxy_loss_weight=getattr(config, 'proxy_loss_weight', 0.05),
-            consistency_loss_weight=getattr(config, 'consistency_loss_weight', 0.0),
+    model_arch = getattr(config, 'model_arch', 'dual_shared_add_baseline')
+    if model_arch == 'dual_shared_add_baseline':
+        from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
+        model = DualSharedAddPETCTBaseline(
+            ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
+            pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
             ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
             pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
+            in_channels=3,
+            out_channels=1,
+            decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
             use_deep_supervision=_resolve_use_deep_supervision(config),
         )
         print(
-            f'[MAFDNet] encoder={getattr(config, "encoder_name", getattr(config, "ct_backbone", "mit_b1"))} '
-            f'freq_method={getattr(config, "freq_method", "fft")} '
-            f'use_pet_proxy={getattr(config, "use_pet_proxy", True)} '
-            f'proxy_loss_weight={getattr(config, "proxy_loss_weight", 0.05)}'
+            f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
+            f'pet={getattr(config, "pet_backbone", "mit_b1")} '
+            f'fusion=add shared_decoder=UNetStyleDecoder '
+            f'deep_supervision={_resolve_use_deep_supervision(config)}'
         )
         return dict(model=model)
-    if model_arch != 'petct_baseline':
-        raise ValueError(
-            f'Unsupported model_arch={model_arch}. '
-            'Use petct_baseline, mafd_net, a1_pet_prompt_ct, ct_lap_hgl, or pet_mrp_gsa.'
-        )
-    from models.baseline_petct_unet import PETCTBaselineUNet
-    use_channel_prior_gate = _resolve_use_channel_prior_gate(config)
-    fusion_type = getattr(config, 'fusion_type', 'concat_conv')
-    hybrid_concat_stages = _parse_hybrid_concat_stages(config)
-    hybrid_dmome_stages = _parse_hybrid_dmome_stages(config)
-    model = PETCTBaselineUNet(
-        ct_backbone=getattr(config, 'ct_backbone', 'mit_b1'),
-        pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
-        ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
-        pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
-        in_channels=3,
-        out_channels=1,
-        fusion_type=fusion_type,
-        dmome_expert_reduction=getattr(config, 'dmome_expert_reduction', 4),
-        dmome_use_status_token=getattr(config, 'dmome_use_status_token', True),
-        dmome_temperature=getattr(config, 'dmome_temperature', 1.0),
-        dmome_init_ct_bias=getattr(config, 'dmome_init_ct_bias', 0.0),
-        dmome_output_proj=getattr(config, 'dmome_output_proj', False),
-        dmome_norm_groups=getattr(config, 'dmome_norm_groups', 8),
-        use_channel_prior_gate=use_channel_prior_gate,
-        prior_gate_stages=_parse_prior_gate_stages(config),
-        hybrid_concat_stages=hybrid_concat_stages,
-        hybrid_dmome_stages=hybrid_dmome_stages,
-        use_deep_supervision=_resolve_use_deep_supervision(config),
+    raise ValueError(
+        f'Unsupported model_arch={model_arch}. '
+        'Only dual_shared_add_baseline is kept for this cleaned checkpoint.'
     )
-    if fusion_type == 'hybrid_concat_dmome':
-        print(
-            f'[hybrid_fusion] concat_conv stages={hybrid_concat_stages}; '
-            f'plain DMoME stages={hybrid_dmome_stages} (no text prior)'
-        )
-    if use_channel_prior_gate:
-        from models.biomedclip_text_encoder import encode_modality_prior_texts
-        model_dir = getattr(
-            config,
-            'biomedclip_model_path',
-            '/root/autodl-tmp/mkd-main/new-train/pretrained/biomedclip_model',
-        )
-        print(f'[channel_prior_gate] Encoding modality prior texts with BioMedCLIP from {model_dir}')
-        text_embeds = encode_modality_prior_texts(model_dir=model_dir, device='cpu')
-        model.set_modality_prior_text_embeds(text_embeds)
-        prior_stages = _parse_prior_gate_stages(config)
-        print(
-            f'[channel_prior_gate] Cached modality text embeds: shape={tuple(text_embeds.shape)}; '
-            f'stages={prior_stages}; channel residual prior (alpha_max=0.20, init≈0.02)'
-        )
-    return dict(model=model)
 
 
 def _resolve_use_deep_supervision(config):

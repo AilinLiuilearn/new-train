@@ -1,0 +1,67 @@
+[
+  {
+    "batch_idx": 0,
+    "case_id": "0487",
+    "slice_id": 1,
+    "c1_abs_diff_mean": 0.6723752021789551,
+    "c1_rel_change": 0.5667668318026439,
+    "c2_abs_diff_mean": 0.51032555103302,
+    "c2_rel_change": 0.2842789311636449,
+    "c3_abs_diff_mean": 0.6221005916595459,
+    "c3_rel_change": 0.15098236077278057,
+    "c4_abs_diff_mean": 1.395788550376892,
+    "c4_rel_change": 1.529262370479013
+  },
+  {
+    "batch_idx": 5,
+    "case_id": "0126",
+    "slice_id": 58,
+    "c1_abs_diff_mean": 0.6225443482398987,
+    "c1_rel_change": 0.5078244035771182,
+    "c2_abs_diff_mean": 0.48073810338974,
+    "c2_rel_change": 0.22995367827029678,
+    "c3_abs_diff_mean": 0.6129801869392395,
+    "c3_rel_change": 0.13920009635913644,
+    "c4_abs_diff_mean": 1.5932252407073975,
+    "c4_rel_change": 1.6692355418865321
+  },
+  {
+    "batch_idx": 12,
+    "case_id": "0540",
+    "slice_id": 41,
+    "c1_abs_diff_mean": 0.610427975654602,
+    "c1_rel_change": 0.49288517919580993,
+    "c2_abs_diff_mean": 0.48712682723999023,
+    "c2_rel_change": 0.23025275529833047,
+    "c3_abs_diff_mean": 0.6372667551040649,
+    "c3_rel_change": 0.1490412608080635,
+    "c4_abs_diff_mean": 1.5435807704925537,
+    "c4_rel_change": 1.9911449441138436
+  },
+  {
+    "batch_idx": 20,
+    "case_id": "0418",
+    "slice_id": 14,
+    "c1_abs_diff_mean": 0.6213559508323669,
+    "c1_rel_change": 0.509629217213841,
+    "c2_abs_diff_mean": 0.48668259382247925,
+    "c2_rel_change": 0.2361378086980886,
+    "c3_abs_diff_mean": 0.6275753378868103,
+    "c3_rel_change": 0.14702350112540544,
+    "c4_abs_diff_mean": 1.432969331741333,
+    "c4_rel_change": 1.5725641406926507
+  },
+  {
+    "batch_idx": 30,
+    "case_id": "0192",
+    "slice_id": 43,
+    "c1_abs_diff_mean": 0.630061149597168,
+    "c1_rel_change": 0.5110484657242647,
+    "c2_abs_diff_mean": 0.48453986644744873,
+    "c2_rel_change": 0.22794024289799883,
+    "c3_abs_diff_mean": 0.6181339025497437,
+    "c3_rel_change": 0.14184914314323308,
+    "c4_abs_diff_mean": 1.5352628231048584,
+    "c4_rel_change": 1.7986512823412004
+  }
+]

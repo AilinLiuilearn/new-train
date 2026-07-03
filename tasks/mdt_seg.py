@@ -32,14 +32,18 @@ def mask_to_boundary(mask):
     return boundary
 
 
-def _forward(nets, ct, pet, target_size, pet_available=None, return_aux=False):
+def _forward(nets, ct, pet, target_size, pet_available=None, return_aux=False, mask=None):
     kwargs = {'target_size': target_size, 'return_aux': return_aux}
     if pet_available is not None:
         kwargs['pet_available'] = pet_available
+    if mask is not None:
+        kwargs['mask'] = mask
     try:
         return nets['model'](ct, pet, **kwargs)
     except TypeError:
         kwargs.pop('return_aux', None)
+        if mask is not None:
+            kwargs.pop('mask', None)
         if pet_available is not None:
             return nets['model'](ct, pet, pet_available=pet_available, target_size=target_size)
         return nets['model'](ct, pet, target_size=target_size)
@@ -301,6 +305,11 @@ class MDTSegTeacher:
         loss_cudm, cudm_stats = self._compute_cudm_disentangle_loss(outputs, mask)
         loss_fnet, fnet_stats = self._compute_fnet_sparse_aux_loss(outputs, mask)
         loss_proxy, proxy_stats = self._compute_proxy_loss(outputs)
+        loss_mem = mask.new_tensor(0.0)
+        if isinstance(outputs, dict) and isinstance(outputs.get('aux'), dict):
+            aux = outputs['aux']
+            if torch.is_tensor(aux.get('L_mem')):
+                loss_mem = aux['L_mem']
         loss_boundary = mask.new_tensor(0.0)
         boundary_weight = float(getattr(self.config, 'boundary_loss_weight', 0.0))
         boundary_logits = None
@@ -313,12 +322,14 @@ class MDTSegTeacher:
             loss_boundary = F.binary_cross_entropy_with_logits(boundary_logits, boundary_target)
         _check_finite('pred', pred)
         _check_finite('loss_seg', loss_seg)
+        _check_finite('loss_mem', loss_mem)
         _check_finite('loss_boundary', loss_boundary)
         _check_finite('loss_proxy', loss_proxy)
-        loss_total = loss_seg + loss_cudm + loss_fnet + loss_proxy + boundary_weight * loss_boundary
+        loss_total = loss_seg + loss_mem + loss_cudm + loss_fnet + loss_proxy + boundary_weight * loss_boundary
         _check_finite('loss_total', loss_total)
         loss_dict = {
             'loss_seg': loss_seg.detach(),
+            'loss_mem': loss_mem.detach(),
             'loss_boundary': loss_boundary.detach(),
             'loss_cudm': loss_cudm.detach(),
             'loss_fnet': loss_fnet.detach(),
@@ -346,6 +357,7 @@ class MDTSegTeacher:
             mask.shape[-2:],
             pet_available=pet_available,
             return_aux=True,
+            mask=mask,
         )
         pred = self._select_main_pred(outputs)
         boundary_logits = outputs.get('boundary_logits') if isinstance(outputs, dict) else None
@@ -423,6 +435,7 @@ class MDTSegTeacher:
                 mask.shape[-2:],
                 pet_available=pet_available,
                 return_aux=need_aux,
+                mask=mask,
             )
             pred = self._select_main_pred(outputs)
             loss_seg, _ = self.loss_seg(pred, mask)

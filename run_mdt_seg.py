@@ -287,11 +287,15 @@ def main():
     if getattr(config, 'model_arch', '') == 'pet_mrp_gsa':
         print(f'use_pet_mrp_gsa={getattr(config, "use_pet_mrp_gsa", True)}')
         print(f'pet_mrp_stages={getattr(config, "pet_mrp_stages", "all")}')
+        print(f'pet_mrp_prior_mode={getattr(config, "pet_mrp_prior_mode", "minmax")}')
     if getattr(config, 'model_arch', '') == 'mafd_net':
         print(f'freq_method={getattr(config, "freq_method", "fft")}')
         print(f'use_pet_proxy={getattr(config, "use_pet_proxy", True)}')
         print(f'proxy_loss_weight={getattr(config, "proxy_loss_weight", 0.05)}')
     print(f'use_deep_supervision={_use_deep_supervision(config)}')
+    print(f'use_fprm={getattr(config, "use_fprm", False)}')
+    print(f'fprm_slots={getattr(config, "fprm_slots", 32)} fprm_dim={getattr(config, "fprm_dim", 0)} fprm_beta={getattr(config, "fprm_beta", 0.1)} fprm_gamma={getattr(config, "fprm_gamma", 0.1)}')
+    print(f'fprm_mem_loss_weight={getattr(config, "fprm_mem_loss_weight", 0.05)} fprm_use_memory={getattr(config, "fprm_use_memory", True)} fprm_use_shape={getattr(config, "fprm_use_shape", True)}')
     print(f'train_pet_drop_prob={getattr(config, "train_pet_drop_prob", 0.0)}')
     print(f'eval_full_pet={getattr(config, "eval_full_pet", True)} eval_fixed_missing_pet={getattr(config, "eval_fixed_missing_pet", False)} eval_random_missing_pet={getattr(config, "eval_random_missing_pet", False)}')
     print(f'aug_mode={getattr(config, "aug_mode", None)}')
