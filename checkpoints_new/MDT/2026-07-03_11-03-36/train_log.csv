@@ -1,0 +1,1 @@
+epoch,train_loss,val_loss,val_dice,val_iou,val_acc,val_acc_pixel,val_hd95,lr,grad_norm,use_deep_supervision,loss_main,loss_aux_d2,loss_aux_d3,loss_aux_d4,ds_weight_main,ds_weight_d2,ds_weight_d3,ds_weight_d4

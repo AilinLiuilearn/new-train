@@ -35,9 +35,9 @@ class SegMDTConfig(ConfigBase):
         p.add_argument(
             "--model_arch",
             type=str,
-            default="petct_baseline",
-            choices=("petct_baseline", "mafd_net", "a1_pet_prompt_ct", "ct_lap_hgl", "pet_mrp_gsa"),
-            help="petct_baseline, mafd_net, a1_pet_prompt_ct, ct_lap_hgl, or pet_mrp_gsa (CT ConvNeXt + PET-MRP-GSA).",
+            default="dual_shared_add_baseline",
+            choices=("dual_shared_add_baseline",),
+            help="dual_shared_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, shared UNet decoder.",
         )
         p.add_argument(
             "--use_pet_mrp_gsa",
@@ -51,6 +51,13 @@ class SegMDTConfig(ConfigBase):
             default="all",
             choices=("all", "c34", "c4"),
             help="Which encoder stages use PET-MRP-GSA: all, c34 (C3+C4), or c4 (C4 only).",
+        )
+        p.add_argument(
+            "--pet_mrp_prior_mode",
+            type=str,
+            default="minmax",
+            choices=("minmax", "full", "local"),
+            help="PET map m for PET-MRP-GSA prior: minmax (V1), full (S_full), local (S_loc).",
         )
         p.add_argument(
             "--pet_prior_type",
@@ -100,11 +107,11 @@ class SegMDTConfig(ConfigBase):
             default=256,
             help="Base channel width for PET prompt projector in A1.",
         )
-        p.add_argument("--ct_backbone", type=str, default="mit_b1")
+        p.add_argument("--ct_backbone", type=str, default="convnextv2_nano")
         p.add_argument("--pet_backbone", type=str, default="mit_b1")
         p.add_argument("--encoder_name", type=str, default="mit_b1", help="Shared backbone name for MAFDNet low/high encoders.")
         p.add_argument("--pretrained", type=str2bool, default=True, help="Load local pretrained encoder weights when paths are provided.")
-        p.add_argument("--ct_pretrained_path", type=str, default="/root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1")
+        p.add_argument("--ct_pretrained_path", type=str, default="/root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano")
         p.add_argument("--pet_pretrained_path", type=str, default="/root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1")
         p.add_argument("--freq_method", type=str, default="fft", choices=("fft", "fft_gaussian", "avgpool", "blur"), help="Frequency decoupling method used by MAFDNet. Default fft uses radial Fourier low-pass + residual high-pass.")
         p.add_argument("--use_pet_proxy", type=str2bool, default=True, help="Use CT-conditioned PET frequency proxy for unavailable PET samples in MAFDNet.")
@@ -166,7 +173,7 @@ class SegMDTConfig(ConfigBase):
     def train_parser():
         p = argparse.ArgumentParser("Train", add_help=False)
         p.add_argument("--epochs", type=int, default=60)
-        p.add_argument("--batch_size", type=int, default=8)
+        p.add_argument("--batch_size", type=int, default=16)
         p.add_argument("--accumulation_steps", type=int, default=1, help="梯度累加步数")
         p.add_argument("--optimizer", type=str, default="adamw", choices=("sgd", "adamw"))
         p.add_argument("--learning_rate", type=float, default=8e-5)
