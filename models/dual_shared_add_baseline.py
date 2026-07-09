@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.ac_hmtr import AnatomyConditionedHierarchicalMissingPETRouter
 from models.baseline_petct_unet import AddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
 from models.build_mdt_seg import ConvBNAct, create_feature_backbone, load_local_weights_safe
 
@@ -28,9 +29,13 @@ class DualSharedAddPETCTBaseline(nn.Module):
         out_channels=1,
         decoder_channels=(512, 256, 128, 64),
         use_deep_supervision=False,
+        missing_mode='ct',
+        ac_hmtr_num_tokens=8,
+        ac_hmtr_residual_scale_init=0.1,
     ):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
+        self.missing_mode = str(missing_mode)
 
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
@@ -50,6 +55,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
             out_channels=out_channels,
             use_deep_supervision=self.use_deep_supervision,
         )
+        self.ac_hmtr = AnatomyConditionedHierarchicalMissingPETRouter(
+            pet_channels,
+            num_tokens=ac_hmtr_num_tokens,
+            residual_scale_init=ac_hmtr_residual_scale_init,
+        )
 
     @staticmethod
     def _to_3ch(x):
@@ -67,6 +77,16 @@ class DualSharedAddPETCTBaseline(nn.Module):
         _check_tensor_list('pet_feats', pet_feats)
         return pet_feats
 
+    def _build_missing_features(self, aligned_ct_feats):
+        if self.missing_mode == 'ct':
+            diagnostics = [{'mode': 'ct'} for _ in aligned_ct_feats]
+            return aligned_ct_feats, diagnostics
+        if self.missing_mode == 'ac_hmtr':
+            residuals, diagnostics = self.ac_hmtr(aligned_ct_feats)
+            missing_feats = [ct + res for ct, res in zip(aligned_ct_feats, residuals)]
+            return missing_feats, diagnostics
+        raise ValueError(f'Unsupported missing_mode={self.missing_mode!r}')
+
     def _decode(self, fused_feats, target_size):
         dec_out = self.decoder(fused_feats, target_size)
         outputs = self._finalize_decoder_output(dec_out)
@@ -83,7 +103,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
 
     def _forward_missing(self, ct, target_size):
         aligned_ct_feats = self._encode_ct(ct)
-        return self._decode(aligned_ct_feats, target_size)
+        missing_feats, diagnostics = self._build_missing_features(aligned_ct_feats)
+        outputs = self._decode(missing_feats, target_size)
+        outputs['aux']['ac_hmtr'] = diagnostics
+        return outputs
 
     def _forward_auto(self, ct, pet, pet_available, target_size):
         pet_available = pet_available.long().view(-1)
@@ -95,6 +118,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         aligned_ct_feats = self._encode_ct(ct)
         fused_feats = list(aligned_ct_feats)
         full_idx = torch.nonzero(pet_available == 1, as_tuple=False).flatten()
+        miss_idx = torch.nonzero(pet_available == 0, as_tuple=False).flatten()
         if full_idx.numel() > 0:
             pet_full = pet.index_select(0, full_idx)
             pet_feats = self._encode_pet(pet_full)
@@ -106,6 +130,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
             for stage_idx, feat in enumerate(fused_full):
                 fused_feats[stage_idx] = fused_feats[stage_idx].clone()
                 fused_feats[stage_idx].index_copy_(0, full_idx, feat)
+        if miss_idx.numel() > 0:
+            miss_ct_feats = [feat.index_select(0, miss_idx) for feat in aligned_ct_feats]
+            miss_feats, _ = self._build_missing_features(miss_ct_feats)
+            for stage_idx, feat in enumerate(miss_feats):
+                fused_feats[stage_idx] = fused_feats[stage_idx].clone()
+                fused_feats[stage_idx].index_copy_(0, miss_idx, feat)
         return self._decode(fused_feats, target_size)
 
     def forward(self, ct, pet, pet_available=None, target_size=None, forward_mode='auto'):
