@@ -32,21 +32,17 @@ def mask_to_boundary(mask):
     return boundary
 
 
-def _forward(nets, ct, pet, target_size, pet_available=None, return_aux=False, mask=None):
-    kwargs = {'target_size': target_size, 'return_aux': return_aux}
+def _forward(nets, ct, pet, target_size, pet_available=None, return_aux=False, mask=None, forward_mode=None):
+    kwargs = {'target_size': target_size}
     if pet_available is not None:
         kwargs['pet_available'] = pet_available
+    if forward_mode is not None:
+        kwargs['forward_mode'] = forward_mode
+    if return_aux:
+        kwargs['return_aux'] = return_aux
     if mask is not None:
         kwargs['mask'] = mask
-    try:
-        return nets['model'](ct, pet, **kwargs)
-    except TypeError:
-        kwargs.pop('return_aux', None)
-        if mask is not None:
-            kwargs.pop('mask', None)
-        if pet_available is not None:
-            return nets['model'](ct, pet, pet_available=pet_available, target_size=target_size)
-        return nets['model'](ct, pet, target_size=target_size)
+    return nets['model'](ct, pet, **kwargs)
 
 
 def _is_finite_tensor(x):
@@ -342,39 +338,41 @@ class MDTSegTeacher:
         loss_dict.update(proxy_stats)
         return loss_total, pred, loss_dict
 
-    def train_step(self, batch):
+    def train_step(self, batch, forward_mode):
+        if forward_mode not in ('full', 'missing'):
+            raise ValueError(f'Unsupported training route: {forward_mode}')
         ct = batch['ct'].float().to(self.device)
-        pet = batch['pet'].float().to(self.device)
         mask = batch['mask'].float().to(self.device)
-        if 'pet_available' in batch:
-            pet_available = batch['pet_available'].to(self.device).long().view(-1)
+        if forward_mode == 'full':
+            pet = batch['pet'].float().to(self.device)
         else:
-            pet_available = torch.ones(ct.shape[0], device=self.device, dtype=torch.long)
+            pet = None
         outputs = _forward(
             self.networks,
             ct,
             pet,
             mask.shape[-2:],
-            pet_available=pet_available,
-            return_aux=True,
-            mask=mask,
+            forward_mode=forward_mode,
         )
-        pred = self._select_main_pred(outputs)
-        boundary_logits = outputs.get('boundary_logits') if isinstance(outputs, dict) else None
-        _check_finite('pred', pred)
-        if boundary_logits is not None:
-            _check_finite('boundary_logits', boundary_logits)
-        loss, pred, loss_dict = self._compute_total_loss(outputs, mask)
-        if isinstance(outputs, dict) and isinstance(outputs.get('aux'), dict):
-            for key, value in outputs['aux'].items():
-                if torch.is_tensor(value):
-                    loss_dict[key] = value.detach()
-                elif value is not None:
-                    loss_dict[key] = value
-        _check_finite('loss_seg', loss_dict.get('loss_seg', loss))
-        _check_finite('loss_boundary', loss_dict.get('loss_boundary', loss))
-        _check_finite('loss_total', loss_dict.get('loss_total', loss))
-        return loss, pred, mask, loss_dict
+        loss_seg, pred, loss_stats = self._compute_segmentation_loss(outputs, mask)
+        if forward_mode == 'missing':
+            missing_weight = float(getattr(self.config, 'missing_loss_weight', 1.0))
+            loss_total = missing_weight * loss_seg
+        else:
+            loss_total = loss_seg
+        zero = loss_seg.detach().new_tensor(0.0)
+        loss_dict = dict(loss_stats)
+        loss_dict.update({
+            'loss_seg': loss_seg.detach(),
+            'loss_total': loss_total.detach(),
+            'loss_full': loss_seg.detach() if forward_mode == 'full' else zero,
+            'loss_missing': loss_seg.detach() if forward_mode == 'missing' else zero,
+            'train_route_full': 1.0 if forward_mode == 'full' else 0.0,
+            'train_route_missing': 1.0 if forward_mode == 'missing' else 0.0,
+        })
+        _check_finite('loss_seg', loss_dict.get('loss_seg', loss_total))
+        _check_finite('loss_total', loss_dict.get('loss_total', loss_total))
+        return loss_total, pred, mask, loss_dict
 
     @torch.no_grad()
     def evaluate(self, loader, threshold=None, eval_mode="full", random_pet_drop_prob=0.0, random_seed=2026, tag="val", force_missing_pet=None):
@@ -434,7 +432,7 @@ class MDTSegTeacher:
                 pet,
                 mask.shape[-2:],
                 pet_available=pet_available,
-                return_aux=need_aux,
+                forward_mode='auto',
                 mask=mask,
             )
             pred = self._select_main_pred(outputs)

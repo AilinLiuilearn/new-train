@@ -355,11 +355,17 @@ def main():
         task.optimizer.zero_grad()
         print(f'[Epoch {epoch}] train PET dropout prob={train_pet_drop_prob:.3f}')
 
+        full_train_steps = 0
+        missing_train_steps = 0
+        full_loss_sum = 0.0
+        missing_loss_sum = 0.0
         for i, batch in enumerate(train_loader):
             stepped = False
+            global_batch_step = (epoch - 1) * spe + i
+            train_route = 'full' if global_batch_step % 2 == 0 else 'missing'
             try:
                 with torch.cuda.amp.autocast(enabled=config.mixed_precision):
-                    loss, _, _, loss_dict = task.train_step(batch)
+                    loss, _, _, loss_dict = task.train_step(batch, forward_mode=train_route)
                     loss = loss / accum_iter
             except RuntimeError as exc:
                 if '[NaN/Inf]' in str(exc) or 'nan' in str(exc).lower() or 'inf' in str(exc).lower():
@@ -431,6 +437,12 @@ def main():
             tseg += step_seg
             tboundary += step_boundary
             tn += 1
+            if train_route == 'full':
+                full_train_steps += 1
+                full_loss_sum += float(loss_dict.get('loss_total', loss.detach()).item())
+            else:
+                missing_train_steps += 1
+                missing_loss_sum += float(loss_dict.get('loss_total', loss.detach()).item())
             if ds_metric_sum:
                 batch_ds = _collect_deep_supervision_metrics(loss_dict)
                 for key in ds_metric_sum:
@@ -440,7 +452,7 @@ def main():
             if (i + 1) % 50 == 0:
                 curr_lr = task.optimizer.param_groups[0]['lr']
                 print(
-                    f'  Ep{epoch}[{i + 1}/{spe}] '
+                    f'  Ep{epoch}[{i + 1}/{spe}] route={train_route} '
                     f'loss={step_loss:.4f} '
                     f'seg={step_seg:.4f} '
                     f'boundary={step_boundary:.4f} '
@@ -458,7 +470,7 @@ def main():
                 val_loader,
                 eval_mode='random_missing',
                 random_pet_drop_prob=getattr(config, 'eval_random_pet_drop_prob', 0.4),
-                random_seed=2026 + epoch,
+                random_seed=getattr(config, 'eval_random_seed', 2026),
                 tag='val_random_missing',
             )
         if not val_results:
@@ -492,6 +504,9 @@ def main():
             f'Epoch {epoch}\n'
             f'train_loss={tloss / max(tn, 1):.4f} train_seg={tseg / max(tn, 1):.4f} train_boundary={tboundary / max(tn, 1):.4f}\n'
             + '\n'.join(val_lines) + '\n'
+            f'route_stats full_steps={full_train_steps} missing_steps={missing_train_steps} '
+            f'avg_full_loss={full_loss_sum / max(full_train_steps, 1):.4f} '
+            f'avg_missing_loss={missing_loss_sum / max(missing_train_steps, 1):.4f}\n'
             f'full PET-CT training/evaluation '
             f'lr={curr_lr:.6f} grad_norm={avg_grad_norm:.4f} grad_clipped_steps={grad_clip_count}/{grad_norm_steps} '
             f'grad_guard_skipped_steps={sum(first_bad_module_counter.values())} first_bad_module_counter={first_bad_module_counter} '
@@ -546,7 +561,7 @@ def main():
                 loader,
                 eval_mode='random_missing',
                 random_pet_drop_prob=getattr(config, 'eval_random_pet_drop_prob', 0.4),
-                random_seed=2026,
+                random_seed=getattr(config, 'eval_random_seed', 2026),
                 tag=f'{prefix}_random_missing',
             )
         if not results:
