@@ -364,7 +364,8 @@ def main():
             global_batch_step = (epoch - 1) * spe + i
             train_route = 'full' if global_batch_step % 2 == 0 else 'missing'
             try:
-                with torch.cuda.amp.autocast(enabled=config.mixed_precision):
+                use_amp = bool(config.mixed_precision) and train_route == 'full'
+                with torch.cuda.amp.autocast(enabled=use_amp):
                     loss, _, _, loss_dict = task.train_step(batch, forward_mode=train_route)
                     loss = loss / accum_iter
             except RuntimeError as exc:
