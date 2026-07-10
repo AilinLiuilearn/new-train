@@ -40,6 +40,17 @@ class SegMDTConfig(ConfigBase):
             help="dual_shared_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, shared UNet decoder.",
         )
         p.add_argument(
+            "--missing_mode",
+            type=str,
+            default="pg_mtr",
+            choices=("ct", "pg_mtr"),
+            help="Missing-route behavior: ct (E1-Control) or pg_mtr (PET-grounded token retrieval).",
+        )
+        p.add_argument("--pg_mtr_num_tokens", type=int, default=8)
+        p.add_argument("--pg_mtr_lambda_route", type=float, default=0.1)
+        p.add_argument("--pg_mtr_lambda_mem", type=float, default=0.05)
+        p.add_argument("--pg_mtr_temperature", type=float, default=0.07)
+        p.add_argument(
             "--use_pet_mrp_gsa",
             type=str2bool,
             default=True,

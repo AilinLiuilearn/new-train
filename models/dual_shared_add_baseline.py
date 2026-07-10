@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from models.baseline_petct_unet import AddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
 from models.build_mdt_seg import ConvBNAct, create_feature_backbone, load_local_weights_safe
+from models.pg_mtr import PETGroundedMetabolicTokenRetrieval
 
 
 class StageChannelAlign(nn.Module):
@@ -28,9 +29,13 @@ class DualSharedAddPETCTBaseline(nn.Module):
         out_channels=1,
         decoder_channels=(512, 256, 128, 64),
         use_deep_supervision=False,
+        missing_mode='ct',
+        pg_mtr_num_tokens=8,
+        pg_mtr_temperature=0.07,
     ):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
+        self.missing_mode = str(missing_mode)
 
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
@@ -44,6 +49,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
 
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
         self.fusion = AddFusion()
+        self.pg_mtr = PETGroundedMetabolicTokenRetrieval(
+            pet_channels,
+            num_tokens=pg_mtr_num_tokens,
+            temperature=pg_mtr_temperature,
+        )
         self.decoder = UNetStyleDecoder(
             pet_channels,
             decoder_channels=decoder_channels,
@@ -79,10 +89,25 @@ class DualSharedAddPETCTBaseline(nn.Module):
         aligned_ct_feats = self._encode_ct(ct)
         pet_feats = self._encode_pet(pet)
         fused_feats = self.fusion(aligned_ct_feats, pet_feats, pet_available=None)
-        return self._decode(fused_feats, target_size)
+        outputs = self._decode(fused_feats, target_size)
+        if self.missing_mode == 'pg_mtr':
+            _, pg_aux, pg_diag = self.pg_mtr(
+                aligned_ct_feats=[feat.detach() for feat in aligned_ct_feats],
+                pet_feats=[feat.detach() for feat in pet_feats],
+                mode='full',
+            )
+            outputs['aux_losses'] = pg_aux
+            outputs['diagnostics'] = pg_diag
+        return outputs
 
     def _forward_missing(self, ct, target_size):
         aligned_ct_feats = self._encode_ct(ct)
+        if self.missing_mode == 'pg_mtr':
+            missing_feats, pg_aux, pg_diag = self.pg_mtr(aligned_ct_feats, pet_feats=None, mode='missing')
+            outputs = self._decode(missing_feats, target_size)
+            outputs['aux_losses'] = pg_aux
+            outputs['diagnostics'] = pg_diag
+            return outputs
         return self._decode(aligned_ct_feats, target_size)
 
     def _forward_auto(self, ct, pet, pet_available, target_size):
@@ -95,6 +120,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         aligned_ct_feats = self._encode_ct(ct)
         fused_feats = list(aligned_ct_feats)
         full_idx = torch.nonzero(pet_available == 1, as_tuple=False).flatten()
+        miss_idx = torch.nonzero(pet_available == 0, as_tuple=False).flatten()
         if full_idx.numel() > 0:
             pet_full = pet.index_select(0, full_idx)
             pet_feats = self._encode_pet(pet_full)
@@ -106,7 +132,13 @@ class DualSharedAddPETCTBaseline(nn.Module):
             for stage_idx, feat in enumerate(fused_full):
                 fused_feats[stage_idx] = fused_feats[stage_idx].clone()
                 fused_feats[stage_idx].index_copy_(0, full_idx, feat)
-        return self._decode(fused_feats, target_size)
+        outputs = self._decode(fused_feats, target_size)
+        if self.missing_mode == 'pg_mtr' and miss_idx.numel() > 0:
+            missing_ct = [feat.index_select(0, miss_idx) for feat in aligned_ct_feats]
+            missing_feats, pg_aux_miss, pg_diag_miss = self.pg_mtr(missing_ct, pet_feats=None, mode='missing')
+            outputs['aux_losses'] = {'missing': pg_aux_miss}
+            outputs['diagnostics'] = {'missing': pg_diag_miss}
+        return outputs
 
     def forward(self, ct, pet, pet_available=None, target_size=None, forward_mode='auto'):
         if target_size is None:

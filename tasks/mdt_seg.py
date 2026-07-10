@@ -84,7 +84,10 @@ class MDTSegTeacher:
     def __init__(self, networks, config):
         self.networks = {k: v for k, v in networks.items() if v is not None}
         self.config = config
-        self.device = torch.device('cuda', int(config.gpus[0]))
+        if torch.cuda.is_available():
+            self.device = torch.device('cuda', int(config.gpus[0]))
+        else:
+            self.device = torch.device('cpu')
         self.data_parallel = torch.cuda.is_available() and len(getattr(config, 'gpus', [])) > 1
         for key, v in list(self.networks.items()):
             v.to(self.device)
@@ -93,7 +96,7 @@ class MDTSegTeacher:
         if self.data_parallel:
             print(f'[+] DataParallel enabled on GPUs: {list(config.gpus)}')
 
-        self.scaler = torch.cuda.amp.GradScaler() if config.mixed_precision else None
+        self.scaler = torch.cuda.amp.GradScaler() if (config.mixed_precision and torch.cuda.is_available()) else None
         self.loss_seg = BCEDiceLoss(
             bce_weight=getattr(config, 'bce_weight', 1.0),
             dice_weight=getattr(config, 'dice_weight', 1.0),
@@ -353,11 +356,19 @@ class MDTSegTeacher:
             forward_mode=forward_mode,
         )
         loss_seg, pred, loss_stats = self._compute_segmentation_loss(outputs, mask)
+        pg_route = loss_seg.new_tensor(0.0)
+        pg_mem = loss_seg.new_tensor(0.0)
+        if forward_mode == 'full' and isinstance(outputs, dict):
+            aux_losses = outputs.get('aux_losses') if isinstance(outputs.get('aux_losses'), dict) else {}
+            if torch.is_tensor(aux_losses.get('pg_mtr_route_loss')):
+                pg_route = aux_losses['pg_mtr_route_loss']
+            if torch.is_tensor(aux_losses.get('pg_mtr_mem_loss')):
+                pg_mem = aux_losses['pg_mtr_mem_loss']
         if forward_mode == 'missing':
             missing_weight = float(getattr(self.config, 'missing_loss_weight', 1.0))
             loss_total = missing_weight * loss_seg
         else:
-            loss_total = loss_seg
+            loss_total = loss_seg + float(getattr(self.config, 'pg_mtr_lambda_route', 0.1)) * pg_route + float(getattr(self.config, 'pg_mtr_lambda_mem', 0.05)) * pg_mem
         zero = loss_seg.detach().new_tensor(0.0)
         loss_dict = dict(loss_stats)
         loss_dict.update({
@@ -367,6 +378,9 @@ class MDTSegTeacher:
             'loss_missing': loss_seg.detach() if forward_mode == 'missing' else zero,
             'train_route_full': 1.0 if forward_mode == 'full' else 0.0,
             'train_route_missing': 1.0 if forward_mode == 'missing' else 0.0,
+            'pg_mtr_route_loss': pg_route.detach(),
+            'pg_mtr_mem_loss': pg_mem.detach(),
+            'pg_mtr_total_aux_loss': (float(getattr(self.config, 'pg_mtr_lambda_route', 0.1)) * pg_route + float(getattr(self.config, 'pg_mtr_lambda_mem', 0.05)) * pg_mem).detach(),
         })
         _check_finite('loss_seg', loss_dict.get('loss_seg', loss_total))
         _check_finite('loss_total', loss_dict.get('loss_total', loss_total))
