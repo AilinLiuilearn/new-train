@@ -176,7 +176,7 @@ class SegMDTConfig(ConfigBase):
         )
         p.add_argument("--log_dmome_weights", type=str2bool, default=True, help="Log stage-wise DMoME fusion weights during validation.")
         p.add_argument("--decoder_type", type=str, default="unet", choices=("unet",))
-        p.add_argument("--use_deep_supervision", type=str2bool, default=True, help="Enable nnU-Net style deep supervision on decoder aux heads.")
+        p.add_argument("--use_deep_supervision", type=str2bool, default=False, help="Enable nnU-Net style deep supervision on decoder aux heads.")
         p.add_argument("--print_trainable_only", type=str2bool, default=True)
         return p
 
