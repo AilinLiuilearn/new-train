@@ -51,6 +51,13 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--pg_mtr_lambda_mem", type=float, default=0.05)
         p.add_argument("--pg_mtr_temperature", type=float, default=0.07)
         p.add_argument(
+            "--pg_mtr_stages",
+            type=str,
+            default="deep",
+            choices=("deep", "all"),
+            help=("PG-MTR active stages: deep means S3+S4; all means S1+S2+S3+S4."),
+        )
+        p.add_argument(
             "--use_pet_mrp_gsa",
             type=str2bool,
             default=True,

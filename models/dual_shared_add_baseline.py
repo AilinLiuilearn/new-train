@@ -32,10 +32,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
         missing_mode='ct',
         pg_mtr_num_tokens=8,
         pg_mtr_temperature=0.07,
+        pg_mtr_stages='deep',
     ):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.missing_mode = str(missing_mode)
+        self.pg_mtr_stages = str(pg_mtr_stages)
 
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
@@ -53,6 +55,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
             pet_channels,
             num_tokens=pg_mtr_num_tokens,
             temperature=pg_mtr_temperature,
+            stage_mode=self.pg_mtr_stages,
         )
         self.decoder = UNetStyleDecoder(
             pet_channels,
@@ -112,32 +115,67 @@ class DualSharedAddPETCTBaseline(nn.Module):
 
     def _forward_auto(self, ct, pet, pet_available, target_size):
         pet_available = pet_available.long().view(-1)
+
         if torch.all(pet_available == 1):
             return self._forward_full(ct, pet, target_size)
+
         if torch.all(pet_available == 0):
             return self._forward_missing(ct, target_size)
 
         aligned_ct_feats = self._encode_ct(ct)
-        fused_feats = list(aligned_ct_feats)
-        full_idx = torch.nonzero(pet_available == 1, as_tuple=False).flatten()
-        miss_idx = torch.nonzero(pet_available == 0, as_tuple=False).flatten()
+        fused_feats = [feat.clone() for feat in aligned_ct_feats]
+
+        full_idx = torch.nonzero(
+            pet_available == 1,
+            as_tuple=False,
+        ).flatten()
+
+        miss_idx = torch.nonzero(
+            pet_available == 0,
+            as_tuple=False,
+        ).flatten()
+
         if full_idx.numel() > 0:
             pet_full = pet.index_select(0, full_idx)
             pet_feats = self._encode_pet(pet_full)
+            ct_full_feats = [feat.index_select(0, full_idx) for feat in aligned_ct_feats]
             fused_full = self.fusion(
-                [feat.index_select(0, full_idx) for feat in aligned_ct_feats],
+                ct_full_feats,
                 pet_feats,
                 pet_available=None,
             )
             for stage_idx, feat in enumerate(fused_full):
-                fused_feats[stage_idx] = fused_feats[stage_idx].clone()
                 fused_feats[stage_idx].index_copy_(0, full_idx, feat)
-        outputs = self._decode(fused_feats, target_size)
-        if self.missing_mode == 'pg_mtr' and miss_idx.numel() > 0:
-            missing_ct = [feat.index_select(0, miss_idx) for feat in aligned_ct_feats]
-            missing_feats, pg_aux_miss, pg_diag_miss = self.pg_mtr(missing_ct, pet_feats=None, mode='missing')
-            outputs['aux_losses'] = {'missing': pg_aux_miss}
-            outputs['diagnostics'] = {'missing': pg_diag_miss}
+
+        pg_diag_miss = {}
+
+        if miss_idx.numel() > 0:
+            missing_ct_feats = [feat.index_select(0, miss_idx) for feat in aligned_ct_feats]
+            if self.missing_mode == 'pg_mtr':
+                missing_feats, _, pg_diag_miss = self.pg_mtr(
+                    aligned_ct_feats=missing_ct_feats,
+                    pet_feats=None,
+                    mode='missing',
+                )
+            elif self.missing_mode == 'ct':
+                missing_feats = missing_ct_feats
+            else:
+                raise ValueError(f'Unsupported missing_mode={self.missing_mode!r}')
+            for stage_idx, feat in enumerate(missing_feats):
+                fused_feats[stage_idx].index_copy_(0, miss_idx, feat)
+
+        outputs = self._decode(
+            fused_feats,
+            target_size,
+        )
+
+        if self.missing_mode == 'pg_mtr':
+            outputs['diagnostics'] = {
+                'missing': pg_diag_miss,
+                'full_count': int(full_idx.numel()),
+                'missing_count': int(miss_idx.numel()),
+            }
+
         return outputs
 
     def forward(self, ct, pet, pet_available=None, target_size=None, forward_mode='auto'):

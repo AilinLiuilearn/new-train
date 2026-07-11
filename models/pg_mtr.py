@@ -1404,22 +1404,13 @@ class PETGroundedMetabolicTokenRetrieval(
         ]
     """
 
-    ACTIVE_STAGE_NUMBERS = (
-        3,
-        4,
-    )
-
-    ACTIVE_STAGE_INDICES = (
-        2,
-        3,
-    )
-
     def __init__(
         self,
         channels_list: Sequence[int],
         num_tokens: int = 8,
         temperature: float = 0.07,
         residual_scale_init: float = 0.1,
+        stage_mode: str = "deep",
     ) -> None:
 
         super().__init__()
@@ -1438,56 +1429,26 @@ class PETGroundedMetabolicTokenRetrieval(
                 f"got {len(channels)}"
             )
 
-        self.channels_list = (
-            channels
-        )
-
-        self.num_tokens = int(
-            num_tokens
-        )
-
-        self.temperature = float(
-            temperature
-        )
-
-        # ----------------------------------------------------
-        # Independent PET-grounded memory for S3 and S4
-        # ----------------------------------------------------
-
-        self.stage_modules = nn.ModuleDict({
-
-            "3":
-                StagePETGroundedMetabolicTokenRetrieval(
-
-                    in_channels=
-                        channels[2],
-
-                    num_tokens=
-                        self.num_tokens,
-
-                    temperature=
-                        self.temperature,
-
-                    residual_scale_init=
-                        residual_scale_init,
-                ),
-
-            "4":
-                StagePETGroundedMetabolicTokenRetrieval(
-
-                    in_channels=
-                        channels[3],
-
-                    num_tokens=
-                        self.num_tokens,
-
-                    temperature=
-                        self.temperature,
-
-                    residual_scale_init=
-                        residual_scale_init,
-                ),
-        })
+        self.channels_list = channels
+        self.num_tokens = int(num_tokens)
+        self.temperature = float(temperature)
+        self.stage_mode = str(stage_mode)
+        if self.stage_mode == "deep":
+            active_stage_numbers = (3, 4)
+        elif self.stage_mode == "all":
+            active_stage_numbers = (1, 2, 3, 4)
+        else:
+            raise ValueError(f"Unsupported stage_mode={stage_mode!r}")
+        self.active_stage_numbers = active_stage_numbers
+        self.active_stage_indices = tuple(stage_number - 1 for stage_number in active_stage_numbers)
+        self.stage_modules = nn.ModuleDict()
+        for stage_number, stage_index in zip(self.active_stage_numbers, self.active_stage_indices):
+            self.stage_modules[str(stage_number)] = StagePETGroundedMetabolicTokenRetrieval(
+                in_channels=channels[stage_index],
+                num_tokens=self.num_tokens,
+                temperature=self.temperature,
+                residual_scale_init=residual_scale_init,
+            )
 
     # ========================================================
     # Validation
@@ -1575,19 +1536,7 @@ class PETGroundedMetabolicTokenRetrieval(
             torch.Tensor,
         ] = {}
 
-        # ----------------------------------------------------
-        # Only S3 and S4
-        # ----------------------------------------------------
-
-        for (
-            stage_number,
-            stage_index,
-        ) in zip(
-
-            self.ACTIVE_STAGE_NUMBERS,
-            self.ACTIVE_STAGE_INDICES,
-
-        ):
+        for stage_number, stage_index in zip(self.active_stage_numbers, self.active_stage_indices):
 
             stage_module = (
                 self.stage_modules[
@@ -1633,7 +1582,7 @@ class PETGroundedMetabolicTokenRetrieval(
             )
 
         # ----------------------------------------------------
-        # Average S3 + S4
+        # Average over active stages
         # ----------------------------------------------------
 
         route_loss = torch.stack(
@@ -1717,19 +1666,7 @@ class PETGroundedMetabolicTokenRetrieval(
             torch.Tensor
         ] = []
 
-        # ----------------------------------------------------
-        # Only S3 / S4 are compensated.
-        # ----------------------------------------------------
-
-        for (
-            stage_number,
-            stage_index,
-        ) in zip(
-
-            self.ACTIVE_STAGE_NUMBERS,
-            self.ACTIVE_STAGE_INDICES,
-
-        ):
+        for stage_number, stage_index in zip(self.active_stage_numbers, self.active_stage_indices):
 
             stage_module = (
                 self.stage_modules[

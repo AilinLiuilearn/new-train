@@ -344,11 +344,14 @@ def build_mdt_seg_teacher(config):
             missing_mode=getattr(config, 'missing_mode', 'ct'),
             pg_mtr_num_tokens=getattr(config, 'pg_mtr_num_tokens', 8),
             pg_mtr_temperature=getattr(config, 'pg_mtr_temperature', 0.07),
+            pg_mtr_stages=getattr(config, 'pg_mtr_stages', 'deep'),
         )
         print(
-            f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
-            f'pet={getattr(config, "pet_backbone", "mit_b1")} fusion=add shared_decoder=UNetStyleDecoder '
-            f'deep_supervision={_resolve_use_deep_supervision(config)} missing_mode={getattr(config, "missing_mode", "ct")}'
+            f'[dual_shared_add_baseline]\nct={getattr(config, "ct_backbone", "convnextv2_nano")} '
+            f'pet={getattr(config, "pet_backbone", "mit_b1")} fusion=add '
+            f'missing_mode={getattr(config, "missing_mode", "ct")} '
+            f'pg_mtr_stages={getattr(config, "pg_mtr_stages", "deep")} '
+            f'deep_supervision={_resolve_use_deep_supervision(config)}'
         )
         return dict(model=model)
     raise ValueError(f'Unsupported model_arch={model_arch}. Only dual_shared_add_baseline is kept for this cleaned checkpoint.')
