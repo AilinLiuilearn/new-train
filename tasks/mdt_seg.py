@@ -354,6 +354,7 @@ class MDTSegTeacher:
         )
         loss_seg, pred, loss_stats = self._compute_segmentation_loss(outputs, mask)
         aux_losses = outputs.get('aux_losses', {}) if isinstance(outputs, dict) else {}
+        diagnostics = outputs.get('diagnostics', {}) if isinstance(outputs, dict) else {}
         zero = loss_seg.new_tensor(0.0)
         route_loss = aux_losses.get('pg_mtr_route_loss', zero)
         mem_loss = aux_losses.get('pg_mtr_mem_loss', zero)
@@ -377,9 +378,41 @@ class MDTSegTeacher:
             'weighted_loss_pg_mtr_route': (route_weight * route_loss).detach(),
             'weighted_loss_pg_mtr_mem': (mem_weight * mem_loss).detach(),
         })
+        for key, value in diagnostics.items():
+            if torch.is_tensor(value) and value.numel() > 0:
+                loss_dict[f'diag_{key}'] = value.detach().float().mean()
         _check_finite('loss_seg', loss_dict.get('loss_seg', loss_total))
         _check_finite('loss_total', loss_dict.get('loss_total', loss_total))
         return loss_total, pred, mask, loss_dict
+
+    def _accumulate_pg_diagnostics(self, pg_diag_sum, pg_diag_count, diagnostics):
+        for key, value in diagnostics.items():
+            scalar = None
+            if torch.is_tensor(value):
+                if value.numel() == 0:
+                    continue
+                scalar = float(value.detach().float().mean().cpu())
+            else:
+                try:
+                    scalar = float(value)
+                except (TypeError, ValueError):
+                    continue
+            if not math.isfinite(scalar):
+                continue
+            pg_diag_sum[key] = pg_diag_sum.get(key, 0.0) + scalar
+            pg_diag_count[key] = pg_diag_count.get(key, 0) + 1
+
+    def _print_pg_diag_summary(self, tag, pg_diag_avg):
+        if not pg_diag_avg:
+            return
+        print(f'[evaluate] PG-MTR diagnostics ({tag}):')
+        stages = sorted({key.split('_')[2] for key in pg_diag_avg.keys() if key.startswith('pg_mtr_s') and len(key.split('_')) >= 4})
+        for stage_tag in stages:
+            stage_keys = sorted([k for k in pg_diag_avg.keys() if k.startswith(f'pg_mtr_{stage_tag}_')])
+            print(f'[PG-MTR][{tag}][{stage_tag.upper()}]')
+            for key in stage_keys:
+                suffix = key.split(f'{stage_tag}_', 1)[-1]
+                print(f'  {suffix}={pg_diag_avg[key]:.4f}')
 
     @torch.no_grad()
     def evaluate(self, loader, threshold=None, eval_mode="full", random_pet_drop_prob=0.0, random_seed=2026, tag="val", force_missing_pet=None):
@@ -420,6 +453,8 @@ class MDTSegTeacher:
         pet_mrp_n = 0
         dmome_weight_acc = {}
         dmome_weight_batches = 0
+        pg_diag_sum = {}
+        pg_diag_count = {}
         for batch_idx, batch in enumerate(loader):
             ct = batch['ct'].float().to(self.device)
             pet = batch['pet'].float().to(self.device)
@@ -452,6 +487,8 @@ class MDTSegTeacher:
                 for key, value in batch_summary.items():
                     dmome_weight_acc[key] = dmome_weight_acc.get(key, 0.0) + float(value)
                 dmome_weight_batches += 1
+            diagnostics = outputs.get('diagnostics', {}) if isinstance(outputs, dict) else {}
+            self._accumulate_pg_diagnostics(pg_diag_sum, pg_diag_count, diagnostics)
             if isinstance(outputs, dict) and isinstance(outputs.get('aux'), dict):
                 aux = outputs['aux']
                 for key in gate_sum:
@@ -505,6 +542,9 @@ class MDTSegTeacher:
                 f'[evaluate] PET-MRP-GSA ({tag}): '
                 + ' '.join(f'{k}={out[k]:.4f}' for k in PET_MRP_GSA_LOG_KEYS if k in out)
             )
+        if pg_diag_sum:
+            out.update({k: pg_diag_sum[k] / max(pg_diag_count.get(k, 1), 1) for k in pg_diag_sum})
+            self._print_pg_diag_summary(tag, {k: out[k] for k in pg_diag_sum})
         if dmome_weight_batches > 0:
             dmome_summary = {k: v / dmome_weight_batches for k, v in dmome_weight_acc.items()}
             out.update(dmome_summary)
