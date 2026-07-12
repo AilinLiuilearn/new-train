@@ -164,6 +164,36 @@ def _deep_supervision_log_headers(config):
     ]
 
 
+def _pg_mtr_log_headers(model, prefix):
+    headers = []
+    stage_numbers = getattr(getattr(model, 'pg_mtr', None), 'active_stage_numbers', ())
+    for stage in stage_numbers:
+        if prefix == 'val_full':
+            headers.extend([
+                f'{prefix}_pg_mtr_s{stage}_ct_route_entropy',
+                f'{prefix}_pg_mtr_s{stage}_ct_route_peak',
+                f'{prefix}_pg_mtr_s{stage}_pet_route_entropy',
+                f'{prefix}_pg_mtr_s{stage}_pet_route_peak',
+                f'{prefix}_pg_mtr_s{stage}_token_key_cosine_offdiag',
+                f'{prefix}_pg_mtr_s{stage}_token_value_cosine_offdiag',
+                f'{prefix}_pg_mtr_s{stage}_pet_memory_rms',
+                f'{prefix}_pg_mtr_s{stage}_route_loss',
+                f'{prefix}_pg_mtr_s{stage}_mem_loss',
+            ])
+        else:
+            headers.extend([
+                f'{prefix}_pg_mtr_s{stage}_ct_route_entropy',
+                f'{prefix}_pg_mtr_s{stage}_ct_route_peak',
+                f'{prefix}_pg_mtr_s{stage}_token_key_cosine_offdiag',
+                f'{prefix}_pg_mtr_s{stage}_token_value_cosine_offdiag',
+                f'{prefix}_pg_mtr_s{stage}_retrieved_memory_rms',
+                f'{prefix}_pg_mtr_s{stage}_ct_rms',
+                f'{prefix}_pg_mtr_s{stage}_injection_rms',
+                f'{prefix}_pg_mtr_s{stage}_injection_ct_ratio',
+            ])
+    return headers
+
+
 _DEEP_SUPERVISION_LOG_KEYS = [
     'use_deep_supervision',
     'loss_main',
@@ -345,7 +375,8 @@ def main():
     log_path = os.path.join(config.checkpoint_dir, 'train_log.csv')
     gamma_headers = _adc_gamma_headers(config)
     ds_headers = _deep_supervision_log_headers(config)
-    init_train_log(log_path, extra_headers=gamma_headers + ds_headers)
+    pg_headers = _pg_mtr_log_headers(task._unwrap(task.networks['model']), 'val_full') + _pg_mtr_log_headers(task._unwrap(task.networks['model']), 'val_missing') + ['val_full_dice', 'val_missing_dice', 'val_joint_dice', 'selected_score', 'best_selected_score', 'best_selected_epoch']
+    init_train_log(log_path, extra_headers=gamma_headers + ds_headers + pg_headers)
 
     grad_clip = getattr(config, 'grad_clip', 5.0)
     clip_params = task.trainable_parameters()
@@ -503,6 +534,25 @@ def main():
         joint_hd95 = 0.5 * float(val_full['hd95']) + 0.5 * float(val_fixed_missing['hd95'])
         selected_score, selected_name, selected_checkpoint_filename = _resolve_checkpoint_selection(checkpoint_select, val_full, val_fixed_missing)
         val_m = val_full
+        def _collect_pg_metrics(metrics, prefix):
+            collected = {}
+            for key, value in metrics.items():
+                if not key.startswith('pg_mtr_'):
+                    continue
+                if torch.is_tensor(value):
+                    if value.numel() == 0:
+                        continue
+                    scalar = float(value.detach().float().mean().cpu())
+                else:
+                    try:
+                        scalar = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                if math.isfinite(scalar):
+                    collected[f'{prefix}_{key}'] = scalar
+            return collected
+        pg_full_metrics = _collect_pg_metrics(val_full, 'val_full')
+        pg_missing_metrics = _collect_pg_metrics(val_fixed_missing, 'val_missing')
         avg_grad_norm = grad_norm_sum / max(grad_norm_steps, 1)
         curr_lr = task.optimizer.param_groups[0]['lr']
         gamma_metrics = _collect_adc_gamma(task)
@@ -519,11 +569,14 @@ def main():
             extra_metrics={
                 **gamma_metrics,
                 **ds_metrics,
+                **pg_full_metrics,
+                **pg_missing_metrics,
                 'val_full_dice': float(val_full['dice']),
                 'val_missing_dice': float(val_fixed_missing['dice']),
                 'val_joint_dice': float(joint_dice),
                 'selected_score': float(selected_score),
                 'best_selected_score': float(best_selected_score if best_selected_epoch > 0 else selected_score),
+                'best_selected_epoch': float(best_selected_epoch),
             },
         )
         gamma_text = ''

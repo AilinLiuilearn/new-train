@@ -11,6 +11,31 @@ CSV_HEADER = [
 ]
 
 
+def _read_csv_header(log_path):
+    with open(log_path, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        return next(reader)
+
+
+def _format_csv_value(value, key=None):
+    if value is None:
+        return ''
+    if isinstance(value, bool):
+        return int(value)
+    if key == 'epoch':
+        return int(value)
+    if key == 'lr':
+        return f"{float(value):.8f}"
+    if key == 'grad_norm':
+        return f"{float(value):.6f}"
+    if isinstance(value, int):
+        return value
+    try:
+        return f"{float(value):.6f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def init_train_log(log_path, extra_headers=None):
     readable_path = _readable_path(log_path)
     headers = list(CSV_HEADER) + list(extra_headers or [])
@@ -37,24 +62,17 @@ def append_epoch_log(log_path, epoch, train_loss_avg, val_metrics, lr=None, grad
         'lr': float(lr) if lr is not None else 0.0,
         'grad_norm': float(grad_norm) if grad_norm is not None else 0.0,
     }
-
-    csv_values = [
-        row['epoch'],
-        f"{row['train_loss']:.4f}",
-        f"{row['val_loss']:.4f}",
-        f"{row['val_dice']:.4f}",
-        f"{row['val_iou']:.4f}",
-        f"{row['val_acc']:.4f}",
-        f"{row['val_acc_pixel']:.4f}",
-        f"{row['val_hd95']:.4f}",
-        f"{row['lr']:.8f}",
-        f"{row['grad_norm']:.6f}",
-    ]
-    csv_values.extend(f"{float(v):.6f}" for v in extra_metrics.values())
+    row.update(extra_metrics)
+    headers = _read_csv_header(log_path)
+    if len(row) > len(headers):
+        extra_keys = [k for k in row.keys() if k not in headers]
+        if extra_keys:
+            print(f'[train_logger] warning: ignoring extra metrics not in header: {extra_keys}')
+    csv_row = {h: _format_csv_value(row.get(h), key=h) for h in headers}
 
     with open(log_path, 'a', newline='', encoding='utf-8') as f:
-        w = csv.writer(f)
-        w.writerow(csv_values)
+        w = csv.DictWriter(f, fieldnames=headers, extrasaction='ignore')
+        w.writerow(csv_row)
 
     with open(_readable_path(log_path), 'a', encoding='utf-8') as f:
         f.write(f"Epoch {row['epoch']}\n")

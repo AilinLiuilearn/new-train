@@ -161,12 +161,16 @@ class StagePETGroundedMetabolicTokenRetrieval(nn.Module):
         route_loss = self._route_alignment_loss(pet_assignment, ct_assignment)
         mem_loss = self._memory_grounding_loss(pet_memory, pet_query)
         aux_losses = {"route_loss": route_loss, "mem_loss": mem_loss}
+        token_key_cosine_offdiag = _mean_off_diagonal_token_cosine(token_key).detach()
+        token_value_cosine_offdiag = _mean_off_diagonal_token_cosine(token_value).detach()
         diagnostics = {
             "ct_route_entropy": _normalized_assignment_entropy(ct_assignment).detach(),
             "ct_route_peak": _assignment_peak(ct_assignment).detach(),
             "pet_route_entropy": _normalized_assignment_entropy(pet_assignment).detach(),
             "pet_route_peak": _assignment_peak(pet_assignment).detach(),
-            "token_cosine_offdiag": _mean_off_diagonal_token_cosine(token_value).detach(),
+            "token_key_cosine_offdiag": token_key_cosine_offdiag,
+            "token_value_cosine_offdiag": token_value_cosine_offdiag,
+            "token_cosine_offdiag": token_value_cosine_offdiag,  # Deprecated compatibility alias.
             "pet_memory_rms": _rms(pet_memory).detach(),
             "route_loss": route_loss.detach(),
             "mem_loss": mem_loss.detach(),
@@ -182,10 +186,14 @@ class StagePETGroundedMetabolicTokenRetrieval(nn.Module):
             token_value = token_value.detach()
         ct_assignment = self._assignment(ct_query, token_key)
         retrieved_memory = self._read_memory(ct_assignment, token_value, output_dtype=ct_feat.dtype)
+        token_key_cosine_offdiag = _mean_off_diagonal_token_cosine(token_key).detach()
+        token_value_cosine_offdiag = _mean_off_diagonal_token_cosine(token_value).detach()
         diagnostics = {
             "ct_route_entropy": _normalized_assignment_entropy(ct_assignment).detach(),
             "ct_route_peak": _assignment_peak(ct_assignment).detach(),
-            "token_cosine_offdiag": _mean_off_diagonal_token_cosine(token_key).detach(),
+            "token_key_cosine_offdiag": token_key_cosine_offdiag,
+            "token_value_cosine_offdiag": token_value_cosine_offdiag,
+            "token_cosine_offdiag": token_value_cosine_offdiag,  # Deprecated compatibility alias.
             "retrieved_memory_rms": _rms(retrieved_memory).detach(),
         }
         return retrieved_memory, diagnostics

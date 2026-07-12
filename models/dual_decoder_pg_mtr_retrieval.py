@@ -109,6 +109,24 @@ class DualDecoderPGMTRRetrieval(nn.Module):
         outputs['diagnostics'] = pg_diag
         return outputs
 
+    @staticmethod
+    def _rms_tensor(x, eps=1e-12):
+        return x.detach().float().pow(2).mean().add(eps).sqrt()
+
+    def _apply_retrieved_memory(self, aligned_ct_feats, retrieved_memories, diagnostics):
+        missing_feats = list(aligned_ct_feats)
+        updated_diagnostics = dict(diagnostics)
+        for stage_number in self.pg_mtr.active_stage_numbers:
+            stage_index = stage_number - 1
+            retrieved_feature = self.retrieval_projs[str(stage_number)](retrieved_memories[stage_number])
+            missing_feats[stage_index] = aligned_ct_feats[stage_index] + retrieved_feature
+            ct_rms = self._rms_tensor(aligned_ct_feats[stage_index])
+            injection_rms = self._rms_tensor(retrieved_feature)
+            updated_diagnostics[f'pg_mtr_s{stage_number}_ct_rms'] = ct_rms
+            updated_diagnostics[f'pg_mtr_s{stage_number}_injection_rms'] = injection_rms
+            updated_diagnostics[f'pg_mtr_s{stage_number}_injection_ct_ratio'] = injection_rms / (ct_rms + 1e-6)
+        return missing_feats, updated_diagnostics
+
     def _forward_missing(self, ct, target_size):
         aligned_ct_feats = self._encode_ct(ct)
         retrieved_memories, _, pg_diag = self.pg_mtr(
@@ -117,11 +135,7 @@ class DualDecoderPGMTRRetrieval(nn.Module):
             mode='missing',
             detach_bank=self.pg_mtr_detach_bank_missing,
         )
-        missing_feats = list(aligned_ct_feats)
-        for stage_number in self.pg_mtr.active_stage_numbers:
-            stage_index = stage_number - 1
-            retrieved_feature = self.retrieval_projs[str(stage_number)](retrieved_memories[stage_number])
-            missing_feats[stage_index] = aligned_ct_feats[stage_index] + retrieved_feature
+        missing_feats, pg_diag = self._apply_retrieved_memory(aligned_ct_feats, retrieved_memories, pg_diag)
         outputs = self._decode_with(self.missing_decoder, missing_feats, target_size)
         outputs['aux_losses'] = {}
         outputs['diagnostics'] = pg_diag
@@ -180,10 +194,7 @@ class DualDecoderPGMTRRetrieval(nn.Module):
                 mode='missing',
                 detach_bank=self.pg_mtr_detach_bank_missing,
             )
-            routed_feats = [feat.index_select(0, missing_idx) for feat in aligned_ct_feats]
-            for stage_number in self.pg_mtr.active_stage_numbers:
-                stage_index = stage_number - 1
-                routed_feats[stage_index] = routed_feats[stage_index] + self.retrieval_projs[str(stage_number)](retrieved_memories[stage_number])
+            routed_feats, pg_diag = self._apply_retrieved_memory(missing_ct_feats, retrieved_memories, pg_diag)
             missing_outputs = self._decode_with(self.missing_decoder, routed_feats, target_size)
             missing_outputs['diagnostics'] = pg_diag
         if full_outputs is None:
