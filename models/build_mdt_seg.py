@@ -475,9 +475,28 @@ def build_mdt_seg_teacher(config):
             f'deep_supervision={_resolve_use_deep_supervision(config)}'
         )
         return dict(model=model)
+    if model_arch == 'dual_decoder_pg_mtr_retrieval':
+        from models.dual_decoder_pg_mtr_retrieval import DualDecoderPGMTRRetrieval
+        model = DualDecoderPGMTRRetrieval(
+            **common_kwargs,
+            pg_mtr_stages=getattr(config, 'pg_mtr_stages', 'all'),
+            pg_mtr_num_tokens=getattr(config, 'pg_mtr_num_tokens', 8),
+            pg_mtr_temperature=getattr(config, 'pg_mtr_temperature', 0.07),
+            pg_mtr_detach_bank_missing=getattr(config, 'pg_mtr_detach_bank_missing', True),
+        )
+        print(
+            f'[dual_decoder_pg_mtr_retrieval] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
+            f'pet={getattr(config, "pet_backbone", "mit_b1")} '
+            f'decoder_shared=False pg_mtr_mode=retrieval_only '
+            f'pg_mtr_stages={model.pg_mtr.active_stage_numbers} '
+            f'pg_mtr_num_tokens={getattr(config, "pg_mtr_num_tokens", 8)} '
+            f'missing_fusion=zero_init_1x1_add '
+            f'detach_bank_missing={getattr(config, "pg_mtr_detach_bank_missing", True)}'
+        )
+        return dict(model=model)
     raise ValueError(
         f'Unsupported model_arch={model_arch}. '
-        'Supported: dual_shared_add_baseline, dual_decoder_add_baseline.'
+        'Supported: dual_shared_add_baseline, dual_decoder_add_baseline, dual_decoder_pg_mtr_retrieval.'
     )
 
 

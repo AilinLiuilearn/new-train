@@ -52,11 +52,14 @@ def print_baseline_profile(networks, config, image_size=None, tag='MODEL PROFILE
     print(f'TOTAL PARAMS: {total / 1e6:.2f}M')
     print(f'TRAINABLE PARAMS: {trainable / 1e6:.2f}M')
     print(f'FROZEN PARAMS: {frozen / 1e6:.2f}M')
-    for name in ('enc_ct', 'enc_pet', 'pet_guides', 'fusion', 'stage_fusion', 'decoder', 'full_decoder', 'missing_decoder', 'boundary_head'):
+    for name in ('enc_ct', 'enc_pet', 'ct_align', 'fusion', 'pg_mtr', 'retrieval_projs', 'decoder', 'full_decoder', 'missing_decoder', 'boundary_head'):
         module = getattr(model, name, None) if model is not None else None
         mt, mtr, mf = _count_module_params(module)
         if module is not None:
             print(f'{name}: total={mt / 1e6:.2f}M trainable={mtr / 1e6:.2f}M frozen={mf / 1e6:.2f}M')
+    if hasattr(model, 'pg_mtr'):
+        print(f'pg_mtr active stages: {getattr(model.pg_mtr, "active_stage_numbers", None)}')
+        print(f'pg_mtr num tokens: {getattr(model.pg_mtr, "num_tokens", None)}')
     print('==============================================')
 
     flops_g = None

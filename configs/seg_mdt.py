@@ -36,12 +36,14 @@ class SegMDTConfig(ConfigBase):
             "--model_arch",
             type=str,
             default="dual_shared_add_baseline",
-            choices=("dual_shared_add_baseline", "dual_decoder_add_baseline"),
+            choices=("dual_shared_add_baseline", "dual_decoder_add_baseline", "dual_decoder_pg_mtr_retrieval"),
             help=(
                 "dual_shared_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, shared UNet decoder. "
-                "dual_decoder_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, independent full/missing UNet decoders."
+                "dual_decoder_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, independent full/missing UNet decoders. "
+                "dual_decoder_pg_mtr_retrieval: dual encoder with retrieval-only PG-MTR and zero-init 1x1 missing fusion."
             ),
         )
+
         p.add_argument(
             "--use_pet_mrp_gsa",
             type=str2bool,
@@ -169,6 +171,12 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--log_dmome_weights", type=str2bool, default=True, help="Log stage-wise DMoME fusion weights during validation.")
         p.add_argument("--decoder_type", type=str, default="unet", choices=("unet",))
         p.add_argument("--use_deep_supervision", type=str2bool, default=True, help="Enable nnU-Net style deep supervision on decoder aux heads.")
+        p.add_argument("--pg_mtr_stages", type=str, default="all", choices=("s4", "s34", "deep", "s234", "all"), help="PG-MTR active stages; all means S1-S4 token retrieval, while simple projection add remains a baseline fusion only.")
+        p.add_argument("--pg_mtr_num_tokens", type=int, default=8, help="Number of PET-grounded tokens per stage.")
+        p.add_argument("--pg_mtr_temperature", type=float, default=0.07, help="Routing temperature for token assignment.")
+        p.add_argument("--pg_mtr_route_weight", type=float, default=0.1, help="Weight for PG-MTR route alignment loss; applied only in tasks/mdt_seg.py.")
+        p.add_argument("--pg_mtr_mem_weight", type=float, default=0.05, help="Weight for PG-MTR memory grounding loss; applied only in tasks/mdt_seg.py.")
+        p.add_argument("--pg_mtr_detach_bank_missing", type=str2bool, default=True, help="Detach token bank key/value during missing-route retrieval to prevent missing-loss updates to memory tokens.")
         p.add_argument("--print_trainable_only", type=str2bool, default=True)
         return p
 

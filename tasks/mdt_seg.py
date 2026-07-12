@@ -353,12 +353,17 @@ class MDTSegTeacher:
             forward_mode=forward_mode,
         )
         loss_seg, pred, loss_stats = self._compute_segmentation_loss(outputs, mask)
+        aux_losses = outputs.get('aux_losses', {}) if isinstance(outputs, dict) else {}
+        zero = loss_seg.new_tensor(0.0)
+        route_loss = aux_losses.get('pg_mtr_route_loss', zero)
+        mem_loss = aux_losses.get('pg_mtr_mem_loss', zero)
+        route_weight = float(getattr(self.config, 'pg_mtr_route_weight', 0.1))
+        mem_weight = float(getattr(self.config, 'pg_mtr_mem_weight', 0.05))
         if forward_mode == 'missing':
             missing_weight = float(getattr(self.config, 'missing_loss_weight', 1.0))
             loss_total = missing_weight * loss_seg
         else:
-            loss_total = loss_seg
-        zero = loss_seg.detach().new_tensor(0.0)
+            loss_total = loss_seg + route_weight * route_loss + mem_weight * mem_loss
         loss_dict = dict(loss_stats)
         loss_dict.update({
             'loss_seg': loss_seg.detach(),
@@ -367,6 +372,10 @@ class MDTSegTeacher:
             'loss_missing': loss_seg.detach() if forward_mode == 'missing' else zero,
             'train_route_full': 1.0 if forward_mode == 'full' else 0.0,
             'train_route_missing': 1.0 if forward_mode == 'missing' else 0.0,
+            'loss_pg_mtr_route': route_loss.detach(),
+            'loss_pg_mtr_mem': mem_loss.detach(),
+            'weighted_loss_pg_mtr_route': (route_weight * route_loss).detach(),
+            'weighted_loss_pg_mtr_mem': (mem_weight * mem_loss).detach(),
         })
         _check_finite('loss_seg', loss_dict.get('loss_seg', loss_total))
         _check_finite('loss_total', loss_dict.get('loss_total', loss_total))
