@@ -54,8 +54,11 @@ class SegMDTConfig(ConfigBase):
             "--pg_mtr_stages",
             type=str,
             default="deep",
-            choices=("deep", "all"),
-            help=("PG-MTR active stages: deep means S3+S4; all means S1+S2+S3+S4."),
+            choices=("s4", "deep", "all"),
+            help=(
+                "PG-MTR active stages: s4 means S4 only; "
+                "deep means S3+S4; all means S1+S2+S3+S4."
+            ),
         )
         p.add_argument(
             "--use_pet_mrp_gsa",

@@ -1433,12 +1433,16 @@ class PETGroundedMetabolicTokenRetrieval(
         self.num_tokens = int(num_tokens)
         self.temperature = float(temperature)
         self.stage_mode = str(stage_mode)
-        if self.stage_mode == "deep":
+        if self.stage_mode == "s4":
+            active_stage_numbers = (4,)
+        elif self.stage_mode == "deep":
             active_stage_numbers = (3, 4)
         elif self.stage_mode == "all":
             active_stage_numbers = (1, 2, 3, 4)
         else:
-            raise ValueError(f"Unsupported stage_mode={stage_mode!r}")
+            raise ValueError(
+                f"Unsupported stage_mode={stage_mode!r}; expected one of ('s4', 'deep', 'all')"
+            )
         self.active_stage_numbers = active_stage_numbers
         self.active_stage_indices = tuple(stage_number - 1 for stage_number in active_stage_numbers)
         self.stage_modules = nn.ModuleDict()
