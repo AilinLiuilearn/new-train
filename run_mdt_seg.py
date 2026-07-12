@@ -134,6 +134,20 @@ def _collect_adc_gamma(task):
     return gammas
 
 
+def _resolve_checkpoint_selection(checkpoint_select, val_full, val_fixed_missing):
+    checkpoint_select = str(checkpoint_select)
+    full_select_score = float(val_full['dice'])
+    missing_select_score = float(val_fixed_missing['dice'])
+    joint_select_score = 0.5 * full_select_score + 0.5 * missing_select_score
+    if checkpoint_select == 'full_dice':
+        return full_select_score, 'full_dice', 'ckpt.best_full_dice.pth.tar'
+    if checkpoint_select == 'missing_dice':
+        return missing_select_score, 'missing_dice', 'ckpt.best_missing_dice.pth.tar'
+    if checkpoint_select == 'joint_dice':
+        return joint_select_score, 'joint_dice', 'ckpt.best_joint_dice.pth.tar'
+    raise ValueError(f'Unsupported checkpoint_select={checkpoint_select!r}. Expected one of full_dice, missing_dice, joint_dice.')
+
+
 def _deep_supervision_log_headers(config):
     if not _use_deep_supervision(config):
         return []
@@ -335,10 +349,12 @@ def main():
 
     grad_clip = getattr(config, 'grad_clip', 5.0)
     clip_params = task.trainable_parameters()
-    checkpoint_select = getattr(config, 'checkpoint_select', 'full_dice')
+    checkpoint_select = getattr(config, 'checkpoint_select', 'joint_dice')
     best_full_dice, best_full_dice_epoch = -1.0, 0
     best_missing_dice, best_missing_dice_epoch = -1.0, 0
     best_joint_dice, best_joint_dice_epoch = -1.0, 0
+    best_selected_score, best_selected_epoch = -float('inf'), 0
+    selected_checkpoint_filename = 'ckpt.best.pth.tar'
     best_full_hd95, best_full_hd95_epoch = float('inf'), 0
     best_missing_hd95, best_missing_hd95_epoch = float('inf'), 0
     best_joint_hd95, best_joint_hd95_epoch = float('inf'), 0
@@ -485,6 +501,7 @@ def main():
         val_fixed_missing = val_results.get('fixed_missing', val_full)
         joint_dice = 0.5 * float(val_full['dice']) + 0.5 * float(val_fixed_missing['dice'])
         joint_hd95 = 0.5 * float(val_full['hd95']) + 0.5 * float(val_fixed_missing['hd95'])
+        selected_score, selected_name, selected_checkpoint_filename = _resolve_checkpoint_selection(checkpoint_select, val_full, val_fixed_missing)
         val_m = val_full
         avg_grad_norm = grad_norm_sum / max(grad_norm_steps, 1)
         curr_lr = task.optimizer.param_groups[0]['lr']
@@ -499,7 +516,15 @@ def main():
             val_m,
             lr=curr_lr,
             grad_norm=avg_grad_norm,
-            extra_metrics={**gamma_metrics, **ds_metrics},
+            extra_metrics={
+                **gamma_metrics,
+                **ds_metrics,
+                'val_full_dice': float(val_full['dice']),
+                'val_missing_dice': float(val_fixed_missing['dice']),
+                'val_joint_dice': float(joint_dice),
+                'selected_score': float(selected_score),
+                'best_selected_score': float(best_selected_score if best_selected_epoch > 0 else selected_score),
+            },
         )
         gamma_text = ''
         if gamma_metrics:
@@ -514,6 +539,7 @@ def main():
             f'train_loss={tloss / max(tn, 1):.4f} train_seg={tseg / max(tn, 1):.4f} train_boundary={tboundary / max(tn, 1):.4f}\n'
             + '\n'.join(val_lines) + '\n'
             f'joint_metrics dice={joint_dice:.4f} hd95={joint_hd95:.2f}\n'
+            f'checkpoint_select={checkpoint_select} selected_score={selected_score:.4f} best_selected_score={best_selected_score:.4f} best_selected_epoch={best_selected_epoch}\n'
             f'route_stats full_steps={full_train_steps} missing_steps={missing_train_steps} '
             f'avg_full_loss={full_loss_sum / max(full_train_steps, 1):.4f} '
             f'avg_missing_loss={missing_loss_sum / max(missing_train_steps, 1):.4f}\n'
@@ -546,8 +572,11 @@ def main():
             best_missing_dice, best_missing_dice_epoch = val_fixed_missing['dice'], epoch
             task.save_checkpoint(os.path.join(config.checkpoint_dir, 'ckpt.best_missing_dice.pth.tar'), epoch)
         if joint_dice > best_joint_dice:
-            best_joint_dice, best_joint_dice_epoch, no_improve = joint_dice, epoch, 0
+            best_joint_dice, best_joint_dice_epoch = joint_dice, epoch
             task.save_checkpoint(os.path.join(config.checkpoint_dir, 'ckpt.best_joint_dice.pth.tar'), epoch)
+        if selected_score > best_selected_score:
+            best_selected_score, best_selected_epoch, no_improve = selected_score, epoch, 0
+            task.save_checkpoint(os.path.join(config.checkpoint_dir, selected_checkpoint_filename), epoch)
             task.save_checkpoint(os.path.join(config.checkpoint_dir, 'ckpt.best.pth.tar'), epoch)
         else:
             no_improve += 1
@@ -592,8 +621,13 @@ def main():
             results['full'] = task.evaluate(loader, eval_mode='full', tag=f'{prefix}_full')
         return results
 
-    best_dice_path = os.path.join(config.checkpoint_dir, 'ckpt.best_joint_dice.pth.tar')
+    best_dice_path = os.path.join(config.checkpoint_dir, 'ckpt.best.pth.tar')
     best_hd95_path = os.path.join(config.checkpoint_dir, 'ckpt.best_joint_hd95.pth.tar')
+
+    print(f'checkpoint_select={checkpoint_select}')
+    print(f'selected_checkpoint={os.path.basename(best_dice_path)}')
+    print(f'best_selected_score={best_selected_score:.4f}')
+    print(f'best_selected_epoch={best_selected_epoch}')
 
     _load_checkpoint(best_dice_path)
     test_results = _evaluate_enabled_modes(test_loader, 'test_best_dice')

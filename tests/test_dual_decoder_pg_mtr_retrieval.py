@@ -76,19 +76,87 @@ def test_zero_init_retrieval_degenerates_to_ct():
         assert torch.allclose(a, b, atol=1e-6)
 
 
-def test_full_aux_and_missing_routing_grads():
+def _module_has_any_grad(module):
+    return any(p.grad is not None for p in module.parameters() if p.requires_grad)
+
+
+def _module_has_no_grad(module):
+    return all(p.grad is None for p in module.parameters() if p.requires_grad)
+
+
+def _assert_existing_grads_finite(module):
+    for p in module.parameters():
+        if p.grad is not None:
+            assert torch.isfinite(p.grad).all()
+
+
+def test_full_auxiliary_loss_gradient_isolation():
     model = DualDecoderPGMTRRetrieval(
         pg_mtr_stages='all',
         pg_mtr_num_tokens=8,
         pg_mtr_temperature=0.07,
     )
+    model.zero_grad(set_to_none=True)
     ct = torch.randn(2, 3, 64, 64, requires_grad=True)
     pet = torch.randn(2, 3, 64, 64, requires_grad=True)
     full_out = model._forward_full(ct, pet, (64, 64))
     loss = full_out['aux_losses']['pg_mtr_route_loss'] + full_out['aux_losses']['pg_mtr_mem_loss']
     loss.backward()
-    assert any(p.grad is not None for p in model.full_decoder.parameters())
-    assert any(p.grad is not None for p in model.pg_mtr.parameters())
+    assert _module_has_any_grad(model.pg_mtr)
+    assert _module_has_no_grad(model.full_decoder)
+    assert _module_has_no_grad(model.missing_decoder)
+    assert _module_has_no_grad(model.enc_ct)
+    assert _module_has_no_grad(model.enc_pet)
+    assert _module_has_no_grad(model.retrieval_projs)
+    _assert_existing_grads_finite(model.pg_mtr)
+
+
+def test_full_total_loss_gradient_routes():
+    model = DualDecoderPGMTRRetrieval(
+        pg_mtr_stages='all',
+        pg_mtr_num_tokens=8,
+        pg_mtr_temperature=0.07,
+    )
+    model.zero_grad(set_to_none=True)
+    ct = torch.randn(2, 3, 64, 64, requires_grad=True)
+    pet = torch.randn(2, 3, 64, 64, requires_grad=True)
+    full_out = model._forward_full(ct, pet, (64, 64))
+    seg_loss = full_out['logits'].float().mean()
+    route_loss = full_out['aux_losses']['pg_mtr_route_loss']
+    mem_loss = full_out['aux_losses']['pg_mtr_mem_loss']
+    total_loss = seg_loss + 0.1 * route_loss + 0.05 * mem_loss
+    total_loss.backward()
+    assert _module_has_any_grad(model.full_decoder)
+    assert _module_has_any_grad(model.enc_ct)
+    assert _module_has_any_grad(model.enc_pet)
+    assert _module_has_any_grad(model.pg_mtr)
+    assert _module_has_no_grad(model.missing_decoder)
+    assert _module_has_no_grad(model.retrieval_projs)
+    _assert_existing_grads_finite(model.full_decoder)
+    _assert_existing_grads_finite(model.enc_ct)
+    _assert_existing_grads_finite(model.enc_pet)
+    _assert_existing_grads_finite(model.pg_mtr)
+
+
+def test_missing_route_gradient_isolation():
+    model = DualDecoderPGMTRRetrieval(pg_mtr_stages='all')
+    model.zero_grad(set_to_none=True)
+    ct = torch.randn(2, 3, 64, 64, requires_grad=True)
+    out = model._forward_missing(ct, (64, 64))
+    seg_loss = out['logits'].float().mean()
+    seg_loss.backward()
+    assert _module_has_any_grad(model.missing_decoder)
+    assert _module_has_any_grad(model.enc_ct)
+    assert _module_has_any_grad(model.retrieval_projs)
+    assert _module_has_no_grad(model.full_decoder)
+    assert _module_has_no_grad(model.enc_pet)
+    assert _module_has_no_grad(model.pg_mtr)
+    _assert_existing_grads_finite(model.missing_decoder)
+    _assert_existing_grads_finite(model.enc_ct)
+    _assert_existing_grads_finite(model.retrieval_projs)
+    assert model.pg_mtr.memory_tokens.grad is None
+    assert model.pg_mtr.token_key.weight.grad is None
+    assert model.pg_mtr.token_value.weight.grad is None
 
 
 def test_mixed_route_order():
