@@ -335,8 +335,13 @@ def main():
 
     grad_clip = getattr(config, 'grad_clip', 5.0)
     clip_params = task.trainable_parameters()
-    best_dice, best_dice_epoch = -1.0, 0
-    best_hd95, best_hd95_epoch = float('inf'), 0
+    checkpoint_select = getattr(config, 'checkpoint_select', 'full_dice')
+    best_full_dice, best_full_dice_epoch = -1.0, 0
+    best_missing_dice, best_missing_dice_epoch = -1.0, 0
+    best_joint_dice, best_joint_dice_epoch = -1.0, 0
+    best_full_hd95, best_full_hd95_epoch = float('inf'), 0
+    best_missing_hd95, best_missing_hd95_epoch = float('inf'), 0
+    best_joint_hd95, best_joint_hd95_epoch = float('inf'), 0
     no_improve = 0
     patience = getattr(config, 'early_stop_patience', 15)
 
@@ -477,6 +482,9 @@ def main():
         if not val_results:
             val_results['full'] = task.evaluate(val_loader, eval_mode='full', tag='val_full')
         val_full = val_results.get('full', next(iter(val_results.values())))
+        val_fixed_missing = val_results.get('fixed_missing', val_full)
+        joint_dice = 0.5 * float(val_full['dice']) + 0.5 * float(val_fixed_missing['dice'])
+        joint_hd95 = 0.5 * float(val_full['hd95']) + 0.5 * float(val_fixed_missing['hd95'])
         val_m = val_full
         avg_grad_norm = grad_norm_sum / max(grad_norm_steps, 1)
         curr_lr = task.optimizer.param_groups[0]['lr']
@@ -505,13 +513,16 @@ def main():
             f'Epoch {epoch}\n'
             f'train_loss={tloss / max(tn, 1):.4f} train_seg={tseg / max(tn, 1):.4f} train_boundary={tboundary / max(tn, 1):.4f}\n'
             + '\n'.join(val_lines) + '\n'
+            f'joint_metrics dice={joint_dice:.4f} hd95={joint_hd95:.2f}\n'
             f'route_stats full_steps={full_train_steps} missing_steps={missing_train_steps} '
             f'avg_full_loss={full_loss_sum / max(full_train_steps, 1):.4f} '
             f'avg_missing_loss={missing_loss_sum / max(missing_train_steps, 1):.4f}\n'
             f'full PET-CT training/evaluation '
             f'lr={curr_lr:.6f} grad_norm={avg_grad_norm:.4f} grad_clipped_steps={grad_clip_count}/{grad_norm_steps} '
             f'grad_guard_skipped_steps={sum(first_bad_module_counter.values())} first_bad_module_counter={first_bad_module_counter} '
-            f'best_dice={best_dice:.4f} best_hd95={best_hd95:.2f} boundary_w={getattr(config, "boundary_loss_weight", 0.0):.3f}{gamma_text}'
+            f'best_full_dice={best_full_dice:.4f} best_missing_dice={best_missing_dice:.4f} best_joint_dice={best_joint_dice:.4f} '
+            f'best_full_hd95={best_full_hd95:.2f} best_missing_hd95={best_missing_hd95:.2f} best_joint_hd95={best_joint_hd95:.2f} '
+            f'boundary_w={getattr(config, "boundary_loss_weight", 0.0):.3f}{gamma_text}'
         )
 
         if getattr(config, 'vis_every_epoch', False):
@@ -528,15 +539,27 @@ def main():
                     mode=eval_mode,
                 )
 
-        if val_m['dice'] > best_dice:
-            best_dice, best_dice_epoch, no_improve = val_m['dice'], epoch, 0
+        if val_full['dice'] > best_full_dice:
+            best_full_dice, best_full_dice_epoch = val_full['dice'], epoch
+            task.save_checkpoint(os.path.join(config.checkpoint_dir, 'ckpt.best_full_dice.pth.tar'), epoch)
+        if val_fixed_missing['dice'] > best_missing_dice:
+            best_missing_dice, best_missing_dice_epoch = val_fixed_missing['dice'], epoch
+            task.save_checkpoint(os.path.join(config.checkpoint_dir, 'ckpt.best_missing_dice.pth.tar'), epoch)
+        if joint_dice > best_joint_dice:
+            best_joint_dice, best_joint_dice_epoch, no_improve = joint_dice, epoch, 0
+            task.save_checkpoint(os.path.join(config.checkpoint_dir, 'ckpt.best_joint_dice.pth.tar'), epoch)
             task.save_checkpoint(os.path.join(config.checkpoint_dir, 'ckpt.best.pth.tar'), epoch)
-            task.save_checkpoint(os.path.join(config.checkpoint_dir, 'ckpt.best_dice.pth.tar'), epoch)
         else:
             no_improve += 1
-
-        if val_m['hd95'] < best_hd95:
-            best_hd95, best_hd95_epoch = val_m['hd95'], epoch
+        if val_full['hd95'] < best_full_hd95:
+            best_full_hd95, best_full_hd95_epoch = val_full['hd95'], epoch
+            task.save_checkpoint(os.path.join(config.checkpoint_dir, 'ckpt.best_full_hd95.pth.tar'), epoch)
+        if val_fixed_missing['hd95'] < best_missing_hd95:
+            best_missing_hd95, best_missing_hd95_epoch = val_fixed_missing['hd95'], epoch
+            task.save_checkpoint(os.path.join(config.checkpoint_dir, 'ckpt.best_missing_hd95.pth.tar'), epoch)
+        if joint_hd95 < best_joint_hd95:
+            best_joint_hd95, best_joint_hd95_epoch = joint_hd95, epoch
+            task.save_checkpoint(os.path.join(config.checkpoint_dir, 'ckpt.best_joint_hd95.pth.tar'), epoch)
             task.save_checkpoint(os.path.join(config.checkpoint_dir, 'ckpt.best_hd95.pth.tar'), epoch)
 
         if patience > 0 and no_improve >= patience:
@@ -569,8 +592,8 @@ def main():
             results['full'] = task.evaluate(loader, eval_mode='full', tag=f'{prefix}_full')
         return results
 
-    best_dice_path = os.path.join(config.checkpoint_dir, 'ckpt.best_dice.pth.tar')
-    best_hd95_path = os.path.join(config.checkpoint_dir, 'ckpt.best_hd95.pth.tar')
+    best_dice_path = os.path.join(config.checkpoint_dir, 'ckpt.best_joint_dice.pth.tar')
+    best_hd95_path = os.path.join(config.checkpoint_dir, 'ckpt.best_joint_hd95.pth.tar')
 
     _load_checkpoint(best_dice_path)
     test_results = _evaluate_enabled_modes(test_loader, 'test_best_dice')

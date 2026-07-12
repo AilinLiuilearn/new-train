@@ -36,8 +36,11 @@ class SegMDTConfig(ConfigBase):
             "--model_arch",
             type=str,
             default="dual_shared_add_baseline",
-            choices=("dual_shared_add_baseline",),
-            help="dual_shared_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, shared UNet decoder.",
+            choices=("dual_shared_add_baseline", "dual_decoder_add_baseline"),
+            help=(
+                "dual_shared_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, shared UNet decoder. "
+                "dual_decoder_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, independent full/missing UNet decoders."
+            ),
         )
         p.add_argument(
             "--use_pet_mrp_gsa",
@@ -195,6 +198,13 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--eval_random_pet_drop_prob", type=float, default=0.4, help="PET missing probability for random-missing evaluation.")
         p.add_argument("--train_mode", type=str, default="alternating_full_missing", choices=("alternating_full_missing",), help="Training route schedule.")
         p.add_argument("--missing_loss_weight", type=float, default=1.0)
+        p.add_argument(
+            "--checkpoint_select",
+            type=str,
+            default="joint_dice",
+            choices=("full_dice", "missing_dice", "joint_dice"),
+            help="Checkpoint selection metric: full_dice, missing_dice, or joint_dice.",
+        )
         p.add_argument("--eval_random_seed", type=int, default=2026)
         p.add_argument("--lr_find_start", type=float, default=1e-7)
         p.add_argument("--lr_find_end", type=float, default=1e-2)

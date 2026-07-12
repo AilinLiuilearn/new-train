@@ -52,7 +52,7 @@ def print_baseline_profile(networks, config, image_size=None, tag='MODEL PROFILE
     print(f'TOTAL PARAMS: {total / 1e6:.2f}M')
     print(f'TRAINABLE PARAMS: {trainable / 1e6:.2f}M')
     print(f'FROZEN PARAMS: {frozen / 1e6:.2f}M')
-    for name in ('enc_ct', 'enc_pet', 'pet_guides', 'fusion', 'stage_fusion', 'decoder', 'boundary_head'):
+    for name in ('enc_ct', 'enc_pet', 'pet_guides', 'fusion', 'stage_fusion', 'decoder', 'full_decoder', 'missing_decoder', 'boundary_head'):
         module = getattr(model, name, None) if model is not None else None
         mt, mtr, mf = _count_module_params(module)
         if module is not None:
@@ -73,7 +73,7 @@ def print_baseline_profile(networks, config, image_size=None, tag='MODEL PROFILE
     except Exception as e:
         print(f'  [profile] FLOPs 统计失败: {e}')
     if flops_g is not None:
-        print(f'[{tag}] FLOPs: {flops_g:.2f}G')
+        print(f'[{tag}] FLOPs(full route): {flops_g:.2f}G')
     else:
         print(f'[{tag}] FLOPs 需 thop: pip install thop')
     return total / 1e6, flops_g

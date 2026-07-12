@@ -445,28 +445,39 @@ def _resolve_use_channel_prior_gate(config):
 
 def build_mdt_seg_teacher(config):
     model_arch = getattr(config, 'model_arch', 'dual_shared_add_baseline')
+    common_kwargs = dict(
+        ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
+        pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
+        ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
+        pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
+        in_channels=3,
+        out_channels=1,
+        decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
+        use_deep_supervision=_resolve_use_deep_supervision(config),
+    )
     if model_arch == 'dual_shared_add_baseline':
         from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
-        model = DualSharedAddPETCTBaseline(
-            ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
-            pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
-            ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
-            pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
-            in_channels=3,
-            out_channels=1,
-            decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
-            use_deep_supervision=_resolve_use_deep_supervision(config),
-        )
+        model = DualSharedAddPETCTBaseline(**common_kwargs)
         print(
             f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
             f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-            f'fusion=add shared_decoder=UNetStyleDecoder '
+            f'fusion=stage-wise-add shared_decoder=UNetStyleDecoder '
+            f'deep_supervision={_resolve_use_deep_supervision(config)}'
+        )
+        return dict(model=model)
+    if model_arch == 'dual_decoder_add_baseline':
+        from models.dual_decoder_add_baseline import DualDecoderAddPETCTBaseline
+        model = DualDecoderAddPETCTBaseline(**common_kwargs)
+        print(
+            f'[dual_decoder_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
+            f'pet={getattr(config, "pet_backbone", "mit_b1")} '
+            f'fusion=stage-wise-add full_decoder=UNetStyleDecoder missing_decoder=UNetStyleDecoder decoder_shared=False '
             f'deep_supervision={_resolve_use_deep_supervision(config)}'
         )
         return dict(model=model)
     raise ValueError(
         f'Unsupported model_arch={model_arch}. '
-        'Only dual_shared_add_baseline is kept for this cleaned checkpoint.'
+        'Supported: dual_shared_add_baseline, dual_decoder_add_baseline.'
     )
 
 
