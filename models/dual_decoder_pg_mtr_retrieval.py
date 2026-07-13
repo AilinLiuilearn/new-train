@@ -35,9 +35,11 @@ class DualDecoderPGMTRRetrieval(nn.Module):
     def _encode_pet(self, pet): pet=self._to_3ch(pet); feats=self.enc_pet(pet); _check_tensor_list('pet_feats', feats); return feats
     def _finalize_decoder_output(self, dec_out):
         if isinstance(dec_out, dict):
-            out={'logits':_sanitize(dec_out['logits'])};
-            if 'aux_logits' in dec_out: out['aux_logits']=[_sanitize(x) for x in dec_out['aux_logits']]; return out
-        return {'logits':_sanitize(dec_out)}
+            out = {'logits': _sanitize(dec_out['logits'])}
+            if 'aux_logits' in dec_out:
+                out['aux_logits'] = [_sanitize(x) for x in dec_out['aux_logits']]
+            return out
+        return {'logits': _sanitize(dec_out)}
     def _decode_with(self, decoder, features, target_size): out=self._finalize_decoder_output(decoder(features, target_size)); _check_tensor('logits', out['logits']); out['pred']=out['logits']; out['aux']={}; return out
     def _forward_full(self, ct, pet, target_size, mask=None):
         aligned=self._encode_ct(ct); petf=self._encode_pet(pet); out=self._decode_with(self.full_decoder, self.fusion(aligned, petf, pet_available=None), target_size); _, aux, diag = self.pg_mtr(aligned, petf, mode='full', mask=mask); out['aux_losses']=aux; out['diagnostics']=diag; return out
