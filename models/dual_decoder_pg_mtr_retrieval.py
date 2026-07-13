@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from models.baseline_petct_unet import AddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
 from models.build_mdt_seg import ConvBNAct, create_feature_backbone, load_local_weights_safe
-from models.pg_mtr import PETGroundedMetabolicTokenRetrieval
+from models.pg_mtr import PETGroundedMetabolicTokenRetrieval, _valid_group_count
 
 
 class StageChannelAlign(nn.Module):
@@ -59,13 +59,18 @@ class DualDecoderPGMTRRetrieval(nn.Module):
             temperature=pg_mtr_temperature,
             stage_mode=pg_mtr_stages,
         )
-        self.retrieval_projs = nn.ModuleDict()
+        self.retrieval_adapters = nn.ModuleDict()
         for stage_number in self.pg_mtr.active_stage_numbers:
             stage_channels = pet_channels[stage_number - 1]
-            latent_dim = self.pg_mtr.stage_modules[str(stage_number)].latent_dim
-            proj = nn.Conv2d(latent_dim, stage_channels, kernel_size=1, bias=False)
-            nn.init.zeros_(proj.weight)
-            self.retrieval_projs[str(stage_number)] = proj
+            latent_dim = self.pg_mtr.latent_dim
+            adapter = nn.Sequential(
+                nn.Conv2d(latent_dim, stage_channels, kernel_size=1, bias=False),
+                nn.GroupNorm(_valid_group_count(stage_channels), stage_channels, affine=False),
+            )
+            nn.init.kaiming_normal_(adapter[0].weight, mode='fan_out', nonlinearity='linear')
+            self.retrieval_adapters[str(stage_number)] = adapter
+            raw_gamma = torch.tensor(0.01).expm1().log()
+            self.register_parameter(f'gamma_s{stage_number}', nn.Parameter(raw_gamma.clone()))
 
     @staticmethod
     def _to_3ch(x):
@@ -99,12 +104,12 @@ class DualDecoderPGMTRRetrieval(nn.Module):
         outputs['aux'] = {}
         return outputs
 
-    def _forward_full(self, ct, pet, target_size):
+    def _forward_full(self, ct, pet, target_size, mask=None):
         aligned_ct_feats = self._encode_ct(ct)
         pet_feats = self._encode_pet(pet)
         full_feats = self.fusion(aligned_ct_feats, pet_feats, pet_available=None)
         outputs = self._decode_with(self.full_decoder, full_feats, target_size)
-        _, pg_aux, pg_diag = self.pg_mtr(aligned_ct_feats=aligned_ct_feats, pet_feats=pet_feats, mode='full')
+        _, pg_aux, pg_diag = self.pg_mtr(aligned_ct_feats, pet_feats, mode='full', mask=mask)
         outputs['aux_losses'] = pg_aux
         outputs['diagnostics'] = pg_diag
         return outputs
@@ -118,11 +123,14 @@ class DualDecoderPGMTRRetrieval(nn.Module):
         updated_diagnostics = dict(diagnostics)
         for stage_number in self.pg_mtr.active_stage_numbers:
             stage_index = stage_number - 1
-            retrieved_feature = self.retrieval_projs[str(stage_number)](retrieved_memories[stage_number])
-            missing_feats[stage_index] = aligned_ct_feats[stage_index] + retrieved_feature
+            adapter = self.retrieval_adapters[str(stage_number)]
+            retrieved_feature = adapter(retrieved_memories[stage_number])
+            gamma = torch.nn.functional.softplus(getattr(self, f'gamma_s{stage_number}'))
+            delta = gamma * retrieved_feature
+            missing_feats[stage_index] = aligned_ct_feats[stage_index] + delta
             ct_rms = self._rms_tensor(aligned_ct_feats[stage_index])
-            injection_rms = self._rms_tensor(retrieved_feature)
-            updated_diagnostics[f'pg_mtr_s{stage_number}_ct_rms'] = ct_rms
+            injection_rms = self._rms_tensor(delta)
+            updated_diagnostics[f'pg_mtr_s{stage_number}_gamma'] = gamma.detach()
             updated_diagnostics[f'pg_mtr_s{stage_number}_injection_rms'] = injection_rms
             updated_diagnostics[f'pg_mtr_s{stage_number}_injection_ct_ratio'] = injection_rms / (ct_rms + 1e-6)
         return missing_feats, updated_diagnostics
@@ -130,7 +138,7 @@ class DualDecoderPGMTRRetrieval(nn.Module):
     def _forward_missing(self, ct, target_size):
         aligned_ct_feats = self._encode_ct(ct)
         retrieved_memories, _, pg_diag = self.pg_mtr(
-            aligned_ct_feats=aligned_ct_feats,
+            aligned_ct_feats,
             pet_feats=None,
             mode='missing',
             detach_bank=self.pg_mtr_detach_bank_missing,
@@ -189,7 +197,7 @@ class DualDecoderPGMTRRetrieval(nn.Module):
         if missing_idx.numel() > 0:
             missing_ct_feats = [feat.index_select(0, missing_idx) for feat in aligned_ct_feats]
             retrieved_memories, _, pg_diag = self.pg_mtr(
-                aligned_ct_feats=missing_ct_feats,
+                missing_ct_feats,
                 pet_feats=None,
                 mode='missing',
                 detach_bank=self.pg_mtr_detach_bank_missing,

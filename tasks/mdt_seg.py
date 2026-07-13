@@ -33,12 +33,14 @@ def mask_to_boundary(mask):
     return boundary
 
 
-def _forward(nets, ct, pet, target_size, pet_available=None, return_aux=False, forward_mode=None):
+def _forward(nets, ct, pet, target_size, pet_available=None, return_aux=False, forward_mode=None, mask=None):
     kwargs = {'target_size': target_size}
     if pet_available is not None:
         kwargs['pet_available'] = pet_available
     if forward_mode is not None:
         kwargs['forward_mode'] = forward_mode
+    if mask is not None:
+        kwargs['mask'] = mask
     if return_aux:
         kwargs['return_aux'] = return_aux
     return nets['model'](ct, pet, **kwargs)
@@ -352,6 +354,7 @@ class MDTSegTeacher:
             pet,
             mask.shape[-2:],
             forward_mode=forward_mode,
+            mask=mask,
         )
         loss_seg, pred, loss_stats = self._compute_segmentation_loss(outputs, mask)
         aux_losses = outputs.get('aux_losses', {}) if isinstance(outputs, dict) else {}

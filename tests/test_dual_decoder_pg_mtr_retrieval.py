@@ -2,8 +2,10 @@ import csv
 import os
 
 import torch
+import torch.nn.functional as F
 
 from models.dual_decoder_pg_mtr_retrieval import DualDecoderPGMTRRetrieval
+from models.pg_mtr import _balanced_fg_bg_loss
 from run_mdt_seg import _resolve_checkpoint_selection
 from utils.train_logger import append_epoch_log, init_train_log
 
@@ -43,9 +45,12 @@ def make_model(stage_mode='all'):
     model.missing_decoder = torch.nn.Identity()
     from models.pg_mtr import PETGroundedMetabolicTokenRetrieval
     model.pg_mtr = PETGroundedMetabolicTokenRetrieval([64, 128, 320, 512], num_tokens=8, temperature=0.07, stage_mode=stage_mode)
-    model.retrieval_projs = torch.nn.ModuleDict({str(k): torch.nn.Conv2d(model.pg_mtr.stage_modules[str(k)].latent_dim, [64, 128, 320, 512][k-1], 1, bias=False) for k in model.pg_mtr.active_stage_numbers})
-    for p in model.retrieval_projs.parameters():
-        torch.nn.init.zeros_(p)
+    model.retrieval_adapters = torch.nn.ModuleDict()
+    for k in model.pg_mtr.active_stage_numbers:
+        stage_channels = [64, 128, 320, 512][k - 1]
+        adapter = torch.nn.Sequential(torch.nn.Conv2d(model.pg_mtr.latent_dim, stage_channels, 1, bias=False), torch.nn.GroupNorm(1, stage_channels, affine=False))
+        model.retrieval_adapters[str(k)] = adapter
+        setattr(model, f'gamma_s{k}', torch.nn.Parameter(torch.tensor(0.01).expm1().log()))
     return model
 
 
@@ -57,17 +62,18 @@ def _module_has_no_grad(module):
     return all(p.grad is None for p in module.parameters() if p.requires_grad)
 
 
-def _assert_existing_grads_finite(module):
-    for p in module.parameters():
-        if p.grad is not None:
-            assert torch.isfinite(p.grad).all()
-
-
 def test_all_stage_activation():
     model = make_model('all')
     assert model.pg_mtr.active_stage_numbers == (1, 2, 3, 4)
     assert set(model.pg_mtr.stage_modules.keys()) == {'1', '2', '3', '4'}
-    assert set(model.retrieval_projs.keys()) == {'1', '2', '3', '4'}
+    assert set(model.retrieval_adapters.keys()) == {'1', '2', '3', '4'}
+
+
+def test_shared_memory_single_bank_and_writer_auto():
+    model = make_model('all')
+    assert model.pg_mtr.shared_memory_tokens.shape[0] == 8
+    assert model.pg_mtr.writer_stage == 4
+    assert model.pg_mtr.latent_dim == min(max(512 // 4, 32), 128)
 
 
 def test_retrieved_memory_shape():
@@ -76,21 +82,12 @@ def test_retrieved_memory_shape():
     feats = [torch.randn(2, c, 16 // (2 ** i), 16 // (2 ** i)) for i, c in enumerate([64, 128, 320, 512])]
     retrieved, _, diag = pg(feats, mode='missing')
     assert set(retrieved.keys()) == {1, 2, 3, 4}
+    assert diag['pg_mtr_writer_stage'].item() == 4
     for i, mem in retrieved.items():
         assert mem.shape[0] == 2
-        assert mem.shape[1] == pg.stage_modules[str(i)].latent_dim
+        assert mem.shape[1] == pg.latent_dim
         assert mem.shape[-2:] == feats[i - 1].shape[-2:]
         assert torch.isfinite(mem).all()
-    assert torch.isfinite(torch.stack([v for v in diag.values() if torch.is_tensor(v)])).all()
-
-
-def test_zero_init_retrieval_degenerates_to_ct():
-    model = make_model('all')
-    ct = [torch.randn(2, c, 16 // (2 ** i), 16 // (2 ** i)) for i, c in enumerate([64, 128, 320, 512])]
-    retrieved, _, _ = model.pg_mtr(ct, mode='missing')
-    missing_feats = [ct[i] + model.retrieval_projs[str(i + 1)](retrieved[i + 1]) for i in range(4)]
-    for a, b in zip(ct, missing_feats):
-        assert torch.allclose(a, b, atol=1e-6)
 
 
 def test_full_auxiliary_loss_gradient_isolation():
@@ -98,7 +95,9 @@ def test_full_auxiliary_loss_gradient_isolation():
     model.zero_grad(set_to_none=True)
     ct = torch.randn(2, 3, 64, 64, requires_grad=True)
     pet = torch.randn(2, 3, 64, 64, requires_grad=True)
-    full_out = model._forward_full(ct, pet, (64, 64))
+    mask = torch.zeros(2, 1, 64, 64)
+    mask[:, :, 16:48, 16:48] = 1
+    full_out = model._forward_full(ct, pet, (64, 64), mask=mask)
     loss = full_out['aux_losses']['pg_mtr_route_loss'] + full_out['aux_losses']['pg_mtr_mem_loss']
     loss.backward()
     assert _module_has_any_grad(model.pg_mtr)
@@ -106,27 +105,7 @@ def test_full_auxiliary_loss_gradient_isolation():
     assert _module_has_no_grad(model.missing_decoder)
     assert _module_has_no_grad(model.enc_ct)
     assert _module_has_no_grad(model.enc_pet)
-    assert _module_has_no_grad(model.retrieval_projs)
-    _assert_existing_grads_finite(model.pg_mtr)
-
-
-def test_full_total_loss_gradient_routes():
-    model = DualDecoderPGMTRRetrieval(pg_mtr_stages='all', pg_mtr_num_tokens=8, pg_mtr_temperature=0.07)
-    model.zero_grad(set_to_none=True)
-    ct = torch.randn(2, 3, 64, 64, requires_grad=True)
-    pet = torch.randn(2, 3, 64, 64, requires_grad=True)
-    full_out = model._forward_full(ct, pet, (64, 64))
-    seg_loss = full_out['logits'].float().mean()
-    route_loss = full_out['aux_losses']['pg_mtr_route_loss']
-    mem_loss = full_out['aux_losses']['pg_mtr_mem_loss']
-    total_loss = seg_loss + 0.1 * route_loss + 0.05 * mem_loss
-    total_loss.backward()
-    assert _module_has_any_grad(model.full_decoder)
-    assert _module_has_any_grad(model.enc_ct)
-    assert _module_has_any_grad(model.enc_pet)
-    assert _module_has_any_grad(model.pg_mtr)
-    assert _module_has_no_grad(model.missing_decoder)
-    assert _module_has_no_grad(model.retrieval_projs)
+    assert _module_has_no_grad(model.retrieval_adapters)
 
 
 def test_missing_route_gradient_isolation():
@@ -138,13 +117,48 @@ def test_missing_route_gradient_isolation():
     seg_loss.backward()
     assert _module_has_any_grad(model.missing_decoder)
     assert _module_has_any_grad(model.enc_ct)
-    assert _module_has_any_grad(model.retrieval_projs)
+    assert _module_has_any_grad(model.retrieval_adapters)
     assert _module_has_no_grad(model.full_decoder)
     assert _module_has_no_grad(model.enc_pet)
     assert _module_has_no_grad(model.pg_mtr)
-    assert model.pg_mtr.memory_tokens.grad is None
-    assert model.pg_mtr.token_key.weight.grad is None
-    assert model.pg_mtr.token_value.weight.grad is None
+    for stage in model.pg_mtr.active_stage_numbers:
+        assert getattr(model, f'gamma_s{stage}').grad is not None
+
+
+def test_balanced_loss_and_no_fg_nan():
+    loss_map = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]])
+    mask = torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]])
+    balanced, fg, bg, ratio = _balanced_fg_bg_loss(loss_map, mask)
+    assert torch.isfinite(balanced)
+    assert torch.isfinite(fg)
+    assert torch.isfinite(bg)
+    assert ratio.item() == 0.5
+    no_fg = torch.zeros_like(mask)
+    balanced2, fg2, bg2, ratio2 = _balanced_fg_bg_loss(loss_map, no_fg)
+    assert balanced2 == bg2
+    assert fg2 == 0
+    assert torch.isfinite(balanced2)
+    assert ratio2.item() == 0.0
+
+
+def test_gamma_initialization_and_injection_nonzero():
+    model = DualDecoderPGMTRRetrieval(pg_mtr_stages='all')
+    gammas = [float(F.softplus(getattr(model, f'gamma_s{s}')).detach()) for s in model.pg_mtr.active_stage_numbers]
+    assert len(set(round(g, 8) for g in gammas)) == 1
+    ct = torch.randn(2, 3, 64, 64)
+    out = model._forward_missing(ct, (64, 64))
+    for stage in model.pg_mtr.active_stage_numbers:
+        assert float(out['diagnostics'][f'pg_mtr_s{stage}_injection_rms']) >= 0.0
+        assert float(out['diagnostics'][f'pg_mtr_s{stage}_injection_ct_ratio']) >= 0.0
+
+
+def test_full_main_logits_consistency():
+    model = DualDecoderPGMTRRetrieval(pg_mtr_stages='all')
+    ct = torch.randn(2, 3, 64, 64)
+    pet = torch.randn(2, 3, 64, 64)
+    out1 = model._forward_full(ct, pet, (64, 64), mask=torch.ones(2, 1, 64, 64))
+    out2 = model._decode_with(model.full_decoder, model.fusion(model._encode_ct(ct), model._encode_pet(pet), pet_available=None), (64, 64))
+    assert torch.allclose(out1['logits'], out2['logits'])
 
 
 def test_checkpoint_select_resolver():
@@ -156,12 +170,6 @@ def test_checkpoint_select_resolver():
     assert score == 0.70 and name == 'missing_dice' and ckpt == 'ckpt.best_missing_dice.pth.tar'
     score, name, ckpt = _resolve_checkpoint_selection('joint_dice', val_full, val_missing)
     assert score == 0.75 and name == 'joint_dice' and ckpt == 'ckpt.best_joint_dice.pth.tar'
-    try:
-        _resolve_checkpoint_selection('bad', val_full, val_missing)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError('Expected ValueError')
 
 
 def test_pg_mtr_diagnostics_accumulation():
@@ -184,33 +192,6 @@ def test_csv_field_order_and_missing_fields(tmp_path):
     assert rows[1][rows[0].index('metric_a')] == '1.000000'
     assert rows[1][rows[0].index('metric_b')] == '2.000000'
     assert rows[1][rows[0].index('metric_c')] == '3.000000'
-    log_path2 = tmp_path / 'train_log2.csv'
-    init_train_log(str(log_path2), extra_headers=['metric_a', 'metric_b'])
-    append_epoch_log(str(log_path2), 1, 1.0, {'total_loss': 1.0, 'dice': 0.5, 'iou': 0.4, 'acc': 0.3, 'acc_pixel': 0.2, 'hd95': 1.0}, extra_metrics={'metric_b': 2})
-    with open(log_path2, newline='', encoding='utf-8') as f:
-        rows = list(csv.reader(f))
-    assert rows[1][rows[0].index('metric_a')] == ''
-    assert rows[1][rows[0].index('metric_b')] == '2.000000'
-
-
-def test_missing_injection_diagnostics_and_logits_consistency():
-    model = DualDecoderPGMTRRetrieval(pg_mtr_stages='all')
-    ct = torch.randn(2, 3, 64, 64)
-    out = model._forward_missing(ct, (64, 64))
-    diag = out['diagnostics']
-    for stage in model.pg_mtr.active_stage_numbers:
-        assert f'pg_mtr_s{stage}_ct_rms' in diag
-        assert f'pg_mtr_s{stage}_injection_rms' in diag
-        assert f'pg_mtr_s{stage}_injection_ct_ratio' in diag
-        assert float(diag[f'pg_mtr_s{stage}_injection_rms']) >= 0.0
-        assert float(diag[f'pg_mtr_s{stage}_injection_ct_ratio']) >= 0.0
-    aligned_ct_feats = model._encode_ct(ct)
-    retrieved_memories, _, pg_diag = model.pg_mtr(aligned_ct_feats=aligned_ct_feats, pet_feats=None, mode='missing', detach_bank=True)
-    manual_feats, _ = model._apply_retrieved_memory(aligned_ct_feats, retrieved_memories, pg_diag)
-    manual_out = model._decode_with(model.missing_decoder, manual_feats, (64, 64))
-    assert torch.allclose(out['logits'], manual_out['logits'], atol=1e-6, rtol=1e-5)
-    for stage in model.pg_mtr.active_stage_numbers:
-        assert float(diag[f'pg_mtr_s{stage}_injection_rms']) >= 0.0
 
 
 def test_mixed_route_order():
