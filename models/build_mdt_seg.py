@@ -494,9 +494,38 @@ def build_mdt_seg_teacher(config):
             f'detach_bank_missing={getattr(config, "pg_mtr_detach_bank_missing", True)}'
         )
         return dict(model=model)
+    if model_arch == 'dual_decoder_pg_mtr_c2maot_ot':
+        from models.dual_decoder_pg_mtr_c2maot_ot import DualDecoderPGMTRC2MAOTOT
+        model = DualDecoderPGMTRC2MAOTOT(
+            **common_kwargs,
+            pg_mtr_stages=getattr(config, 'pg_mtr_stages', 'all'),
+            pg_mtr_num_tokens=getattr(config, 'pg_mtr_num_tokens', 8),
+            pg_mtr_temperature=getattr(config, 'pg_mtr_temperature', 0.07),
+            pg_mtr_detach_bank_missing=getattr(config, 'pg_mtr_detach_bank_missing', True),
+            pg_mtr_ot_alpha=getattr(config, 'pg_mtr_ot_alpha', 1.5),
+        )
+        print(
+            f'[dual_decoder_pg_mtr_c2maot_ot] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
+            f'pet={getattr(config, "pet_backbone", "mit_b1")} '
+            f'decoder_shared=False '
+            f'full_fusion=stage-wise-add '
+            f'ot_type=1d_empirical_wasserstein '
+            f'ot_flatten=True '
+            f'ot_sort=True '
+            f'ot_sinkhorn=False '
+            f'ot_cosine=False '
+            f'ot_hierarchical=True '
+            f'ot_alpha={getattr(config, "pg_mtr_ot_alpha", 1.5)} '
+            f'ot_weight={getattr(config, "pg_mtr_ot_weight", 0.01)} '
+            f'ot_source=ct_conditioned_retrieved_compensation '
+            f'ot_target=detached_pet_encoder_feature '
+            f'missing_bank_detach={getattr(config, "pg_mtr_detach_bank_missing", True)} '
+            f'stages={model.pg_mtr.active_stage_numbers}'
+        )
+        return dict(model=model)
     raise ValueError(
         f'Unsupported model_arch={model_arch}. '
-        'Supported: dual_shared_add_baseline, dual_decoder_add_baseline, dual_decoder_pg_mtr_retrieval.'
+        'Supported: dual_shared_add_baseline, dual_decoder_add_baseline, dual_decoder_pg_mtr_retrieval, dual_decoder_pg_mtr_c2maot_ot.'
     )
 
 

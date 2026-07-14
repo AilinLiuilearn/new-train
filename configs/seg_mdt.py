@@ -36,11 +36,12 @@ class SegMDTConfig(ConfigBase):
             "--model_arch",
             type=str,
             default="dual_shared_add_baseline",
-            choices=("dual_shared_add_baseline", "dual_decoder_add_baseline", "dual_decoder_pg_mtr_retrieval"),
+            choices=("dual_shared_add_baseline", "dual_decoder_add_baseline", "dual_decoder_pg_mtr_retrieval", "dual_decoder_pg_mtr_c2maot_ot"),
             help=(
                 "dual_shared_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, shared UNet decoder. "
                 "dual_decoder_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, independent full/missing UNet decoders. "
-                "dual_decoder_pg_mtr_retrieval: dual encoder with retrieval-only PG-MTR and zero-init 1x1 missing fusion."
+                "dual_decoder_pg_mtr_retrieval: dual encoder with retrieval-only PG-MTR and zero-init 1x1 missing fusion. "
+                "dual_decoder_pg_mtr_c2maot_ot: dual encoder with C2MAOT-style hierarchical 1-Wasserstein OT supervision."
             ),
         )
 
@@ -176,6 +177,8 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--pg_mtr_temperature", type=float, default=0.07, help="Routing temperature for token assignment.")
         p.add_argument("--pg_mtr_route_weight", type=float, default=0.1, help="Weight for PG-MTR route alignment loss; applied only in tasks/mdt_seg.py.")
         p.add_argument("--pg_mtr_mem_weight", type=float, default=0.05, help="Weight for PG-MTR memory grounding loss; applied only in tasks/mdt_seg.py.")
+        p.add_argument("--pg_mtr_ot_weight", type=float, default=0.01, help="External task integration weight for C2MAOT-style hierarchical 1-Wasserstein loss.")
+        p.add_argument("--pg_mtr_ot_alpha", type=float, default=1.5, help="Exponential layer-depth weighting base alpha. The C2MAOT paper specifies alpha > 1 but does not report an exact numeric alpha in the paper text. Default 1.5 is this project's explicit experimental setting.")
         p.add_argument("--pg_mtr_detach_bank_missing", type=str2bool, default=True, help="Detach token bank key/value during missing-route retrieval to prevent missing-loss updates to memory tokens.")
         p.add_argument("--print_trainable_only", type=str2bool, default=True)
         return p
