@@ -36,82 +36,28 @@ class SegMDTConfig(ConfigBase):
             "--model_arch",
             type=str,
             default="dual_shared_add_baseline",
-            choices=("dual_shared_add_baseline", "dual_decoder_add_baseline", "dual_decoder_pg_mtr_retrieval"),
+            choices=("dual_shared_add_baseline", "dual_decoder_add_baseline", "dual_decoder_pg_mtr_retrieval", "dual_decoder_task_codebook_retrieval"),
             help=(
                 "dual_shared_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, shared UNet decoder. "
                 "dual_decoder_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, independent full/missing UNet decoders. "
-                "dual_decoder_pg_mtr_retrieval: dual encoder with retrieval-only PG-MTR and zero-init 1x1 missing fusion."
+                "dual_decoder_pg_mtr_retrieval: dual encoder with retrieval-only PG-MTR and zero-init 1x1 missing fusion. "
+                "dual_decoder_task_codebook_retrieval: missing-segmentation-driven learnable codebook retrieval without PET writing, PET reconstruction, or route/memory auxiliary losses."
             ),
         )
 
-        p.add_argument(
-            "--use_pet_mrp_gsa",
-            type=str2bool,
-            default=True,
-            help="Enable PET metabolic relation prior guided self-attention on CT encoder stages.",
-        )
-        p.add_argument(
-            "--pet_mrp_stages",
-            type=str,
-            default="all",
-            choices=("all", "c34", "c4"),
-            help="Which encoder stages use PET-MRP-GSA: all, c34 (C3+C4), or c4 (C4 only).",
-        )
-        p.add_argument(
-            "--pet_mrp_prior_mode",
-            type=str,
-            default="minmax",
-            choices=("minmax", "full", "local"),
-            help="PET map m for PET-MRP-GSA prior: minmax (V1), full (S_full), local (S_loc).",
-        )
-        p.add_argument(
-            "--pet_prior_type",
-            type=str,
-            default="lap_hgl",
-            choices=("none", "intensity", "lap_hgl"),
-            help="PET prior for ct_lap_hgl: none (B0), intensity (P0), lap_hgl (P1).",
-        )
-        p.add_argument(
-            "--pet_prior_size",
-            type=str,
-            default="lite",
-            choices=("lite", "full", "minimal"),
-            help="PET prior for ct_lap_hgl: lite (full-stage lightweight), full (heavy), minimal (high-freq only ablation).",
-        )
-        p.add_argument(
-            "--pet_prior_c4_channels",
-            type=int,
-            default=64,
-            help="Internal spatial width for lite PET prior fusion head.",
-        )
+        p.add_argument("--use_pet_mrp_gsa", type=str2bool, default=True, help="Enable PET metabolic relation prior guided self-attention on CT encoder stages.")
+        p.add_argument("--pet_mrp_stages", type=str, default="all", choices=("all", "c34", "c4"), help="Which encoder stages use PET-MRP-GSA: all, c34 (C3+C4), or c4 (C4 only).")
+        p.add_argument("--pet_mrp_prior_mode", type=str, default="minmax", choices=("minmax", "full", "local"), help="PET map m for PET-MRP-GSA prior: minmax (V1), full (S_full), local (S_loc).")
+        p.add_argument("--pet_prior_type", type=str, default="lap_hgl", choices=("none", "intensity", "lap_hgl"), help="PET prior for ct_lap_hgl: none (B0), intensity (P0), lap_hgl (P1).")
+        p.add_argument("--pet_prior_size", type=str, default="lite", choices=("lite", "full", "minimal"), help="PET prior for ct_lap_hgl: lite (full-stage lightweight), full (heavy), minimal (high-freq only ablation).")
+        p.add_argument("--pet_prior_c4_channels", type=int, default=64, help="Internal spatial width for lite PET prior fusion head.")
         p.add_argument("--pet_prior_mid_channels", type=int, default=32, help="Deprecated alias; use pet_fuse_mid_channels.")
-        p.add_argument(
-            "--pet_prior_channels",
-            type=int,
-            nargs=4,
-            default=[24, 32, 48, 64],
-            help="Lite PET encoder stage channels (F1..F4). Full mode uses wider defaults if unchanged.",
-        )
+        p.add_argument("--pet_prior_channels", type=int, nargs=4, default=[24, 32, 48, 64], help="Lite PET encoder stage channels (F1..F4). Full mode uses wider defaults if unchanged.")
         p.add_argument("--pet_fuse_mid_channels", type=int, default=32, help="Per-scale 1x1 projection width before PET prior fusion.")
         p.add_argument("--pet_gn_groups", type=int, default=8, help="GroupNorm groups for PET LapHGL prior blocks.")
-        p.add_argument(
-            "--dinov3_model_name",
-            type=str,
-            default="vit_small_patch16_dinov3",
-            help="timm DINOv3 model name for frozen PET encoder in A1.",
-        )
-        p.add_argument(
-            "--dinov3_pretrained_path",
-            type=str,
-            default="/root/autodl-tmp/mkd-main/new-train/pretrained/dinov3_small",
-            help="Local DINOv3 weight file or directory for A1 frozen PET encoder.",
-        )
-        p.add_argument(
-            "--pet_prompt_base_channels",
-            type=int,
-            default=256,
-            help="Base channel width for PET prompt projector in A1.",
-        )
+        p.add_argument("--dinov3_model_name", type=str, default="vit_small_patch16_dinov3", help="timm DINOv3 model name for frozen PET encoder in A1.")
+        p.add_argument("--dinov3_pretrained_path", type=str, default="/root/autodl-tmp/mkd-main/new-train/pretrained/dinov3_small", help="Local DINOv3 weight file or directory for A1 frozen PET encoder.")
+        p.add_argument("--pet_prompt_base_channels", type=int, default=256, help="Base channel width for PET prompt projector in A1.")
         p.add_argument("--ct_backbone", type=str, default="convnextv2_nano")
         p.add_argument("--pet_backbone", type=str, default="mit_b1")
         p.add_argument("--encoder_name", type=str, default="mit_b1", help="Shared backbone name for MAFDNet low/high encoders.")
@@ -122,52 +68,18 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--use_pet_proxy", type=str2bool, default=True, help="Use CT-conditioned PET frequency proxy for unavailable PET samples in MAFDNet.")
         p.add_argument("--proxy_loss_weight", type=float, default=0.05, help="Weight for MAFDNet PET frequency proxy L1 loss on PET-available samples.")
         p.add_argument("--consistency_loss_weight", type=float, default=0.0, help="Reserved MAFDNet consistency loss weight; default disabled.")
-        p.add_argument(
-            "--fusion_type",
-            type=str,
-            default="dmome",
-            choices=("concat_conv", "add", "dmome", "dmome_channel_prior_gate", "hybrid_concat_dmome"),
-            help="Default dmome: 4-stage DMoME + DS (best baseline, dmome_ds_no_tpe_v7).",
-        )
+        p.add_argument("--fusion_type", type=str, default="dmome", choices=("concat_conv", "add", "dmome", "dmome_channel_prior_gate", "hybrid_concat_dmome"), help="Default dmome: 4-stage DMoME + DS (best baseline, dmome_ds_no_tpe_v7).")
         p.add_argument("--dmome_expert_reduction", type=int, default=4)
         p.add_argument("--dmome_use_status_token", type=str2bool, default=True)
         p.add_argument("--dmome_temperature", type=float, default=1.0)
         p.add_argument("--dmome_init_ct_bias", type=float, default=0.0)
         p.add_argument("--dmome_output_proj", type=str2bool, default=False)
         p.add_argument("--dmome_norm_groups", type=int, default=8)
-        p.add_argument(
-            "--use_channel_prior_gate",
-            type=str2bool,
-            default=False,
-            help="Enable text-guided channel residual prior gate (auto-enabled for fusion_type=dmome_channel_prior_gate).",
-        )
-        p.add_argument(
-            "--prior_gate_stages",
-            type=str,
-            default="1,2,3,4",
-            help=(
-                "1-based stage indices for channel prior gate, comma-separated. "
-                'Examples: "4" (S4 only), "3,4" (deep stages), "1,2,3,4" (all).'
-            ),
-        )
-        p.add_argument(
-            "--hybrid_concat_stages",
-            type=str,
-            default="1,2,3",
-            help='Shallow stages for Concat+Conv1x1 when fusion_type=hybrid_concat_dmome. Default "1,2,3".',
-        )
-        p.add_argument(
-            "--hybrid_dmome_stages",
-            type=str,
-            default="4",
-            help='Deep stages for plain DMoME (no text) when fusion_type=hybrid_concat_dmome. Default "4".',
-        )
-        p.add_argument(
-            "--biomedclip_model_path",
-            type=str,
-            default="/root/autodl-tmp/mkd-main/new-train/pretrained/biomedclip_model",
-            help="Local BioMedCLIP directory for encoding fixed modality prior texts once at model build.",
-        )
+        p.add_argument("--use_channel_prior_gate", type=str2bool, default=False, help="Enable text-guided channel residual prior gate (auto-enabled for fusion_type=dmome_channel_prior_gate).")
+        p.add_argument("--prior_gate_stages", type=str, default="1,2,3,4", help=("1-based stage indices for channel prior gate, comma-separated. Examples: \"4\" (S4 only), \"3,4\" (deep stages), \"1,2,3,4\" (all)."))
+        p.add_argument("--hybrid_concat_stages", type=str, default="1,2,3", help='Shallow stages for Concat+Conv1x1 when fusion_type=hybrid_concat_dmome. Default "1,2,3".')
+        p.add_argument("--hybrid_dmome_stages", type=str, default="4", help='Deep stages for plain DMoME (no text) when fusion_type=hybrid_concat_dmome. Default "4".')
+        p.add_argument("--biomedclip_model_path", type=str, default="/root/autodl-tmp/mkd-main/new-train/pretrained/biomedclip_model", help="Local BioMedCLIP directory for encoding fixed modality prior texts once at model build.")
         p.add_argument("--log_dmome_weights", type=str2bool, default=True, help="Log stage-wise DMoME fusion weights during validation.")
         p.add_argument("--decoder_type", type=str, default="unet", choices=("unet",))
         p.add_argument("--use_deep_supervision", type=str2bool, default=True, help="Enable nnU-Net style deep supervision on decoder aux heads.")
@@ -177,6 +89,9 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--pg_mtr_route_weight", type=float, default=0.1, help="Weight for PG-MTR route alignment loss; applied only in tasks/mdt_seg.py.")
         p.add_argument("--pg_mtr_mem_weight", type=float, default=0.05, help="Weight for PG-MTR memory grounding loss; applied only in tasks/mdt_seg.py.")
         p.add_argument("--pg_mtr_detach_bank_missing", type=str2bool, default=True, help="Detach token bank key/value during missing-route retrieval to prevent missing-loss updates to memory tokens.")
+        p.add_argument("--task_codebook_stages", type=str, default="all", choices=("s4", "s34", "deep", "s234", "all"), help="Task-driven learnable codebook active stages; supervised only by missing segmentation loss, without PET writing, PET reconstruction, route loss, or memory loss.")
+        p.add_argument("--task_codebook_num_tokens", type=int, default=8, help="Number of learnable codebook tokens updated by missing segmentation loss.")
+        p.add_argument("--task_codebook_temperature", type=float, default=0.07, help="Temperature for task-driven codebook routing; learnable through missing segmentation loss only.")
         p.add_argument("--print_trainable_only", type=str2bool, default=True)
         return p
 
@@ -206,13 +121,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--eval_random_pet_drop_prob", type=float, default=0.4, help="PET missing probability for random-missing evaluation.")
         p.add_argument("--train_mode", type=str, default="alternating_full_missing", choices=("alternating_full_missing",), help="Training route schedule.")
         p.add_argument("--missing_loss_weight", type=float, default=1.0)
-        p.add_argument(
-            "--checkpoint_select",
-            type=str,
-            default="joint_dice",
-            choices=("full_dice", "missing_dice", "joint_dice"),
-            help="Checkpoint selection metric: full_dice, missing_dice, or joint_dice.",
-        )
+        p.add_argument("--checkpoint_select", type=str, default="joint_dice", choices=("full_dice", "missing_dice", "joint_dice"), help="Checkpoint selection metric: full_dice, missing_dice, or joint_dice.")
         p.add_argument("--eval_random_seed", type=int, default=2026)
         p.add_argument("--lr_find_start", type=float, default=1e-7)
         p.add_argument("--lr_find_end", type=float, default=1e-2)
