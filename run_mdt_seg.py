@@ -411,6 +411,8 @@ def main():
         missing_train_steps = 0
         full_loss_sum = 0.0
         missing_loss_sum = 0.0
+        full_pg_route_sum = 0.0
+        full_pg_mem_sum = 0.0
         for i, batch in enumerate(train_loader):
             stepped = False
             global_batch_step = (epoch - 1) * spe + i
@@ -493,6 +495,8 @@ def main():
             if train_route == 'full':
                 full_train_steps += 1
                 full_loss_sum += float(loss_dict.get('loss_total', loss.detach()).item())
+                full_pg_route_sum += float(loss_dict.get('loss_pg_mtr_route', torch.tensor(0.0)).item())
+                full_pg_mem_sum += float(loss_dict.get('loss_pg_mtr_mem', torch.tensor(0.0)).item())
             else:
                 missing_train_steps += 1
                 missing_loss_sum += float(loss_dict.get('loss_total', loss.detach()).item())
@@ -504,10 +508,18 @@ def main():
                 ds_metric_steps += 1
             if (i + 1) % 50 == 0:
                 curr_lr = task.optimizer.param_groups[0]['lr']
+                step_route = float(loss_dict.get('loss_pg_mtr_route', torch.tensor(0.0)).item())
+                step_mem = float(loss_dict.get('loss_pg_mtr_mem', torch.tensor(0.0)).item())
+                step_w_route = float(loss_dict.get('weighted_loss_pg_mtr_route', torch.tensor(0.0)).item())
+                step_w_mem = float(loss_dict.get('weighted_loss_pg_mtr_mem', torch.tensor(0.0)).item())
                 print(
                     f'  Ep{epoch}[{i + 1}/{spe}] route={train_route} '
                     f'loss={step_loss:.4f} '
                     f'seg={step_seg:.4f} '
+                    f'pg_route={step_route:.4f} '
+                    f'pg_mem={step_mem:.4f} '
+                    f'wp_route={step_w_route:.4f} '
+                    f'wp_mem={step_w_mem:.4f} '
                     f'boundary={step_boundary:.4f} '
                     f'total={float(loss_dict.get("loss_total", loss.detach()).item()):.4f} '
                     f'lr={curr_lr:.6f}'
@@ -587,6 +599,10 @@ def main():
             val_lines.append(
                 f'val_{mode_name}: Dice={metrics["dice"]:.4f} IoU={metrics["iou"]:.4f} Acc={metrics["acc"]:.4f} HD95={metrics["hd95"]:.2f}'
             )
+        avg_full_loss = full_loss_sum / max(full_train_steps, 1)
+        avg_missing_loss = missing_loss_sum / max(missing_train_steps, 1)
+        avg_full_pg_route = full_pg_route_sum / max(full_train_steps, 1)
+        avg_full_pg_mem = full_pg_mem_sum / max(full_train_steps, 1)
         print(
             f'Epoch {epoch}\n'
             f'train_loss={tloss / max(tn, 1):.4f} train_seg={tseg / max(tn, 1):.4f} train_boundary={tboundary / max(tn, 1):.4f}\n'
@@ -594,8 +610,10 @@ def main():
             f'joint_metrics dice={joint_dice:.4f} hd95={joint_hd95:.2f}\n'
             f'checkpoint_select={checkpoint_select} selected_score={selected_score:.4f} best_selected_score={best_selected_score:.4f} best_selected_epoch={best_selected_epoch}\n'
             f'route_stats full_steps={full_train_steps} missing_steps={missing_train_steps} '
-            f'avg_full_loss={full_loss_sum / max(full_train_steps, 1):.4f} '
-            f'avg_missing_loss={missing_loss_sum / max(missing_train_steps, 1):.4f}\n'
+            f'avg_full_loss={avg_full_loss:.4f} '
+            f'avg_full_pg_route={avg_full_pg_route:.4f} '
+            f'avg_full_pg_mem={avg_full_pg_mem:.4f} '
+            f'avg_missing_loss={avg_missing_loss:.4f}\n'
             f'full PET-CT training/evaluation '
             f'lr={curr_lr:.6f} grad_norm={avg_grad_norm:.4f} grad_clipped_steps={grad_clip_count}/{grad_norm_steps} '
             f'grad_guard_skipped_steps={sum(first_bad_module_counter.values())} first_bad_module_counter={first_bad_module_counter} '
