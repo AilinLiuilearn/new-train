@@ -193,11 +193,25 @@ class MDTSegTeacher:
         mem_loss = aux_losses.get('pg_mtr_mem_loss', zero)
         route_weight = float(getattr(self.config, 'pg_mtr_route_weight', 0.1))
         mem_weight = float(getattr(self.config, 'pg_mtr_mem_weight', 0.05))
-        if forward_mode == 'missing':
+        if forward_mode == 'full':
+            if route_weight > 0:
+                if not torch.is_tensor(route_loss):
+                    raise RuntimeError('PG-MTR route loss must be a tensor.')
+                if not route_loss.requires_grad:
+                    raise RuntimeError('PG-MTR route loss is enabled but has no gradient. Check whether mask is passed into the full route.')
+                if not torch.isfinite(route_loss).all():
+                    raise RuntimeError('PG-MTR route loss contains NaN or Inf.')
+            if mem_weight > 0:
+                if not torch.is_tensor(mem_loss):
+                    raise RuntimeError('PG-MTR memory loss must be a tensor.')
+                if not mem_loss.requires_grad:
+                    raise RuntimeError('PG-MTR memory loss is enabled but has no gradient. Check whether mask is passed into the full route.')
+                if not torch.isfinite(mem_loss).all():
+                    raise RuntimeError('PG-MTR memory loss contains NaN or Inf.')
+            loss_total = loss_seg + route_weight * route_loss + mem_weight * mem_loss
+        else:
             missing_weight = float(getattr(self.config, 'missing_loss_weight', 1.0))
             loss_total = missing_weight * loss_seg
-        else:
-            loss_total = loss_seg + route_weight * route_loss + mem_weight * mem_loss
         loss_dict = dict(loss_stats)
         loss_dict.update({'loss_seg': loss_seg.detach(), 'loss_total': loss_total.detach(), 'loss_full': loss_seg.detach() if forward_mode == 'full' else zero, 'loss_missing': loss_seg.detach() if forward_mode == 'missing' else zero, 'train_route_full': 1.0 if forward_mode == 'full' else 0.0, 'train_route_missing': 1.0 if forward_mode == 'missing' else 0.0, 'loss_pg_mtr_route': route_loss.detach(), 'loss_pg_mtr_mem': mem_loss.detach(), 'weighted_loss_pg_mtr_route': (route_weight * route_loss).detach(), 'weighted_loss_pg_mtr_mem': (mem_weight * mem_loss).detach()})
         for key, value in diagnostics.items():

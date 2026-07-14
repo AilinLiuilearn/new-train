@@ -57,22 +57,54 @@ class DualDecoderPGMTRRetrieval(nn.Module):
         if missing_idx.numel()>0: logits=logits.index_copy(0, missing_idx, missing_outputs['logits'])
         merged['logits']=logits; merged['pred']=logits; merged['aux']={}; return merged
     def _forward_auto(self, ct, pet, pet_available, target_size, mask=None):
-        pa=pet_available.long().view(-1)
-        if torch.all(pa==1): return self._forward_full(ct, pet, target_size, mask=mask)
-        if torch.all(pa==0): return self._forward_missing(ct, target_size)
-        aligned=self._encode_ct(ct); full_idx=torch.nonzero(pa==1, as_tuple=False).flatten(); missing_idx=torch.nonzero(pa==0, as_tuple=False).flatten(); full_outputs=None; missing_outputs=None
-        if full_idx.numel()>0:
-            full_ct=[f.index_select(0, full_idx) for f in aligned]; pet_full=pet.index_select(0, full_idx); full_outputs=self._decode_with(self.full_decoder, self.fusion(full_ct, self._encode_pet(pet_full), pet_available=None), target_size)
-        if missing_idx.numel()>0:
-            miss_ct=[f.index_select(0, missing_idx) for f in aligned]; retrieved,_,diag=self.pg_mtr(miss_ct, mode='missing', detach_bank=self.pg_mtr_detach_bank_missing); miss_feat,diag=self._apply_retrieved_memory(miss_ct, retrieved, diag); missing_outputs=self._decode_with(self.missing_decoder, miss_feat, target_size); missing_outputs['diagnostics']=diag
-        if full_outputs is None: return missing_outputs
-        if missing_outputs is None: return full_outputs
+        pa = pet_available.long().view(-1)
+        if torch.all(pa == 1):
+            return self._forward_full(ct, pet, target_size, mask=mask)
+        if torch.all(pa == 0):
+            return self._forward_missing(ct, target_size)
+        aligned = self._encode_ct(ct)
+        full_idx = torch.nonzero(pa == 1, as_tuple=False).flatten()
+        missing_idx = torch.nonzero(pa == 0, as_tuple=False).flatten()
+        full_outputs = None
+        missing_outputs = None
+        if full_idx.numel() > 0:
+            full_ct = [f.index_select(0, full_idx) for f in aligned]
+            pet_full = pet.index_select(0, full_idx)
+            pet_full_feats = self._encode_pet(pet_full)
+            full_outputs = self._decode_with(
+                self.full_decoder,
+                self.fusion(full_ct, pet_full_feats, pet_available=None),
+                target_size,
+            )
+            full_mask = None
+            if mask is not None:
+                full_mask = mask.index_select(0, full_idx)
+            _, full_aux, full_diag = self.pg_mtr(full_ct, pet_full_feats, mode='full', mask=full_mask)
+            full_outputs['aux_losses'] = full_aux
+            full_outputs['diagnostics'] = full_diag
+        if missing_idx.numel() > 0:
+            miss_ct = [f.index_select(0, missing_idx) for f in aligned]
+            retrieved, _, diag = self.pg_mtr(miss_ct, mode='missing', detach_bank=self.pg_mtr_detach_bank_missing)
+            miss_feat, diag = self._apply_retrieved_memory(miss_ct, retrieved, diag)
+            missing_outputs = self._decode_with(self.missing_decoder, miss_feat, target_size)
+            missing_outputs['diagnostics'] = diag
+        if full_outputs is None:
+            return missing_outputs
+        if missing_outputs is None:
+            return full_outputs
         return self._merge_outputs(full_outputs, missing_outputs, full_idx, missing_idx, ct.shape[0])
+
     def forward(self, ct, pet, pet_available=None, target_size=None, forward_mode='auto', mask=None):
-        if target_size is None: target_size=ct.shape[-2:]
-        if forward_mode=='full': return self._forward_full(ct, pet, target_size)
-        if forward_mode=='missing': return self._forward_missing(ct, target_size)
-        if forward_mode=='auto':
-            if pet_available is None: pet_available=torch.ones(ct.shape[0], device=ct.device, dtype=torch.long)
-            return self._forward_auto(ct, pet, pet_available, target_size)
-        raise ValueError(forward_mode)
+        if target_size is None:
+            target_size = ct.shape[-2:]
+        if forward_mode == 'full':
+            if self.training and mask is None:
+                raise RuntimeError('Full training requires mask for PG-MTR route and memory losses.')
+            return self._forward_full(ct, pet, target_size, mask=mask)
+        if forward_mode == 'missing':
+            return self._forward_missing(ct, target_size)
+        if forward_mode == 'auto':
+            if pet_available is None:
+                pet_available = torch.ones(ct.shape[0], device=ct.device, dtype=torch.long)
+            return self._forward_auto(ct, pet, pet_available, target_size, mask=mask)
+        raise ValueError(f'Unsupported forward_mode={forward_mode!r}. Expected \'full\', \'missing\', or \'auto\'.')
