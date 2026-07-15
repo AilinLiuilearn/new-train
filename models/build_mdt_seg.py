@@ -494,9 +494,29 @@ def build_mdt_seg_teacher(config):
             f'detach_bank_missing={getattr(config, "pg_mtr_detach_bank_missing", True)}'
         )
         return dict(model=model)
+    if model_arch == 'dual_decoder_multiscale_task_increment_bank':
+        from models.dual_decoder_multiscale_task_increment_bank import DualDecoderMultiScaleTaskIncrementBank
+        model = DualDecoderMultiScaleTaskIncrementBank(
+            **common_kwargs,
+            mtib_stages=getattr(config, 'mtib_stages', 'all'),
+            mtib_num_tokens=getattr(config, 'mtib_num_tokens', 8),
+            mtib_temperature=getattr(config, 'mtib_temperature', 0.07),
+        )
+        print(
+            f'[dual_decoder_multiscale_task_increment_bank] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
+            f'pet={getattr(config, "pet_backbone", "mit_b1")} decoder_shared=False '
+            f'full_base_fusion=stage-wise-add task_refinement=residual_zero_init '
+            f'true_increment=P+H(C+P) shared_bank=True bank_guidance=multi_scale_complete_modal_task_increment '
+            f'full_query_source=C+P missing_query_source=CT bank_trainable_on_full=True '
+            f'bank_detached_on_ct_comp=True bank_detached_on_missing=True '
+            f'num_tokens={getattr(config, "mtib_num_tokens", 8)} '
+            f'latent_dim={model.mtib.latent_dim} temperature={getattr(config, "mtib_temperature", 0.07)} '
+            f'bank_loss=smooth_l1 comp_loss=smooth_l1 orthogonal_constraint=False'
+        )
+        return dict(model=model)
     raise ValueError(
         f'Unsupported model_arch={model_arch}. '
-        'Supported: dual_shared_add_baseline, dual_decoder_add_baseline, dual_decoder_pg_mtr_retrieval.'
+        'Supported: dual_shared_add_baseline, dual_decoder_add_baseline, dual_decoder_pg_mtr_retrieval, dual_decoder_multiscale_task_increment_bank.'
     )
 
 

@@ -191,15 +191,22 @@ class MDTSegTeacher:
         zero = loss_seg.new_tensor(0.0)
         route_loss = aux_losses.get('pg_mtr_route_loss', zero)
         mem_loss = aux_losses.get('pg_mtr_mem_loss', zero)
+        bank_loss = aux_losses.get('mtib_bank_loss', zero)
+        comp_loss = aux_losses.get('mtib_comp_loss', zero)
         route_weight = float(getattr(self.config, 'pg_mtr_route_weight', 0.1))
         mem_weight = float(getattr(self.config, 'pg_mtr_mem_weight', 0.05))
+        bank_weight = float(getattr(self.config, 'mtib_bank_weight', 0.05))
+        comp_weight = float(getattr(self.config, 'mtib_comp_weight', 0.05))
         if forward_mode == 'missing':
             missing_weight = float(getattr(self.config, 'missing_loss_weight', 1.0))
             loss_total = missing_weight * loss_seg
         else:
-            loss_total = loss_seg + route_weight * route_loss + mem_weight * mem_loss
+            if 'mtib_bank_loss' in aux_losses or 'mtib_comp_loss' in aux_losses:
+                loss_total = loss_seg + bank_weight * bank_loss + comp_weight * comp_loss
+            else:
+                loss_total = loss_seg + route_weight * route_loss + mem_weight * mem_loss
         loss_dict = dict(loss_stats)
-        loss_dict.update({'loss_seg': loss_seg.detach(), 'loss_total': loss_total.detach(), 'loss_full': loss_seg.detach() if forward_mode == 'full' else zero, 'loss_missing': loss_seg.detach() if forward_mode == 'missing' else zero, 'train_route_full': 1.0 if forward_mode == 'full' else 0.0, 'train_route_missing': 1.0 if forward_mode == 'missing' else 0.0, 'loss_pg_mtr_route': route_loss.detach(), 'loss_pg_mtr_mem': mem_loss.detach(), 'weighted_loss_pg_mtr_route': (route_weight * route_loss).detach(), 'weighted_loss_pg_mtr_mem': (mem_weight * mem_loss).detach()})
+        loss_dict.update({'loss_seg': loss_seg.detach(), 'loss_total': loss_total.detach(), 'loss_full': loss_seg.detach() if forward_mode == 'full' else zero, 'loss_missing': loss_seg.detach() if forward_mode == 'missing' else zero, 'train_route_full': 1.0 if forward_mode == 'full' else 0.0, 'train_route_missing': 1.0 if forward_mode == 'missing' else 0.0, 'loss_pg_mtr_route': route_loss.detach(), 'loss_pg_mtr_mem': mem_loss.detach(), 'weighted_loss_pg_mtr_route': (route_weight * route_loss).detach(), 'weighted_loss_pg_mtr_mem': (mem_weight * mem_loss).detach(), 'loss_mtib_bank': bank_loss.detach(), 'loss_mtib_comp': comp_loss.detach(), 'weighted_loss_mtib_bank': (bank_weight * bank_loss).detach(), 'weighted_loss_mtib_comp': (comp_weight * comp_loss).detach()})
         for key, value in diagnostics.items():
             if torch.is_tensor(value) and value.numel() > 0:
                 loss_dict[f'diag_{key}'] = value.detach().float().mean()

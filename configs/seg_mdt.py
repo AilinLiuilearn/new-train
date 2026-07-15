@@ -36,11 +36,12 @@ class SegMDTConfig(ConfigBase):
             "--model_arch",
             type=str,
             default="dual_shared_add_baseline",
-            choices=("dual_shared_add_baseline", "dual_decoder_add_baseline", "dual_decoder_pg_mtr_retrieval"),
+            choices=("dual_shared_add_baseline", "dual_decoder_add_baseline", "dual_decoder_pg_mtr_retrieval", "dual_decoder_multiscale_task_increment_bank"),
             help=(
                 "dual_shared_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, shared UNet decoder. "
                 "dual_decoder_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, independent full/missing UNet decoders. "
-                "dual_decoder_pg_mtr_retrieval: dual encoder with retrieval-only PG-MTR and zero-init 1x1 missing fusion."
+                "dual_decoder_pg_mtr_retrieval: dual encoder with retrieval-only PG-MTR and zero-init 1x1 missing fusion. "
+                "dual_decoder_multiscale_task_increment_bank: dual encoder with zero-init task refinement and shared multi-scale task-increment bank."
             ),
         )
 
@@ -177,6 +178,11 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--pg_mtr_route_weight", type=float, default=0.1, help="Weight for PG-MTR route alignment loss; applied only in tasks/mdt_seg.py.")
         p.add_argument("--pg_mtr_mem_weight", type=float, default=0.05, help="Weight for PG-MTR memory grounding loss; applied only in tasks/mdt_seg.py.")
         p.add_argument("--pg_mtr_detach_bank_missing", type=str2bool, default=True, help="Detach token bank key/value during missing-route retrieval to prevent missing-loss updates to memory tokens.")
+        p.add_argument("--mtib_stages", type=str, default="all", choices=("s4", "s34", "deep", "s234", "all"))
+        p.add_argument("--mtib_num_tokens", type=int, default=8)
+        p.add_argument("--mtib_temperature", type=float, default=0.07)
+        p.add_argument("--mtib_bank_weight", type=float, default=0.05)
+        p.add_argument("--mtib_comp_weight", type=float, default=0.05)
         p.add_argument("--print_trainable_only", type=str2bool, default=True)
         return p
 
