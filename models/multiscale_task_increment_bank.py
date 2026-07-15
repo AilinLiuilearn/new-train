@@ -132,7 +132,7 @@ class SharedMultiScaleTaskIncrementBank(nn.Module):
         losses = []
         for s in self.active_stage_numbers:
             i = s - 1
-            q = self.full_queries[str(s)](full_feats[i].detach())
+            q = self.full_queries[str(s)](full_feats[i])
             assignment, mem, k, v = self._route(q, detach_bank=False)
             delta = self._apply_adapter(s, mem)
             target = true_increment[s].detach()
