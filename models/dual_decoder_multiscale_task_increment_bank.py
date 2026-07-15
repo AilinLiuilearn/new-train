@@ -35,6 +35,25 @@ class ZeroInitResidualTaskRefine(nn.Module):
         return self.conv2(self.act(self.conv1(self.norm(x))))
 
 
+class DifferenceConditionEncoder(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        hidden_channels = min(max(channels // 4, 32), 128)
+        self.conv1 = nn.Conv2d(channels, hidden_channels, kernel_size=1, bias=False)
+        self.norm = nn.GroupNorm(_valid_group_count(hidden_channels), hidden_channels, affine=True)
+        self.act = nn.GELU()
+        self.conv2 = nn.Conv2d(hidden_channels, channels, kernel_size=1, bias=False)
+        nn.init.kaiming_normal_(self.conv1.weight, mode='fan_out', nonlinearity='linear')
+        nn.init.zeros_(self.conv2.weight)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.norm(x)
+        x = self.act(x)
+        x = self.conv2(x)
+        return x
+
+
 class DualDecoderMultiScaleTaskIncrementBank(nn.Module):
     def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, mtib_stages='all', mtib_num_tokens=8, mtib_temperature=0.07):
         super().__init__()
@@ -50,6 +69,7 @@ class DualDecoderMultiScaleTaskIncrementBank(nn.Module):
         self.missing_decoder = copy.deepcopy(self.full_decoder)
         self.task_refine = nn.ModuleDict({str(s): ZeroInitResidualTaskRefine(pet_channels[s - 1]) for s in (1, 2, 3, 4)})
         self.mtib = SharedMultiScaleTaskIncrementBank(pet_channels, num_tokens=mtib_num_tokens, temperature=mtib_temperature, stage_mode=mtib_stages)
+        self.diff_conditioners = nn.ModuleDict({str(s): DifferenceConditionEncoder(pet_channels[s - 1]) for s in self.mtib.active_stage_numbers})
 
     @staticmethod
     def _to_3ch(x):
@@ -82,6 +102,36 @@ class DualDecoderMultiScaleTaskIncrementBank(nn.Module):
         out['aux'] = {}
         return out
 
+    def _rms_tensor(self, x):
+        return x.detach().float().pow(2).mean().add(1e-12).sqrt()
+
+    def _build_full_query_conditions(self, ct_feats, pet_feats, joint_feats):
+        conditions = []
+        diagnostics = {}
+        active_stages = set(self.mtib.active_stage_numbers)
+        for s in (1, 2, 3, 4):
+            i = s - 1
+            j = joint_feats[i]
+            if s not in active_stages:
+                conditions.append(j.detach())
+                continue
+            c = ct_feats[i].detach()
+            p = pet_feats[i].detach()
+            j_det = j.detach()
+            with torch.cuda.amp.autocast(enabled=False):
+                c_norm = torch.nn.functional.normalize(c.float(), dim=1, eps=1e-6)
+                p_norm = torch.nn.functional.normalize(p.float(), dim=1, eps=1e-6)
+                diff = (c_norm - p_norm).abs()
+            diff = diff.to(dtype=j_det.dtype)
+            diff_residual = self.diff_conditioners[str(s)](diff)
+            condition = j_det + diff_residual
+            conditions.append(condition)
+            diagnostics[f'mtib_s{s}_raw_difference_rms'] = self._rms_tensor(diff)
+            diagnostics[f'mtib_s{s}_difference_residual_rms'] = self._rms_tensor(diff_residual)
+            diagnostics[f'mtib_s{s}_difference_joint_ratio'] = self._rms_tensor(diff_residual) / (self._rms_tensor(j_det) + 1e-6)
+            diagnostics[f'mtib_s{s}_query_condition_rms'] = self._rms_tensor(condition)
+        return conditions, diagnostics
+
     def _true_increment(self, ct_feats, pet_feats):
         joint_feats = []
         full_feats = []
@@ -103,11 +153,12 @@ class DualDecoderMultiScaleTaskIncrementBank(nn.Module):
         ct_feats = self._encode_ct(ct)
         pet_feats = self._encode_pet(pet)
         joint_feats, full_feats, true_inc = self._true_increment(ct_feats, pet_feats)
+        query_conditions, diff_diag = self._build_full_query_conditions(ct_feats, pet_feats, joint_feats)
         out = self._decode_with(self.full_decoder, full_feats, target_size)
-        bank_out, bank_loss, bank_diag = self.mtib.forward_full(joint_feats, true_inc)
+        bank_out, bank_loss, bank_diag = self.mtib.forward_full(query_conditions, true_inc)
         comp_out, comp_loss, comp_diag = self.mtib.forward_ct_comp(ct_feats, true_inc)
         out['aux_losses'] = {'mtib_bank_loss': bank_loss, 'mtib_comp_loss': comp_loss}
-        out['diagnostics'] = {**bank_diag, **comp_diag}
+        out['diagnostics'] = {**bank_diag, **comp_diag, **diff_diag}
         out['mtib_bank'] = bank_out
         out['mtib_comp'] = comp_out
         return out
@@ -136,11 +187,12 @@ class DualDecoderMultiScaleTaskIncrementBank(nn.Module):
             full_ct = [f.index_select(0, full_idx) for f in ct_feats]
             full_pet = self._encode_pet(pet.index_select(0, full_idx))
             joint_feats, full_feats, true_inc = self._true_increment(full_ct, full_pet)
+            query_conditions, diff_diag = self._build_full_query_conditions(full_ct, full_pet, joint_feats)
             full_out = self._decode_with(self.full_decoder, full_feats, target_size)
-            bank_out, bank_loss, bank_diag = self.mtib.forward_full(joint_feats, true_inc)
+            bank_out, bank_loss, bank_diag = self.mtib.forward_full(query_conditions, true_inc)
             comp_out, comp_loss, comp_diag = self.mtib.forward_ct_comp(full_ct, true_inc)
             full_out['aux_losses'] = {'mtib_bank_loss': bank_loss, 'mtib_comp_loss': comp_loss}
-            full_out['diagnostics'] = {**bank_diag, **comp_diag}
+            full_out['diagnostics'] = {**bank_diag, **comp_diag, **diff_diag}
             full_out['mtib_bank'] = bank_out
             full_out['mtib_comp'] = comp_out
         if missing_idx.numel() > 0:
