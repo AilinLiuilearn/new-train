@@ -171,6 +171,37 @@ class MDTSegTeacher:
         zero = next(iter(self.networks['model'].parameters())).new_tensor(0.0)
         return zero, {'loss_proxy': zero.detach()}
 
+    def _compute_hatr_residual_loss(self, outputs, mask):
+        zero = mask.new_tensor(0.0)
+        required = ['hatr_counterfactual_logits', 'hatr_full_states', 'hatr_counterfactual_states', 'hatr_pred_residuals']
+        if not isinstance(outputs, dict) or not all(k in outputs for k in required):
+            return zero, {'loss_hatr': zero.detach()}
+        full_logits = outputs['logits']
+        ct_cf_logits = outputs['hatr_counterfactual_logits']
+        full_states = outputs['hatr_full_states']
+        ct_cf_states = outputs['hatr_counterfactual_states']
+        pred_residuals = outputs['hatr_pred_residuals']
+        with torch.no_grad():
+            p_f = torch.sigmoid(full_logits.detach().float())
+            p_c = torch.sigmoid(ct_cf_logits.detach().float())
+            y = mask.float()
+            e_f = (p_f - y).pow(2)
+            e_c = (p_c - y).pow(2)
+            advantage = F.relu(e_c - e_f) / (e_c + e_f + 1e-6)
+        loss_total = zero
+        stats = {'loss_hatr': zero.detach(), 'hatr_advantage_mean': advantage.mean().detach(), 'hatr_advantage_active_ratio': (advantage > 0).float().mean().detach(), 'hatr_full_error_mean': e_f.mean().detach(), 'hatr_counterfactual_error_mean': e_c.mean().detach()}
+        for idx, (full_state, ct_cf_state, pred_residual) in enumerate(zip(full_states, ct_cf_states, pred_residuals), start=1):
+            advantage_s = F.interpolate(advantage, size=full_state.shape[-2:], mode='bilinear', align_corners=False)
+            target_s = advantage_s * (full_state.detach() - ct_cf_state.detach())
+            loss_s = F.smooth_l1_loss(pred_residual.float(), target_s.float())
+            loss_total = loss_total + loss_s
+            stats[f'hatr_s{idx}_target_rms'] = target_s.float().pow(2).mean().sqrt().detach()
+            stats[f'hatr_s{idx}_pred_rms'] = pred_residual.float().pow(2).mean().sqrt().detach()
+            stats[f'hatr_s{idx}_loss'] = loss_s.detach()
+        loss_total = loss_total / 4.0
+        stats['loss_hatr'] = loss_total.detach()
+        return loss_total, stats
+
     def _compute_total_loss(self, outputs, mask, pixel_weight=None):
         loss_seg, pred, loss_stats = self._compute_segmentation_loss(outputs, mask)
         loss_total = loss_seg
@@ -193,20 +224,25 @@ class MDTSegTeacher:
         mem_loss = aux_losses.get('pg_mtr_mem_loss', zero)
         bank_loss = aux_losses.get('mtib_bank_loss', zero)
         comp_loss = aux_losses.get('mtib_comp_loss', zero)
+        hatr_loss, hatr_stats = self._compute_hatr_residual_loss(outputs, mask)
         route_weight = float(getattr(self.config, 'pg_mtr_route_weight', 0.1))
         mem_weight = float(getattr(self.config, 'pg_mtr_mem_weight', 0.05))
         bank_weight = float(getattr(self.config, 'mtib_bank_weight', 0.05))
         comp_weight = float(getattr(self.config, 'mtib_comp_weight', 0.05))
+        hatr_weight = float(getattr(self.config, 'hatr_weight', 0.1))
         if forward_mode == 'missing':
             missing_weight = float(getattr(self.config, 'missing_loss_weight', 1.0))
             loss_total = missing_weight * loss_seg
         else:
-            if 'mtib_bank_loss' in aux_losses or 'mtib_comp_loss' in aux_losses:
+            if 'hatr_pred_residuals' in outputs:
+                loss_total = loss_seg + hatr_weight * hatr_loss
+            elif 'mtib_bank_loss' in aux_losses or 'mtib_comp_loss' in aux_losses:
                 loss_total = loss_seg + bank_weight * bank_loss + comp_weight * comp_loss
             else:
                 loss_total = loss_seg + route_weight * route_loss + mem_weight * mem_loss
         loss_dict = dict(loss_stats)
-        loss_dict.update({'loss_seg': loss_seg.detach(), 'loss_total': loss_total.detach(), 'loss_full': loss_seg.detach() if forward_mode == 'full' else zero, 'loss_missing': loss_seg.detach() if forward_mode == 'missing' else zero, 'train_route_full': 1.0 if forward_mode == 'full' else 0.0, 'train_route_missing': 1.0 if forward_mode == 'missing' else 0.0, 'loss_pg_mtr_route': route_loss.detach(), 'loss_pg_mtr_mem': mem_loss.detach(), 'weighted_loss_pg_mtr_route': (route_weight * route_loss).detach(), 'weighted_loss_pg_mtr_mem': (mem_weight * mem_loss).detach(), 'loss_mtib_bank': bank_loss.detach(), 'loss_mtib_comp': comp_loss.detach(), 'weighted_loss_mtib_bank': (bank_weight * bank_loss).detach(), 'weighted_loss_mtib_comp': (comp_weight * comp_loss).detach()})
+        loss_dict.update({'loss_seg': loss_seg.detach(), 'loss_total': loss_total.detach(), 'loss_full': loss_seg.detach() if forward_mode == 'full' else zero, 'loss_missing': loss_seg.detach() if forward_mode == 'missing' else zero, 'train_route_full': 1.0 if forward_mode == 'full' else 0.0, 'train_route_missing': 1.0 if forward_mode == 'missing' else 0.0, 'loss_pg_mtr_route': route_loss.detach(), 'loss_pg_mtr_mem': mem_loss.detach(), 'weighted_loss_pg_mtr_route': (route_weight * route_loss).detach(), 'weighted_loss_pg_mtr_mem': (mem_weight * mem_loss).detach(), 'loss_mtib_bank': bank_loss.detach(), 'loss_mtib_comp': comp_loss.detach(), 'weighted_loss_mtib_bank': (bank_weight * bank_loss).detach(), 'weighted_loss_mtib_comp': (comp_weight * comp_loss).detach(), 'loss_hatr': hatr_loss.detach(), 'weighted_loss_hatr': (hatr_weight * hatr_loss).detach()})
+        loss_dict.update(hatr_stats)
         for key, value in diagnostics.items():
             if torch.is_tensor(value) and value.numel() > 0:
                 loss_dict[f'diag_{key}'] = value.detach().float().mean()

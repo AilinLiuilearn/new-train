@@ -514,9 +514,22 @@ def build_mdt_seg_teacher(config):
             f'bank_loss=smooth_l1 comp_loss=smooth_l1 orthogonal_constraint=False'
         )
         return dict(model=model)
+    if model_arch == 'dual_decoder_hatr_task_residual':
+        from models.dual_decoder_hatr_task_residual import DualDecoderHATRTaskResidual
+        model = DualDecoderHATRTaskResidual(**common_kwargs)
+        print(
+            f'[dual_decoder_hatr_task_residual] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
+            f'pet={getattr(config, "pet_backbone", "mit_b1")} '
+            f'full_fusion=stage-wise-add decoder_shared=False '
+            f'teacher_observation=same_full_decoder_counterfactual_CT '
+            f'task_target=advantage_qualified_decoder_state_residual '
+            f'recovery=hierarchical_S4_to_S1 correction_space=missing_decoder_states '
+            f'hatr_weight={getattr(config, "hatr_weight", 0.1)}'
+        )
+        return dict(model=model)
     raise ValueError(
         f'Unsupported model_arch={model_arch}. '
-        'Supported: dual_shared_add_baseline, dual_decoder_add_baseline, dual_decoder_pg_mtr_retrieval, dual_decoder_multiscale_task_increment_bank.'
+        'Supported: dual_shared_add_baseline, dual_decoder_add_baseline, dual_decoder_pg_mtr_retrieval, dual_decoder_multiscale_task_increment_bank, dual_decoder_hatr_task_residual.'
     )
 
 
