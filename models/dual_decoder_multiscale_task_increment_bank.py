@@ -83,23 +83,28 @@ class DualDecoderMultiScaleTaskIncrementBank(nn.Module):
         return out
 
     def _true_increment(self, ct_feats, pet_feats):
-        increments = {}
+        joint_feats = []
         full_feats = []
+        increments = {}
         for s in (1, 2, 3, 4):
             i = s - 1
-            j = ct_feats[i] + pet_feats[i]
+            c = ct_feats[i]
+            p = pet_feats[i]
+            j = c + p
             r = self.task_refine[str(s)](j)
             z = j + r
+            d_star = z - c
+            joint_feats.append(j)
             full_feats.append(z)
-            increments[s] = z - ct_feats[i]
-        return full_feats, increments
+            increments[s] = d_star
+        return joint_feats, full_feats, increments
 
     def _forward_full(self, ct, pet, target_size):
         ct_feats = self._encode_ct(ct)
         pet_feats = self._encode_pet(pet)
-        full_feats, true_inc = self._true_increment(ct_feats, pet_feats)
+        joint_feats, full_feats, true_inc = self._true_increment(ct_feats, pet_feats)
         out = self._decode_with(self.full_decoder, full_feats, target_size)
-        bank_out, bank_loss, bank_diag = self.mtib.forward_full(full_feats, true_inc)
+        bank_out, bank_loss, bank_diag = self.mtib.forward_full(joint_feats, true_inc)
         comp_out, comp_loss, comp_diag = self.mtib.forward_ct_comp(ct_feats, true_inc)
         out['aux_losses'] = {'mtib_bank_loss': bank_loss, 'mtib_comp_loss': comp_loss}
         out['diagnostics'] = {**bank_diag, **comp_diag}
@@ -130,9 +135,9 @@ class DualDecoderMultiScaleTaskIncrementBank(nn.Module):
         if full_idx.numel() > 0:
             full_ct = [f.index_select(0, full_idx) for f in ct_feats]
             full_pet = self._encode_pet(pet.index_select(0, full_idx))
-            full_feats, true_inc = self._true_increment(full_ct, full_pet)
+            joint_feats, full_feats, true_inc = self._true_increment(full_ct, full_pet)
             full_out = self._decode_with(self.full_decoder, full_feats, target_size)
-            bank_out, bank_loss, bank_diag = self.mtib.forward_full(full_feats, true_inc)
+            bank_out, bank_loss, bank_diag = self.mtib.forward_full(joint_feats, true_inc)
             comp_out, comp_loss, comp_diag = self.mtib.forward_ct_comp(full_ct, true_inc)
             full_out['aux_losses'] = {'mtib_bank_loss': bank_loss, 'mtib_comp_loss': comp_loss}
             full_out['diagnostics'] = {**bank_diag, **comp_diag}
