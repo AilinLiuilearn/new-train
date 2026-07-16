@@ -356,19 +356,41 @@ def create_feature_backbone(backbone, in_channels=3):
         if SegformerConfig is None or SegformerModel is None:
             return FallbackFeatureBackbone(in_channels=in_channels, channels=(32, 64, 160, 256) if backbone == 'mit_b0' else (64, 128, 320, 512))
         return SegformerFeatureBackbone(backbone, in_channels=in_channels)
-    if backbone == 'convnext_tiny':
-        if ConvNextConfig is None or ConvNextModel is None:
-            return FallbackFeatureBackbone(in_channels=in_channels, channels=(96, 192, 384, 768))
-        return ConvNextFeatureBackbone(backbone, in_channels=in_channels)
+    if backbone in ('convnext_tiny', 'convnext_nano', 'convnextv2_nano', 'convnextv2_atto', 'convnextv2_femto', 'convnextv2_pico'):
+        convnext_fallback_channels = {
+            'convnext_tiny': (96, 192, 384, 768),
+            'convnext_nano': (80, 160, 320, 640),
+            'convnextv2_nano': (80, 160, 320, 640),
+            'convnextv2_atto': (40, 80, 160, 320),
+            'convnextv2_femto': (48, 96, 192, 384),
+            'convnextv2_pico': (64, 128, 256, 512),
+        }
+        if timm is None:
+            return FallbackFeatureBackbone(in_channels=in_channels, channels=convnext_fallback_channels[backbone])
+        try:
+            return timm.create_model(
+                backbone,
+                pretrained=False,
+                features_only=True,
+                out_indices=_get_backbone_out_indices(backbone),
+                in_chans=in_channels,
+            )
+        except Exception as exc:
+            print(f'[-] backbone {backbone} via timm failed ({exc}); using fallback backbone instead')
+            return FallbackFeatureBackbone(in_channels=in_channels, channels=convnext_fallback_channels[backbone])
     if timm is None:
         return FallbackFeatureBackbone(in_channels=in_channels)
-    return timm.create_model(
-        backbone,
-        pretrained=False,
-        features_only=True,
-        out_indices=_get_backbone_out_indices(backbone),
-        in_chans=in_channels,
-    )
+    try:
+        return timm.create_model(
+            backbone,
+            pretrained=False,
+            features_only=True,
+            out_indices=_get_backbone_out_indices(backbone),
+            in_chans=in_channels,
+        )
+    except Exception as exc:
+        print(f'[-] backbone {backbone} via timm failed ({exc}); using fallback backbone instead')
+        return FallbackFeatureBackbone(in_channels=in_channels)
 
 
 class ConvBNAct(nn.Module):
