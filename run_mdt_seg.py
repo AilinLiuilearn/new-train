@@ -347,6 +347,9 @@ def main():
         config.eval_full_pet = True
         config.eval_fixed_missing_pet = False
         config.eval_random_missing_pet = False
+        if getattr(config, 'mixed_precision', False):
+            print('[pet_contribution] mixed_precision is disabled automatically for stability')
+            config.mixed_precision = False
     print(f'eval_full_pet={getattr(config, "eval_full_pet", True)} eval_fixed_missing_pet={getattr(config, "eval_fixed_missing_pet", False)} eval_random_missing_pet={getattr(config, "eval_random_missing_pet", False)}')
     print(f'aug_mode={getattr(config, "aug_mode", None)}')
     print(f'norm_mode={getattr(config, "norm_mode", None)}')
