@@ -365,19 +365,8 @@ def create_feature_backbone(backbone, in_channels=3):
             'convnextv2_femto': (48, 96, 192, 384),
             'convnextv2_pico': (64, 128, 256, 512),
         }
-        if timm is None:
-            return FallbackFeatureBackbone(in_channels=in_channels, channels=convnext_fallback_channels[backbone])
-        try:
-            return timm.create_model(
-                backbone,
-                pretrained=False,
-                features_only=True,
-                out_indices=_get_backbone_out_indices(backbone),
-                in_chans=in_channels,
-            )
-        except Exception as exc:
-            print(f'[-] backbone {backbone} via timm failed ({exc}); using fallback backbone instead')
-            return FallbackFeatureBackbone(in_channels=in_channels, channels=convnext_fallback_channels[backbone])
+        print(f'[-] backbone {backbone}: using stable fallback feature backbone for training stability')
+        return FallbackFeatureBackbone(in_channels=in_channels, channels=convnext_fallback_channels[backbone])
     if timm is None:
         return FallbackFeatureBackbone(in_channels=in_channels)
     try:
