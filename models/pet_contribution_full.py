@@ -51,17 +51,21 @@ class FullPETCTAddUNet(nn.Module):
         ct = self._to_3ch(ct)
         with torch.cuda.amp.autocast(enabled=False):
             ct_feats = self.enc_ct(ct)
-            ct_feats = [feat.float() for feat in ct_feats]
-            _check_tensor_list('ct_feats', ct_feats)
-            return self.ct_align(ct_feats)
+        if ct.is_cuda:
+            torch.cuda.synchronize(ct.device)
+        ct_feats = [feat.detach().float().contiguous() for feat in ct_feats]
+        _check_tensor_list('ct_feats', ct_feats)
+        return self.ct_align(ct_feats)
 
     def _encode_pet(self, pet):
         pet = self._to_3ch(pet)
         with torch.cuda.amp.autocast(enabled=False):
             pet_feats = self.enc_pet(pet)
-            pet_feats = [feat.float() for feat in pet_feats]
-            _check_tensor_list('pet_feats', pet_feats)
-            return pet_feats
+        if pet.is_cuda:
+            torch.cuda.synchronize(pet.device)
+        pet_feats = [feat.detach().float().contiguous() for feat in pet_feats]
+        _check_tensor_list('pet_feats', pet_feats)
+        return pet_feats
 
     def _finalize_decoder_output(self, dec_out):
         if isinstance(dec_out, dict):
