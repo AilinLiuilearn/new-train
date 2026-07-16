@@ -14,8 +14,10 @@ from models.simmlm_dmome_fusion import (
 
 
 def _check_tensor(name, x):
-    if torch.is_tensor(x) and not torch.isfinite(x).all():
-        raise RuntimeError(f'[NaN/Inf] {name} contains invalid values')
+    if torch.is_tensor(x):
+        x_cpu = x.detach().float().cpu()
+        if not torch.isfinite(x_cpu).all():
+            raise RuntimeError(f'[NaN/Inf] {name} contains invalid values')
 
 
 def _check_tensor_list(name, xs):
