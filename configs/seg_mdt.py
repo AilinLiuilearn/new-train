@@ -36,12 +36,14 @@ class SegMDTConfig(ConfigBase):
             "--model_arch",
             type=str,
             default="dual_shared_add_baseline",
-            choices=("dual_shared_add_baseline", "dual_decoder_add_baseline", "dual_decoder_pg_mtr_retrieval", "dual_decoder_multiscale_task_increment_bank", "dual_decoder_hatr_task_residual"),
+            choices=("dual_shared_add_baseline", "dual_decoder_add_baseline", "dual_decoder_pg_mtr_retrieval", "dual_decoder_multiscale_task_increment_bank", "dual_decoder_hatr_task_residual", "pet_contribution_ct_only", "pet_contribution_full"),
             help=(
                 "dual_shared_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, shared UNet decoder. "
                 "dual_decoder_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, independent full/missing UNet decoders. "
                 "dual_decoder_pg_mtr_retrieval: dual encoder with retrieval-only PG-MTR and zero-init 1x1 missing fusion. "
-                "dual_decoder_multiscale_task_increment_bank: dual encoder with zero-init task refinement and shared multi-scale task-increment bank."
+                "dual_decoder_multiscale_task_increment_bank: dual encoder with zero-init task refinement and shared multi-scale task-increment bank. "
+                "pet_contribution_ct_only: ConvNeXtV2-Nano CT encoder + channel alignment + single UNetStyleDecoder. "
+                "pet_contribution_full: ConvNeXtV2-Nano CT encoder + MiT-B1 PET encoder + stage-wise add + single UNetStyleDecoder."
             ),
         )
 
@@ -218,7 +220,7 @@ class SegMDTConfig(ConfigBase):
             type=str,
             default="joint_dice",
             choices=("full_dice", "missing_dice", "joint_dice"),
-            help="Checkpoint selection metric: full_dice, missing_dice, or joint_dice.",
+            help="Checkpoint selection metric: full_dice, missing_dice, or joint_dice. Use full_dice for controlled PET contribution experiments.",
         )
         p.add_argument("--eval_random_seed", type=int, default=2026)
         p.add_argument("--lr_find_start", type=float, default=1e-7)

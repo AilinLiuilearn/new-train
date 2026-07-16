@@ -207,7 +207,11 @@ class MDTSegTeacher:
 
     def _compute_total_loss(self, outputs, mask, pixel_weight=None):
         loss_seg, pred, loss_stats = self._compute_segmentation_loss(outputs, mask)
-        loss_total = loss_seg
+        pet_contribution_archs = {'pet_contribution_ct_only', 'pet_contribution_full'}
+        if getattr(self.config, 'model_arch', '') in pet_contribution_archs:
+            loss_total = loss_seg
+        else:
+            loss_total = loss_seg
         loss_dict = {'loss_seg': loss_seg.detach(), 'loss_total': loss_total.detach()}
         loss_dict.update(loss_stats)
         return loss_total, pred, loss_dict
@@ -217,6 +221,9 @@ class MDTSegTeacher:
             raise ValueError(f'Unsupported training route: {forward_mode}')
         ct = batch['ct'].float().to(self.device)
         mask = batch['mask'].float().to(self.device)
+        pet_contribution_archs = {'pet_contribution_ct_only', 'pet_contribution_full'}
+        if getattr(self.config, 'model_arch', '') in pet_contribution_archs:
+            forward_mode = 'full'
         pet = batch['pet'].float().to(self.device) if forward_mode == 'full' else None
         outputs = _forward(self.networks, ct, pet, mask.shape[-2:], forward_mode=forward_mode, mask=mask)
         loss_seg, pred, loss_stats = self._compute_segmentation_loss(outputs, mask)
@@ -233,7 +240,9 @@ class MDTSegTeacher:
         bank_weight = float(getattr(self.config, 'mtib_bank_weight', 0.05))
         comp_weight = float(getattr(self.config, 'mtib_comp_weight', 0.05))
         hatr_weight = float(getattr(self.config, 'hatr_weight', 0.1))
-        if forward_mode == 'missing':
+        if getattr(self.config, 'model_arch', '') in pet_contribution_archs:
+            loss_total = loss_seg
+        elif forward_mode == 'missing':
             missing_weight = float(getattr(self.config, 'missing_loss_weight', 1.0))
             loss_total = missing_weight * loss_seg
         else:

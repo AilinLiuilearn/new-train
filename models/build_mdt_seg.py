@@ -445,6 +445,32 @@ def _resolve_use_channel_prior_gate(config):
 
 def build_mdt_seg_teacher(config):
     model_arch = getattr(config, 'model_arch', 'dual_shared_add_baseline')
+    if model_arch == 'pet_contribution_ct_only':
+        from models.pet_contribution_ct_only import CTOnlyConvNeXtUNet
+
+        model = CTOnlyConvNeXtUNet(
+            ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
+            ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
+            in_channels=3,
+            out_channels=1,
+            decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
+        )
+        print('[pet_contribution_ct_only] CT=ConvNeXtV2-Nano CT_align=[64,128,320,512] decoder=single_UNetStyleDecoder deep_supervision=False loss=final_BCE_Dice_only')
+        return dict(model=model)
+    if model_arch == 'pet_contribution_full':
+        from models.pet_contribution_full import FullPETCTAddUNet
+
+        model = FullPETCTAddUNet(
+            ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
+            pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
+            ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
+            pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
+            in_channels=3,
+            out_channels=1,
+            decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
+        )
+        print('[pet_contribution_full] CT=ConvNeXtV2-Nano PET=MiT-B1 fusion=stage-wise-add decoder=single_UNetStyleDecoder deep_supervision=False loss=final_BCE_Dice_only')
+        return dict(model=model)
     common_kwargs = dict(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
@@ -458,22 +484,12 @@ def build_mdt_seg_teacher(config):
     if model_arch == 'dual_shared_add_baseline':
         from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
         model = DualSharedAddPETCTBaseline(**common_kwargs)
-        print(
-            f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
-            f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-            f'fusion=stage-wise-add shared_decoder=UNetStyleDecoder '
-            f'deep_supervision={_resolve_use_deep_supervision(config)}'
-        )
+        print(f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} pet={getattr(config, "pet_backbone", "mit_b1")} fusion=stage-wise-add shared_decoder=UNetStyleDecoder deep_supervision={_resolve_use_deep_supervision(config)}')
         return dict(model=model)
     if model_arch == 'dual_decoder_add_baseline':
         from models.dual_decoder_add_baseline import DualDecoderAddPETCTBaseline
         model = DualDecoderAddPETCTBaseline(**common_kwargs)
-        print(
-            f'[dual_decoder_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
-            f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-            f'fusion=stage-wise-add full_decoder=UNetStyleDecoder missing_decoder=UNetStyleDecoder decoder_shared=False '
-            f'deep_supervision={_resolve_use_deep_supervision(config)}'
-        )
+        print(f'[dual_decoder_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} pet={getattr(config, "pet_backbone", "mit_b1")} fusion=stage-wise-add full_decoder=UNetStyleDecoder missing_decoder=UNetStyleDecoder decoder_shared=False deep_supervision={_resolve_use_deep_supervision(config)}')
         return dict(model=model)
     if model_arch == 'dual_decoder_pg_mtr_retrieval':
         from models.dual_decoder_pg_mtr_retrieval import DualDecoderPGMTRRetrieval
@@ -484,15 +500,7 @@ def build_mdt_seg_teacher(config):
             pg_mtr_temperature=getattr(config, 'pg_mtr_temperature', 0.07),
             pg_mtr_detach_bank_missing=getattr(config, 'pg_mtr_detach_bank_missing', True),
         )
-        print(
-            f'[dual_decoder_pg_mtr_retrieval] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
-            f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-            f'decoder_shared=False pg_mtr_mode=retrieval_only '
-            f'pg_mtr_stages={model.pg_mtr.active_stage_numbers} '
-            f'pg_mtr_num_tokens={getattr(config, "pg_mtr_num_tokens", 8)} '
-            f'missing_fusion=zero_init_1x1_add '
-            f'detach_bank_missing={getattr(config, "pg_mtr_detach_bank_missing", True)}'
-        )
+        print(f'[dual_decoder_pg_mtr_retrieval] ct={getattr(config, "ct_backbone", "convnextv2_nano")} pet={getattr(config, "pet_backbone", "mit_b1")} decoder_shared=False pg_mtr_mode=retrieval_only pg_mtr_stages={model.pg_mtr.active_stage_numbers} pg_mtr_num_tokens={getattr(config, "pg_mtr_num_tokens", 8)} missing_fusion=zero_init_1x1_add detach_bank_missing={getattr(config, "pg_mtr_detach_bank_missing", True)}')
         return dict(model=model)
     if model_arch == 'dual_decoder_multiscale_task_increment_bank':
         from models.dual_decoder_multiscale_task_increment_bank import DualDecoderMultiScaleTaskIncrementBank
@@ -502,35 +510,14 @@ def build_mdt_seg_teacher(config):
             mtib_num_tokens=getattr(config, 'mtib_num_tokens', 8),
             mtib_temperature=getattr(config, 'mtib_temperature', 0.07),
         )
-        print(
-            f'[dual_decoder_multiscale_task_increment_bank] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
-            f'pet={getattr(config, "pet_backbone", "mit_b1")} decoder_shared=False '
-            f'full_base_fusion=stage-wise-add task_refinement=residual_zero_init '
-            f'true_increment=P+H(C+P) shared_bank=True bank_guidance=multi_scale_complete_modal_task_increment '
-            f'full_query_source=C+P missing_query_source=CT bank_trainable_on_full=True '
-            f'bank_detached_on_ct_comp=True bank_detached_on_missing=True '
-            f'num_tokens={getattr(config, "mtib_num_tokens", 8)} '
-            f'latent_dim={model.mtib.latent_dim} temperature={getattr(config, "mtib_temperature", 0.07)} '
-            f'bank_loss=smooth_l1 comp_loss=smooth_l1 orthogonal_constraint=False'
-        )
+        print(f'[dual_decoder_multiscale_task_increment_bank] ct={getattr(config, "ct_backbone", "convnextv2_nano")} pet={getattr(config, "pet_backbone", "mit_b1")} decoder_shared=False full_base_fusion=stage-wise-add task_refinement=residual_zero_init true_increment=P+H(C+P) shared_bank=True bank_guidance=multi_scale_complete_modal_task_increment full_query_source=C+P missing_query_source=CT bank_trainable_on_full=True bank_detached_on_ct_comp=True bank_detached_on_missing=True num_tokens={getattr(config, "mtib_num_tokens", 8)} latent_dim={model.mtib.latent_dim} temperature={getattr(config, "mtib_temperature", 0.07)} bank_loss=smooth_l1 comp_loss=smooth_l1 orthogonal_constraint=False')
         return dict(model=model)
     if model_arch == 'dual_decoder_hatr_task_residual':
         from models.dual_decoder_hatr_task_residual import DualDecoderHATRTaskResidual
         model = DualDecoderHATRTaskResidual(**common_kwargs)
-        print(
-            f'[dual_decoder_hatr_task_residual] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
-            f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-            f'full_fusion=stage-wise-add decoder_shared=False '
-            f'teacher_observation=same_full_decoder_counterfactual_CT '
-            f'task_target=advantage_qualified_decoder_state_residual '
-            f'recovery=hierarchical_S4_to_S1 correction_space=missing_decoder_states '
-            f'hatr_weight={getattr(config, "hatr_weight", 0.1)}'
-        )
+        print(f'[dual_decoder_hatr_task_residual] ct={getattr(config, "ct_backbone", "convnextv2_nano")} pet={getattr(config, "pet_backbone", "mit_b1")} full_fusion=stage-wise-add decoder_shared=False teacher_observation=same_full_decoder_counterfactual_CT task_target=advantage_qualified_decoder_state_residual recovery=hierarchical_S4_to_S1 correction_space=missing_decoder_states hatr_weight={getattr(config, "hatr_weight", 0.1)}')
         return dict(model=model)
-    raise ValueError(
-        f'Unsupported model_arch={model_arch}. '
-        'Supported: dual_shared_add_baseline, dual_decoder_add_baseline, dual_decoder_pg_mtr_retrieval, dual_decoder_multiscale_task_increment_bank, dual_decoder_hatr_task_residual.'
-    )
+    raise ValueError(f'Unsupported model_arch={model_arch}. Supported: pet_contribution_ct_only, pet_contribution_full, dual_shared_add_baseline, dual_decoder_add_baseline, dual_decoder_pg_mtr_retrieval, dual_decoder_multiscale_task_increment_bank, dual_decoder_hatr_task_residual.')
 
 
 def _resolve_use_deep_supervision(config):

@@ -134,11 +134,13 @@ def _collect_adc_gamma(task):
     return gammas
 
 
-def _resolve_checkpoint_selection(checkpoint_select, val_full, val_fixed_missing):
+def _resolve_checkpoint_selection(checkpoint_select, val_full, val_fixed_missing, force_full_only=False):
     checkpoint_select = str(checkpoint_select)
     full_select_score = float(val_full['dice'])
     missing_select_score = float(val_fixed_missing['dice'])
     joint_select_score = 0.5 * full_select_score + 0.5 * missing_select_score
+    if force_full_only:
+        return full_select_score, 'full_dice', 'ckpt.best_full_dice.pth.tar'
     if checkpoint_select == 'full_dice':
         return full_select_score, 'full_dice', 'ckpt.best_full_dice.pth.tar'
     if checkpoint_select == 'missing_dice':
@@ -341,6 +343,10 @@ def main():
     print(f'fprm_slots={getattr(config, "fprm_slots", 32)} fprm_dim={getattr(config, "fprm_dim", 0)} fprm_beta={getattr(config, "fprm_beta", 0.1)} fprm_gamma={getattr(config, "fprm_gamma", 0.1)}')
     print(f'fprm_mem_loss_weight={getattr(config, "fprm_mem_loss_weight", 0.05)} fprm_use_memory={getattr(config, "fprm_use_memory", True)} fprm_use_shape={getattr(config, "fprm_use_shape", True)}')
     print(f'train_pet_drop_prob={getattr(config, "train_pet_drop_prob", 0.0)}')
+    if config.model_arch in {'pet_contribution_ct_only', 'pet_contribution_full'}:
+        config.eval_full_pet = True
+        config.eval_fixed_missing_pet = False
+        config.eval_random_missing_pet = False
     print(f'eval_full_pet={getattr(config, "eval_full_pet", True)} eval_fixed_missing_pet={getattr(config, "eval_fixed_missing_pet", False)} eval_random_missing_pet={getattr(config, "eval_random_missing_pet", False)}')
     print(f'aug_mode={getattr(config, "aug_mode", None)}')
     print(f'norm_mode={getattr(config, "norm_mode", None)}')
@@ -414,7 +420,11 @@ def main():
         for i, batch in enumerate(train_loader):
             stepped = False
             global_batch_step = (epoch - 1) * spe + i
-            train_route = 'full' if global_batch_step % 2 == 0 else 'missing'
+            pet_contribution_archs = {'pet_contribution_ct_only', 'pet_contribution_full'}
+            if config.model_arch in pet_contribution_archs:
+                train_route = 'full'
+            else:
+                train_route = 'full' if global_batch_step % 2 == 0 else 'missing'
             try:
                 use_amp = bool(config.mixed_precision) and train_route == 'full'
                 with torch.cuda.amp.autocast(enabled=use_amp):
@@ -516,9 +526,9 @@ def main():
         val_results = {}
         if getattr(config, 'eval_full_pet', True):
             val_results['full'] = task.evaluate(val_loader, eval_mode='full', tag='val_full')
-        if getattr(config, 'eval_fixed_missing_pet', False):
+        if getattr(config, 'eval_fixed_missing_pet', False) and config.model_arch not in {'pet_contribution_ct_only', 'pet_contribution_full'}:
             val_results['fixed_missing'] = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_fixed_missing')
-        if getattr(config, 'eval_random_missing_pet', False):
+        if getattr(config, 'eval_random_missing_pet', False) and config.model_arch not in {'pet_contribution_ct_only', 'pet_contribution_full'}:
             val_results['random_missing'] = task.evaluate(
                 val_loader,
                 eval_mode='random_missing',
@@ -532,7 +542,8 @@ def main():
         val_fixed_missing = val_results.get('fixed_missing', val_full)
         joint_dice = 0.5 * float(val_full['dice']) + 0.5 * float(val_fixed_missing['dice'])
         joint_hd95 = 0.5 * float(val_full['hd95']) + 0.5 * float(val_fixed_missing['hd95'])
-        selected_score, selected_name, selected_checkpoint_filename = _resolve_checkpoint_selection(checkpoint_select, val_full, val_fixed_missing)
+        force_full_only = config.model_arch in {'pet_contribution_ct_only', 'pet_contribution_full'}
+        selected_score, selected_name, selected_checkpoint_filename = _resolve_checkpoint_selection(checkpoint_select, val_full, val_fixed_missing, force_full_only=force_full_only)
         val_m = val_full
         def _collect_pg_metrics(metrics, prefix):
             collected = {}
@@ -660,9 +671,9 @@ def main():
         results = {}
         if getattr(config, 'eval_full_pet', True):
             results['full'] = task.evaluate(loader, eval_mode='full', tag=f'{prefix}_full')
-        if getattr(config, 'eval_fixed_missing_pet', False):
+        if getattr(config, 'eval_fixed_missing_pet', False) and config.model_arch not in {'pet_contribution_ct_only', 'pet_contribution_full'}:
             results['fixed_missing'] = task.evaluate(loader, eval_mode='fixed_missing', tag=f'{prefix}_fixed_missing')
-        if getattr(config, 'eval_random_missing_pet', False):
+        if getattr(config, 'eval_random_missing_pet', False) and config.model_arch not in {'pet_contribution_ct_only', 'pet_contribution_full'}:
             results['random_missing'] = task.evaluate(
                 loader,
                 eval_mode='random_missing',
