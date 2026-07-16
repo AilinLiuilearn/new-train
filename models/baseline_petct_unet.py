@@ -14,13 +14,17 @@ from models.simmlm_dmome_fusion import (
 
 
 def _check_tensor(name, x):
+    if os.environ.get('MDT_ENABLE_TENSOR_CHECKS', '0') != '1':
+        return
     if torch.is_tensor(x):
-        x_cpu = x.detach().float().cpu()
-        if not torch.isfinite(x_cpu).all():
+        x_detached = x.detach()
+        if not torch.isfinite(x_detached).all():
             raise RuntimeError(f'[NaN/Inf] {name} contains invalid values')
 
 
 def _check_tensor_list(name, xs):
+    if os.environ.get('MDT_ENABLE_TENSOR_CHECKS', '0') != '1':
+        return
     for i, x in enumerate(xs):
         _check_tensor(f'{name}[{i}]', x)
 
