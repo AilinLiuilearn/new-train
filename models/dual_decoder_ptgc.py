@@ -153,11 +153,20 @@ class DualDecoderPTGC(nn.Module):
         if forward_mode == 'full':
             if pet is None:
                 raise ValueError('forward_mode="full" requires pet input.')
+            if self.training:
+                return self._forward_train_joint(ct, pet, target_size)
             return self._forward_full_eval(ct, pet, target_size)
         if forward_mode == 'missing':
             return self._forward_missing(ct, target_size)
         if forward_mode == 'auto':
-            if pet is None:
-                raise ValueError('forward_mode="auto" requires pet input.')
-            return self._forward_train_joint(ct, pet, target_size)
+            if pet_available is None:
+                pet_available = torch.ones(ct.shape[0], device=ct.device, dtype=torch.long) if pet is not None else torch.zeros(ct.shape[0], device=ct.device, dtype=torch.long)
+            pet_available = pet_available.view(-1).long()
+            if torch.all(pet_available == 1):
+                if pet is None:
+                    raise ValueError('Full evaluation requires PET input.')
+                return self._forward_full_eval(ct, pet, target_size) if not self.training else self._forward_train_joint(ct, pet, target_size)
+            if torch.all(pet_available == 0):
+                return self._forward_missing(ct, target_size)
+            raise ValueError('PTGC currently supports homogeneous full or missing evaluation batches only.')
         raise ValueError(f'Unsupported forward_mode={forward_mode!r}')

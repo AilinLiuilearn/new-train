@@ -279,9 +279,9 @@ class MDTSegTeacher:
         loss_gpnd = ct_logits.new_tensor(0.0)
         gpnd_stats = {'loss_gpnd_pred': loss_gpnd.detach(), 'loss_gpnd_rank': loss_gpnd.detach(), 'loss_gpnd_support': loss_gpnd.detach(), 'weighted_loss_gpnd': loss_gpnd.detach()}
         if mode == 'baseline':
-            loss_total = 0.5 * (loss_ct + loss_full)
+            loss_total = 0.5 * loss_full + 0.5 * loss_ct
             return loss_total, {'loss_ptgc_ct': loss_ct.detach(), 'loss_ptgc_full': loss_full.detach(), 'loss_ptgc_comp': loss_gpnd.detach(), 'loss_seg_joint': loss_total.detach(), 'loss_gpnd': loss_gpnd.detach(), **gpnd_stats}
-        loss_seg_joint = (loss_ct + loss_full + loss_comp) / 3.0
+        loss_seg_joint = 0.5 * loss_full + 0.25 * loss_ct + 0.25 * loss_comp
         if mode == 'ptgc_gpnd':
             loss_gpnd, gpnd_stats = self._compute_gpnd_loss(outputs, mask)
             weighted_gpnd = float(getattr(self.config, 'ptgc_loss_weight', 0.2)) * loss_gpnd
