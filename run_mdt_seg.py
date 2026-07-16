@@ -384,7 +384,8 @@ def main():
     log_path = os.path.join(config.checkpoint_dir, 'train_log.csv')
     gamma_headers = _adc_gamma_headers(config)
     ds_headers = _deep_supervision_log_headers(config)
-    pg_headers = _pg_mtr_log_headers(task._unwrap(task.networks['model']), 'val_full') + _pg_mtr_log_headers(task._unwrap(task.networks['model']), 'val_missing') + ['val_full_dice', 'val_missing_dice', 'val_joint_dice', 'selected_score', 'best_selected_score', 'best_selected_epoch']
+    model_for_logging = task._unwrap(task.networks['model'])
+    pg_headers = _pg_mtr_log_headers(model_for_logging, 'val_full') + _pg_mtr_log_headers(model_for_logging, 'val_missing') + ['val_full_dice', 'val_missing_dice', 'val_joint_dice', 'selected_score', 'best_selected_score', 'best_selected_epoch']
     init_train_log(log_path, extra_headers=gamma_headers + ds_headers + pg_headers)
 
     grad_clip = getattr(config, 'grad_clip', 5.0)
@@ -542,9 +543,9 @@ def main():
         if not val_results:
             val_results['full'] = task.evaluate(val_loader, eval_mode='full', tag='val_full')
         val_full = val_results.get('full', next(iter(val_results.values())))
-        val_fixed_missing = val_results.get('fixed_missing', val_full)
-        joint_dice = 0.5 * float(val_full['dice']) + 0.5 * float(val_fixed_missing['dice'])
-        joint_hd95 = 0.5 * float(val_full['hd95']) + 0.5 * float(val_fixed_missing['hd95'])
+        val_fixed_missing = val_results.get('fixed_missing', val_full) if config.model_arch not in {'pet_contribution_ct_only', 'pet_contribution_full'} else val_full
+        joint_dice = float(val_full['dice'])
+        joint_hd95 = float(val_full['hd95'])
         force_full_only = config.model_arch in {'pet_contribution_ct_only', 'pet_contribution_full'}
         selected_score, selected_name, selected_checkpoint_filename = _resolve_checkpoint_selection(checkpoint_select, val_full, val_fixed_missing, force_full_only=force_full_only)
         val_m = val_full
