@@ -199,10 +199,12 @@ class MDTSegTeacher:
         loss_total = zero
         stats = {'loss_hatr': zero.detach(), 'hatr_advantage_mean': advantage.mean().detach(), 'hatr_advantage_active_ratio': (advantage > 0).float().mean().detach(), 'hatr_full_error_mean': e_f.mean().detach(), 'hatr_counterfactual_error_mean': e_c.mean().detach()}
         for idx, (full_state, ct_cf_state, pred_residual) in enumerate(zip(full_states, ct_cf_states, pred_residuals), start=1):
+            raw_residual = full_state.detach() - ct_cf_state.detach()
             advantage_s = F.interpolate(advantage, size=full_state.shape[-2:], mode='bilinear', align_corners=False)
-            target_s = advantage_s * (full_state.detach() - ct_cf_state.detach())
+            target_s = advantage_s * raw_residual
             loss_s = F.smooth_l1_loss(pred_residual.float(), target_s.float())
             loss_total = loss_total + loss_s
+            stats[f'hatr_s{idx}_raw_residual_rms'] = raw_residual.float().pow(2).mean().sqrt().detach()
             stats[f'hatr_s{idx}_target_rms'] = target_s.float().pow(2).mean().sqrt().detach()
             stats[f'hatr_s{idx}_pred_rms'] = pred_residual.float().pow(2).mean().sqrt().detach()
             stats[f'hatr_s{idx}_hidden_rms'] = outputs['hatr_hidden_states'][idx - 1].float().pow(2).mean().sqrt().detach() if 'hatr_hidden_states' in outputs else zero.detach()
