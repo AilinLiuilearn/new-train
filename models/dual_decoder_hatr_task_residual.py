@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import copy
 
 import torch
@@ -17,6 +18,20 @@ class StageChannelAlign(nn.Module):
 
     def forward(self, feats):
         return [proj(feat) for proj, feat in zip(self.proj, feats)]
+
+
+@contextmanager
+def _frozen_batchnorm_stats(module):
+    bn_states = []
+    for submodule in module.modules():
+        if isinstance(submodule, nn.modules.batchnorm._BatchNorm):
+            bn_states.append((submodule, submodule.training))
+            submodule.eval()
+    try:
+        yield
+    finally:
+        for bn_module, was_training in bn_states:
+            bn_module.train(was_training)
 
 
 class DualDecoderHATRTaskResidual(nn.Module):
@@ -84,21 +99,30 @@ class DualDecoderHATRTaskResidual(nn.Module):
         x1, x2, x3, x4 = features
         r1, r2, r3, r4 = pred_residuals
         d4_base = decoder.proj4(x4)
-        d4 = d4_base + self.correction_adapter4(r4)
+        d4 = d4_base + self.correction_adapter4(r4.detach())
         s3 = decoder.proj3(x3)
         d3_base = decoder.fuse3(torch.cat([F.interpolate(d4, size=s3.shape[-2:], mode='bilinear', align_corners=False), s3], dim=1))
-        d3 = d3_base + self.correction_adapter3(r3)
+        d3 = d3_base + self.correction_adapter3(r3.detach())
         s2 = decoder.proj2(x2)
         d2_base = decoder.fuse2(torch.cat([F.interpolate(d3, size=s2.shape[-2:], mode='bilinear', align_corners=False), s2], dim=1))
-        d2 = d2_base + self.correction_adapter2(r2)
+        d2 = d2_base + self.correction_adapter2(r2.detach())
         s1 = decoder.proj1(x1)
         d1_base = decoder.fuse1(torch.cat([F.interpolate(d2, size=s1.shape[-2:], mode='bilinear', align_corners=False), s1], dim=1))
-        d1 = d1_base + self.correction_adapter1(r1)
+        d1 = d1_base + self.correction_adapter1(r1.detach())
         logits = F.interpolate(decoder.seg_head(d1), size=target_size, mode='bilinear', align_corners=False)
         out = {'logits': logits}
         if decoder.use_deep_supervision:
             out['aux_logits'] = [decoder.aux_head_d2(d2), decoder.aux_head_d3(d3), decoder.aux_head_d4(d4)]
         return out, [d1, d2, d3, d4], [d1_base, d2_base, d3_base, d4_base]
+
+    def _build_hatr_observation(self, ct_feats, fused_feats, target_size):
+        detached_full_feats = [x.detach() for x in fused_feats]
+        detached_ct_feats = [x.detach() for x in ct_feats]
+        with _frozen_batchnorm_stats(self.full_decoder):
+            with torch.no_grad():
+                teacher_full_out, teacher_full_states = self._decode_with_states(self.full_decoder, detached_full_feats, target_size)
+            counterfactual_out, counterfactual_states = self._decode_with_states(self.full_decoder, detached_ct_feats, target_size)
+        return teacher_full_out, teacher_full_states, counterfactual_out, counterfactual_states
 
     def _forward_full(self, ct, pet, target_size):
         ct_feats = self._encode_ct(ct)
@@ -106,18 +130,19 @@ class DualDecoderHATRTaskResidual(nn.Module):
         fused_feats = [c + p for c, p in zip(ct_feats, pet_feats)]
         full_out, full_states = self._decode_with_states(self.full_decoder, fused_feats, target_size)
         if self.training:
-            with torch.no_grad():
-                ct_cf_out, ct_cf_states = self._decode_with_states(self.full_decoder, [c.detach() for c in ct_feats], target_size)
-            pred_residuals = self.hatr_recovery([c.detach() for c in ct_feats])
-            full_out['hatr_counterfactual_logits'] = ct_cf_out['logits'].detach()
-            full_out['hatr_full_states'] = [x.detach() for x in full_states]
+            teacher_full_out, teacher_full_states, ct_cf_out, ct_cf_states = self._build_hatr_observation(ct_feats, fused_feats, target_size)
+            pred_residuals, hidden_states = self.hatr_recovery([c.detach() for c in ct_feats])
+            full_out['hatr_teacher_full_logits'] = teacher_full_out['logits'].detach()
+            full_out['hatr_counterfactual_logits'] = ct_cf_out['logits']
+            full_out['hatr_teacher_full_states'] = [x.detach() for x in teacher_full_states]
             full_out['hatr_counterfactual_states'] = [x.detach() for x in ct_cf_states]
             full_out['hatr_pred_residuals'] = pred_residuals
+            full_out['hatr_hidden_states'] = hidden_states
         return full_out
 
     def _forward_missing(self, ct, target_size):
         ct_feats = self._encode_ct(ct)
-        pred_residuals = self.hatr_recovery([c.detach() for c in ct_feats])
+        pred_residuals, hidden_states = self.hatr_recovery([c.detach() for c in ct_feats])
         out, _, _ = self._decode_missing_with_residuals(self.missing_decoder, ct_feats, pred_residuals, target_size)
         return out
 
@@ -149,7 +174,7 @@ class DualDecoderHATRTaskResidual(nn.Module):
                 full_outputs, _ = self._decode_with_states(self.full_decoder, fused, target_size)
             if missing_idx.numel() > 0:
                 missing_ct_feats = [feat.index_select(0, missing_idx) for feat in ct_feats]
-                pred_residuals = self.hatr_recovery([c.detach() for c in missing_ct_feats])
+                pred_residuals, _ = self.hatr_recovery([c.detach() for c in missing_ct_feats])
                 missing_outputs, _, _ = self._decode_missing_with_residuals(self.missing_decoder, missing_ct_feats, pred_residuals, target_size)
             if full_outputs is None:
                 return missing_outputs
