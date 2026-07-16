@@ -189,7 +189,7 @@ class MDTSegTeacher:
             e_a = (p_a - y).pow(2)
             advantage = F.relu(e_a - e_f) / (e_a + e_f + 1e-6)
         loss_total = zero
-        stats = {'loss_hatr': zero.detach(), 'hatr_advantage_mean': advantage.mean().detach(), 'hatr_advantage_active_ratio': (advantage > 0).float().mean().detach(), 'hatr_full_error_mean': e_f.mean().detach(), 'hatr_counterfactual_error_mean': e_c.mean().detach()}
+        stats = {'loss_hatr': zero.detach(), 'hatr_advantage_mean': advantage.mean().detach(), 'hatr_advantage_active_ratio': (advantage > 0).float().mean().detach(), 'hatr_full_error_mean': e_f.mean().detach(), 'hatr_counterfactual_error_mean': e_a.mean().detach()}
         for idx, (full_state, ct_cf_state, pred_residual) in enumerate(zip(full_states, ct_cf_states, pred_residuals), start=1):
             raw_residual = full_state.detach() - ct_cf_state.detach()
             advantage_s = F.interpolate(advantage, size=full_state.shape[-2:], mode='bilinear', align_corners=False)
