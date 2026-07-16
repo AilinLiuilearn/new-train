@@ -131,8 +131,12 @@ class DualDecoderHATRTaskResidual(nn.Module):
         full_out, full_states = self._decode_with_states(self.full_decoder, fused_feats, target_size)
         if self.training:
             teacher_full_out, teacher_full_states, ct_cf_out, ct_cf_states = self._build_hatr_observation(ct_feats, fused_feats, target_size)
+            with _frozen_batchnorm_stats(self.missing_decoder):
+                with torch.no_grad():
+                    anchor_out = self._forward_missing(ct, target_size)
             pred_residuals, hidden_states = self.hatr_recovery([c.detach() for c in ct_feats])
             full_out['hatr_teacher_full_logits'] = teacher_full_out['logits'].detach()
+            full_out['hatr_anchor_logits'] = anchor_out['logits'].detach()
             full_out['hatr_counterfactual_logits'] = ct_cf_out['logits']
             full_out['hatr_teacher_full_states'] = [x.detach() for x in teacher_full_states]
             full_out['hatr_counterfactual_states'] = [x.detach() for x in ct_cf_states]

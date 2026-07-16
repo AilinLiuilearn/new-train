@@ -27,13 +27,14 @@ def main():
         missing_manual, miss_states, miss_base = model._decode_missing_with_residuals(model.missing_decoder, ct_feats, preds, ct.shape[-2:])
     bn_before = {n: (b.clone() if torch.is_tensor(b) else b) for n, b in [(k, v) for k, v in model.full_decoder.named_buffers() if 'running_' in k or 'num_batches_tracked' in k]}
     teacher_out, teacher_states, cf_out, cf_states = model._build_hatr_observation(ct_feats, fused, ct.shape[-2:])
+    anchor_out = model._forward_missing(ct, ct.shape[-2:])
     bn_after = {n: (b.clone() if torch.is_tensor(b) else b) for n, b in [(k, v) for k, v in model.full_decoder.named_buffers() if 'running_' in k or 'num_batches_tracked' in k]}
     p_f = torch.sigmoid(teacher_out['logits'])
-    p_c = torch.sigmoid(cf_out['logits'])
+    p_a = torch.sigmoid(anchor_out['logits'])
     y = torch.zeros_like(p_f)
     e_f = (p_f - y).pow(2)
-    e_c = (p_c - y).pow(2)
-    adv = F.relu(e_c - e_f) / (e_c + e_f + 1e-6)
+    e_a = (p_a - y).pow(2)
+    adv = F.relu(e_a - e_f) / (e_a + e_f + 1e-6)
     out = {
         'decoder_equivalence_error_full': max_abs(orig, manual['logits']),
         'decoder_equivalence_error_ct': max_abs(ct_orig, ct_manual['logits']),
