@@ -277,16 +277,52 @@ class MDTSegTeacher:
         loss_full, _ = self.loss_seg(full_logits, mask)
         loss_comp, _ = self.loss_seg(comp_logits, mask)
         loss_gpnd = ct_logits.new_tensor(0.0)
-        gpnd_stats = {'loss_gpnd_pred': loss_gpnd.detach(), 'loss_gpnd_rank': loss_gpnd.detach(), 'loss_gpnd_support': loss_gpnd.detach(), 'weighted_loss_gpnd': loss_gpnd.detach()}
+        gpnd_stats = {
+            'loss_gpnd_pred': loss_gpnd.detach(),
+            'loss_gpnd_rank': loss_gpnd.detach(),
+            'loss_gpnd_support': loss_gpnd.detach(),
+            'weighted_loss_gpnd': loss_gpnd.detach(),
+        }
         if mode == 'baseline':
-            loss_total = 0.5 * loss_full + 0.5 * loss_ct
-            return loss_total, {'loss_ptgc_ct': loss_ct.detach(), 'loss_ptgc_full': loss_full.detach(), 'loss_ptgc_comp': loss_gpnd.detach(), 'loss_seg_joint': loss_total.detach(), 'loss_gpnd': loss_gpnd.detach(), **gpnd_stats}
-        loss_seg_joint = 0.5 * loss_full + 0.25 * loss_ct + 0.25 * loss_comp
+            loss_task = 0.5 * loss_full + 0.5 * loss_ct
+            return loss_task, {
+                'loss_ptgc_ct': loss_ct.detach(),
+                'loss_ptgc_full': loss_full.detach(),
+                'loss_ptgc_missing': loss_ct.detach(),
+                'loss_ptgc_comp': loss_gpnd.detach(),
+                'loss_seg_joint': loss_task.detach(),
+                'loss_gpnd': loss_gpnd.detach(),
+                **gpnd_stats,
+            }
+
+        loss_task = 0.5 * loss_full + 0.5 * loss_comp
+        if mode == 'ptgc':
+            return loss_task, {
+                'loss_ptgc_ct': loss_ct.detach(),
+                'loss_ptgc_full': loss_full.detach(),
+                'loss_ptgc_missing': loss_comp.detach(),
+                'loss_ptgc_ct_anchor': loss_ct.detach(),
+                'loss_ptgc_comp': loss_comp.detach(),
+                'loss_seg_joint': loss_task.detach(),
+                'loss_gpnd': loss_gpnd.detach(),
+                **gpnd_stats,
+            }
         if mode == 'ptgc_gpnd':
             loss_gpnd, gpnd_stats = self._compute_gpnd_loss(outputs, mask)
             weighted_gpnd = float(getattr(self.config, 'ptgc_loss_weight', 0.2)) * loss_gpnd
-            return loss_seg_joint + weighted_gpnd, {'loss_ptgc_ct': loss_ct.detach(), 'loss_ptgc_full': loss_full.detach(), 'loss_ptgc_comp': loss_comp.detach(), 'loss_seg_joint': loss_seg_joint.detach(), 'loss_gpnd': loss_gpnd.detach(), **gpnd_stats, 'weighted_loss_gpnd': weighted_gpnd.detach()}
-        return loss_seg_joint, {'loss_ptgc_ct': loss_ct.detach(), 'loss_ptgc_full': loss_full.detach(), 'loss_ptgc_comp': loss_comp.detach(), 'loss_seg_joint': loss_seg_joint.detach(), 'loss_gpnd': loss_gpnd.detach(), **gpnd_stats}
+            loss_total = loss_task + weighted_gpnd
+            return loss_total, {
+                'loss_ptgc_ct': loss_ct.detach(),
+                'loss_ptgc_full': loss_full.detach(),
+                'loss_ptgc_missing': loss_comp.detach(),
+                'loss_ptgc_ct_anchor': loss_ct.detach(),
+                'loss_ptgc_comp': loss_comp.detach(),
+                'loss_seg_joint': loss_task.detach(),
+                'loss_gpnd': loss_gpnd.detach(),
+                'weighted_loss_gpnd': weighted_gpnd.detach(),
+                **gpnd_stats,
+            }
+        raise ValueError(f'Unsupported PTGC ablation mode: {mode}')
 
     def _compute_total_loss(self, outputs, mask, pixel_weight=None):
         if isinstance(outputs, dict) and 'ptgc_ablation_mode' in outputs:
