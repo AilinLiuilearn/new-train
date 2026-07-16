@@ -42,8 +42,9 @@ class FullPETCTAddUNet(nn.Module):
 
     @staticmethod
     def _to_3ch(x):
+        x = torch.nan_to_num(x.float(), nan=0.0, posinf=0.0, neginf=0.0)
         if x.shape[1] == 1:
-            return x.repeat(1, 3, 1, 1)
+            x = x.repeat(1, 3, 1, 1)
         return x
 
     def _encode_ct(self, ct):
