@@ -42,9 +42,11 @@ class CTOnlyConvNeXtUNet(nn.Module):
 
     def _encode_ct(self, ct):
         ct = self._to_3ch(ct)
-        ct_feats = self.enc_ct(ct)
-        _check_tensor_list('ct_feats', ct_feats)
-        return self.ct_align(ct_feats)
+        with torch.cuda.amp.autocast(enabled=False):
+            ct_feats = self.enc_ct(ct)
+            ct_feats = [feat.float() for feat in ct_feats]
+            _check_tensor_list('ct_feats', ct_feats)
+            return self.ct_align(ct_feats)
 
     def _finalize_decoder_output(self, dec_out):
         if isinstance(dec_out, dict):
