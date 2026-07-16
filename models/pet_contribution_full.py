@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from models.baseline_petct_unet import UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
+from models.baseline_petct_unet import AddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.dual_decoder_add_baseline import StageChannelAlign
 
