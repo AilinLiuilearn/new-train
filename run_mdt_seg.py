@@ -340,6 +340,9 @@ def main():
     print(f'use_fprm={getattr(config, "use_fprm", False)}')
     print(f'fprm_slots={getattr(config, "fprm_slots", 32)} fprm_dim={getattr(config, "fprm_dim", 0)} fprm_beta={getattr(config, "fprm_beta", 0.1)} fprm_gamma={getattr(config, "fprm_gamma", 0.1)}')
     print(f'fprm_mem_loss_weight={getattr(config, "fprm_mem_loss_weight", 0.05)} fprm_use_memory={getattr(config, "fprm_use_memory", True)} fprm_use_shape={getattr(config, "fprm_use_shape", True)}')
+    if getattr(config, 'model_arch', '') == 'dual_decoder_ptgc' and float(getattr(config, 'train_pet_drop_prob', 0.0)) != 0.0:
+        print('[dual_decoder_ptgc] train_pet_drop_prob forced to 0.0 for modular ablation')
+        config.train_pet_drop_prob = 0.0
     print(f'train_pet_drop_prob={getattr(config, "train_pet_drop_prob", 0.0)}')
     print(f'eval_full_pet={getattr(config, "eval_full_pet", True)} eval_fixed_missing_pet={getattr(config, "eval_fixed_missing_pet", False)} eval_random_missing_pet={getattr(config, "eval_random_missing_pet", False)}')
     print(f'aug_mode={getattr(config, "aug_mode", None)}')
@@ -399,6 +402,9 @@ def main():
         grad_norm_sum, grad_norm_steps, grad_clip_count = 0.0, 0, 0
         first_bad_module_counter = {k: 0 for k in ('enc_ct', 'enc_pet', 'pet_proj', 'decoder', 'boundary_head')}
         train_pet_drop_prob = float(getattr(config, 'train_pet_drop_prob', 0.0))
+        if getattr(config, 'model_arch', '') == 'dual_decoder_ptgc':
+            train_route = 'full'
+            train_pet_drop_prob = 0.0
         _set_train_pet_drop_prob(train_loader, train_pet_drop_prob)
         model_for_epoch = _unwrap_model(task.networks.get('model'))
         if hasattr(model_for_epoch, 'set_epoch'):

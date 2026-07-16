@@ -205,11 +205,52 @@ class MDTSegTeacher:
         stats['loss_hatr'] = loss_total.detach()
         return loss_total, stats
 
+    def _compute_gpnd_loss(self, outputs, mask):
+        zero = mask.new_tensor(0.0)
+        required = ['ptgc_ct_logits', 'ptgc_full_logits', 'ptgc_comp_logits', 'ptgc_gain_pred', 'ptgc_delta_d4']
+        if not isinstance(outputs, dict) or not all(k in outputs for k in required):
+            return zero, {'loss_gpnd_pred': zero.detach(), 'loss_gpnd_rank': zero.detach(), 'loss_gpnd_support': zero.detach()}
+        ct_logits = outputs['ptgc_ct_logits']
+        full_logits = outputs['ptgc_full_logits']
+        comp_logits = outputs['ptgc_comp_logits']
+        gain_pred = outputs['ptgc_gain_pred']
+        delta_d4 = outputs['ptgc_delta_d4']
+        pixel_ct = F.binary_cross_entropy_with_logits(ct_logits.float(), mask.float(), reduction='none')
+        pixel_full = F.binary_cross_entropy_with_logits(full_logits.float(), mask.float(), reduction='none')
+        pixel_comp = F.binary_cross_entropy_with_logits(comp_logits.float(), mask.float(), reduction='none')
+        patch_resolution = gain_pred.shape[-2:]
+        patch_ct = F.adaptive_avg_pool2d(pixel_ct, patch_resolution)
+        patch_full = F.adaptive_avg_pool2d(pixel_full, patch_resolution)
+        patch_comp = F.adaptive_avg_pool2d(pixel_comp, patch_resolution)
+        signed_gain_target = ((patch_ct - patch_full) / (patch_ct + patch_full + 1e-6)).detach()
+        benefit_norm = F.relu(signed_gain_target).detach()
+        benefit_abs = F.relu(patch_ct - patch_full).detach()
+        loss_pred = F.smooth_l1_loss(gain_pred.float(), signed_gain_target.float())
+        desired_patch_loss = patch_ct.detach() - float(getattr(self.config, 'ptgc_alpha', 0.25)) * benefit_abs
+        loss_rank = F.relu(patch_comp - desired_patch_loss).mean()
+        delta_energy = torch.sqrt(delta_d4.float().pow(2).mean(dim=1, keepdim=True) + 1e-6)
+        loss_support = ((1.0 - benefit_norm) * delta_energy).mean()
+        loss_gpnd = loss_pred + float(getattr(self.config, 'gpnd_rank_weight', 1.0)) * loss_rank + float(getattr(self.config, 'gpnd_support_weight', 0.05)) * loss_support
+        return loss_gpnd, {'loss_gpnd_pred': loss_pred.detach(), 'loss_gpnd_rank': loss_rank.detach(), 'loss_gpnd_support': loss_support.detach()}
+
     def _compute_total_loss(self, outputs, mask, pixel_weight=None):
         loss_seg, pred, loss_stats = self._compute_segmentation_loss(outputs, mask)
         loss_total = loss_seg
         loss_dict = {'loss_seg': loss_seg.detach(), 'loss_total': loss_total.detach()}
         loss_dict.update(loss_stats)
+        if isinstance(outputs, dict) and 'ptgc_comp_logits' in outputs:
+            loss_dict['loss_ptgc_comp'] = loss_seg.detach()
+            if getattr(self.config, 'model_arch', '') == 'dual_decoder_ptgc':
+                loss_gpnd, gpnd_stats = self._compute_gpnd_loss(outputs, mask)
+                loss_dict['loss_gpnd'] = loss_gpnd.detach()
+                loss_dict.update(gpnd_stats)
+                weighted_gpnd = float(getattr(self.config, 'ptgc_loss_weight', 0.2)) * loss_gpnd if getattr(self.config, 'use_gpnd', True) else loss_seg.new_tensor(0.0)
+                loss_dict['weighted_loss_gpnd'] = weighted_gpnd.detach()
+                loss_total = loss_seg + weighted_gpnd if getattr(self.config, 'use_gpnd', True) else loss_seg
+            else:
+                loss_dict['weighted_loss_gpnd'] = loss_seg.new_tensor(0.0)
+            loss_dict['loss_total'] = loss_total.detach()
+            return loss_total, pred, loss_dict
         return loss_total, pred, loss_dict
 
     def train_step(self, batch, forward_mode):
@@ -219,10 +260,10 @@ class MDTSegTeacher:
         mask = batch['mask'].float().to(self.device)
         pet = batch['pet'].float().to(self.device) if forward_mode == 'full' else None
         outputs = _forward(self.networks, ct, pet, mask.shape[-2:], forward_mode=forward_mode, mask=mask)
-        loss_seg, pred, loss_stats = self._compute_segmentation_loss(outputs, mask)
+        loss_total, pred, loss_dict = self._compute_total_loss(outputs, mask)
         aux_losses = outputs.get('aux_losses', {}) if isinstance(outputs, dict) else {}
         diagnostics = outputs.get('diagnostics', {}) if isinstance(outputs, dict) else {}
-        zero = loss_seg.new_tensor(0.0)
+        zero = loss_total.new_tensor(0.0)
         route_loss = aux_losses.get('pg_mtr_route_loss', zero)
         mem_loss = aux_losses.get('pg_mtr_mem_loss', zero)
         bank_loss = aux_losses.get('mtib_bank_loss', zero)
@@ -233,18 +274,16 @@ class MDTSegTeacher:
         bank_weight = float(getattr(self.config, 'mtib_bank_weight', 0.05))
         comp_weight = float(getattr(self.config, 'mtib_comp_weight', 0.05))
         hatr_weight = float(getattr(self.config, 'hatr_weight', 0.1))
-        if forward_mode == 'missing':
+        if forward_mode == 'missing' and getattr(self.config, 'model_arch', '') != 'dual_decoder_ptgc':
             missing_weight = float(getattr(self.config, 'missing_loss_weight', 1.0))
-            loss_total = missing_weight * loss_seg
-        else:
-            if 'hatr_pred_residuals' in outputs:
-                loss_total = loss_seg + hatr_weight * hatr_loss
-            elif 'mtib_bank_loss' in aux_losses or 'mtib_comp_loss' in aux_losses:
-                loss_total = loss_seg + bank_weight * bank_loss + comp_weight * comp_loss
-            else:
-                loss_total = loss_seg + route_weight * route_loss + mem_weight * mem_loss
-        loss_dict = dict(loss_stats)
-        loss_dict.update({'loss_seg': loss_seg.detach(), 'loss_total': loss_total.detach(), 'loss_full': loss_seg.detach() if forward_mode == 'full' else zero, 'loss_missing': loss_seg.detach() if forward_mode == 'missing' else zero, 'train_route_full': 1.0 if forward_mode == 'full' else 0.0, 'train_route_missing': 1.0 if forward_mode == 'missing' else 0.0, 'loss_pg_mtr_route': route_loss.detach(), 'loss_pg_mtr_mem': mem_loss.detach(), 'weighted_loss_pg_mtr_route': (route_weight * route_loss).detach(), 'weighted_loss_pg_mtr_mem': (mem_weight * mem_loss).detach(), 'loss_mtib_bank': bank_loss.detach(), 'loss_mtib_comp': comp_loss.detach(), 'weighted_loss_mtib_bank': (bank_weight * bank_loss).detach(), 'weighted_loss_mtib_comp': (comp_weight * comp_loss).detach(), 'loss_hatr': hatr_loss.detach(), 'weighted_loss_hatr': (hatr_weight * hatr_loss).detach()})
+            loss_total = missing_weight * loss_total
+        elif 'hatr_pred_residuals' in outputs:
+            loss_total = loss_total + hatr_weight * hatr_loss
+        elif 'mtib_bank_loss' in aux_losses or 'mtib_comp_loss' in aux_losses:
+            loss_total = loss_total + bank_weight * bank_loss + comp_weight * comp_loss
+        elif getattr(self.config, 'model_arch', '') not in ('dual_decoder_ptgc',):
+            loss_total = loss_total + route_weight * route_loss + mem_weight * mem_loss
+        loss_dict.update({'loss_seg': loss_dict.get('loss_seg', loss_total.detach()), 'loss_total': loss_total.detach(), 'loss_full': loss_total.detach() if forward_mode == 'full' else zero, 'loss_missing': loss_total.detach() if forward_mode == 'missing' else zero, 'train_route_full': 1.0 if forward_mode == 'full' else 0.0, 'train_route_missing': 1.0 if forward_mode == 'missing' else 0.0, 'loss_pg_mtr_route': route_loss.detach(), 'loss_pg_mtr_mem': mem_loss.detach(), 'weighted_loss_pg_mtr_route': (route_weight * route_loss).detach(), 'weighted_loss_pg_mtr_mem': (mem_weight * mem_loss).detach(), 'loss_mtib_bank': bank_loss.detach(), 'loss_mtib_comp': comp_loss.detach(), 'weighted_loss_mtib_bank': (bank_weight * bank_loss).detach(), 'weighted_loss_mtib_comp': (comp_weight * comp_loss).detach(), 'loss_hatr': hatr_loss.detach(), 'weighted_loss_hatr': (hatr_weight * hatr_loss).detach()})
         loss_dict.update(hatr_stats)
         for key, value in diagnostics.items():
             if torch.is_tensor(value) and value.numel() > 0:

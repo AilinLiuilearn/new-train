@@ -36,7 +36,7 @@ class SegMDTConfig(ConfigBase):
             "--model_arch",
             type=str,
             default="dual_shared_add_baseline",
-            choices=("dual_shared_add_baseline", "dual_decoder_add_baseline", "dual_decoder_pg_mtr_retrieval", "dual_decoder_multiscale_task_increment_bank", "dual_decoder_hatr_task_residual"),
+            choices=("dual_shared_add_baseline", "dual_decoder_add_baseline", "dual_decoder_pg_mtr_retrieval", "dual_decoder_multiscale_task_increment_bank", "dual_decoder_hatr_task_residual", "dual_decoder_ptgc"),
             help=(
                 "dual_shared_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, shared UNet decoder. "
                 "dual_decoder_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, independent full/missing UNet decoders. "
@@ -184,6 +184,13 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--mtib_bank_weight", type=float, default=0.05)
         p.add_argument("--mtib_comp_weight", type=float, default=0.05)
         p.add_argument("--hatr_weight", type=float, default=0.1)
+        p.add_argument("--use_gpnd", type=str2bool, default=True)
+        p.add_argument("--ptgc_base_checkpoint", type=str, default=None)
+        p.add_argument("--ptgc_alpha", type=float, default=0.25)
+        p.add_argument("--ptgc_loss_weight", type=float, default=0.2)
+        p.add_argument("--gpnd_rank_weight", type=float, default=1.0)
+        p.add_argument("--gpnd_support_weight", type=float, default=0.05)
+        p.add_argument("--ptgc_delta_active_threshold", type=float, default=1e-4)
         p.add_argument("--print_trainable_only", type=str2bool, default=True)
         return p
 
