@@ -134,6 +134,12 @@ def _collect_adc_gamma(task):
     return gammas
 
 
+def _resolve_train_route(model_arch, global_batch_step):
+    if str(model_arch) == 'dual_decoder_ptgc':
+        return 'full'
+    return 'full' if global_batch_step % 2 == 0 else 'missing'
+
+
 def _resolve_checkpoint_selection(checkpoint_select, val_full, val_fixed_missing):
     checkpoint_select = str(checkpoint_select)
     full_select_score = float(val_full['dice'])
@@ -343,6 +349,9 @@ def main():
     if getattr(config, 'model_arch', '') == 'dual_decoder_ptgc' and float(getattr(config, 'train_pet_drop_prob', 0.0)) != 0.0:
         print('[dual_decoder_ptgc] train_pet_drop_prob forced to 0.0 for modular ablation')
         config.train_pet_drop_prob = 0.0
+    if getattr(config, 'model_arch', '') == 'dual_decoder_ptgc' and float(getattr(config, 'train_pet_drop_prob', 0.0)) != 0.0:
+        print('[dual_decoder_ptgc] train_pet_drop_prob forced to 0.0 for joint-scratch ablation')
+        config.train_pet_drop_prob = 0.0
     print(f'train_pet_drop_prob={getattr(config, "train_pet_drop_prob", 0.0)}')
     print(f'eval_full_pet={getattr(config, "eval_full_pet", True)} eval_fixed_missing_pet={getattr(config, "eval_fixed_missing_pet", False)} eval_random_missing_pet={getattr(config, "eval_random_missing_pet", False)}')
     print(f'aug_mode={getattr(config, "aug_mode", None)}')
@@ -403,7 +412,6 @@ def main():
         first_bad_module_counter = {k: 0 for k in ('enc_ct', 'enc_pet', 'pet_proj', 'decoder', 'boundary_head')}
         train_pet_drop_prob = float(getattr(config, 'train_pet_drop_prob', 0.0))
         if getattr(config, 'model_arch', '') == 'dual_decoder_ptgc':
-            train_route = 'full'
             train_pet_drop_prob = 0.0
         _set_train_pet_drop_prob(train_loader, train_pet_drop_prob)
         model_for_epoch = _unwrap_model(task.networks.get('model'))
@@ -420,7 +428,7 @@ def main():
         for i, batch in enumerate(train_loader):
             stepped = False
             global_batch_step = (epoch - 1) * spe + i
-            train_route = 'full' if global_batch_step % 2 == 0 else 'missing'
+            train_route = _resolve_train_route(config.model_arch, global_batch_step)
             try:
                 use_amp = bool(config.mixed_precision) and train_route == 'full'
                 with torch.cuda.amp.autocast(enabled=use_amp):

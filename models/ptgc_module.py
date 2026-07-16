@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.build_mdt_seg import ConvBNAct
 
 
 class PatchTaskGainCompensator(nn.Module):

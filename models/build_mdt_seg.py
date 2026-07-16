@@ -531,21 +531,18 @@ def build_mdt_seg_teacher(config):
         from models.dual_decoder_ptgc import DualDecoderPTGC
         model = DualDecoderPTGC(
             **common_kwargs,
-            ptgc_base_checkpoint=getattr(config, 'ptgc_base_checkpoint', None),
+            ptgc_ablation_mode=getattr(config, 'ptgc_ablation_mode', 'ptgc_gpnd'),
             ptgc_alpha=getattr(config, 'ptgc_alpha', 0.25),
             ptgc_loss_weight=getattr(config, 'ptgc_loss_weight', 0.2),
             gpnd_rank_weight=getattr(config, 'gpnd_rank_weight', 1.0),
             gpnd_support_weight=getattr(config, 'gpnd_support_weight', 0.05),
             ptgc_delta_active_threshold=getattr(config, 'ptgc_delta_active_threshold', 1e-4),
-            use_gpnd=getattr(config, 'use_gpnd', True),
         )
-        model.set_ptgc_training_mode()
         print(
-            f'[dual_decoder_ptgc] model_arch={model_arch} base_checkpoint={getattr(config, "ptgc_base_checkpoint", None)} '
+            f'[dual_decoder_ptgc] model_arch={model_arch} mode={getattr(config, "ptgc_ablation_mode", "ptgc_gpnd")} '
             f'ct_backbone={getattr(config, "ct_backbone", "convnextv2_nano")} pet_backbone={getattr(config, "pet_backbone", "mit_b1")} '
-            f'fusion=stage-wise-add decoder_shared=False compensation_stage=S4 trainable_module=PTGC_only '
-            f'use_gpnd={getattr(config, "use_gpnd", True)} ptgc_alpha={getattr(config, "ptgc_alpha", 0.25)} '
-            f'ptgc_loss_weight={getattr(config, "ptgc_loss_weight", 0.2)}'
+            f'fusion=stage-wise-add decoder_shared=False joint_training=True '
+            f'ptgc_alpha={getattr(config, "ptgc_alpha", 0.25)} ptgc_loss_weight={getattr(config, "ptgc_loss_weight", 0.2)}'
         )
         return dict(model=model)
     raise ValueError(
