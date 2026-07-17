@@ -206,130 +206,70 @@ class MDTSegTeacher:
         stats['loss_hatr'] = loss_total.detach()
         return loss_total, stats
 
-    def _compute_gpnd_loss(self, outputs, mask):
-        zero = mask.new_tensor(0.0)
-        required = ['ptgc_ct_logits', 'ptgc_full_logits', 'ptgc_comp_logits', 'ptgc_gain_pred', 'ptgc_delta_d4']
-        if not isinstance(outputs, dict) or not all(k in outputs for k in required):
-            return zero, {'loss_gpnd_pred': zero.detach(), 'loss_gpnd_rank': zero.detach(), 'loss_gpnd_support': zero.detach()}
-        ct_logits = outputs['ptgc_ct_logits']
-        full_logits = outputs['ptgc_full_logits']
-        comp_logits = outputs['ptgc_comp_logits']
-        gain_pred = outputs['ptgc_gain_pred']
-        delta_d4 = outputs['ptgc_delta_d4']
-        pixel_ct = F.binary_cross_entropy_with_logits(ct_logits.float(), mask.float(), reduction='none')
-        pixel_full = F.binary_cross_entropy_with_logits(full_logits.float(), mask.float(), reduction='none')
-        pixel_comp = F.binary_cross_entropy_with_logits(comp_logits.float(), mask.float(), reduction='none')
-        patch_resolution = gain_pred.shape[-2:]
-        patch_ct = F.adaptive_avg_pool2d(pixel_ct, patch_resolution)
-        patch_full = F.adaptive_avg_pool2d(pixel_full, patch_resolution)
-        patch_comp = F.adaptive_avg_pool2d(pixel_comp, patch_resolution)
-        signed_gain_target = ((patch_ct - patch_full) / (patch_ct + patch_full + 1e-6)).detach()
-        benefit_abs = F.relu(patch_ct - patch_full).detach()
-        gain_target = signed_gain_target.float()
-        gain_prediction = gain_pred.float()
-        loss_pred = F.smooth_l1_loss(gain_prediction, gain_target)
-        desired_patch_loss = patch_ct.detach() - float(getattr(self.config, 'ptgc_alpha', 0.25)) * benefit_abs
-        loss_rank = F.relu(patch_comp - desired_patch_loss).mean()
-        delta_energy = torch.sqrt(delta_d4.float().pow(2).mean(dim=1, keepdim=True) + 1e-6)
-        benefit_norm = F.relu(signed_gain_target).detach()
-        loss_support = ((1.0 - benefit_norm) * delta_energy).mean()
-        flat_p = gain_prediction.flatten()
-        flat_t = gain_target.flatten()
-        pred_var = flat_p.var(unbiased=False)
-        tgt_var = flat_t.var(unbiased=False)
-        if float(pred_var) > 1e-8 and float(tgt_var) > 1e-8:
-            corr = torch.corrcoef(torch.stack([flat_p, flat_t]))[0, 1]
-        else:
-            corr = zero
-        gain_mae = (gain_prediction - gain_target).abs().mean()
-        gain_target_mean = gain_target.mean()
-        gain_pred_mean = gain_prediction.mean()
-        benefit_ratio = (gain_target > 0).float().mean()
-        harm_ratio = (gain_target < 0).float().mean()
-        delta_rms = delta_d4.detach().float().pow(2).mean().sqrt()
-        delta_active = (delta_energy > float(getattr(self.config, 'ptgc_delta_active_threshold', 1e-4))).float().mean()
-        violation_ratio = (patch_comp.detach() > patch_ct.detach()).float().mean()
-        actual_gain = F.relu(patch_ct.detach() - patch_comp.detach())
-        recovered_gain = torch.minimum(actual_gain, benefit_abs)
-        gain_recovery_ratio = recovered_gain.sum() / (benefit_abs.sum() + 1e-6)
-        loss_gpnd = loss_pred + float(getattr(self.config, 'gpnd_rank_weight', 1.0)) * loss_rank + float(getattr(self.config, 'gpnd_support_weight', 0.05)) * loss_support
-        return loss_gpnd, {
-            'loss_gpnd_pred': loss_pred.detach(),
-            'loss_gpnd_rank': loss_rank.detach(),
-            'loss_gpnd_support': loss_support.detach(),
-            'ptgc_gain_target_mean': gain_target_mean.detach(),
-            'ptgc_gain_pred_mean': gain_pred_mean.detach(),
-            'ptgc_gain_mae': gain_mae.detach(),
-            'ptgc_gain_corr': corr.detach(),
-            'ptgc_benefit_patch_ratio': benefit_ratio.detach(),
-            'ptgc_harm_patch_ratio': harm_ratio.detach(),
-            'ptgc_delta_rms': delta_rms.detach(),
-            'ptgc_delta_active_ratio': delta_active.detach(),
-            'ptgc_non_degrade_violation_ratio': violation_ratio.detach(),
-            'ptgc_gain_recovery_ratio': gain_recovery_ratio.detach(),
+    def _compute_balanced_patch_risk(self, logits, mask, patch_size):
+        pixel_loss = F.binary_cross_entropy_with_logits(logits.float(), mask.float(), reduction='none')
+        fg_mass = F.adaptive_avg_pool2d(mask.float(), patch_size)
+        fg_error = F.adaptive_avg_pool2d(pixel_loss * mask.float(), patch_size) / (fg_mass + 1e-6)
+        bg_mask = 1.0 - mask.float()
+        bg_mass = F.adaptive_avg_pool2d(bg_mask, patch_size)
+        bg_error = F.adaptive_avg_pool2d(pixel_loss * bg_mask, patch_size) / (bg_mass + 1e-6)
+        has_fg = (fg_mass > 0).float()
+        has_bg = (bg_mass > 0).float()
+        return (has_fg * fg_error + has_bg * bg_error) / (has_fg + has_bg).clamp_min(1.0)
+
+    def _compute_pgmr_loss(self, outputs, mask):
+        ct_logits = outputs['gvtc_ct_logits']
+        full_logits = outputs['gvtc_full_logits']
+        comp_logits = outputs['gvtc_comp_logits']
+        patch_resolution = outputs['gvtc_delta_d4'].shape[-2:]
+        risk_ct = self._compute_balanced_patch_risk(ct_logits, mask, patch_resolution)
+        risk_full = self._compute_balanced_patch_risk(full_logits, mask, patch_resolution)
+        risk_comp = self._compute_balanced_patch_risk(comp_logits, mask, patch_resolution)
+        risk_best = torch.minimum(risk_ct.detach(), risk_full.detach())
+        loss_pgmr = F.relu(risk_comp - risk_best).mean()
+        diagnostics = {
+            'pgmr_positive_pet_gain_ratio': (risk_full < risk_ct).float().mean(),
+            'pgmr_ct_dominant_ratio': (risk_ct <= risk_full).float().mean(),
+            'pgmr_violation_ratio': (risk_comp > risk_best).float().mean(),
+            'pgmr_comp_better_than_ct_ratio': (risk_comp < risk_ct).float().mean(),
+            'pgmr_comp_better_than_full_ratio': (risk_comp < risk_full).float().mean(),
+            'risk_ct': risk_ct.mean().detach(),
+            'risk_full': risk_full.mean().detach(),
+            'risk_comp': risk_comp.mean().detach(),
         }
+        return loss_pgmr, diagnostics
 
     def _compute_ptgc_joint_loss(self, outputs, mask):
-        mode = str(outputs.get('ptgc_ablation_mode', getattr(self.config, 'ptgc_ablation_mode', 'ptgc_gpnd')))
-        ct_logits = outputs['ptgc_ct_logits']
-        full_logits = outputs['ptgc_full_logits']
-        comp_logits = outputs.get('ptgc_comp_logits', ct_logits)
+        mode = str(outputs.get('gvtc_ablation_mode', getattr(self.config, 'ptgc_ablation_mode', 'gvtc_pgmr')))
+        ct_logits = outputs['gvtc_ct_logits']
+        full_logits = outputs['gvtc_full_logits']
+        comp_logits = outputs.get('gvtc_comp_logits', ct_logits)
         loss_ct, _ = self.loss_seg(ct_logits, mask)
         loss_full, _ = self.loss_seg(full_logits, mask)
         loss_comp, _ = self.loss_seg(comp_logits, mask)
-        loss_gpnd = ct_logits.new_tensor(0.0)
-        gpnd_stats = {
-            'loss_gpnd_pred': loss_gpnd.detach(),
-            'loss_gpnd_rank': loss_gpnd.detach(),
-            'loss_gpnd_support': loss_gpnd.detach(),
-            'weighted_loss_gpnd': loss_gpnd.detach(),
+        loss_seg_joint = 0.5 * loss_full + 0.5 * loss_comp if mode != 'baseline' else 0.5 * loss_full + 0.5 * loss_ct
+        stats = {
+            'loss_gvtc_ct': loss_ct.detach(),
+            'loss_gvtc_full': loss_full.detach(),
+            'loss_gvtc_comp': loss_comp.detach(),
+            'loss_seg_joint': loss_seg_joint.detach(),
         }
         if mode == 'baseline':
-            loss_task = 0.5 * loss_full + 0.5 * loss_ct
-            return loss_task, {
-                'loss_ptgc_ct': loss_ct.detach(),
-                'loss_ptgc_full': loss_full.detach(),
-                'loss_ptgc_missing': loss_ct.detach(),
-                'loss_ptgc_comp': loss_gpnd.detach(),
-                'loss_seg_joint': loss_task.detach(),
-                'loss_gpnd': loss_gpnd.detach(),
-                **gpnd_stats,
-            }
-
-        loss_task = 0.5 * loss_full + 0.5 * loss_comp
-        if mode == 'ptgc':
-            return loss_task, {
-                'loss_ptgc_ct': loss_ct.detach(),
-                'loss_ptgc_full': loss_full.detach(),
-                'loss_ptgc_missing': loss_comp.detach(),
-                'loss_ptgc_ct_anchor': loss_ct.detach(),
-                'loss_ptgc_comp': loss_comp.detach(),
-                'loss_seg_joint': loss_task.detach(),
-                'loss_gpnd': loss_gpnd.detach(),
-                **gpnd_stats,
-            }
-        if mode == 'ptgc_gpnd':
-            loss_gpnd, gpnd_stats = self._compute_gpnd_loss(outputs, mask)
-            weighted_gpnd = float(getattr(self.config, 'ptgc_loss_weight', 0.2)) * loss_gpnd
-            loss_total = loss_task + weighted_gpnd
-            return loss_total, {
-                'loss_ptgc_ct': loss_ct.detach(),
-                'loss_ptgc_full': loss_full.detach(),
-                'loss_ptgc_missing': loss_comp.detach(),
-                'loss_ptgc_ct_anchor': loss_ct.detach(),
-                'loss_ptgc_comp': loss_comp.detach(),
-                'loss_seg_joint': loss_task.detach(),
-                'loss_gpnd': loss_gpnd.detach(),
-                'weighted_loss_gpnd': weighted_gpnd.detach(),
-                **gpnd_stats,
-            }
+            return loss_seg_joint, {**stats, 'loss_pgmr': loss_ct.new_tensor(0.0).detach(), 'weighted_loss_pgmr': loss_ct.new_tensor(0.0).detach()}
+        if mode == 'gvtc':
+            return loss_seg_joint, {**stats, 'loss_pgmr': loss_ct.new_tensor(0.0).detach(), 'weighted_loss_pgmr': loss_ct.new_tensor(0.0).detach()}
+        if mode == 'gvtc_pgmr':
+            loss_pgmr, pgmr_stats = self._compute_pgmr_loss(outputs, mask)
+            weighted_loss_pgmr = float(getattr(self.config, 'pgmr_weight', 0.1)) * loss_pgmr
+            loss_total = loss_seg_joint + weighted_loss_pgmr
+            return loss_total, {**stats, 'loss_pgmr': loss_pgmr.detach(), 'weighted_loss_pgmr': weighted_loss_pgmr.detach(), **pgmr_stats}
         raise ValueError(f'Unsupported PTGC ablation mode: {mode}')
 
     def _compute_total_loss(self, outputs, mask, pixel_weight=None):
-        if isinstance(outputs, dict) and 'ptgc_ablation_mode' in outputs:
+        if isinstance(outputs, dict) and 'gvtc_ablation_mode' in outputs:
             loss_total, stats = self._compute_ptgc_joint_loss(outputs, mask)
             loss_dict = {'loss_total': loss_total.detach(), **stats}
-            return loss_total, outputs['ptgc_ct_logits'], loss_dict
+            return loss_total, outputs['logits'], loss_dict
         loss_seg, pred, loss_stats = self._compute_segmentation_loss(outputs, mask)
         loss_dict = {'loss_seg': loss_seg.detach(), 'loss_total': loss_seg.detach()}
         loss_dict.update(loss_stats)
