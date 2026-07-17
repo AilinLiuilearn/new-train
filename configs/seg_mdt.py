@@ -35,8 +35,8 @@ class SegMDTConfig(ConfigBase):
         p.add_argument(
             "--model_arch",
             type=str,
-            default="dual_shared_add_baseline",
-            choices=("dual_shared_add_baseline", "dual_decoder_add_baseline", "dual_decoder_pg_mtr_retrieval", "dual_decoder_multiscale_task_increment_bank", "dual_decoder_hatr_task_residual", "dual_decoder_ptgc"),
+            default="dual_decoder_paired_add_baseline",
+            choices=("dual_shared_add_baseline", "dual_decoder_add_baseline", "dual_decoder_pg_mtr_retrieval", "dual_decoder_multiscale_task_increment_bank", "dual_decoder_hatr_task_residual", "dual_decoder_paired_add_baseline"),
             help=(
                 "dual_shared_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, shared UNet decoder. "
                 "dual_decoder_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, independent full/missing UNet decoders. "
@@ -171,7 +171,7 @@ class SegMDTConfig(ConfigBase):
         )
         p.add_argument("--log_dmome_weights", type=str2bool, default=True, help="Log stage-wise DMoME fusion weights during validation.")
         p.add_argument("--decoder_type", type=str, default="unet", choices=("unet",))
-        p.add_argument("--use_deep_supervision", type=str2bool, default=True, help="Enable nnU-Net style deep supervision on decoder aux heads.")
+        p.add_argument("--use_deep_supervision", type=str2bool, default=False, help="Enable nnU-Net style deep supervision on decoder aux heads.")
         p.add_argument("--pg_mtr_stages", type=str, default="all", choices=("s4", "s34", "deep", "s234", "all"), help="PG-MTR active stages; all means S1-S4 token retrieval, while simple projection add remains a baseline fusion only.")
         p.add_argument("--pg_mtr_num_tokens", type=int, default=8, help="Number of PET-grounded tokens per stage.")
         p.add_argument("--pg_mtr_temperature", type=float, default=0.07, help="Routing temperature for token assignment.")
@@ -184,13 +184,6 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--mtib_bank_weight", type=float, default=0.05)
         p.add_argument("--mtib_comp_weight", type=float, default=0.05)
         p.add_argument("--hatr_weight", type=float, default=0.1)
-        p.add_argument("--ptgc_ablation_mode", type=str, default="ptgc_gpnd", choices=("baseline", "ptgc", "ptgc_gpnd"))
-        p.add_argument("--ptgc_alpha", type=float, default=0.25)
-        p.add_argument("--ptgc_loss_weight", type=float, default=0.2)
-        p.add_argument("--gpnd_rank_weight", type=float, default=1.0)
-        p.add_argument("--gpnd_support_weight", type=float, default=0.05)
-        p.add_argument("--ptgc_delta_active_threshold", type=float, default=1e-4)
-        p.add_argument("--ptgc_base_checkpoint", type=str, default=None, help="Deprecated; ignored in joint-scratch PTGC training.")
         p.add_argument("--print_trainable_only", type=str2bool, default=True)
         return p
 
@@ -218,7 +211,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument("--eval_fixed_missing_pet", type=str2bool, default=False, help="Evaluate with all PET marked unavailable and proxy used by missing-aware models.")
         p.add_argument("--eval_random_missing_pet", type=str2bool, default=False, help="Evaluate with random PET availability masks.")
         p.add_argument("--eval_random_pet_drop_prob", type=float, default=0.4, help="PET missing probability for random-missing evaluation.")
-        p.add_argument("--train_mode", type=str, default="alternating_full_missing", choices=("alternating_full_missing",), help="Training route schedule.")
+        p.add_argument("--train_mode", type=str, default="paired_joint", choices=("paired_joint",), help="Training route schedule.")
         p.add_argument("--missing_loss_weight", type=float, default=1.0)
         p.add_argument(
             "--checkpoint_select",

@@ -135,6 +135,8 @@ def _collect_adc_gamma(task):
 
 
 def _resolve_train_route(model_arch, global_batch_step):
+    if str(model_arch) == 'dual_decoder_paired_add_baseline':
+        return 'full'
     if str(model_arch) == 'dual_decoder_ptgc':
         return 'full'
     return 'full' if global_batch_step % 2 == 0 else 'missing'
@@ -343,6 +345,12 @@ def main():
         print(f'use_pet_proxy={getattr(config, "use_pet_proxy", True)}')
         print(f'proxy_loss_weight={getattr(config, "proxy_loss_weight", 0.05)}')
     print(f'use_deep_supervision={_use_deep_supervision(config)}')
+    if str(getattr(config, 'model_arch', '')) == 'dual_decoder_paired_add_baseline':
+        print('training_protocol=paired_full_missing_joint')
+        print('each_batch_runs_full_and_missing=True')
+        print('loss_formula=0.5_full_plus_0.5_missing')
+        print('extra_module=None')
+        print('extra_loss=None')
     print(f'use_fprm={getattr(config, "use_fprm", False)}')
     print(f'fprm_slots={getattr(config, "fprm_slots", 32)} fprm_dim={getattr(config, "fprm_dim", 0)} fprm_beta={getattr(config, "fprm_beta", 0.1)} fprm_gamma={getattr(config, "fprm_gamma", 0.1)}')
     print(f'fprm_mem_loss_weight={getattr(config, "fprm_mem_loss_weight", 0.05)} fprm_use_memory={getattr(config, "fprm_use_memory", True)} fprm_use_shape={getattr(config, "fprm_use_shape", True)}')
@@ -351,6 +359,9 @@ def main():
         config.train_pet_drop_prob = 0.0
     if getattr(config, 'model_arch', '') == 'dual_decoder_ptgc' and float(getattr(config, 'train_pet_drop_prob', 0.0)) != 0.0:
         print('[dual_decoder_ptgc] train_pet_drop_prob forced to 0.0 for joint-scratch ablation')
+        config.train_pet_drop_prob = 0.0
+    if getattr(config, 'model_arch', '') == 'dual_decoder_paired_add_baseline':
+        print('[dual_decoder_paired_add_baseline] train_pet_drop_prob forced to 0.0 for paired joint baseline')
         config.train_pet_drop_prob = 0.0
     print(f'train_pet_drop_prob={getattr(config, "train_pet_drop_prob", 0.0)}')
     print(f'eval_full_pet={getattr(config, "eval_full_pet", True)} eval_fixed_missing_pet={getattr(config, "eval_fixed_missing_pet", False)} eval_random_missing_pet={getattr(config, "eval_random_missing_pet", False)}')
