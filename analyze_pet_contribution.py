@@ -20,7 +20,6 @@ import torch.nn.functional as F
 from configs.seg_mdt import SegMDTConfig
 from models.build_mdt_seg import build_mdt_seg_teacher
 from tasks.mdt_seg import MDTSegTeacher
-from utils.metrics_seg import SegmentationMetricsCIPA
 
 
 def _load_dataset_module():
@@ -71,6 +70,8 @@ def _set_checkpoint_config(path, model_arch, ct_backbone, pet_backbone=None):
     cfg.batch_size = 1
     cfg.num_workers = 0
     cfg.pin_memory = False
+    cfg.norm_mode = 'cipa'
+    cfg.aug_mode = 'none'
     return cfg
 
 
@@ -100,11 +101,29 @@ def _dice_from_logits(logits, mask, threshold=0.5):
 
 
 def _hd95_proxy(pred, target):
-    # Lightweight proxy for ranking samples by boundary mismatch.
-    # For exact HD95 use the built-in evaluator separately.
     pred_edges = F.max_pool2d(pred, kernel_size=3, stride=1, padding=1) - F.avg_pool2d(pred, kernel_size=3, stride=1, padding=1)
     tgt_edges = F.max_pool2d(target, kernel_size=3, stride=1, padding=1) - F.avg_pool2d(target, kernel_size=3, stride=1, padding=1)
     return (pred_edges - tgt_edges).abs().mean(dim=(1, 2, 3))
+
+
+def _get_image_ids(batch):
+    if 'image_id' in batch:
+        ids = batch['image_id']
+        if isinstance(ids, (list, tuple)):
+            return [str(x) for x in ids]
+        return [str(ids)]
+    if 'case_id' in batch and 'slice_id' in batch:
+        case_ids = batch['case_id']
+        slice_ids = batch['slice_id']
+        if not isinstance(case_ids, (list, tuple)):
+            case_ids = [case_ids]
+        if not isinstance(slice_ids, (list, tuple)):
+            slice_ids = [slice_ids]
+        return [f'{c}_{s}' for c, s in zip(case_ids, slice_ids)]
+    idx = batch.get('idx', [])
+    if not isinstance(idx, (list, tuple)):
+        idx = [idx]
+    return [str(x) for x in idx]
 
 
 def main():
@@ -140,13 +159,10 @@ def main():
     _load_checkpoint(ct_task, args.ct_ckpt)
     _load_checkpoint(full_task, args.full_ckpt)
 
-    ct_model = ct_task._unwrap(ct_task.networks['model'])
-    full_model = full_task._unwrap(full_task.networks['model'])
-    ct_model.eval()
-    full_model.eval()
+    ct_task.networks['model'].eval()
+    full_task.networks['model'].eval()
 
     rows = []
-    metric_bins = defaultdict(list)
     threshold = 0.5
 
     with torch.no_grad():
@@ -154,11 +170,7 @@ def main():
             ct = batch['ct'].float().to(ct_task.device)
             pet = batch['pet'].float().to(full_task.device)
             mask = batch['mask'].float().to(ct_task.device)
-            image_ids = batch.get('image_id')
-            if image_ids is None:
-                image_ids = [str(i) for i in batch.get('idx', range(ct.shape[0]))]
-            elif isinstance(image_ids, str):
-                image_ids = [image_ids]
+            image_ids = _get_image_ids(batch)
 
             ct_out = ct_task.networks['model'](ct, pet, target_size=mask.shape[-2:], forward_mode='auto')
             full_out = full_task.networks['model'](ct, pet, target_size=mask.shape[-2:], forward_mode='auto')
@@ -180,7 +192,7 @@ def main():
             hd95_proxy_gain = hd95_proxy_ct - hd95_proxy_full
 
             for i in range(ct.shape[0]):
-                row = {
+                rows.append({
                     'image_id': image_ids[i] if i < len(image_ids) else str(i),
                     'ct_dice': float(ct_dice[i]),
                     'full_dice': float(full_dice[i]),
@@ -191,10 +203,7 @@ def main():
                     'pred_delta_mean': float(pred_delta[i]),
                     'logit_delta_mean': float(logit_delta[i]),
                     'mask_pos_fraction': float(mask_cpu[i].mean()),
-                }
-                rows.append(row)
-                metric_bins['dice_gain'].append(row['dice_gain'])
-                metric_bins['hd95_proxy_gain'].append(row['hd95_proxy_gain'])
+                })
 
     rows.sort(key=lambda x: x['dice_gain'], reverse=True)
     os.makedirs(os.path.dirname(args.out_csv) or '.', exist_ok=True)
