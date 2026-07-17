@@ -88,7 +88,10 @@ class MDTSegTeacher:
     def __init__(self, networks, config):
         self.networks = {k: v for k, v in networks.items() if v is not None}
         self.config = config
-        self.device = torch.device('cuda', int(config.gpus[0]))
+        if torch.cuda.is_available() and getattr(config, 'gpus', None):
+            self.device = torch.device('cuda', int(config.gpus[0]))
+        else:
+            self.device = torch.device('cpu')
         self.data_parallel = torch.cuda.is_available() and len(getattr(config, 'gpus', [])) > 1
         for key, v in list(self.networks.items()):
             v.to(self.device)
@@ -240,7 +243,7 @@ class MDTSegTeacher:
         return loss_pgmr, diagnostics
 
     def _compute_ptgc_joint_loss(self, outputs, mask):
-        mode = str(outputs.get('gvtc_ablation_mode', getattr(self.config, 'ptgc_ablation_mode', 'gvtc_pgmr')))
+        mode = str(getattr(self.config, 'ptgc_ablation_mode', outputs.get('gvtc_ablation_mode', 'gvtc_pgmr')))
         ct_logits = outputs['gvtc_ct_logits']
         full_logits = outputs['gvtc_full_logits']
         comp_logits = outputs.get('gvtc_comp_logits', ct_logits)

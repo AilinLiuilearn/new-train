@@ -31,52 +31,58 @@ class GainVerifiedVirtualTaskCompensation(nn.Module):
         self.num_nodes = 9
         self.num_active_operators = 8
         self.route_hw = (16, 16)
-        self.region_hw = (8, 8)
 
         self.semantic_ln = nn.LayerNorm(self.task_channels)
         self.semantic_projection = nn.Linear(self.task_channels, self.route_dim)
         self.decision_projection = nn.Linear(1, self.route_dim)
         self.local_query_projection = nn.Linear(self.route_dim, self.route_dim, bias=False)
         self.region_query_projection = nn.Linear(self.route_dim, self.route_dim, bias=False)
+
         self.local_keys = nn.Parameter(torch.randn(self.num_nodes, self.route_dim) * 0.02)
         self.region_keys = nn.Parameter(torch.randn(self.num_nodes, self.route_dim) * 0.02)
         self.local_keys.data[0].zero_()
         self.region_keys.data[0].zero_()
+
         self.operator_down = nn.Parameter(torch.empty(self.num_active_operators, self.task_channels, self.operator_rank))
         self.operator_up = nn.Parameter(torch.empty(self.num_active_operators, self.operator_rank, self.task_channels))
         nn.init.xavier_uniform_(self.operator_down)
         nn.init.xavier_uniform_(self.operator_up)
+
         self.value_norm = nn.LayerNorm(self.task_channels)
         self.output_projection = nn.Linear(self.task_channels, self.task_channels)
         nn.init.zeros_(self.output_projection.weight)
         nn.init.zeros_(self.output_projection.bias)
 
     def forward(self, d4_ct, ct_logits):
-        x = d4_ct.detach().flatten(2).transpose(1, 2)
+        d4_pool = F.adaptive_avg_pool2d(d4_ct.detach(), self.route_hw)
+        x = d4_pool.flatten(2).transpose(1, 2)  # [B,256,512]
+
         q_sem = self.semantic_projection(self.semantic_ln(x))
         ct_prob = torch.sigmoid(ct_logits.detach().float())
-        prob_patch = F.adaptive_avg_pool2d(ct_prob, output_size=self.route_hw)
-        prob_token = prob_patch.flatten(2).transpose(1, 2)
-        q_dec = self.decision_projection(prob_token)
+        prob_patch = F.adaptive_avg_pool2d(ct_prob, self.route_hw)
+        q_dec = self.decision_projection(prob_patch.flatten(2).transpose(1, 2))
         q_local = F.layer_norm(q_sem + q_dec, (self.route_dim,))
+
         q_map = q_local.transpose(1, 2).reshape(d4_ct.size(0), self.route_dim, *self.route_hw)
         region_map = F.avg_pool2d(q_map, kernel_size=2, stride=2)
         region_map = F.interpolate(region_map, size=self.route_hw, mode='nearest')
         q_region = region_map.flatten(2).transpose(1, 2)
-        q_local_p = self.local_query_projection(q_local)
-        q_region_p = self.region_query_projection(q_region)
-        local_score = torch.einsum('bnc,nc->bn', q_local_p, self.local_keys) / math.sqrt(self.route_dim)
-        region_score = torch.einsum('bnc,nc->bn', q_region_p, self.region_keys) / math.sqrt(self.route_dim)
-        routing_logits = local_score + region_score
+
+        local_score = (self.local_query_projection(q_local)[:, :, None, :] * self.local_keys[None, None, :, :]).sum(-1)
+        region_score = (self.region_query_projection(q_region)[:, :, None, :] * self.region_keys[None, None, :, :]).sum(-1)
+        routing_logits = (local_score + region_score) / math.sqrt(self.route_dim)
         routing_weights = sparsemax(routing_logits, dim=-1)
-        x_operator = self.value_norm(d4_ct.detach().flatten(2).transpose(1, 2))
-        hidden = torch.einsum('bnc,mcr->bnmr', x_operator, self.operator_down)
+
+        x_operator = self.value_norm(x)
+        hidden = torch.einsum('bpc,mcr->bpmr', x_operator, self.operator_down)
         hidden = F.gelu(hidden)
-        operator_outputs = torch.einsum('bnmr,mrc->bnmc', hidden, self.operator_up)
+        operator_outputs = torch.einsum('bpmr,mrc->bpmc', hidden, self.operator_up)
         active_weights = routing_weights[:, :, 1:]
         raw_delta = (active_weights.unsqueeze(-1) * operator_outputs).sum(dim=2)
         delta_token = self.output_projection(raw_delta)
-        delta_d4 = delta_token.transpose(1, 2).reshape_as(d4_ct)
+        delta_map = delta_token.transpose(1, 2).reshape(d4_ct.size(0), self.task_channels, *self.route_hw)
+        delta_d4 = F.adaptive_avg_pool2d(delta_map, d4_ct.shape[-2:])
+
         diagnostics = {
             'gvtc_null_weight_mean': routing_weights[:, :, 0].mean(),
             'gvtc_null_selection_ratio': (routing_weights.argmax(dim=-1) == 0).float().mean(),
