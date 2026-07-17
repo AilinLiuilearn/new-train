@@ -80,7 +80,7 @@ class GainVerifiedVirtualTaskCompensation(nn.Module):
         x_operator = self.value_norm(x)
         hidden = torch.einsum('bpc,mcr->bpmr', x_operator, self.operator_down)
         hidden = F.gelu(hidden)
-        operator_outputs = torch.einsum('bpmr,mrd->bpmc', hidden, self.operator_up)
+        operator_outputs = torch.einsum('bpmr,mrd->bpmd', hidden, self.operator_up)
         raw_delta = (routing_weights[:, :, 1:].unsqueeze(-1) * operator_outputs).sum(dim=2)
         return raw_delta
 
