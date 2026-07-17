@@ -12,12 +12,12 @@ import importlib.util
 import json
 import os
 from collections import defaultdict
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from configs.seg_mdt import SegMDTConfig
 from models.build_mdt_seg import build_mdt_seg_teacher
 from tasks.mdt_seg import MDTSegTeacher
 
@@ -54,7 +54,7 @@ def _load_checkpoint(task, path):
 
 
 def _set_checkpoint_config(path, model_arch, ct_backbone, pet_backbone=None):
-    cfg = SegMDTConfig.parse_arguments()
+    cfg = SimpleNamespace()
     cfg.model_arch = model_arch
     cfg.ct_backbone = ct_backbone
     if pet_backbone is not None:
@@ -72,6 +72,40 @@ def _set_checkpoint_config(path, model_arch, ct_backbone, pet_backbone=None):
     cfg.pin_memory = False
     cfg.norm_mode = 'cipa'
     cfg.aug_mode = 'none'
+    cfg.root = '/root/autodl-tmp/data/PCLT20K'
+    cfg.random_state = 2023
+    cfg.val_ratio = 0.1
+    cfg.use_case_split = False
+    cfg.train_split_file = 'train.txt'
+    cfg.val_split_file = 'val.txt'
+    cfg.test_split_file = 'test.txt'
+    cfg.use_aligned_loader = True
+    cfg.cipa_aligned = True
+    cfg.train_list = 'train_original.txt'
+    cfg.image_size_2d = 512
+    cfg.optimizer = 'adamw'
+    cfg.learning_rate = 8e-5
+    cfg.decoder_lr = 8e-5
+    cfg.weight_decay = 1e-4
+    cfg.cosine_warmup = 3
+    cfg.cosine_min_lr = 1e-6
+    cfg.nan_safe_mode = True
+    cfg.vis_every_epoch = False
+    cfg.vis_epoch_samples = 2
+    cfg.early_stop_patience = 10
+    cfg.eval_threshold = 0.5
+    cfg.grad_clip = 5.0
+    cfg.train_pet_drop_prob = 0.0
+    cfg.eval_random_pet_drop_prob = 0.4
+    cfg.eval_random_seed = 2026
+    cfg.train_mode = 'alternating_full_missing'
+    cfg.missing_loss_weight = 1.0
+    cfg.checkpoint_select = 'full_dice'
+    cfg.lr_flat_ratio = 0.3
+    cfg.bce_weight = 1.0
+    cfg.dice_weight = 1.0
+    cfg.loss_smooth = 1.0
+    cfg.pos_weight = None
     return cfg
 
 
