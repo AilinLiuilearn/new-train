@@ -229,16 +229,6 @@ class MDTSegTeacher:
         loss_dict.update(loss_stats)
         return loss_seg, pred, loss_dict
 
-    def _compute_total_loss(self, outputs, mask, pixel_weight=None):
-        if isinstance(outputs, dict) and outputs.get('paired_joint', False):
-            loss_total, pred, stats = self._compute_paired_joint_loss(outputs, mask)
-            loss_dict = {'loss_total': loss_total.detach(), **stats}
-            return loss_total, pred, loss_dict
-        loss_seg, pred, loss_stats = self._compute_segmentation_loss(outputs, mask)
-        loss_dict = {'loss_seg': loss_seg.detach(), 'loss_total': loss_seg.detach()}
-        loss_dict.update(loss_stats)
-        return loss_seg, pred, loss_dict
-
     def train_step(self, batch, forward_mode):
         if forward_mode not in ('full', 'missing'):
             raise ValueError(f'Unsupported training route: {forward_mode}')
@@ -305,34 +295,24 @@ class MDTSegTeacher:
         th = threshold or getattr(self.config, 'eval_threshold', 0.5)
         mode_alias = {'full': 'full', 'full_pet': 'full', 'missing': 'fixed_missing', 'fixed_missing': 'fixed_missing', 'fixed_missing_pet': 'fixed_missing', 'random': 'random_missing', 'random_missing': 'random_missing', 'random_missing_pet': 'random_missing'}
         eval_mode = mode_alias.get(str(eval_mode), str(eval_mode))
-        if eval_mode not in ('full', 'fixed_missing', 'random_missing'):
+        if eval_mode not in ('full', 'fixed_missing'):
             raise ValueError(f'Unsupported eval_mode={eval_mode}.')
-        rng = torch.Generator(device=self.device); rng.manual_seed(int(random_seed))
         m = SegmentationMetricsCIPA(threshold=th).to(self.device); m.reset(); total_loss, n = 0.0, 0
-        pg_diag_sum, pg_diag_count = {}, {}
         for batch in loader:
             ct = batch['ct'].float().to(self.device)
             pet = batch['pet'].float().to(self.device)
             mask = batch['mask'].float().to(self.device)
             if eval_mode == 'full':
-                pet_available = torch.ones(ct.shape[0], device=self.device, dtype=torch.long)
-            elif eval_mode == 'fixed_missing':
-                pet_available = torch.zeros(ct.shape[0], device=self.device, dtype=torch.long)
+                outputs = _forward(self.networks, ct, pet, mask.shape[-2:], forward_mode='full', mask=mask)
+                pred = outputs['logits'] if isinstance(outputs, dict) and 'logits' in outputs else self._select_main_pred(outputs)
             else:
-                pet_available = (torch.rand(ct.shape[0], device=self.device, generator=rng) >= float(random_pet_drop_prob)).long()
-            if force_missing_pet is not None:
-                pet_available = torch.zeros(ct.shape[0], device=self.device, dtype=torch.long) if force_missing_pet else torch.ones(ct.shape[0], device=self.device, dtype=torch.long)
-            outputs = _forward(self.networks, ct, pet, mask.shape[-2:], pet_available=pet_available, forward_mode='auto', mask=mask)
-            pred = self._select_main_pred(outputs)
+                outputs = _forward(self.networks, ct, None, mask.shape[-2:], forward_mode='missing', mask=mask)
+                pred = outputs['logits'] if isinstance(outputs, dict) and 'logits' in outputs else self._select_main_pred(outputs)
             loss_seg, _ = self.loss_seg(pred, mask)
             total_loss += loss_seg.item() * ct.size(0); n += ct.size(0)
             m.update(pred, mask)
-            diagnostics = outputs.get('diagnostics', {}) if isinstance(outputs, dict) else {}
-            self._accumulate_pg_diagnostics(pg_diag_sum, pg_diag_count, diagnostics)
         for v in self.networks.values(): v.train()
         out = m.compute(); out['total_loss'] = total_loss / max(n, 1)
-        if pg_diag_sum:
-            out.update({k: pg_diag_sum[k] / max(pg_diag_count.get(k, 1), 1) for k in pg_diag_sum})
         return out
 
     def _unwrap(self, model):
