@@ -209,6 +209,10 @@ class MDTSegTeacher:
         stats['loss_hatr'] = loss_total.detach()
         return loss_total, stats
 
+    def _masked_patch_mean(self, value, mask):
+        denom = mask.sum().clamp_min(1.0)
+        return (value * mask).sum() / denom, (mask.sum() > 0).float()
+
     def _compute_balanced_patch_risk(self, logits, mask, patch_size):
         pixel_loss = F.binary_cross_entropy_with_logits(logits.float(), mask.float(), reduction='none')
         fg_mass = F.adaptive_avg_pool2d(mask.float(), patch_size)
@@ -218,24 +222,37 @@ class MDTSegTeacher:
         bg_error = F.adaptive_avg_pool2d(pixel_loss * bg_mask, patch_size) / (bg_mass + 1e-6)
         has_fg = (fg_mass > 0).float()
         has_bg = (bg_mass > 0).float()
-        return (has_fg * fg_error + has_bg * bg_error) / (has_fg + has_bg).clamp_min(1.0)
+        return (has_fg * fg_error + has_bg * bg_error) / (has_fg + has_bg).clamp_min(1.0), fg_mass, bg_mass
 
     def _compute_pgmr_loss(self, outputs, mask):
         ct_logits = outputs['gvtc_ct_logits']
         full_logits = outputs['gvtc_full_logits']
         comp_logits = outputs['gvtc_comp_logits']
         patch_resolution = outputs['gvtc_delta_d4'].shape[-2:]
-        risk_ct = self._compute_balanced_patch_risk(ct_logits, mask, patch_resolution)
-        risk_full = self._compute_balanced_patch_risk(full_logits, mask, patch_resolution)
-        risk_comp = self._compute_balanced_patch_risk(comp_logits, mask, patch_resolution)
+        risk_ct, fg_mass, bg_mass = self._compute_balanced_patch_risk(ct_logits, mask, patch_resolution)
+        risk_full, _, _ = self._compute_balanced_patch_risk(full_logits, mask, patch_resolution)
+        risk_comp, _, _ = self._compute_balanced_patch_risk(comp_logits, mask, patch_resolution)
         risk_best = torch.minimum(risk_ct.detach(), risk_full.detach())
-        loss_pgmr = F.relu(risk_comp - risk_best).mean()
+        violation = F.relu(risk_comp - risk_best)
+        fg_patch = (F.adaptive_max_pool2d(mask.float(), patch_resolution) > 0).float()
+        bg_patch = 1.0 - fg_patch
+        loss_pgmr_fg, valid_fg = self._masked_patch_mean(violation, fg_patch)
+        loss_pgmr_bg, valid_bg = self._masked_patch_mean(violation, bg_patch)
+        loss_pgmr = (valid_fg * loss_pgmr_fg + valid_bg * loss_pgmr_bg) / (valid_fg + valid_bg).clamp_min(1.0)
         diagnostics = {
-            'pgmr_positive_pet_gain_ratio': (risk_full < risk_ct).float().mean(),
-            'pgmr_ct_dominant_ratio': (risk_ct <= risk_full).float().mean(),
-            'pgmr_violation_ratio': (risk_comp > risk_best).float().mean(),
-            'pgmr_comp_better_than_ct_ratio': (risk_comp < risk_ct).float().mean(),
-            'pgmr_comp_better_than_full_ratio': (risk_comp < risk_full).float().mean(),
+            'loss_pgmr_fg': loss_pgmr_fg.detach(),
+            'loss_pgmr_bg': loss_pgmr_bg.detach(),
+            'pgmr_positive_pet_gain_ratio': (risk_full < risk_ct).float().mean().detach(),
+            'pgmr_positive_pet_gain_fg_ratio': ((risk_full < risk_ct) * fg_patch).sum().div(fg_patch.sum().clamp_min(1.0)).detach(),
+            'pgmr_positive_pet_gain_bg_ratio': ((risk_full < risk_ct) * bg_patch).sum().div(bg_patch.sum().clamp_min(1.0)).detach(),
+            'pgmr_ct_dominant_ratio': (risk_ct <= risk_full).float().mean().detach(),
+            'pgmr_violation_ratio': (risk_comp > risk_best).float().mean().detach(),
+            'pgmr_violation_fg_ratio': ((risk_comp > risk_best) * fg_patch).sum().div(fg_patch.sum().clamp_min(1.0)).detach(),
+            'pgmr_violation_bg_ratio': ((risk_comp > risk_best) * bg_patch).sum().div(bg_patch.sum().clamp_min(1.0)).detach(),
+            'pgmr_comp_better_than_ct_ratio': (risk_comp < risk_ct).float().mean().detach(),
+            'pgmr_comp_better_than_ct_fg_ratio': ((risk_comp < risk_ct) * fg_patch).sum().div(fg_patch.sum().clamp_min(1.0)).detach(),
+            'pgmr_comp_better_than_ct_bg_ratio': ((risk_comp < risk_ct) * bg_patch).sum().div(bg_patch.sum().clamp_min(1.0)).detach(),
+            'pgmr_comp_better_than_full_ratio': (risk_comp < risk_full).float().mean().detach(),
             'risk_ct': risk_ct.mean().detach(),
             'risk_full': risk_full.mean().detach(),
             'risk_comp': risk_comp.mean().detach(),
@@ -243,7 +260,10 @@ class MDTSegTeacher:
         return loss_pgmr, diagnostics
 
     def _compute_ptgc_joint_loss(self, outputs, mask):
-        mode = str(getattr(self.config, 'ptgc_ablation_mode', outputs.get('gvtc_ablation_mode', 'gvtc_pgmr')))
+        mode = str(outputs.get('gvtc_ablation_mode', 'gvtc_pgmr'))
+        config_mode = str(getattr(self.config, 'ptgc_ablation_mode', mode))
+        if mode != config_mode:
+            raise RuntimeError(f'Model mode {mode!r} does not match config mode {config_mode!r}')
         ct_logits = outputs['gvtc_ct_logits']
         full_logits = outputs['gvtc_full_logits']
         comp_logits = outputs.get('gvtc_comp_logits', ct_logits)
