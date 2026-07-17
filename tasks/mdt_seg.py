@@ -278,9 +278,9 @@ class MDTSegTeacher:
             'loss_seg_joint': loss_seg_joint.detach(),
         }
         if mode == 'baseline':
-            return loss_seg_joint, {**stats, 'loss_pgmr': loss_ct.new_tensor(0.0).detach(), 'weighted_loss_pgmr': loss_ct.new_tensor(0.0).detach()}
+            return loss_seg_joint, {**stats, 'loss_pgmr': loss_ct.new_tensor(0.0).detach(), 'weighted_loss_pgmr': loss_ct.new_tensor(0.0).detach(), 'loss_pgmr_fg': loss_ct.new_tensor(0.0).detach(), 'loss_pgmr_bg': loss_ct.new_tensor(0.0).detach()}
         if mode == 'gvtc':
-            return loss_seg_joint, {**stats, 'loss_pgmr': loss_ct.new_tensor(0.0).detach(), 'weighted_loss_pgmr': loss_ct.new_tensor(0.0).detach()}
+            return loss_seg_joint, {**stats, 'loss_pgmr': loss_ct.new_tensor(0.0).detach(), 'weighted_loss_pgmr': loss_ct.new_tensor(0.0).detach(), 'loss_pgmr_fg': loss_ct.new_tensor(0.0).detach(), 'loss_pgmr_bg': loss_ct.new_tensor(0.0).detach()}
         if mode == 'gvtc_pgmr':
             loss_pgmr, pgmr_stats = self._compute_pgmr_loss(outputs, mask)
             weighted_loss_pgmr = float(getattr(self.config, 'pgmr_weight', 0.1)) * loss_pgmr

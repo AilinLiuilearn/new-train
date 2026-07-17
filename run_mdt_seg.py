@@ -387,8 +387,23 @@ def main():
     log_path = os.path.join(config.checkpoint_dir, 'train_log.csv')
     gamma_headers = _adc_gamma_headers(config)
     ds_headers = _deep_supervision_log_headers(config)
-    pg_headers = _pg_mtr_log_headers(task._unwrap(task.networks['model']), 'val_full') + _pg_mtr_log_headers(task._unwrap(task.networks['model']), 'val_missing') + ['val_full_dice', 'val_missing_dice', 'val_joint_dice', 'selected_score', 'best_selected_score', 'best_selected_epoch']
-    init_train_log(log_path, extra_headers=gamma_headers + ds_headers + pg_headers)
+    model_for_logs = _unwrap_model(task.networks['model'])
+    gvtc_train_headers = [
+        'loss_gvtc_ct', 'loss_gvtc_full', 'loss_gvtc_comp', 'loss_seg_joint', 'loss_pgmr', 'weighted_loss_pgmr',
+        'loss_pgmr_fg', 'loss_pgmr_bg',
+        'pgmr_positive_pet_gain_ratio', 'pgmr_ct_dominant_ratio', 'pgmr_violation_ratio',
+        'pgmr_comp_better_than_ct_ratio', 'pgmr_comp_better_than_full_ratio',
+        'pgmr_positive_pet_gain_fg_ratio', 'pgmr_positive_pet_gain_bg_ratio',
+        'pgmr_violation_fg_ratio', 'pgmr_violation_bg_ratio',
+        'pgmr_comp_better_than_ct_fg_ratio', 'pgmr_comp_better_than_ct_bg_ratio',
+        'diag_gvtc_null_weight_mean', 'diag_gvtc_null_selection_ratio', 'diag_gvtc_active_operator_count',
+        'diag_gvtc_operator_1_usage', 'diag_gvtc_operator_2_usage', 'diag_gvtc_operator_3_usage', 'diag_gvtc_operator_4_usage',
+        'diag_gvtc_operator_5_usage', 'diag_gvtc_operator_6_usage', 'diag_gvtc_operator_7_usage', 'diag_gvtc_operator_8_usage',
+        'diag_gvtc_delta_rms', 'diag_gvtc_routing_max_weight', 'diag_gvtc_routing_zero_ratio', 'diag_gvtc_non_null_weight_mean',
+        'diag_gvtc_route_h', 'diag_gvtc_route_w'
+    ]
+    pg_headers = _pg_mtr_log_headers(model_for_logs, 'val_full') + _pg_mtr_log_headers(model_for_logs, 'val_missing') + ['val_full_dice', 'val_missing_dice', 'val_joint_dice', 'selected_score', 'best_selected_score', 'best_selected_epoch']
+    init_train_log(log_path, extra_headers=gamma_headers + ds_headers + gvtc_train_headers + pg_headers)
 
     grad_clip = getattr(config, 'grad_clip', 5.0)
     clip_params = task.trainable_parameters()
@@ -408,6 +423,19 @@ def main():
         tloss, tseg, tboundary, tn = 0.0, 0.0, 0.0, 0
         ds_metric_sum = {k: 0.0 for k in _deep_supervision_log_headers(config)}
         ds_metric_steps = 0
+        gvtc_metric_sum = {k: 0.0 for k in [
+            'loss_gvtc_ct', 'loss_gvtc_full', 'loss_gvtc_comp', 'loss_seg_joint', 'loss_pgmr', 'weighted_loss_pgmr',
+            'loss_pgmr_fg', 'loss_pgmr_bg', 'pgmr_positive_pet_gain_ratio', 'pgmr_ct_dominant_ratio', 'pgmr_violation_ratio',
+            'pgmr_comp_better_than_ct_ratio', 'pgmr_comp_better_than_full_ratio', 'pgmr_positive_pet_gain_fg_ratio',
+            'pgmr_positive_pet_gain_bg_ratio', 'pgmr_violation_fg_ratio', 'pgmr_violation_bg_ratio',
+            'pgmr_comp_better_than_ct_fg_ratio', 'pgmr_comp_better_than_ct_bg_ratio',
+            'diag_gvtc_null_weight_mean', 'diag_gvtc_null_selection_ratio', 'diag_gvtc_active_operator_count',
+            'diag_gvtc_operator_1_usage', 'diag_gvtc_operator_2_usage', 'diag_gvtc_operator_3_usage', 'diag_gvtc_operator_4_usage',
+            'diag_gvtc_operator_5_usage', 'diag_gvtc_operator_6_usage', 'diag_gvtc_operator_7_usage', 'diag_gvtc_operator_8_usage',
+            'diag_gvtc_delta_rms', 'diag_gvtc_routing_max_weight', 'diag_gvtc_routing_zero_ratio', 'diag_gvtc_non_null_weight_mean',
+            'diag_gvtc_route_h', 'diag_gvtc_route_w'
+        ]}
+        gvtc_metric_steps = 0
         grad_norm_sum, grad_norm_steps, grad_clip_count = 0.0, 0, 0
         first_bad_module_counter = {k: 0 for k in ('enc_ct', 'enc_pet', 'pet_proj', 'decoder', 'boundary_head')}
         train_pet_drop_prob = float(getattr(config, 'train_pet_drop_prob', 0.0))
@@ -516,6 +544,12 @@ def main():
                     if key in batch_ds:
                         ds_metric_sum[key] += batch_ds[key]
                 ds_metric_steps += 1
+            batch_gvtc = {k: v for k, v in loss_dict.items() if k in gvtc_metric_sum}
+            for key in gvtc_metric_sum:
+                if key in batch_gvtc and torch.is_tensor(batch_gvtc[key]):
+                    gvtc_metric_sum[key] += float(batch_gvtc[key].detach().float().cpu())
+            if batch_gvtc:
+                gvtc_metric_steps += 1
             if (i + 1) % 50 == 0:
                 curr_lr = task.optimizer.param_groups[0]['lr']
                 print(
@@ -524,6 +558,12 @@ def main():
                     f'seg={step_seg:.4f} '
                     f'boundary={step_boundary:.4f} '
                     f'total={float(loss_dict.get("loss_total", loss.detach()).item()):.4f} '
+                    f'loss_gvtc_full={float(loss_dict.get("loss_gvtc_full", torch.tensor(0.0)).item() if torch.is_tensor(loss_dict.get("loss_gvtc_full", None)) else loss_dict.get("loss_gvtc_full", 0.0)):.4f} '
+                    f'loss_gvtc_comp={float(loss_dict.get("loss_gvtc_comp", torch.tensor(0.0)).item() if torch.is_tensor(loss_dict.get("loss_gvtc_comp", None)) else loss_dict.get("loss_gvtc_comp", 0.0)):.4f} '
+                    f'loss_pgmr={float(loss_dict.get("loss_pgmr", torch.tensor(0.0)).item() if torch.is_tensor(loss_dict.get("loss_pgmr", None)) else loss_dict.get("loss_pgmr", 0.0)):.4f} '
+                    f'gvtc_null_selection_ratio={float(loss_dict.get("diag_gvtc_null_selection_ratio", torch.tensor(0.0)).item() if torch.is_tensor(loss_dict.get("diag_gvtc_null_selection_ratio", None)) else loss_dict.get("diag_gvtc_null_selection_ratio", 0.0)):.4f} '
+                    f'gvtc_active_operator_count={float(loss_dict.get("diag_gvtc_active_operator_count", torch.tensor(0.0)).item() if torch.is_tensor(loss_dict.get("diag_gvtc_active_operator_count", None)) else loss_dict.get("diag_gvtc_active_operator_count", 0.0)):.4f} '
+                    f'gvtc_delta_rms={float(loss_dict.get("diag_gvtc_delta_rms", torch.tensor(0.0)).item() if torch.is_tensor(loss_dict.get("diag_gvtc_delta_rms", None)) else loss_dict.get("diag_gvtc_delta_rms", 0.0)):.4f} '
                     f'lr={curr_lr:.6f}'
                 )
 
@@ -573,6 +613,9 @@ def main():
         ds_metrics = {}
         if ds_metric_sum and ds_metric_steps > 0:
             ds_metrics = {k: v / ds_metric_steps for k, v in ds_metric_sum.items()}
+        gvtc_metrics = {}
+        if gvtc_metric_sum and gvtc_metric_steps > 0:
+            gvtc_metrics = {k: v / gvtc_metric_steps for k, v in gvtc_metric_sum.items()}
         append_epoch_log(
             log_path,
             epoch,
@@ -583,6 +626,7 @@ def main():
             extra_metrics={
                 **gamma_metrics,
                 **ds_metrics,
+                **gvtc_metrics,
                 **pg_full_metrics,
                 **pg_missing_metrics,
                 'val_full_dice': float(val_full['dice']),

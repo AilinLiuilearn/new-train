@@ -92,6 +92,8 @@ class DualDecoderPTGC(nn.Module):
         return {'logits': _sanitize(comp_logits)}, [d1, d2, d3, d4_comp]
 
     def _forward_train_joint(self, ct, pet, target_size):
+        if pet is None:
+            raise ValueError('Training requires PET input for joint full-modality supervision.')
         ct_feats = self._encode_ct(ct)
         pet_feats = self._encode_pet(pet)
         ct_out, ct_states = self._decode_with_states(self.missing_decoder, ct_feats, target_size)
@@ -119,6 +121,39 @@ class DualDecoderPTGC(nn.Module):
         full_out, _ = self._decode_with_states(self.full_decoder, full_feats, target_size)
         return {'logits': full_out['logits']}
 
+    def _forward_auto_eval(self, ct, pet, pet_available, target_size):
+        ct_feats = self._encode_ct(ct)
+        pet_available = pet_available.view(-1).long()
+        full_idx = torch.nonzero(pet_available == 1, as_tuple=False).squeeze(1)
+        missing_idx = torch.nonzero(pet_available == 0, as_tuple=False).squeeze(1)
+        outputs = ct.new_zeros((ct.shape[0], 1, target_size[0], target_size[1]))
+        if full_idx.numel() > 0:
+            if pet is None:
+                raise ValueError('Full evaluation requires PET input.')
+            pet_feats = self._encode_pet(pet[full_idx])
+            full_feats = [c[full_idx] + p for c, p in zip(ct_feats, pet_feats)]
+            full_out, _ = self._decode_with_states(self.full_decoder, full_feats, target_size)
+            outputs[full_idx] = full_out['logits']
+        if missing_idx.numel() > 0:
+            ct_sub = [c[missing_idx] for c in ct_feats]
+            ct_out, ct_states = self._decode_with_states(self.missing_decoder, ct_sub, target_size)
+            if self.ptgc_ablation_mode == 'baseline':
+                outputs[missing_idx] = ct_out['logits']
+            else:
+                gvtc_out = self.gvtc(ct_states[-1], ct_out['logits'])
+                comp_out, _ = self._decode_missing_with_delta(ct_sub, ct_states[-1], gvtc_out['delta_d4'], target_size)
+                outputs[missing_idx] = comp_out['logits']
+        return {'logits': outputs}
+
+    def _forward_missing(self, ct, target_size):
+        ct_feats = self._encode_ct(ct)
+        ct_out, ct_states = self._decode_with_states(self.missing_decoder, ct_feats, target_size)
+        if self.ptgc_ablation_mode == 'baseline':
+            return {'logits': ct_out['logits'], 'gvtc_ct_logits': ct_out['logits'], 'gvtc_ablation_mode': 'baseline'}
+        gvtc_out = self.gvtc(ct_states[-1], ct_out['logits'])
+        comp_out, _ = self._decode_missing_with_delta(ct_feats, ct_states[-1], gvtc_out['delta_d4'], target_size)
+        return {'logits': comp_out['logits'], 'gvtc_ct_logits': ct_out['logits'], 'gvtc_comp_logits': comp_out['logits'], 'gvtc_delta_d4': gvtc_out['delta_d4'], 'gvtc_routing_weights': gvtc_out['routing_weights'], 'gvtc_ablation_mode': self.ptgc_ablation_mode, 'diagnostics': gvtc_out['diagnostics']}
+
     def _forward_missing(self, ct, target_size):
         ct_feats = self._encode_ct(ct)
         ct_out, ct_states = self._decode_with_states(self.missing_decoder, ct_feats, target_size)
@@ -143,11 +178,19 @@ class DualDecoderPTGC(nn.Module):
             if pet_available is None:
                 pet_available = torch.ones(ct.shape[0], device=ct.device, dtype=torch.long) if pet is not None else torch.zeros(ct.shape[0], device=ct.device, dtype=torch.long)
             pet_available = pet_available.view(-1).long()
+            if self.training:
+                if not (torch.all(pet_available == 1) or torch.all(pet_available == 0)):
+                    raise RuntimeError('Training does not support mixed pet_available batches.')
+                if torch.all(pet_available == 1):
+                    if pet is None:
+                        raise ValueError('Full evaluation requires PET input.')
+                    return self._forward_train_joint(ct, pet, target_size)
+                return self._forward_missing(ct, target_size)
             if torch.all(pet_available == 1):
                 if pet is None:
                     raise ValueError('Full evaluation requires PET input.')
-                return self._forward_full_eval(ct, pet, target_size) if not self.training else self._forward_train_joint(ct, pet, target_size)
+                return self._forward_full_eval(ct, pet, target_size)
             if torch.all(pet_available == 0):
                 return self._forward_missing(ct, target_size)
-            raise ValueError('PTGC currently supports homogeneous full or missing evaluation batches only.')
+            return self._forward_auto_eval(ct, pet, pet_available, target_size)
         raise ValueError(f'Unsupported forward_mode={forward_mode!r}')

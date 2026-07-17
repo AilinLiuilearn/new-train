@@ -531,18 +531,16 @@ def build_mdt_seg_teacher(config):
         from models.dual_decoder_ptgc import DualDecoderPTGC
         model = DualDecoderPTGC(
             **common_kwargs,
-            ptgc_ablation_mode=getattr(config, 'ptgc_ablation_mode', 'ptgc_gpnd'),
-            ptgc_alpha=getattr(config, 'ptgc_alpha', 0.25),
-            ptgc_loss_weight=getattr(config, 'ptgc_loss_weight', 0.2),
-            gpnd_rank_weight=getattr(config, 'gpnd_rank_weight', 1.0),
-            gpnd_support_weight=getattr(config, 'gpnd_support_weight', 0.05),
-            ptgc_delta_active_threshold=getattr(config, 'ptgc_delta_active_threshold', 1e-4),
+            ptgc_ablation_mode=getattr(config, 'ptgc_ablation_mode', 'gvtc_pgmr'),
         )
         print(
-            f'[dual_decoder_ptgc] model_arch={model_arch} mode={getattr(config, "ptgc_ablation_mode", "ptgc_gpnd")} '
-            f'ct_backbone={getattr(config, "ct_backbone", "convnextv2_nano")} pet_backbone={getattr(config, "pet_backbone", "mit_b1")} '
-            f'fusion=stage-wise-add decoder_shared=False joint_training=True '
-            f'ptgc_alpha={getattr(config, "ptgc_alpha", 0.25)} ptgc_loss_weight={getattr(config, "ptgc_loss_weight", 0.2)}'
+            f'[dual_decoder_ptgc] method=GVTC mode={getattr(config, "ptgc_ablation_mode", "gvtc_pgmr")} '
+            f'ct_backbone={getattr(config, "ct_backbone", "convnextv2_nano")} '
+            f'pet_backbone={getattr(config, "pet_backbone", "mit_b1")} '
+            f'fusion=stage-wise-add decoder_shared=False '
+            f'task_state=CT_S4_plus_prediction routing=region_local_cosine_sparsemax '
+            f'virtual_nodes=1_null_plus_8_operators operator=low_rank_16 insertion=S4 '
+            f'training=joint_from_scratch pgmr_weight={getattr(config, "pgmr_weight", 0.1)}'
         )
         return dict(model=model)
     raise ValueError(
