@@ -114,6 +114,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--random_state', type=int, default=2023)
+    parser.add_argument('--gpus', type=int, nargs='+', default=[0])
     parser.add_argument('--norm_mode', type=str, default='cipa', choices=('imagenet', 'cipa'))
     parser.add_argument('--train_list', type=str, default='train_original.txt')
     parser.add_argument('--val_list', type=str, default='test.txt')
