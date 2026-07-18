@@ -137,6 +137,8 @@ def _collect_adc_gamma(task):
 def _resolve_train_route(model_arch, global_batch_step):
     if str(model_arch) == 'dual_decoder_paired_add_baseline':
         return 'full'
+    if str(model_arch) == 'dual_decoder_paired_add_bcort':
+        return 'full'
     if str(model_arch) == 'dual_decoder_ptgc':
         return 'full'
     return 'full' if global_batch_step % 2 == 0 else 'missing'

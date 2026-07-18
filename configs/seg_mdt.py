@@ -36,12 +36,13 @@ class SegMDTConfig(ConfigBase):
             "--model_arch",
             type=str,
             default="dual_decoder_paired_add_baseline",
-            choices=("dual_shared_add_baseline", "dual_decoder_add_baseline", "dual_decoder_pg_mtr_retrieval", "dual_decoder_multiscale_task_increment_bank", "dual_decoder_hatr_task_residual", "dual_decoder_paired_add_baseline"),
+            choices=("dual_shared_add_baseline", "dual_decoder_add_baseline", "dual_decoder_pg_mtr_retrieval", "dual_decoder_multiscale_task_increment_bank", "dual_decoder_hatr_task_residual", "dual_decoder_paired_add_baseline", "dual_decoder_paired_add_bcort"),
             help=(
                 "dual_shared_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, shared UNet decoder. "
                 "dual_decoder_add_baseline: dual encoder (ConvNeXt-Nano + MiT-B1), stage-wise sum fusion, independent full/missing UNet decoders. "
                 "dual_decoder_pg_mtr_retrieval: dual encoder with retrieval-only PG-MTR and zero-init 1x1 missing fusion. "
-                "dual_decoder_multiscale_task_increment_bank: dual encoder with zero-init task refinement and shared multi-scale task-increment bank."
+                "dual_decoder_multiscale_task_increment_bank: dual encoder with zero-init task refinement and shared multi-scale task-increment bank. "
+                "dual_decoder_paired_add_bcort: paired joint baseline with shared BCORT transport for full/missing routes."
             ),
         )
 

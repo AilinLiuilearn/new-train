@@ -542,9 +542,25 @@ def build_mdt_seg_teacher(config):
             'extra_loss=None'
         )
         return dict(model=model)
+    if model_arch == 'dual_decoder_paired_add_bcort':
+        from models.dual_decoder_paired_add_bcort import DualDecoderPairedAddBCORT
+        model = DualDecoderPairedAddBCORT(**common_kwargs)
+        print(
+            '[dual_decoder_paired_add_bcort] '
+            f'ct_backbone={getattr(config, "ct_backbone", "convnextv2_nano")} '
+            f'pet_backbone={getattr(config, "pet_backbone", "mit_b1")} '
+            'fusion=stage-wise-add '
+            'decoder_shared=False '
+            'training=paired_joint '
+            'bcort_stages=S1-S4 '
+            'bcort_shared_across_routes=True '
+            f'deep_supervision={_resolve_use_deep_supervision(config)} '
+            'extra_loss=None'
+        )
+        return dict(model=model)
     raise ValueError(
         f'Unsupported model_arch={model_arch}. '
-        'Supported: dual_shared_add_baseline, dual_decoder_add_baseline, dual_decoder_pg_mtr_retrieval, dual_decoder_multiscale_task_increment_bank, dual_decoder_hatr_task_residual, dual_decoder_paired_add_baseline.'
+        'Supported: dual_shared_add_baseline, dual_decoder_add_baseline, dual_decoder_pg_mtr_retrieval, dual_decoder_multiscale_task_increment_bank, dual_decoder_hatr_task_residual, dual_decoder_paired_add_baseline, dual_decoder_paired_add_bcort.'
     )
 
 def _resolve_use_deep_supervision(config):
