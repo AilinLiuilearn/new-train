@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -25,15 +25,12 @@ class _ChannelMapper(nn.Module):
 
 
 class BCORT(nn.Module):
-    """Bidirectional Cross-scale Orthogonal Residual Transport."""
-
     def __init__(self, stage_channels: Sequence[int], eps: float = 1e-6) -> None:
         super().__init__()
         if len(stage_channels) != 4:
             raise ValueError(f"BCORT expects 4 stages, got {len(stage_channels)}")
         self.stage_channels = tuple(int(c) for c in stage_channels)
         self.eps = float(eps)
-
         self.td_align = nn.ModuleList([
             _ChannelMapper(self.stage_channels[3], self.stage_channels[2], mode="bilinear"),
             _ChannelMapper(self.stage_channels[2], self.stage_channels[1], mode="bilinear"),
@@ -44,104 +41,80 @@ class BCORT(nn.Module):
             _ChannelMapper(self.stage_channels[1], self.stage_channels[2], mode="area"),
             _ChannelMapper(self.stage_channels[2], self.stage_channels[3], mode="area"),
         ])
-        self.gamma = nn.ParameterList([
-            nn.Parameter(torch.zeros(1, c, 1, 1)) for c in self.stage_channels
-        ])
+        self.gamma = nn.ParameterList([nn.Parameter(torch.zeros(1, c, 1, 1)) for c in self.stage_channels])
 
     def _check_inputs(self, feats: Sequence[torch.Tensor]) -> None:
         if len(feats) != 4:
             raise ValueError(f"BCORT expects 4 input tensors, got {len(feats)}")
         for i, (feat, ch) in enumerate(zip(feats, self.stage_channels), start=1):
-            if not torch.is_tensor(feat):
-                raise TypeError(f"Stage S{i} is not a tensor")
-            if feat.ndim != 4:
-                raise ValueError(f"Stage S{i} must be NCHW, got shape {tuple(feat.shape)}")
-            if feat.shape[1] != ch:
-                raise ValueError(f"Stage S{i} channel mismatch: expected {ch}, got {feat.shape[1]}")
+            if feat.ndim != 4 or feat.shape[1] != ch:
+                raise ValueError(f"Stage S{i} mismatch: expected NCHW with C={ch}, got {tuple(feat.shape)}")
 
     @staticmethod
     def _rms(x: torch.Tensor) -> torch.Tensor:
         return torch.sqrt(torch.mean(x.float() ** 2) + 1e-12)
 
     def _orth_residual(self, candidate: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-        numerator = torch.sum(candidate * ref, dim=1, keepdim=True)
-        denominator = torch.sum(ref * ref, dim=1, keepdim=True) + self.eps
-        parallel = numerator / denominator * ref
-        return candidate - parallel
+        candidate_fp32 = candidate.float()
+        ref_fp32 = ref.float()
+        numerator = (candidate_fp32 * ref_fp32).sum(dim=1, keepdim=True)
+        denominator = ref_fp32.square().sum(dim=1, keepdim=True) + self.eps
+        parallel = numerator / denominator * ref_fp32
+        return (candidate_fp32 - parallel).to(candidate.dtype)
 
-    def _match_rms(self, residual: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-        r_rms = self._rms(residual)
-        ref_rms = self._rms(ref)
-        scale = ref_rms / (r_rms + self.eps)
-        return residual * scale
-
-    def _diag_item(self, gamma: torch.Tensor, td: torch.Tensor, bu: torch.Tensor, transport: torch.Tensor, injection: torch.Tensor, ref: torch.Tensor) -> Dict[str, torch.Tensor]:
-        return {
-            "gamma_abs_mean": gamma.abs().mean(),
-            "td_rms": self._rms(td),
-            "bu_rms": self._rms(bu),
-            "transport_rms": self._rms(transport),
-            "injection_rms": self._rms(injection),
-            "injection_feature_ratio": self._rms(injection) / (self._rms(ref) + self.eps),
-        }
+    def _cap_local_energy(self, residual: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        residual_fp32 = residual.float()
+        ref_fp32 = ref.float()
+        residual_rms = torch.sqrt(residual_fp32.square().mean(dim=1, keepdim=True) + self.eps)
+        ref_rms = torch.sqrt(ref_fp32.square().mean(dim=1, keepdim=True) + self.eps)
+        scale = ref_rms / torch.maximum(residual_rms, ref_rms)
+        return (residual_fp32 * scale).to(residual.dtype)
 
     def forward(self, feats: Sequence[torch.Tensor], return_diagnostics: bool = False):
         self._check_inputs(feats)
         s1, s2, s3, s4 = feats
 
-        td3_cand = self.td_align[0](s4, s3.shape[-2:])
-        td3 = self._match_rms(self._orth_residual(td3_cand, s3), s3)
-        td2_cand = self.td_align[1](td3, s2.shape[-2:])
-        td2 = self._match_rms(self._orth_residual(td2_cand, s2), s2)
-        td1_cand = self.td_align[2](td2, s1.shape[-2:])
-        td1 = self._match_rms(self._orth_residual(td1_cand, s1), s1)
+        top_down = [torch.zeros_like(x) for x in feats]
+        semantic_carrier = s4
+        for stage_index, mapper_index in ((2, 0), (1, 1), (0, 2)):
+            candidate = self.td_align[mapper_index](semantic_carrier, feats[stage_index].shape[-2:])
+            complement = self._cap_local_energy(self._orth_residual(candidate, feats[stage_index]), feats[stage_index])
+            top_down[stage_index] = complement
+            semantic_carrier = feats[stage_index] + complement
 
-        bu2_cand = self.bu_align[0](s1, s2.shape[-2:])
-        bu2 = self._match_rms(self._orth_residual(s2 - bu2_cand, s2), s2)
-        bu3_cand = self.bu_align[1](bu2, s3.shape[-2:])
-        bu3 = self._match_rms(self._orth_residual(s3 - bu3_cand, s3), s3)
-        bu4_cand = self.bu_align[2](bu3, s4.shape[-2:])
-        bu4 = self._match_rms(self._orth_residual(s4 - bu4_cand, s4), s4)
+        bottom_up = [torch.zeros_like(x) for x in feats]
+        coarse_s1 = self.td_align[2](s2, s1.shape[-2:])
+        detail_carrier = s1 - coarse_s1
+        for stage_index, mapper_index in ((1, 0), (2, 1), (3, 2)):
+            candidate = self.bu_align[mapper_index](detail_carrier, feats[stage_index].shape[-2:])
+            complement = self._cap_local_energy(self._orth_residual(candidate, feats[stage_index]), feats[stage_index])
+            bottom_up[stage_index] = complement
+            if stage_index < 3:
+                deeper_mapper_index = 2 - stage_index
+                coarse_current = self.td_align[deeper_mapper_index](feats[stage_index + 1], feats[stage_index].shape[-2:])
+                intrinsic_detail = feats[stage_index] - coarse_current
+                detail_carrier = intrinsic_detail + complement
 
-        transport1 = td1
-        transport2 = 0.5 * (td2 + bu2)
-        transport3 = 0.5 * (td3 + bu3)
-        transport4 = bu4
-        injections = [self.gamma[i] * t for i, t in enumerate([transport1, transport2, transport3, transport4])]
-
-        outs = [s1 + injections[0], s2 + injections[1], s3 + injections[2], s4 + injections[3]]
-
+        transport = [
+            top_down[0],
+            0.5 * (top_down[1] + bottom_up[1]),
+            0.5 * (top_down[2] + bottom_up[2]),
+            bottom_up[3],
+        ]
+        injections = [self.gamma[i] * transport[i] for i in range(4)]
+        outs = [feats[i] + injections[i] for i in range(4)]
         for i, out in enumerate(outs, start=1):
             if not torch.isfinite(out).all():
                 raise RuntimeError(f"BCORT output stage S{i} contains non-finite values")
 
-        diagnostics = {
-            "s1_gamma_abs_mean": self.gamma[0].abs().mean(),
-            "s1_td_rms": self._rms(td1),
-            "s1_bu_rms": self._rms(torch.zeros_like(s1)),
-            "s1_transport_rms": self._rms(transport1),
-            "s1_injection_rms": self._rms(injections[0]),
-            "s1_injection_feature_ratio": self._rms(injections[0]) / (self._rms(s1) + self.eps),
-            "s2_gamma_abs_mean": self.gamma[1].abs().mean(),
-            "s2_td_rms": self._rms(td2),
-            "s2_bu_rms": self._rms(bu2),
-            "s2_transport_rms": self._rms(transport2),
-            "s2_injection_rms": self._rms(injections[1]),
-            "s2_injection_feature_ratio": self._rms(injections[1]) / (self._rms(s2) + self.eps),
-            "s3_gamma_abs_mean": self.gamma[2].abs().mean(),
-            "s3_td_rms": self._rms(td3),
-            "s3_bu_rms": self._rms(bu3),
-            "s3_transport_rms": self._rms(transport3),
-            "s3_injection_rms": self._rms(injections[2]),
-            "s3_injection_feature_ratio": self._rms(injections[2]) / (self._rms(s3) + self.eps),
-            "s4_gamma_abs_mean": self.gamma[3].abs().mean(),
-            "s4_td_rms": self._rms(s4),
-            "s4_bu_rms": self._rms(bu4),
-            "s4_transport_rms": self._rms(transport4),
-            "s4_injection_rms": self._rms(injections[3]),
-            "s4_injection_feature_ratio": self._rms(injections[3]) / (self._rms(s4) + self.eps),
-        }
-
-        if return_diagnostics:
-            return outs, diagnostics
-        return outs
+        diagnostics = {}
+        for i in range(4):
+            diagnostics.update({
+                f"s{i+1}_gamma_abs_mean": self.gamma[i].abs().mean(),
+                f"s{i+1}_td_rms": self._rms(top_down[i]),
+                f"s{i+1}_bu_rms": self._rms(bottom_up[i]),
+                f"s{i+1}_transport_rms": self._rms(transport[i]),
+                f"s{i+1}_injection_rms": self._rms(injections[i]),
+                f"s{i+1}_injection_feature_ratio": self._rms(injections[i]) / (self._rms(feats[i]) + self.eps),
+            })
+        return (outs, diagnostics) if return_diagnostics else outs

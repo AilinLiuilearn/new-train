@@ -39,23 +39,43 @@ class DualDecoderPairedAddBCORT(DualDecoderPairedAddPETCTBaseline):
     def _prefix_diagnostics(diagnostics: Dict[str, torch.Tensor], prefix: str) -> Dict[str, torch.Tensor]:
         return {f"{prefix}_{k}": v for k, v in diagnostics.items()}
 
-    def _forward_full_only(self, ct: torch.Tensor, pet: torch.Tensor, target_size):
+    def _forward_pair(self, ct: torch.Tensor, pet: torch.Tensor, target_size):
+        if pet is None:
+            raise ValueError("Paired BCORT training requires PET input.")
+
         ct_feats = self._encode_ct(ct)
         pet_feats = self._encode_pet(pet)
-        fused_feats = [_sanitize(ct_feat + pet_feat) for ct_feat, pet_feat in zip(ct_feats, pet_feats)]
-        refined_feats, diagnostics = self.bcort(fused_feats, return_diagnostics=True)
-        refined_feats = [_sanitize(x) for x in refined_feats]
-        outputs = self._decode(self.full_decoder, refined_feats, target_size)
-        outputs["diagnostics"] = self._prefix_diagnostics(diagnostics, "full")
-        return outputs
 
-    def _forward_missing_only(self, ct: torch.Tensor, target_size):
-        ct_feats = self._encode_ct(ct)
-        refined_feats, diagnostics = self.bcort(ct_feats, return_diagnostics=True)
-        refined_feats = [_sanitize(x) for x in refined_feats]
-        outputs = self._decode(self.missing_decoder, refined_feats, target_size)
-        outputs["diagnostics"] = self._prefix_diagnostics(diagnostics, "missing")
-        return outputs
+        fused_feats = [_sanitize(c + p) for c, p in zip(ct_feats, pet_feats)]
+
+        full_feats, full_diag = self.bcort(
+            fused_feats,
+            return_diagnostics=True,
+        )
+        missing_feats, missing_diag = self.bcort(
+            ct_feats,
+            return_diagnostics=True,
+        )
+
+        full_feats = [_sanitize(x) for x in full_feats]
+        missing_feats = [_sanitize(x) for x in missing_feats]
+
+        full_outputs = self._decode(
+            self.full_decoder,
+            full_feats,
+            target_size,
+        )
+
+        missing_outputs = self._decode(
+            self.missing_decoder,
+            missing_feats,
+            target_size,
+        )
+
+        diagnostics = {}
+        diagnostics.update(self._prefix_diagnostics(full_diag, "full"))
+        diagnostics.update(self._prefix_diagnostics(missing_diag, "missing"))
+        return full_outputs, missing_outputs, diagnostics
 
     def forward(self, ct: torch.Tensor, pet: torch.Tensor | None, pet_available=None, target_size=None, forward_mode: str = "auto"):
         if target_size is None:
@@ -63,13 +83,7 @@ class DualDecoderPairedAddBCORT(DualDecoderPairedAddPETCTBaseline):
         forward_mode = str(forward_mode)
         if forward_mode == "full":
             if self.training:
-                if pet is None:
-                    raise ValueError('forward_mode="full" requires PET during training.')
-                full_outputs = self._forward_full_only(ct, pet, target_size)
-                missing_outputs = self._forward_missing_only(ct, target_size)
-                diagnostics = {}
-                diagnostics.update(full_outputs.get("diagnostics", {}))
-                diagnostics.update(missing_outputs.get("diagnostics", {}))
+                full_outputs, missing_outputs, diagnostics = self._forward_pair(ct, pet, target_size)
                 return {
                     "logits": missing_outputs["logits"],
                     "paired_joint": True,
@@ -79,7 +93,13 @@ class DualDecoderPairedAddBCORT(DualDecoderPairedAddPETCTBaseline):
                 }
             if pet is None:
                 raise ValueError('forward_mode="full" requires PET input.')
-            return self._forward_full_only(ct, pet, target_size)
+            full_outputs, _, _ = self._forward_pair(ct, pet, target_size)
+            return full_outputs
         if forward_mode == "missing":
-            return self._forward_missing_only(ct, target_size)
+            ct_feats = self._encode_ct(ct)
+            refined_feats, diagnostics = self.bcort(ct_feats, return_diagnostics=True)
+            refined_feats = [_sanitize(x) for x in refined_feats]
+            outputs = self._decode(self.missing_decoder, refined_feats, target_size)
+            outputs["diagnostics"] = self._prefix_diagnostics(diagnostics, "missing")
+            return outputs
         raise ValueError('forward_mode must be "full" or "missing" for paired BCORT.')
