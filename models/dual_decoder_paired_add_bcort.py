@@ -93,8 +93,14 @@ class DualDecoderPairedAddBCORT(DualDecoderPairedAddPETCTBaseline):
                 }
             if pet is None:
                 raise ValueError('forward_mode="full" requires PET input.')
-            full_outputs, _, _ = self._forward_pair(ct, pet, target_size)
-            return full_outputs
+            ct_feats = self._encode_ct(ct)
+            pet_feats = self._encode_pet(pet)
+            fused_feats = [_sanitize(c + p) for c, p in zip(ct_feats, pet_feats)]
+            refined_feats, diagnostics = self.bcort(fused_feats, return_diagnostics=True)
+            refined_feats = [_sanitize(x) for x in refined_feats]
+            outputs = self._decode(self.full_decoder, refined_feats, target_size)
+            outputs["diagnostics"] = self._prefix_diagnostics(diagnostics, "full")
+            return outputs
         if forward_mode == "missing":
             ct_feats = self._encode_ct(ct)
             refined_feats, diagnostics = self.bcort(ct_feats, return_diagnostics=True)
