@@ -75,15 +75,13 @@ class DualDecoderPairedAddPETCTBaseline(nn.Module):
         outputs['pred'] = outputs['logits']
         return outputs
 
-    def _forward_full_only(self, ct, pet, target_size):
+    def _forward_pair(self, ct, pet, target_size):
         ct_feats = self._encode_ct(ct)
         pet_feats = self._encode_pet(pet)
         fused = [_sanitize(c + p) for c, p in zip(ct_feats, pet_feats)]
-        return self._decode(self.full_decoder, fused, target_size)
-
-    def _forward_missing_only(self, ct, target_size):
-        ct_feats = self._encode_ct(ct)
-        return self._decode(self.missing_decoder, ct_feats, target_size)
+        full_logits = self._decode(self.full_decoder, fused, target_size)
+        missing_logits = self._decode(self.missing_decoder, ct_feats, target_size)
+        return full_logits, missing_logits
 
     def forward(self, ct, pet, pet_available=None, target_size=None, forward_mode='auto'):
         if target_size is None:
@@ -93,8 +91,7 @@ class DualDecoderPairedAddPETCTBaseline(nn.Module):
             if self.training:
                 if pet is None:
                     raise ValueError('forward_mode="full" requires pet input during training.')
-                full_logits = self._forward_full_only(ct, pet, target_size)
-                missing_logits = self._forward_missing_only(ct, target_size)
+                full_logits, missing_logits = self._forward_pair(ct, pet, target_size)
                 return {
                     'logits': missing_logits['logits'],
                     'paired_joint': True,
@@ -103,7 +100,8 @@ class DualDecoderPairedAddPETCTBaseline(nn.Module):
                 }
             if pet is None:
                 raise ValueError('forward_mode="full" requires pet input.')
-            return self._forward_full_only(ct, pet, target_size)
+            return self._decode(self.full_decoder, [_sanitize(c + p) for c, p in zip(self._encode_ct(ct), self._encode_pet(pet))], target_size)
         if forward_mode == 'missing':
-            return self._forward_missing_only(ct, target_size)
+            ct_feats = self._encode_ct(ct)
+            return self._decode(self.missing_decoder, ct_feats, target_size)
         raise ValueError('forward_mode must be full or missing for paired baseline')
