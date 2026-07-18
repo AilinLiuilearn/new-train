@@ -59,7 +59,13 @@ def save_segmentation_diagnostics(
         if hasattr(model, 'set_adc_mac_visuals'):
             model.set_adc_mac_visuals(True)
         try:
-            outputs = model(ct, pet, pet_available=pet_available, target_size=mask.shape[-2:])
+            if hasattr(model, 'forward'):
+                if eval_mode == 'fixed_missing':
+                    outputs = model(ct, None, target_size=mask.shape[-2:], forward_mode='missing')
+                else:
+                    outputs = model(ct, pet, target_size=mask.shape[-2:], forward_mode='full')
+            else:
+                outputs = model(ct, pet, target_size=mask.shape[-2:])
         except TypeError:
             outputs = model(ct, pet, target_size=mask.shape[-2:])
         if hasattr(model, 'set_adc_mac_visuals'):
