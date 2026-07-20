@@ -5,7 +5,6 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from utils.seg_losses import BCEDiceLoss
 from utils.metrics_seg import SegmentationMetricsCIPA
@@ -45,9 +44,15 @@ class MDTSegTeacher:
         pet = batch['pet'].to(self.device, non_blocking=True) if forward_mode == 'full' else None
         mask = batch['mask'].to(self.device, non_blocking=True).float()
         with self._amp_ctx():
-            logits = self.model(ct, pet=pet, forward_mode=forward_mode)
-            loss = self.criterion(logits, mask)
-        return loss, logits, logits, {'loss_total': loss.detach(), 'loss_seg': loss.detach(), 'loss_boundary': torch.tensor(0.0, device=loss.device)}
+            outputs = self.model(ct, pet=pet, forward_mode=forward_mode)
+            logits = outputs['logits'] if isinstance(outputs, dict) else outputs
+            loss, loss_stats = self.criterion(logits, mask)
+        stats = {
+            'loss_total': loss.detach(),
+            'loss_seg': loss_stats.get('loss_dice', loss.detach()),
+            'loss_boundary': torch.tensor(0.0, device=loss.device),
+        }
+        return loss, logits, outputs, stats
 
     @torch.no_grad()
     def evaluate(self, loader, eval_mode='full', tag='val'):
@@ -70,11 +75,10 @@ class MDTSegTeacher:
                 pet = batch['pet'].to(self.device, non_blocking=True)
                 forward_mode = 'auto'
                 pet_available = batch.get('pet_available')
-            logits = self.model(ct, pet=pet, pet_available=pet_available, forward_mode=forward_mode)
-            loss = self.criterion(logits, mask)
-            probs = torch.sigmoid(logits)
-            pred = (probs > 0.5).float()
-            self.metrics.update(pred, mask)
+            outputs = self.model(ct, pet=pet, pet_available=pet_available, forward_mode=forward_mode)
+            logits = outputs['logits'] if isinstance(outputs, dict) else outputs
+            loss, _ = self.criterion(logits, mask)
+            self.metrics.update(logits, mask)
             total.append(float(loss))
         out = self.metrics.compute()
         out['total_loss'] = float(np.mean(total)) if total else 0.0
@@ -100,10 +104,12 @@ class MDTSegTeacher:
             params_ct = list(self.model.enc_ct.parameters())
             params_align = list(self.model.ct_align.parameters())
             params_dec = list(self.model.decoder.parameters())
-            logits_full = self.model(ct, pet=pet, forward_mode='full')
-            loss_full = self.criterion(logits_full.float(), mask.float())
-            logits_missing = self.model(ct, pet=None, forward_mode='missing')
-            loss_missing = self.criterion(logits_missing.float(), mask.float())
+            outputs_full = self.model(ct, pet=pet, forward_mode='full')
+            outputs_missing = self.model(ct, pet=None, forward_mode='missing')
+            logits_full = outputs_full['logits'] if isinstance(outputs_full, dict) else outputs_full
+            logits_missing = outputs_missing['logits'] if isinstance(outputs_missing, dict) else outputs_missing
+            loss_full, _ = self.criterion(logits_full.float(), mask.float())
+            loss_missing, _ = self.criterion(logits_missing.float(), mask.float())
             g_full_shared = torch.autograd.grad(loss_full, params_shared, retain_graph=True, allow_unused=True)
             g_missing_shared = torch.autograd.grad(loss_missing, params_shared, retain_graph=True, allow_unused=True)
             g_full_ct = torch.autograd.grad(loss_full, params_ct, retain_graph=True, allow_unused=True)
@@ -112,11 +118,13 @@ class MDTSegTeacher:
             g_missing_align = torch.autograd.grad(loss_missing, params_align, retain_graph=True, allow_unused=True)
             g_full_dec = torch.autograd.grad(loss_full, params_dec, retain_graph=True, allow_unused=True)
             g_missing_dec = torch.autograd.grad(loss_missing, params_dec, retain_graph=True, allow_unused=True)
+
             def cos(a, b):
                 a = _flatten_grads(a)
                 b = _flatten_grads(b)
                 eps = 1e-8
                 return float(torch.dot(a, b) / (a.norm() * b.norm() + eps))
+
             full_vec = _flatten_grads(g_full_shared)
             missing_vec = _flatten_grads(g_missing_shared)
             stats = {
