@@ -32,6 +32,8 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--deep_supervision', type=str2bool, default=False)
         p.add_argument('--joint_full_weight', type=float, default=0.5)
         p.add_argument('--joint_missing_weight', type=float, default=0.5)
+        p.add_argument('--mtpi_filter_ratio', type=float, default=0.05)
+        p.add_argument('--mtpi_reference_weight', type=float, default=0.1)
         p.add_argument('--enable_gradient_diagnostics', type=str2bool, default=False)
         p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)

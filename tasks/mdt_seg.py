@@ -39,12 +39,15 @@ class MDTSegTeacher:
         ct = batch['ct'].to(self.device, non_blocking=True)
         pet = batch['pet'].to(self.device, non_blocking=True) if forward_mode == 'full' else None
         mask = batch['mask'].to(self.device, non_blocking=True).float()
-        outputs = self.model(ct, pet=pet, forward_mode=forward_mode)
+        outputs = self.model(ct, pet=pet, forward_mode=forward_mode, target=mask)
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-        loss, loss_stats = self.criterion(logits, mask)
+        seg_loss, loss_stats = self.criterion(logits, mask)
+        reference_loss = outputs.get('mtpi_reference_loss', seg_loss.new_zeros(())) if isinstance(outputs, dict) else seg_loss.new_zeros(())
+        loss = seg_loss if forward_mode == 'full' else seg_loss + float(getattr(self.config, 'mtpi_reference_weight', 0.1)) * reference_loss
         stats = {
             'loss_total': loss.detach(),
-            'loss_seg': loss_stats.get('loss_dice', loss.detach()),
+            'loss_seg': seg_loss.detach(),
+            'loss_mtpi_reference': reference_loss.detach(),
             'loss_boundary': torch.tensor(0.0, device=loss.device),
         }
         return loss, logits, outputs, stats

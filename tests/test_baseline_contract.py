@@ -3,7 +3,6 @@ import copy
 import torch
 
 from configs.seg_mdt import SegMDTConfig
-from datasets.pclt20k_seg import PCLT20KSegDataset
 from models.build_mdt_seg import build_mdt_seg_teacher
 from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
 from tasks.mdt_seg import MDTSegTeacher
@@ -34,9 +33,12 @@ def test_forward_full_missing_shapes():
     model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
     ct = torch.randn(2, 1, 64, 64)
     pet = torch.randn(2, 1, 64, 64)
-    out_full = model(ct, pet, forward_mode='full')
-    out_missing = model(ct, None, forward_mode='missing')
+    mask = torch.zeros(2, 1, 64, 64)
+    mask[:, :, 16:48, 16:48] = 1
+    out_full = model(ct, pet, forward_mode='full', target=mask)
+    out_missing = model(ct, None, forward_mode='missing', target=mask)
     assert out_full['logits'].shape == out_missing['logits'].shape
+    assert model.mtpi.reference_status()['fully_initialized'] is True
 
 
 def test_bce_dice_loss_unpack():
@@ -99,9 +101,16 @@ def test_missing_path_pet_encoder_not_called(monkeypatch):
 
     monkeypatch.setattr(model.enc_pet, 'forward', wrapped)
     ct = torch.randn(1, 1, 64, 64)
-    out = model(ct, None, forward_mode='missing')
+    pet = torch.randn(1, 1, 64, 64)
+    mask = torch.zeros(1, 1, 64, 64)
+    mask[:, :, 16:48, 16:48] = 1
+    model(ct, pet, forward_mode='full', target=mask)
+    before = calls['n']
+    out = model(ct, None, forward_mode='missing', target=mask)
     assert 'logits' in out
-    assert calls['n'] == 0
+    assert 'mtpi_reference_loss' in out
+    assert torch.isfinite(out['mtpi_reference_loss'])
+    assert calls['n'] == before
 
 
 def test_checkpoint_save_and_eval_config_contract(tmp_path):
@@ -117,3 +126,5 @@ def test_checkpoint_save_and_eval_config_contract(tmp_path):
     saved_config['pet_pretrained_path'] = None
     cfg = SegMDTConfig(args=saved_config)
     assert cfg.root == '/tmp/root'
+    assert any('mtpi' in k for k in ckpt['model'].keys())
+    assert any('reference_banks' in k for k in ckpt['model'].keys())
