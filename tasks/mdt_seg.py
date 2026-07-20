@@ -1,7 +1,6 @@
 import json
 import os
 import random
-from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -36,17 +35,13 @@ class MDTSegTeacher:
     def trainable_parameters(self):
         return [p for p in self.model.parameters() if p.requires_grad]
 
-    def _amp_ctx(self):
-        return torch.cuda.amp.autocast(enabled=bool(self.config.mixed_precision) and torch.cuda.is_available()) if torch.cuda.is_available() else nullcontext()
-
     def train_step(self, batch, forward_mode='full'):
         ct = batch['ct'].to(self.device, non_blocking=True)
         pet = batch['pet'].to(self.device, non_blocking=True) if forward_mode == 'full' else None
         mask = batch['mask'].to(self.device, non_blocking=True).float()
-        with self._amp_ctx():
-            outputs = self.model(ct, pet=pet, forward_mode=forward_mode)
-            logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-            loss, loss_stats = self.criterion(logits, mask)
+        outputs = self.model(ct, pet=pet, forward_mode=forward_mode)
+        logits = outputs['logits'] if isinstance(outputs, dict) else outputs
+        loss, loss_stats = self.criterion(logits, mask)
         stats = {
             'loss_total': loss.detach(),
             'loss_seg': loss_stats.get('loss_dice', loss.detach()),

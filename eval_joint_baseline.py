@@ -9,7 +9,6 @@ import numpy as np
 import torch
 
 from configs.seg_mdt import SegMDTConfig
-from datasets.pclt20k_seg import _records_from_ids, _read_list
 from models.build_mdt_seg import build_mdt_seg_teacher
 from tasks.mdt_seg import MDTSegTeacher
 from utils.metrics_seg import SegmentationMetricsCIPA
@@ -22,31 +21,41 @@ def _group_by_case(records):
     return grouped
 
 
-def _run_eval(task, records, mode, pet_available_mask=None):
+@torch.inference_mode()
+def _run_full_test(task, loader, case_mask):
     metric = SegmentationMetricsCIPA()
     total_loss = []
-    for i, rec in enumerate(records):
-        batch = {
-            'ct': rec['ct'],
-            'pet': rec['pet'],
-            'mask': rec['mask'],
-        }
-        if mode == 'full':
-            outputs = task.model(batch['ct'].unsqueeze(0).to(task.device), batch['pet'].unsqueeze(0).to(task.device), forward_mode='full')
-        elif mode == 'missing':
-            outputs = task.model(batch['ct'].unsqueeze(0).to(task.device), None, forward_mode='missing')
-        else:
-            pet = batch['pet'].unsqueeze(0).to(task.device)
-            ct = batch['ct'].unsqueeze(0).to(task.device)
-            pet_available = torch.tensor([pet_available_mask[i]], device=task.device, dtype=torch.long)
-            outputs = task.model(ct, pet, pet_available=pet_available, forward_mode='auto')
+    total_case_ids = set()
+    missing_case_ids = set()
+    slice_count = 0
+    for batch in loader:
+        ct = batch['ct'].to(task.device, non_blocking=True)
+        pet = batch['pet'].to(task.device, non_blocking=True)
+        mask = batch['mask'].to(task.device, non_blocking=True).float()
+        case_ids = list(batch['case_id'])
+        total_case_ids.update(case_ids)
+        pet_available = torch.tensor([0 if case_mask.get(cid, 1) else 1 for cid in case_ids], device=task.device, dtype=torch.long)
+        missing_case_ids.update([cid for cid in case_ids if case_mask.get(cid, 1) == 1])
+        outputs = task.model(ct, pet, pet_available=pet_available, forward_mode='auto')
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-        loss, _ = task.criterion(logits, batch['mask'].unsqueeze(0).to(task.device).float())
-        metric.update(logits, batch['mask'].unsqueeze(0).to(task.device).float())
+        loss, _ = task.criterion(logits, mask)
+        metric.update(logits, mask)
         total_loss.append(float(loss))
+        slice_count += len(case_ids)
     out = metric.compute()
-    out['total_loss'] = float(np.mean(total_loss)) if total_loss else 0.0
+    out['loss'] = float(np.mean(total_loss)) if total_loss else 0.0
+    out['missing_case_count'] = len(missing_case_ids)
+    out['total_case_count'] = len(total_case_ids)
+    out['slice_count'] = slice_count
     return out
+
+
+def _build_case_mask(case_ids, missing_rate, seed):
+    rng = np.random.default_rng(seed)
+    perm = list(rng.permutation(len(case_ids)))
+    cut = int(round(float(missing_rate) * len(case_ids)))
+    missing = {case_ids[idx] for idx in perm[:cut]}
+    return {cid: (1 if cid in missing else 0) for cid in case_ids}
 
 
 def main():
@@ -55,56 +64,59 @@ def main():
     p.add_argument('--root', type=str, default='/root/autodl-tmp/data/PCLT20K')
     p.add_argument('--random_state', type=int, default=2023)
     args = p.parse_args()
+
     ckpt = torch.load(os.path.join(args.checkpoint_dir, 'ckpt.best_joint.pth.tar'), map_location='cpu')
-    cfg = SegMDTConfig(args={**ckpt['config'], 'root': args.root, 'random_state': args.random_state, 'checkpoint_dir': args.checkpoint_dir})
+    saved_config = dict(ckpt['config'])
+    saved_config.pop('checkpoint_dir', None)
+    saved_config['root'] = args.root
+    saved_config['random_state'] = args.random_state
+    saved_config['ct_pretrained_path'] = None
+    saved_config['pet_pretrained_path'] = None
+    cfg = SegMDTConfig(args=saved_config)
+
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
-    task.model.load_state_dict(ckpt['model'])
+    task.model.load_state_dict(ckpt['model'], strict=True)
     task.model.eval()
 
     from datasets.pclt20k_seg import get_pclt20k_loaders_cipa_aligned
-    _, _, test_loader = get_pclt20k_loaders_cipa_aligned(cfg.root, cfg.image_size_2d, cfg.batch_size, cfg.num_workers, cfg.random_state, cfg.pin_memory, 'none', cfg.norm_mode, cfg.train_split_file, cfg.val_split_file, cfg.test_split_file, checkpoint_dir=cfg.checkpoint_dir)
-    test_records = []
+    _, _, test_loader = get_pclt20k_loaders_cipa_aligned(
+        cfg.root,
+        cfg.image_size_2d,
+        cfg.batch_size,
+        cfg.num_workers,
+        cfg.random_state,
+        cfg.pin_memory,
+        'none',
+        cfg.norm_mode,
+        cfg.train_split_file,
+        cfg.val_split_file,
+        cfg.test_split_file,
+        checkpoint_dir=cfg.checkpoint_dir,
+    )
+
+    all_case_ids = []
     for batch in test_loader:
-        for i in range(batch['ct'].shape[0]):
-            test_records.append({
-                'ct': batch['ct'][i],
-                'pet': batch['pet'][i],
-                'mask': batch['mask'][i],
-                'case_id': batch['case_id'][i],
-                'slice_id': batch['slice_id'][i],
-            })
+        all_case_ids.extend(list(batch['case_id']))
+    all_case_ids = sorted(set(all_case_ids))
 
-    case_ids = sorted({r['case_id'] for r in test_records})
-    rng = np.random.default_rng(int(args.random_state))
-    perm = list(rng.permutation(len(case_ids)))
-    case_to_rank = {case_ids[idx]: rank for rank, idx in enumerate(perm)}
-    def build_mask(rate):
-        cut = int(round(rate * len(case_ids)))
-        return {cid: 1 if case_to_rank[cid] < cut else 0 for cid in case_ids}
-
+    rates = [0.0, 0.25, 0.5, 0.75, 1.0]
     results = []
     assignments = {}
-    for rate in [0.0, 0.25, 0.5, 0.75, 1.0]:
-        mask = build_mask(rate)
-        assignments[str(rate)] = mask
-        full_cases = [r for r in test_records if mask[r['case_id']] == 0]
-        miss_cases = [r for r in test_records if mask[r['case_id']] == 1]
-        full_out = _run_eval(task, full_cases, 'full') if full_cases else {'dice': 0, 'iou': 0, 'acc': 0, 'acc_pixel': 0, 'hd95': 0, 'total_loss': 0}
-        miss_out = _run_eval(task, miss_cases, 'missing') if miss_cases else {'dice': 0, 'iou': 0, 'acc': 0, 'acc_pixel': 0, 'hd95': 0, 'total_loss': 0}
-        joint_dice = 0.5 * full_out['dice'] + 0.5 * miss_out['dice']
+    for rate in rates:
+        case_mask = _build_case_mask(all_case_ids, rate, int(args.random_state))
+        assignments[str(rate)] = case_mask
+        out = _run_full_test(task, test_loader, case_mask)
         results.append({
             'missing_rate': rate,
-            'full_dice': full_out['dice'],
-            'full_iou': full_out['iou'],
-            'full_acc': full_out['acc'],
-            'full_acc_pixel': full_out['acc_pixel'],
-            'full_hd95': full_out['hd95'],
-            'missing_dice': miss_out['dice'],
-            'missing_iou': miss_out['iou'],
-            'missing_acc': miss_out['acc'],
-            'missing_acc_pixel': miss_out['acc_pixel'],
-            'missing_hd95': miss_out['hd95'],
-            'joint_dice': joint_dice,
+            'dice': out['dice'],
+            'iou': out['iou'],
+            'acc': out['acc'],
+            'acc_pixel': out['acc_pixel'],
+            'hd95': out['hd95'],
+            'loss': out['loss'],
+            'missing_case_count': out['missing_case_count'],
+            'total_case_count': out['total_case_count'],
+            'slice_count': out['slice_count'],
         })
 
     csv_path = os.path.join(args.checkpoint_dir, 'final_test_metrics.csv')
