@@ -14,6 +14,8 @@ try:
 except Exception:
     cv2 = None
 
+from utils.image_augmentation import randomHorizontalFlip, randomShiftScaleRotate, randomcrop
+
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
 
@@ -71,6 +73,12 @@ class PCLT20KSegDataset(Dataset):
             ct = _resize_gray(ct, self.image_size)
             pet = _resize_gray(pet, self.image_size)
             mask = _resize_gray(mask, self.image_size, nearest=True)
+        if self.train and self.aug_mode == 'cipa':
+            image = np.stack([ct, pet], axis=-1)
+            image, mask = randomShiftScaleRotate(image, mask)
+            image, mask = randomHorizontalFlip(image, mask)
+            image, mask = randomcrop(image, mask)
+            ct, pet = image[..., 0], image[..., 1]
         ct_t = torch.tensor(_normalize_ch(ct, self.norm_mode), dtype=torch.float32)
         pet_t = torch.tensor(_normalize_ch(pet, self.norm_mode), dtype=torch.float32)
         mask = (mask.astype(np.float32) / 255.0)
@@ -114,7 +122,7 @@ def _split_summary(records):
     return {'case_count': len(by_case), 'slice_count': len(records)}
 
 
-def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_workers=4, random_state=2023, pin_memory=True, aug_mode='cipa', norm_mode='cipa', train_split_file='train.txt', val_split_file='val.txt', test_split_file='test.txt'):
+def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_workers=4, random_state=2023, pin_memory=True, aug_mode='cipa', norm_mode='cipa', train_split_file='train.txt', val_split_file='val.txt', test_split_file='test.txt', checkpoint_dir=None):
     train_ids = _read_list(os.path.join(root, train_split_file))
     val_ids = _read_list(os.path.join(root, val_split_file))
     test_ids = _read_list(os.path.join(root, test_split_file))
@@ -138,7 +146,10 @@ def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_wor
         'val': {**_split_summary(val_records), 'case_ids': sorted(val_cases)},
         'test': {**_split_summary(test_records), 'case_ids': sorted(test_cases)},
     }
-    with open(os.path.join(root, 'split_summary.json'), 'w') as f:
+    if checkpoint_dir is None:
+        checkpoint_dir = root
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    with open(os.path.join(checkpoint_dir, 'split_summary.json'), 'w') as f:
         json.dump(split_summary, f, indent=2)
     train_ds = PCLT20KSegDataset(train_records, image_size=image_size, train=True, random_state=random_state, aug_mode=aug_mode, norm_mode=norm_mode)
     val_ds = PCLT20KSegDataset(val_records, image_size=image_size, train=False, random_state=random_state, aug_mode='none', norm_mode=norm_mode)

@@ -9,8 +9,8 @@ class SegMDTConfig(ConfigBase):
     def data_parser():
         p = argparse.ArgumentParser('Data', add_help=False)
         p.add_argument('--root', type=str, default='/root/autodl-tmp/data/PCLT20K')
-        p.add_argument('--train_split_file', type=str, default='train.txt')
-        p.add_argument('--val_split_file', type=str, default='val.txt')
+        p.add_argument('--train_split_file', type=str, default='train_original.txt')
+        p.add_argument('--val_split_file', type=str, default='test.txt')
         p.add_argument('--test_split_file', type=str, default='test.txt')
         p.add_argument('--image_size_2d', type=int, default=512)
         p.add_argument('--num_workers', type=int, default=4)
