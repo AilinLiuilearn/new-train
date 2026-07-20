@@ -120,15 +120,7 @@ def load_local_weights_safe(model, path, name='Encoder'):
     if os.path.isdir(path):
         print(f'[+] {name}: pretrained path is a directory: {path}')
         found = False
-        for cand in ('pytorch_model.bin', 'model.safetensors',
-                     'mit_b0.pth', 'mit_b0.bin', 'mit_b0.pt',
-                     'mit-b0.pth', 'mit-b0.bin', 'mit-b0.pt',
-                     'mit_b1.pth', 'mit_b1.bin', 'mit_b1.pt',
-                     'mit-b1.pth', 'mit-b1.bin', 'mit-b1.pt',
-                     'pvt_v2_b1.pth', 'pvt_v2_b1.bin', 'pvt_v2_b1.pt',
-                     'convnext_tiny.pth', 'convnext_tiny.bin', 'convnext_tiny.pt',
-                     'convnext_nano.pth', 'convnext_nano.bin', 'convnext_nano.pt',
-                     'convnextv2_nano.pth', 'convnextv2_nano.bin', 'convnextv2_nano.pt'):
+        for cand in ('pytorch_model.bin', 'model.safetensors', 'mit_b0.pth', 'mit_b0.bin', 'mit_b0.pt', 'mit-b0.pth', 'mit-b0.bin', 'mit-b0.pt', 'mit_b1.pth', 'mit_b1.bin', 'mit_b1.pt', 'mit-b1.pth', 'mit-b1.bin', 'mit-b1.pt', 'pvt_v2_b1.pth', 'pvt_v2_b1.bin', 'pvt_v2_b1.pt', 'convnext_tiny.pth', 'convnext_tiny.bin', 'convnext_tiny.pt', 'convnext_nano.pth', 'convnext_nano.bin', 'convnext_nano.pt', 'convnextv2_nano.pth', 'convnextv2_nano.bin', 'convnextv2_nano.pt'):
             full = os.path.join(path, cand)
             if os.path.exists(full):
                 path = full
@@ -154,7 +146,6 @@ def load_local_weights_safe(model, path, name='Encoder'):
                 from safetensors.torch import load_file
                 state_dict = load_file(path, device='cpu')
     state_dict = _sanitize_state_dict(_unwrap_state_dict(state_dict))
-
     model_state = model.state_dict()
     loadable = {}
     skipped = []
@@ -238,18 +229,8 @@ class SegformerFeatureBackbone(nn.Module):
         super().__init__()
         variant = _normalize_backbone_name(variant)
         mit_settings = {
-            'mit_b0': dict(
-                depths=[2, 2, 2, 2],
-                hidden_sizes=[32, 64, 160, 256],
-                num_attention_heads=[1, 2, 5, 8],
-                drop_path_rate=0.1,
-            ),
-            'mit_b1': dict(
-                depths=[2, 2, 2, 2],
-                hidden_sizes=[64, 128, 320, 512],
-                num_attention_heads=[1, 2, 5, 8],
-                drop_path_rate=0.1,
-            ),
+            'mit_b0': dict(depths=[2, 2, 2, 2], hidden_sizes=[32, 64, 160, 256], num_attention_heads=[1, 2, 5, 8], drop_path_rate=0.1),
+            'mit_b1': dict(depths=[2, 2, 2, 2], hidden_sizes=[64, 128, 320, 512], num_attention_heads=[1, 2, 5, 8], drop_path_rate=0.1),
         }
         if variant not in mit_settings:
             raise ValueError(f'Unsupported MiT variant: {variant}')
@@ -276,7 +257,6 @@ class SegformerFeatureBackbone(nn.Module):
         )
         self.model = SegformerModel(config)
         self.feature_info = SimpleFeatureInfo(config.hidden_sizes)
-        self._pretrained_path = None
 
     def forward(self, x):
         outputs = self.model(pixel_values=x, output_hidden_states=True, return_dict=True)
@@ -300,16 +280,9 @@ class ConvNextFeatureBackbone(nn.Module):
         if ConvNextConfig is None or ConvNextModel is None:
             raise ImportError('HuggingFace ConvNeXt backbone requires transformers. Install it with: pip install transformers')
         settings = convnext_settings[variant]
-        config = ConvNextConfig(
-            num_channels=in_channels,
-            depths=settings['depths'],
-            hidden_sizes=settings['hidden_sizes'],
-            patch_size=4,
-            out_features=['stage1', 'stage2', 'stage3', 'stage4'],
-        )
+        config = ConvNextConfig(num_channels=in_channels, depths=settings['depths'], hidden_sizes=settings['hidden_sizes'], patch_size=4, out_features=['stage1', 'stage2', 'stage3', 'stage4'])
         self.model = ConvNextModel(config)
         self.feature_info = SimpleFeatureInfo(config.hidden_sizes)
-        self._pretrained_path = None
 
     def forward(self, x):
         outputs = self.model(pixel_values=x, output_hidden_states=True, return_dict=True)
@@ -325,10 +298,7 @@ def _get_backbone_out_indices(backbone):
         return (0, 1, 2, 3)
     if backbone in ('convnext_tiny', 'convnext_nano', 'convnextv2_nano', 'convnextv2_atto', 'convnextv2_femto', 'convnextv2_pico'):
         return (0, 1, 2, 3)
-    raise ValueError(
-        f'Unsupported backbone: {backbone}. '
-        'Supported: pvt_v2_b1, mit_b0, mit_b1, convnext_tiny, convnext_nano, convnextv2_nano.'
-    )
+    raise ValueError(f'Unsupported backbone: {backbone}. Supported: pvt_v2_b1, mit_b0, mit_b1, convnext_tiny, convnext_nano, convnextv2_nano.')
 
 
 class FallbackFeatureBackbone(nn.Module):
@@ -362,13 +332,7 @@ def create_feature_backbone(backbone, in_channels=3):
         return ConvNextFeatureBackbone(backbone, in_channels=in_channels)
     if timm is None:
         return FallbackFeatureBackbone(in_channels=in_channels)
-    return timm.create_model(
-        backbone,
-        pretrained=False,
-        features_only=True,
-        out_indices=_get_backbone_out_indices(backbone),
-        in_chans=in_channels,
-    )
+    return timm.create_model(backbone, pretrained=False, features_only=True, out_indices=_get_backbone_out_indices(backbone), in_chans=in_channels)
 
 
 class ConvBNAct(nn.Module):
@@ -376,8 +340,7 @@ class ConvBNAct(nn.Module):
         super().__init__()
         padding = (kernel_size // 2) * dilation
         self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride,
-                      padding=padding, dilation=dilation, bias=False),
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
         )
@@ -386,91 +349,22 @@ class ConvBNAct(nn.Module):
         return self.block(x)
 
 
-from models.simmlm_dmome_fusion import (
-    DEFAULT_HYBRID_CONCAT_STAGES,
-    DEFAULT_HYBRID_DMOME_STAGES,
-    DEFAULT_PRIOR_GATE_STAGES,
-    VALID_PRIOR_GATE_STAGES,
-)
-
-
-def _parse_stage_list(stages, default, name):
-    if isinstance(stages, str):
-        stages = tuple(int(x.strip()) for x in stages.split(',') if x.strip())
-    else:
-        stages = tuple(int(s) for s in (stages or default))
-    invalid = [s for s in stages if s not in VALID_PRIOR_GATE_STAGES]
-    if invalid:
-        raise ValueError(
-            f'Invalid {name}={stages}. '
-            f'Use comma-separated indices from {sorted(VALID_PRIOR_GATE_STAGES)}.'
-        )
-    return stages
-
-
-def _parse_prior_gate_stages(config):
-    stages = getattr(config, 'prior_gate_stages', DEFAULT_PRIOR_GATE_STAGES)
-    if isinstance(stages, str) and stages.strip().lower() in ('all', '1,2,3,4', '1-4'):
-        return DEFAULT_PRIOR_GATE_STAGES
-    return _parse_stage_list(stages, DEFAULT_PRIOR_GATE_STAGES, 'prior_gate_stages')
-
-
-def _parse_hybrid_concat_stages(config):
-    return _parse_stage_list(
-        getattr(config, 'hybrid_concat_stages', DEFAULT_HYBRID_CONCAT_STAGES),
-        DEFAULT_HYBRID_CONCAT_STAGES,
-        'hybrid_concat_stages',
-    )
-
-
-def _parse_hybrid_dmome_stages(config):
-    return _parse_stage_list(
-        getattr(config, 'hybrid_dmome_stages', DEFAULT_HYBRID_DMOME_STAGES),
-        DEFAULT_HYBRID_DMOME_STAGES,
-        'hybrid_dmome_stages',
-    )
-
-
-def _resolve_use_channel_prior_gate(config):
-    fusion_type = getattr(config, 'fusion_type', 'concat_conv')
-    if fusion_type == 'dmome_channel_prior_gate':
-        return True
-    if fusion_type == 'dmome_prior_gate':
-        raise ValueError(
-            'fusion_type=dmome_prior_gate (spatial mask) is removed. '
-            'Use fusion_type=dmome_channel_prior_gate instead.'
-        )
-    return bool(getattr(config, 'use_channel_prior_gate', False))
-
-
 def build_mdt_seg_teacher(config):
-    model_arch = getattr(config, 'model_arch', 'dual_shared_add_baseline')
-    if model_arch == 'dual_shared_add_baseline':
-        from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
-        model = DualSharedAddPETCTBaseline(
-            ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
-            pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
-            ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
-            pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
-            in_channels=3,
-            out_channels=1,
-            decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
-            use_deep_supervision=_resolve_use_deep_supervision(config),
-        )
-        print(
-            f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
-            f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-            f'fusion=add shared_decoder=UNetStyleDecoder '
-            f'deep_supervision={_resolve_use_deep_supervision(config)}'
-        )
-        return dict(model=model)
-    raise ValueError(
-        f'Unsupported model_arch={model_arch}. '
-        'Only dual_shared_add_baseline is kept for this cleaned checkpoint.'
+    from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
+    model = DualSharedAddPETCTBaseline(
+        ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
+        pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
+        ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
+        pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
+        in_channels=3,
+        out_channels=1,
+        decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
+        use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
     )
-
-
-def _resolve_use_deep_supervision(config):
-    if getattr(config, 'use_deep_supervision', False):
-        return True
-    return bool(getattr(config, 'deep_supervision', False))
+    print(
+        f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
+        f'pet={getattr(config, "pet_backbone", "mit_b1")} '
+        f'fusion=add shared_decoder=UNetStyleDecoder '
+        f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
+    )
+    return {'model': model}
