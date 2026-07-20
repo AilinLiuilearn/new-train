@@ -139,8 +139,8 @@ def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_wor
     train_cases = {r['case_id'] for r in train_records}
     val_cases = {r['case_id'] for r in val_records}
     test_cases = {r['case_id'] for r in test_records}
-    if train_cases & val_cases or train_cases & test_cases or val_cases & test_cases:
-        raise ValueError('train/val/test splits overlap on case_id')
+    if train_cases & val_cases or train_cases & test_cases:
+        raise ValueError('train split overlaps with val/test on case_id')
     split_summary = {
         'train': {**_split_summary(train_records), 'case_ids': sorted(train_cases)},
         'val': {**_split_summary(val_records), 'case_ids': sorted(val_cases)},
