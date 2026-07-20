@@ -72,6 +72,12 @@ def _checkpoint_paths(checkpoint_dir):
     }
 
 
+def _count_parameters(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+
 def main():
     print('[INFO] starting baseline training', flush=True)
     cfg = SegMDTConfig.parse_arguments()
@@ -85,6 +91,8 @@ def main():
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)}', flush=True)
 
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
+    total_params, trainable_params = _count_parameters(task.model)
+    print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
     task.scheduler = get_cosine_scheduler(
         task.optimizer,
         epochs=cfg.epochs,
