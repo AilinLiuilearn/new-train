@@ -63,12 +63,6 @@ def module_grad_norm(module):
     return float(total.sqrt().item()) if total is not None else 0.0
 
 
-def _diag_batch_from_loader(loader):
-    for batch in loader:
-        return batch
-    return None
-
-
 def _checkpoint_paths(checkpoint_dir):
     return {
         'best_joint': os.path.join(checkpoint_dir, 'ckpt.best_joint.pth.tar'),
@@ -125,12 +119,14 @@ def main():
         task.model.train()
         full_n = missing_n = 0
         full_loss = missing_loss = 0.0
+        grad_norm_accum = 0.0
+        grad_norm_steps = 0
         grads = {
             'full': {'enc_ct': [], 'ct_align': [], 'decoder': []},
             'missing': {'enc_ct': [], 'ct_align': [], 'decoder': []},
         }
         epoch_start = time.time()
-        diag_batch = _diag_batch_from_loader(train_loader)
+        fixed_diag_batch = None
         diag_stats = {}
 
         for batch_idx, batch in enumerate(train_loader):
@@ -150,9 +146,9 @@ def main():
             grads[route]['enc_ct'].append(module_grad_norm(task.model.enc_ct))
             grads[route]['ct_align'].append(module_grad_norm(task.model.ct_align))
             grads[route]['decoder'].append(module_grad_norm(task.model.decoder))
-
-            if float(cfg.grad_clip) > 0:
-                torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip))
+            total_grad_norm = torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip)) if float(cfg.grad_clip) > 0 else 0.0
+            grad_norm_accum += float(total_grad_norm)
+            grad_norm_steps += 1
 
             if task.scaler.is_enabled():
                 task.scaler.step(task.optimizer)
@@ -174,39 +170,57 @@ def main():
 
             global_batch_step += 1
             task.global_batch_step = global_batch_step
+            if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is None:
+                fixed_diag_batch = {
+                    'ct': batch['ct'][:1].detach().cpu(),
+                    'pet': batch['pet'][:1].detach().cpu(),
+                    'mask': batch['mask'][:1].detach().cpu(),
+                }
 
-        if getattr(cfg, 'enable_gradient_diagnostics', False) and diag_batch is not None and epoch % int(cfg.gradient_diagnostics_interval) == 0:
-            diag_stats = task.gradient_diagnostics(diag_batch, max_samples=min(1, int(cfg.gradient_diagnostics_num_samples))) or {}
+        if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is not None and epoch % int(cfg.gradient_diagnostics_interval) == 0:
+            diag_stats = task.gradient_diagnostics(fixed_diag_batch, max_samples=min(1, int(cfg.gradient_diagnostics_num_samples))) or {}
 
         val_full = task.evaluate(val_loader, eval_mode='full', tag='val_full')
         val_missing = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_missing')
         joint_dice = float(cfg.joint_full_weight) * val_full['dice'] + float(cfg.joint_missing_weight) * val_missing['dice']
 
-        if joint_dice > best_joint:
+        joint_improved = joint_dice > best_joint
+        full_improved = val_full['dice'] > best_full
+        missing_improved = val_missing['dice'] > best_missing
+        if joint_improved:
             best_joint = joint_dice
             best_joint_epoch = epoch
             no_improve = 0
         else:
             no_improve += 1
-
-        if val_full['dice'] > best_full:
+        if full_improved:
             best_full = val_full['dice']
-        if val_missing['dice'] > best_missing:
+        if missing_improved:
             best_missing = val_missing['dice']
 
-        task.save_checkpoint(paths['best_joint'], epoch, best_joint, best_full, best_missing, best_joint_epoch, val_full, val_missing, joint_dice)
-        task.save_checkpoint(paths['best_full'], epoch, best_joint, best_full, best_missing, best_joint_epoch, val_full, val_missing, joint_dice)
-        task.save_checkpoint(paths['best_missing'], epoch, best_joint, best_full, best_missing, best_joint_epoch, val_full, val_missing, joint_dice)
+        if joint_improved:
+            task.save_checkpoint(paths['best_joint'], epoch, best_joint, best_full, best_missing, best_joint_epoch, val_full, val_missing, joint_dice)
+        if full_improved:
+            task.save_checkpoint(paths['best_full'], epoch, best_joint, best_full, best_missing, best_joint_epoch, val_full, val_missing, joint_dice)
+        if missing_improved:
+            task.save_checkpoint(paths['best_missing'], epoch, best_joint, best_full, best_missing, best_joint_epoch, val_full, val_missing, joint_dice)
         task.save_checkpoint(paths['last'], epoch, best_joint, best_full, best_missing, best_joint_epoch, val_full, val_missing, joint_dice)
 
         train_loss = (full_loss + missing_loss) / max(1, full_n + missing_n)
+        val_loss = 0.5 * val_full['total_loss'] + 0.5 * val_missing['total_loss']
+        val_dice = joint_dice
+        val_iou = 0.5 * val_full['iou'] + 0.5 * val_missing['iou']
+        val_acc = 0.5 * val_full['acc'] + 0.5 * val_missing['acc']
+        val_acc_pixel = 0.5 * val_full.get('acc_pixel', 0.0) + 0.5 * val_missing.get('acc_pixel', 0.0)
+        val_hd95 = 0.5 * val_full['hd95'] + 0.5 * val_missing['hd95']
+        avg_grad_norm = grad_norm_accum / max(1, grad_norm_steps)
         append_epoch_log(
             os.path.join(cfg.checkpoint_dir, 'train_log.csv'),
             epoch,
             train_loss,
-            {'total_loss': val_full['total_loss'], 'dice': joint_dice, 'iou': joint_dice, 'acc': 0.0, 'acc_pixel': 0.0, 'hd95': val_full['hd95']},
+            {'total_loss': val_loss, 'dice': val_dice, 'iou': val_iou, 'acc': val_acc, 'acc_pixel': val_acc_pixel, 'hd95': val_hd95},
             lr=task.optimizer.param_groups[0]['lr'],
-            grad_norm=0.0,
+            grad_norm=avg_grad_norm,
             extra_metrics={
                 'train_full_loss': full_loss / max(1, full_n),
                 'train_missing_loss': missing_loss / max(1, missing_n),

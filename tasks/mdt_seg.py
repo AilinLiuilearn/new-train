@@ -53,11 +53,13 @@ class MDTSegTeacher:
     def evaluate(self, loader, eval_mode='full', tag='val'):
         was_training = self.model.training
         self.model.eval()
-        total = []
+        total_loss = 0.0
+        sample_count = 0
         self.metrics.reset()
         for batch in loader:
             ct = batch['ct'].to(self.device, non_blocking=True)
             mask = batch['mask'].to(self.device, non_blocking=True).float()
+            batch_size = ct.shape[0]
             if eval_mode == 'full':
                 pet = batch['pet'].to(self.device, non_blocking=True)
                 forward_mode = 'full'
@@ -74,16 +76,17 @@ class MDTSegTeacher:
             logits = outputs['logits'] if isinstance(outputs, dict) else outputs
             loss, _ = self.criterion(logits, mask)
             self.metrics.update(logits, mask)
-            total.append(float(loss))
+            total_loss += float(loss) * batch_size
+            sample_count += batch_size
         out = self.metrics.compute()
-        out['total_loss'] = float(np.mean(total)) if total else 0.0
+        out['total_loss'] = total_loss / max(1, sample_count)
         self.model.train(was_training)
         return out
 
     def _module_param_grads(self, module):
         return [p.grad for p in module.parameters() if p.requires_grad and p.grad is not None]
 
-    def gradient_diagnostics(self, batch):
+    def gradient_diagnostics(self, batch, max_samples=1):
         was_training = self.model.training
         self.model.eval()
         bn_states = []
@@ -92,9 +95,9 @@ class MDTSegTeacher:
                 bn_states.append((m, m.track_running_stats))
                 m.track_running_stats = False
         try:
-            ct = batch['ct'].to(self.device, non_blocking=True)
-            mask = batch['mask'].to(self.device, non_blocking=True).float()
-            pet = batch['pet'].to(self.device, non_blocking=True)
+            ct = batch['ct'][:max_samples].to(self.device, non_blocking=True)
+            mask = batch['mask'][:max_samples].to(self.device, non_blocking=True).float()
+            pet = batch['pet'][:max_samples].to(self.device, non_blocking=True)
             params_shared = list(self.model.enc_ct.parameters()) + list(self.model.ct_align.parameters()) + list(self.model.decoder.parameters())
             params_ct = list(self.model.enc_ct.parameters())
             params_align = list(self.model.ct_align.parameters())
