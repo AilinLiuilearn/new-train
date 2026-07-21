@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from models.baseline_blocks import AddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
+from models.mppc import MPPC
 
 
 class StageChannelAlign(nn.Module):
@@ -31,6 +33,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         ct_channels = list(self.enc_ct.feature_info.channels())
         pet_channels = list(self.enc_pet.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
+        self.mppc = MPPC(channels=pet_channels, num_slots=3, momentum=0.9, temperature=0.1, gate_init_logit=-6.0)
         self.fusion = AddFusion()
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
 
@@ -55,34 +58,62 @@ class DualSharedAddPETCTBaseline(nn.Module):
         out['aux'] = {}
         return out
 
-    def _forward_full(self, ct, pet, target_size):
-        return self._decode(self.fusion(self._encode_ct(ct), self._encode_pet(pet), None), target_size)
+    def _align_pet_to_ct(self, ct_feats, pet_feats):
+        aligned = []
+        for ct_feat, pet_feat in zip(ct_feats, pet_feats):
+            if pet_feat.shape[-2:] != ct_feat.shape[-2:]:
+                pet_feat = F.interpolate(pet_feat, size=ct_feat.shape[-2:], mode='bilinear', align_corners=False)
+            aligned.append(pet_feat)
+        return aligned
+
+    def _forward_full(self, ct, pet, target_size, mask=None):
+        if pet is None:
+            raise ValueError('Full forward requires pet')
+        aligned_ct = self._encode_ct(ct)
+        pet_feats = self._encode_pet(pet)
+        pet_feats = self._align_pet_to_ct(aligned_ct, pet_feats)
+        pet_for_sum = self.mppc(aligned_ct, pet_features=pet_feats, target=mask, mode='full', update_bank=self.training)
+        fused_feats = self.fusion(aligned_ct, pet_for_sum, None)
+        return self._decode(fused_feats, target_size)
 
     def _forward_missing(self, ct, target_size):
-        return self._decode(self._encode_ct(ct), target_size)
+        aligned_ct = self._encode_ct(ct)
+        pet_compensation = self.mppc(aligned_ct, pet_features=None, target=None, mode='missing')
+        fused_feats = self.fusion(aligned_ct, pet_compensation, None)
+        return self._decode(fused_feats, target_size)
 
     def _forward_auto(self, ct, pet, pet_available, target_size):
         pet_available = pet_available.long().view(-1)
         if torch.all(pet_available == 1):
-            return self._forward_full(ct, pet, target_size)
+            return self._forward_full(ct, pet, target_size, mask=None)
         if torch.all(pet_available == 0):
             return self._forward_missing(ct, target_size)
         aligned_ct = self._encode_ct(ct)
-        fused = list(aligned_ct)
+        fused = [feat.clone() for feat in aligned_ct]
         full_idx = torch.nonzero(pet_available == 1, as_tuple=False).flatten()
+        missing_idx = torch.nonzero(pet_available == 0, as_tuple=False).flatten()
         if full_idx.numel() > 0:
+            ct_full = [feat.index_select(0, full_idx) for feat in aligned_ct]
             pet_full = pet.index_select(0, full_idx)
             pet_feats = self._encode_pet(pet_full)
-            fused_full = self.fusion([feat.index_select(0, full_idx) for feat in aligned_ct], pet_feats, None)
+            pet_feats = self._align_pet_to_ct(ct_full, pet_feats)
+            pet_for_sum = self.mppc(ct_full, pet_features=pet_feats, target=None, mode='full', update_bank=False)
+            fused_full = self.fusion(ct_full, pet_for_sum, None)
             for i, feat in enumerate(fused_full):
-                fused[i] = fused[i].clone(); fused[i].index_copy_(0, full_idx, feat)
+                fused[i].index_copy_(0, full_idx, feat)
+        if missing_idx.numel() > 0:
+            ct_missing = [feat.index_select(0, missing_idx) for feat in aligned_ct]
+            pet_compensation = self.mppc(ct_missing, pet_features=None, target=None, mode='missing')
+            fused_missing = self.fusion(ct_missing, pet_compensation, None)
+            for i, feat in enumerate(fused_missing):
+                fused[i].index_copy_(0, missing_idx, feat)
         return self._decode(fused, target_size)
 
-    def forward(self, ct, pet, pet_available=None, target_size=None, forward_mode='auto'):
+    def forward(self, ct, pet=None, pet_available=None, target_size=None, forward_mode='auto', mask=None):
         if target_size is None:
             target_size = ct.shape[-2:]
         if forward_mode == 'full':
-            return self._forward_full(ct, pet, target_size)
+            return self._forward_full(ct, pet, target_size, mask=mask)
         if forward_mode == 'missing':
             return self._forward_missing(ct, target_size)
         if forward_mode == 'auto':
