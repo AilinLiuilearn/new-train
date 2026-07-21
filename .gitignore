@@ -1,6 +1,5 @@
-__pycache__/
-*.py[cod]
-.pytest_cache/
-checkpoints_new/
-outputs/
-wandb/
+*
+!.gitignore
+!*/
+!*.py
+!**/*.py
