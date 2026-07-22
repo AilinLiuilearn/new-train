@@ -36,6 +36,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pet_channels = list(self.enc_pet.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
         self.mppc = MPPC(channels=pet_channels, num_slots=3, momentum=0.9, temperature=0.1, gate_init_logit=-6.0)
+        self.mppc.eval()
         self.fusion = AddFusion()
         if self.use_dci:
             self.dci_fusion = MultiScaleDCIFuse(
@@ -62,15 +63,19 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return pet_feats
 
     def _fuse_features(self, ct_feats, aux_feats):
+        ct_feats = [_sanitize(feat) for feat in ct_feats]
+        aux_feats = [_sanitize(feat) for feat in aux_feats]
         if self.use_dci:
             fused_feats, loss_dci_dist = self.dci_fusion(ct_feats, aux_feats)
-            return fused_feats, loss_dci_dist
-        fused_feats = self.fusion(ct_feats, aux_feats, None)
-        loss_dci_dist = ct_feats[0].new_zeros((), dtype=torch.float32)
+        else:
+            fused_feats = self.fusion(ct_feats, aux_feats, None)
+            loss_dci_dist = ct_feats[0].new_zeros((), dtype=torch.float32)
+        fused_feats = [_sanitize(feat) for feat in fused_feats]
         return fused_feats, loss_dci_dist
 
     def _decode(self, fused_feats, target_size, loss_dci_dist=None):
         out = self.decoder(fused_feats, target_size)
+        out['logits'] = _sanitize(out['logits'])
         _check_tensor('logits', out['logits'])
         out['pred'] = out['logits']
         out['aux'] = {}

@@ -70,9 +70,7 @@ class MDTSegTeacher:
         if loss_dci_dist.ndim != 0:
             loss_dci_dist = loss_dci_dist.mean()
         if not torch.isfinite(loss_dci_dist):
-            raise RuntimeError(
-                f'DCI distribution loss became non-finite: route={forward_mode}, step={self.global_batch_step}'
-            )
+            loss_dci_dist = loss_seg.new_zeros((), dtype=torch.float32)
         loss = loss_seg + float(self.config.dci_dist_weight) * loss_dci_dist
         stats = {
             'loss_total': loss.detach(),

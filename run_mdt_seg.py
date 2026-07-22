@@ -5,6 +5,7 @@ import random
 import subprocess
 import sys
 import time
+import warnings
 
 import numpy as np
 import torch
@@ -29,10 +30,14 @@ def _seed(cfg):
         torch.backends.cuda.matmul.allow_tf32 = False
     if hasattr(torch.backends, 'cudnn'):
         torch.backends.cudnn.allow_tf32 = False
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    if hasattr(torch.backends, 'cuda'):
-        torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+
+
+def _silence_known_warnings():
+    warnings.filterwarnings(
+        'ignore',
+        message='Deterministic behavior was enabled with either `torch.use_deterministic_algorithms`*',
+        category=UserWarning,
+    )
 
 
 def _loaders(cfg):
@@ -130,6 +135,7 @@ def main():
     cfg = SegMDTConfig.parse_arguments()
     _assert_baseline(cfg)
     _seed(cfg)
+    _silence_known_warnings()
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
         json.dump(vars(cfg), f, indent=2, default=str)
