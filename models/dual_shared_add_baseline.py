@@ -33,7 +33,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         ct_channels = list(self.enc_ct.feature_info.channels())
         pet_channels = list(self.enc_pet.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
-        self.mppc = MPPC(channels=pet_channels, num_slots=1, momentum=0.9, temperature=0.1, gate_init_logit=-6.0)
+        self.mppc = MPPC(channels=pet_channels, num_slots=3, momentum=0.9, temperature=0.1, gate_init_logit=-6.0)
         self.fusion = AddFusion()
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
 
