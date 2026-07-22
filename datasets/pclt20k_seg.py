@@ -86,7 +86,7 @@ class PCLT20KSegDataset(Dataset):
         return {
             'ct': ct_t,
             'pet': pet_t,
-            'mask': torch.tensor(mask),
+            'mask': torch.tensor(mask, dtype=torch.float32),
             'image_id': record.get('image_id', str(idx)),
             'case_id': record.get('case_id', str(idx)),
             'slice_id': record.get('slice_id', record.get('image_id', str(idx))),

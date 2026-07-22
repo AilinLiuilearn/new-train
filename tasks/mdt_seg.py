@@ -39,6 +39,20 @@ class MDTSegTeacher:
         ct = batch['ct'].to(self.device, non_blocking=True)
         pet = batch['pet'].to(self.device, non_blocking=True) if forward_mode == 'full' else None
         mask = batch['mask'].to(self.device, non_blocking=True).float()
+
+        if torch.isnan(ct).any() or torch.isinf(ct).any():
+            raise RuntimeError(
+                f"CT input contains NaN/Inf before model forward (forward_mode={forward_mode}, step={self.global_batch_step})"
+            )
+        if forward_mode == 'full' and pet is not None and (torch.isnan(pet).any() or torch.isinf(pet).any()):
+            raise RuntimeError(
+                f"PET input contains NaN/Inf before model forward (forward_mode={forward_mode}, step={self.global_batch_step})"
+            )
+        if torch.isnan(mask).any() or torch.isinf(mask).any():
+            raise RuntimeError(
+                f"Mask contains NaN/Inf before loss (forward_mode={forward_mode}, step={self.global_batch_step})"
+            )
+
         outputs = self.model(
             ct,
             pet=pet,
@@ -65,8 +79,14 @@ class MDTSegTeacher:
             ct = batch['ct'].to(self.device, non_blocking=True)
             mask = batch['mask'].to(self.device, non_blocking=True).float()
             batch_size = ct.shape[0]
+            if torch.isnan(ct).any() or torch.isinf(ct).any():
+                raise RuntimeError(f"CT input contains NaN/Inf during evaluation (tag={tag}, eval_mode={eval_mode})")
+            if torch.isnan(mask).any() or torch.isinf(mask).any():
+                raise RuntimeError(f"Mask contains NaN/Inf during evaluation (tag={tag}, eval_mode={eval_mode})")
             if eval_mode == 'full':
                 pet = batch['pet'].to(self.device, non_blocking=True)
+                if torch.isnan(pet).any() or torch.isinf(pet).any():
+                    raise RuntimeError(f"PET input contains NaN/Inf during evaluation (tag={tag}, eval_mode={eval_mode})")
                 forward_mode = 'full'
                 pet_available = None
             elif eval_mode == 'fixed_missing':
@@ -75,6 +95,8 @@ class MDTSegTeacher:
                 pet_available = None
             else:
                 pet = batch['pet'].to(self.device, non_blocking=True)
+                if torch.isnan(pet).any() or torch.isinf(pet).any():
+                    raise RuntimeError(f"PET input contains NaN/Inf during evaluation (tag={tag}, eval_mode={eval_mode})")
                 forward_mode = 'auto'
                 pet_available = batch.get('pet_available')
             outputs = self.model(ct, pet=pet, pet_available=pet_available, forward_mode=forward_mode)
@@ -103,6 +125,12 @@ class MDTSegTeacher:
             ct = batch['ct'][:max_samples].to(self.device, non_blocking=True)
             mask = batch['mask'][:max_samples].to(self.device, non_blocking=True).float()
             pet = batch['pet'][:max_samples].to(self.device, non_blocking=True)
+            if torch.isnan(ct).any() or torch.isinf(ct).any():
+                raise RuntimeError("CT input contains NaN/Inf in gradient diagnostics")
+            if torch.isnan(mask).any() or torch.isinf(mask).any():
+                raise RuntimeError("Mask contains NaN/Inf in gradient diagnostics")
+            if torch.isnan(pet).any() or torch.isinf(pet).any():
+                raise RuntimeError("PET input contains NaN/Inf in gradient diagnostics")
             params_shared = list(self.model.enc_ct.parameters()) + list(self.model.ct_align.parameters()) + list(self.model.decoder.parameters())
             params_ct = list(self.model.enc_ct.parameters())
             params_align = list(self.model.ct_align.parameters())
