@@ -351,6 +351,8 @@ class ConvBNAct(nn.Module):
 
 def build_mdt_seg_teacher(config):
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
+    use_dci = bool(getattr(config, 'use_dci', True))
+    dci_sample_during_training = bool(getattr(config, 'dci_sample_during_training', True))
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
@@ -360,11 +362,14 @@ def build_mdt_seg_teacher(config):
         out_channels=1,
         decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
         use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
+        use_dci=use_dci,
+        dci_sample_during_training=dci_sample_during_training,
     )
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion=add shared_decoder=UNetStyleDecoder '
+        f'fusion={"dci_fuse" if use_dci else "add"} shared_decoder=UNetStyleDecoder '
+        f'use_dci={use_dci} dci_sample_during_training={dci_sample_during_training} '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
     return {'model': model}

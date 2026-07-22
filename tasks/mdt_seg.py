@@ -29,6 +29,8 @@ class MDTSegTeacher:
         self.scheduler = None
         self.scaler = torch.cuda.amp.GradScaler(enabled=bool(config.mixed_precision))
         self.global_batch_step = 0
+        if float(getattr(config, 'dci_dist_weight', 1e-3)) < 0:
+            raise ValueError('dci_dist_weight must be non-negative')
         self.criterion = BCEDiceLoss(smooth=config.loss_smooth, bce_weight=config.bce_weight, dice_weight=config.dice_weight)
         self.metrics = SegmentationMetricsCIPA()
 
@@ -60,10 +62,22 @@ class MDTSegTeacher:
             mask=mask if forward_mode == 'full' else None,
         )
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-        loss, loss_stats = self.criterion(logits, mask)
+        loss_seg, loss_stats = self.criterion(logits, mask)
+        if isinstance(outputs, dict):
+            loss_dci_dist = outputs.get('loss_dci_dist', loss_seg.new_zeros((), dtype=torch.float32))
+        else:
+            loss_dci_dist = loss_seg.new_zeros((), dtype=torch.float32)
+        if loss_dci_dist.ndim != 0:
+            loss_dci_dist = loss_dci_dist.mean()
+        if not torch.isfinite(loss_dci_dist):
+            raise RuntimeError(
+                f'DCI distribution loss became non-finite: route={forward_mode}, step={self.global_batch_step}'
+            )
+        loss = loss_seg + float(self.config.dci_dist_weight) * loss_dci_dist
         stats = {
             'loss_total': loss.detach(),
-            'loss_seg': loss_stats.get('loss_dice', loss.detach()),
+            'loss_seg': loss_seg.detach(),
+            'loss_dci_dist': loss_dci_dist.detach(),
             'loss_boundary': torch.tensor(0.0, device=loss.device),
         }
         return loss, logits, outputs, stats

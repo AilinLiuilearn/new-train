@@ -2,6 +2,8 @@
 import json
 import os
 import random
+import subprocess
+import sys
 import time
 
 import numpy as np
@@ -20,8 +22,17 @@ def _seed(cfg):
     torch.manual_seed(cfg.random_state)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.random_state)
+    torch.use_deterministic_algorithms(True, warn_only=True)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'matmul'):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    if hasattr(torch.backends, 'cudnn'):
+        torch.backends.cudnn.allow_tf32 = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    if hasattr(torch.backends, 'cuda'):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
 
 def _loaders(cfg):
@@ -78,6 +89,42 @@ def _count_parameters(model):
     return total, trainable
 
 
+def _git_info(repo_dir):
+    def _run(args):
+        return subprocess.check_output(args, cwd=repo_dir, stderr=subprocess.DEVNULL).decode().strip()
+    try:
+        return {
+            'git_commit_sha': _run(['git', 'rev-parse', 'HEAD']),
+            'git_branch': _run(['git', 'branch', '--show-current']),
+        }
+    except Exception:
+        return {'git_commit_sha': None, 'git_branch': None}
+
+
+def _write_reproducibility(cfg):
+    payload = {
+        **_git_info('/root/autodl-tmp/mkd-main/new-train'),
+        'sys_argv': sys.argv,
+        'random_state': cfg.random_state,
+        'torch_version': torch.__version__,
+        'cuda_version': torch.version.cuda,
+        'cudnn_version': torch.backends.cudnn.version(),
+        'use_dci': getattr(cfg, 'use_dci', True),
+        'dci_dist_weight': getattr(cfg, 'dci_dist_weight', 1e-3),
+        'dci_sample_during_training': getattr(cfg, 'dci_sample_during_training', True),
+        'mppc_params': {'num_slots': 3, 'momentum': 0.9, 'temperature': 0.1, 'gate_init_logit': -6.0},
+        'ct_backbone': getattr(cfg, 'ct_backbone', 'convnextv2_nano'),
+        'pet_backbone': getattr(cfg, 'pet_backbone', 'mit_b1'),
+        'train_split_file': getattr(cfg, 'train_split_file', None),
+        'val_split_file': getattr(cfg, 'val_split_file', None),
+        'test_split_file': getattr(cfg, 'test_split_file', None),
+        'norm_mode': getattr(cfg, 'norm_mode', None),
+        'aug_mode': getattr(cfg, 'aug_mode', None),
+    }
+    with open(os.path.join(cfg.checkpoint_dir, 'reproducibility.json'), 'w') as f:
+        json.dump(payload, f, indent=2, default=str)
+
+
 def main():
     print('[INFO] starting baseline training', flush=True)
     cfg = SegMDTConfig.parse_arguments()
@@ -86,13 +133,15 @@ def main():
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
         json.dump(vars(cfg), f, indent=2, default=str)
+    _write_reproducibility(cfg)
 
     train_loader, val_loader, _ = _loaders(cfg)
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)}', flush=True)
 
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
     total_params, trainable_params = _count_parameters(task.model)
-    print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
+    dci_params = sum(p.numel() for p in task.model.dci_fusion.parameters()) if getattr(task.model, 'dci_fusion', None) is not None else 0
+    print(f'[INFO] use_dci={getattr(cfg, "use_dci", True)} dci_dist_weight={getattr(cfg, "dci_dist_weight", 1e-3)} dci_sample_during_training={getattr(cfg, "dci_sample_during_training", True)} random_state={cfg.random_state} params_total={total_params} dci_params={dci_params} params_trainable={trainable_params}', flush=True)
     task.scheduler = get_cosine_scheduler(
         task.optimizer,
         epochs=cfg.epochs,
@@ -103,7 +152,7 @@ def main():
     )
 
     extra_headers = [
-        'train_full_loss', 'train_missing_loss', 'train_overall_loss',
+        'train_full_loss', 'train_missing_loss', 'train_overall_loss', 'train_dci_dist', 'train_full_dci_dist', 'train_missing_dci_dist',
         'full_train_batches', 'missing_train_batches',
         'val_full_loss', 'val_full_dice', 'val_full_iou', 'val_full_acc', 'val_full_acc_pixel', 'val_full_hd95',
         'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
@@ -127,6 +176,8 @@ def main():
         task.model.train()
         full_n = missing_n = 0
         full_loss = missing_loss = 0.0
+        full_dci_loss = missing_dci_loss = 0.0
+        route_dci_loss = []
         grad_norm_accum = 0.0
         grad_norm_steps = 0
         grads = {
@@ -141,7 +192,7 @@ def main():
             route = 'full' if global_batch_step % 2 == 0 else 'missing'
             task.optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
-                loss, _, _, _ = task.train_step(batch, forward_mode=route)
+                loss, _, _, loss_stats = task.train_step(batch, forward_mode=route)
             if not torch.isfinite(loss):
                 raise RuntimeError('loss became non-finite')
 
@@ -166,15 +217,19 @@ def main():
 
             task.scheduler.step()
 
+            dci_loss_value = float(loss_stats['loss_dci_dist'].detach()) if isinstance(loss_stats, dict) and 'loss_dci_dist' in loss_stats else 0.0
+            route_dci_loss.append((route, dci_loss_value))
             if (batch_idx + 1) % 100 == 0:
-                print(f'[BATCH {batch_idx + 1}] route={route} loss={float(loss.detach()):.6f}', flush=True)
+                print(f'[BATCH {batch_idx + 1}] route={route} total={float(loss.detach()):.6f} seg={float(loss_stats["loss_seg"].detach()):.6f} dci_dist={dci_loss_value:.6f}', flush=True)
 
             if route == 'full':
                 full_n += 1
                 full_loss += float(loss.detach())
+                full_dci_loss += dci_loss_value
             else:
                 missing_n += 1
                 missing_loss += float(loss.detach())
+                missing_dci_loss += dci_loss_value
 
             global_batch_step += 1
             task.global_batch_step = global_batch_step
@@ -233,6 +288,9 @@ def main():
                 'train_full_loss': full_loss / max(1, full_n),
                 'train_missing_loss': missing_loss / max(1, missing_n),
                 'train_overall_loss': train_loss,
+                'train_dci_dist': (full_dci_loss + missing_dci_loss) / max(1, full_n + missing_n),
+                'train_full_dci_dist': full_dci_loss / max(1, full_n),
+                'train_missing_dci_dist': missing_dci_loss / max(1, missing_n),
                 'full_train_batches': full_n,
                 'missing_train_batches': missing_n,
                 'val_full_loss': val_full['total_loss'],
