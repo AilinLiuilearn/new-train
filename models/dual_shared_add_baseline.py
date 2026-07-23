@@ -1,25 +1,12 @@
 # -*- coding: utf-8 -*-
-import json
-import os
-import random
-import subprocess
-import sys
-import time
-import warnings
-
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from configs.seg_mdt import SegMDTConfig
 from models.apsf_module import APSF
 from models.baseline_blocks import UNetStyleDecoder, _check_tensor, _check_tensor_list
-from models.build_mdt_seg import build_mdt_seg_teacher, create_feature_backbone, load_local_weights_safe
+from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.mppc import MPPC
-from tasks.mdt_seg import MDTSegTeacher
-from utils.optimization import get_cosine_scheduler
-from utils.train_logger import append_epoch_log, init_train_log
 
 
 class StageChannelAlign(nn.Module):
@@ -108,7 +95,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return self._decode(fused_feats, target_size)
 
     def _forward_auto(self, ct, pet, pet_available, target_size):
-        pet_available = pet_available.long().view(-1)
+        pet_available = torch.as_tensor(
+            pet_available,
+            device=ct.device,
+            dtype=torch.long,
+        ).view(-1)
         if pet_available.numel() != ct.shape[0]:
             raise ValueError(f'pet_available length must match batch size, got {pet_available.numel()} vs {ct.shape[0]}')
         uniq = set(int(v) for v in pet_available.unique().tolist())

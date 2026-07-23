@@ -2,6 +2,7 @@ import copy
 import os
 import sys
 
+import pytest
 import torch
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -9,7 +10,6 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from configs.seg_mdt import SegMDTConfig
-from datasets.pclt20k_seg import PCLT20KSegDataset
 from models.build_mdt_seg import build_mdt_seg_teacher
 from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
 from tasks.mdt_seg import MDTSegTeacher
@@ -46,6 +46,35 @@ def test_forward_full_missing_shapes():
     out_full = model(ct, pet, forward_mode='full')
     out_missing = model(ct, None, forward_mode='missing')
     assert out_full['logits'].shape == out_missing['logits'].shape
+
+
+def test_auto_forward_list_pet_available():
+    model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
+    model.eval()
+    ct = torch.randn(2, 1, 64, 64)
+    pet = torch.randn(2, 1, 64, 64)
+    out = model(ct, pet=pet, pet_available=[1, 0], forward_mode='auto')
+    assert out['logits'].shape[0] == 2
+
+
+def test_auto_forward_cpu_tensor_pet_available():
+    model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
+    model.eval()
+    ct = torch.randn(2, 1, 64, 64)
+    pet = torch.randn(2, 1, 64, 64)
+    out = model(ct, pet=pet, pet_available=torch.tensor([1, 0], device='cpu'), forward_mode='auto')
+    assert out['logits'].shape[0] == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA not available')
+def test_auto_forward_cuda_cpu_pet_available():
+    model = DualSharedAddPETCTBaseline(use_deep_supervision=False).cuda()
+    model.eval()
+    ct = torch.randn(2, 1, 64, 64, device='cuda')
+    pet = torch.randn(2, 1, 64, 64, device='cuda')
+    out = model(ct, pet=pet, pet_available=torch.tensor([1, 0], device='cpu'), forward_mode='auto')
+    assert out['logits'].is_cuda
+    assert out['logits'].shape[0] == 2
 
 
 def test_bce_dice_loss_unpack():
@@ -112,6 +141,21 @@ def test_missing_path_pet_encoder_not_called(monkeypatch):
     out = model(ct, None, forward_mode='missing')
     assert 'logits' in out
     assert calls['n'] == 0
+
+
+def test_auto_forward_invalid_states():
+    model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
+    model.eval()
+    ct = torch.randn(2, 1, 64, 64)
+    pet = torch.randn(2, 1, 64, 64)
+    with pytest.raises(ValueError):
+        model(ct, pet=pet, pet_available=[1, 2], forward_mode='auto')
+    with pytest.raises(ValueError):
+        model(ct, pet=pet, pet_available=[-1, 0], forward_mode='auto')
+    with pytest.raises(ValueError):
+        model(ct, pet=pet, pet_available=[1], forward_mode='auto')
+    with pytest.raises(ValueError):
+        model(ct, pet=None, pet_available=[1, 0], forward_mode='auto')
 
 
 def test_checkpoint_save_and_eval_config_contract(tmp_path):
