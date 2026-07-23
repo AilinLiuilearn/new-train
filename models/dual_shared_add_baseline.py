@@ -36,7 +36,6 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pet_channels = list(self.enc_pet.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
         self.mppc = MPPC(channels=pet_channels, num_slots=3, momentum=0.9, temperature=0.1, gate_init_logit=-6.0)
-        self.mppc.eval()
         self.fusion = AddFusion()
         if self.use_dci:
             self.dci_fusion = MultiScaleDCIFuse(
@@ -63,20 +62,25 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return pet_feats
 
     def _fuse_features(self, ct_feats, aux_feats):
-        ct_feats = [_sanitize(feat) for feat in ct_feats]
-        aux_feats = [_sanitize(feat) for feat in aux_feats]
         if self.use_dci:
+            _check_tensor_list('dci_ct_input', ct_feats)
+            _check_tensor_list('dci_aux_input', aux_feats)
             fused_feats, loss_dci_dist = self.dci_fusion(ct_feats, aux_feats)
-        else:
-            fused_feats = self.fusion(ct_feats, aux_feats, None)
-            loss_dci_dist = ct_feats[0].new_zeros((), dtype=torch.float32)
-        fused_feats = [_sanitize(feat) for feat in fused_feats]
+            _check_tensor_list('dci_fused_output', fused_feats)
+            if not torch.isfinite(loss_dci_dist).all():
+                raise RuntimeError(
+                    f'[NaN/Inf] DCI distribution loss is non-finite: '
+                    f'dtype={loss_dci_dist.dtype}, '
+                    f'value={loss_dci_dist.detach().float().item()}'
+                )
+            return fused_feats, loss_dci_dist
+        fused_feats = self.fusion(ct_feats, aux_feats, None)
+        loss_dci_dist = torch.zeros((), device=ct_feats[0].device, dtype=torch.float32)
         return fused_feats, loss_dci_dist
 
     def _decode(self, fused_feats, target_size, loss_dci_dist=None):
         out = self.decoder(fused_feats, target_size)
-        out['logits'] = _sanitize(out['logits'])
-        _check_tensor('logits', out['logits'])
+        _check_tensor('decoder_logits', out['logits'])
         out['pred'] = out['logits']
         out['aux'] = {}
         if loss_dci_dist is None:
@@ -98,7 +102,14 @@ class DualSharedAddPETCTBaseline(nn.Module):
         aligned_ct = self._encode_ct(ct)
         pet_feats = self._encode_pet(pet)
         pet_feats = self._align_pet_to_ct(aligned_ct, pet_feats)
-        pet_for_fusion = self.mppc(aligned_ct, pet_features=pet_feats, target=mask, mode='full', update_bank=self.training)
+        with torch.autocast(device_type=aligned_ct[0].device.type, enabled=False):
+            pet_for_fusion = self.mppc(
+                aligned_ct,
+                pet_features=pet_feats,
+                target=mask,
+                mode='full',
+                update_bank=self.training,
+            )
         fused_feats, loss_dci_dist = self._fuse_features(aligned_ct, pet_for_fusion)
         return self._decode(fused_feats, target_size, loss_dci_dist=loss_dci_dist)
 

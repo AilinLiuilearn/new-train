@@ -28,13 +28,15 @@ class BCEDiceLoss(nn.Module):
             pw = torch.tensor(pw, dtype=logits.dtype, device=logits.device)
 
         bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pw)
-        pred = torch.sigmoid(logits)
-        intersection = (pred * target).sum(dim=(1, 2, 3))
+        pred = torch.sigmoid(logits).float()
+        target_f = target.float()
+        intersection = (pred * target_f).sum(dim=(1, 2, 3))
         pred_sum = pred.sum(dim=(1, 2, 3))
-        target_sum = target.sum(dim=(1, 2, 3))
+        target_sum = target_f.sum(dim=(1, 2, 3))
+        denom = (pred_sum + target_sum + float(self.smooth)).clamp_min(1e-6)
 
-        dice = 1.0 - (2.0 * intersection + self.smooth) / (pred_sum + target_sum + self.smooth)
-        dice = dice.mean()
+        dice = 1.0 - (2.0 * intersection + float(self.smooth)) / denom
+        dice = dice.mean().to(dtype=bce.dtype)
 
         total = self.bce_weight * bce + self.dice_weight * dice
         stats = {

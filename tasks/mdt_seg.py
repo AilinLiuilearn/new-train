@@ -18,6 +18,17 @@ def _flatten_grads(grads):
     return torch.cat(flat) if flat else torch.zeros(1)
 
 
+def _check_loss(name, value, forward_mode, global_batch_step):
+    if not torch.isfinite(value).all():
+        raise RuntimeError(
+            f'[NaN/Inf] {name} is non-finite: '
+            f'route={forward_mode}, '
+            f'global_batch_step={global_batch_step}, '
+            f'dtype={value.dtype}, '
+            f'value={value.detach().float().item()}'
+        )
+
+
 class MDTSegTeacher:
     def __init__(self, networks, config):
         self.networks = networks
@@ -27,7 +38,13 @@ class MDTSegTeacher:
         self.model.to(self.device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
         self.scheduler = None
-        self.scaler = torch.cuda.amp.GradScaler(enabled=bool(config.mixed_precision))
+        amp_init_scale = float(getattr(config, 'amp_init_scale', 4096.0))
+        if amp_init_scale <= 0:
+            raise ValueError('amp_init_scale must be positive')
+        self.scaler = torch.cuda.amp.GradScaler(
+            enabled=bool(config.mixed_precision),
+            init_scale=amp_init_scale,
+        )
         self.global_batch_step = 0
         if float(getattr(config, 'dci_dist_weight', 1e-3)) < 0:
             raise ValueError('dci_dist_weight must be non-negative')
@@ -42,19 +59,6 @@ class MDTSegTeacher:
         pet = batch['pet'].to(self.device, non_blocking=True) if forward_mode == 'full' else None
         mask = batch['mask'].to(self.device, non_blocking=True).float()
 
-        if torch.isnan(ct).any() or torch.isinf(ct).any():
-            raise RuntimeError(
-                f"CT input contains NaN/Inf before model forward (forward_mode={forward_mode}, step={self.global_batch_step})"
-            )
-        if forward_mode == 'full' and pet is not None and (torch.isnan(pet).any() or torch.isinf(pet).any()):
-            raise RuntimeError(
-                f"PET input contains NaN/Inf before model forward (forward_mode={forward_mode}, step={self.global_batch_step})"
-            )
-        if torch.isnan(mask).any() or torch.isinf(mask).any():
-            raise RuntimeError(
-                f"Mask contains NaN/Inf before loss (forward_mode={forward_mode}, step={self.global_batch_step})"
-            )
-
         outputs = self.model(
             ct,
             pet=pet,
@@ -63,15 +67,16 @@ class MDTSegTeacher:
         )
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
         loss_seg, loss_stats = self.criterion(logits, mask)
+        _check_loss('loss_seg', loss_seg, forward_mode, self.global_batch_step)
         if isinstance(outputs, dict):
             loss_dci_dist = outputs.get('loss_dci_dist', loss_seg.new_zeros((), dtype=torch.float32))
         else:
             loss_dci_dist = loss_seg.new_zeros((), dtype=torch.float32)
         if loss_dci_dist.ndim != 0:
             loss_dci_dist = loss_dci_dist.mean()
-        if not torch.isfinite(loss_dci_dist):
-            loss_dci_dist = loss_seg.new_zeros((), dtype=torch.float32)
+        _check_loss('loss_dci_dist', loss_dci_dist, forward_mode, self.global_batch_step)
         loss = loss_seg + float(self.config.dci_dist_weight) * loss_dci_dist
+        _check_loss('loss_total', loss, forward_mode, self.global_batch_step)
         stats = {
             'loss_total': loss.detach(),
             'loss_seg': loss_seg.detach(),

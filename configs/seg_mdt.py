@@ -53,6 +53,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--cosine_min_lr', type=float, default=1e-6)
         p.add_argument('--lr_flat_ratio', type=float, default=0.3)
         p.add_argument('--mixed_precision', type=str2bool, default=True)
+        p.add_argument('--amp_init_scale', type=float, default=4096.0)
         p.add_argument('--grad_clip', type=float, default=5.0)
         p.add_argument('--early_stop_patience', type=int, default=10)
         p.add_argument('--validation_frequency', type=int, default=1)

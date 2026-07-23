@@ -79,6 +79,30 @@ def module_grad_norm(module):
     return float(total.sqrt().item()) if total is not None else 0.0
 
 
+def _check_model_finite(model):
+    for name, parameter in model.named_parameters():
+        if not torch.isfinite(parameter).all():
+            return f'parameter:{name}'
+    for name, buffer in model.named_buffers():
+        if buffer.is_floating_point() and not torch.isfinite(buffer).all():
+            return f'buffer:{name}'
+    return None
+
+
+def _tensor_finite_stats(x):
+    x = x.detach().float()
+    finite = torch.isfinite(x)
+    if finite.any():
+        vals = x[finite]
+        return {
+            'finite': True,
+            'min': float(vals.min().item()),
+            'max': float(vals.max().item()),
+            'mean': float(vals.mean().item()),
+        }
+    return {'finite': False, 'min': None, 'max': None, 'mean': None}
+
+
 def _checkpoint_paths(checkpoint_dir):
     return {
         'best_joint': os.path.join(checkpoint_dir, 'ckpt.best_joint.pth.tar'),
@@ -117,6 +141,7 @@ def _write_reproducibility(cfg):
         'use_dci': getattr(cfg, 'use_dci', True),
         'dci_dist_weight': getattr(cfg, 'dci_dist_weight', 1e-3),
         'dci_sample_during_training': getattr(cfg, 'dci_sample_during_training', True),
+        'amp_init_scale': getattr(cfg, 'amp_init_scale', 4096.0),
         'mppc_params': {'num_slots': 3, 'momentum': 0.9, 'temperature': 0.1, 'gate_init_logit': -6.0},
         'ct_backbone': getattr(cfg, 'ct_backbone', 'convnextv2_nano'),
         'pet_backbone': getattr(cfg, 'pet_backbone', 'mit_b1'),
@@ -190,6 +215,8 @@ def main():
             'full': {'enc_ct': [], 'ct_align': [], 'decoder': []},
             'missing': {'enc_ct': [], 'ct_align': [], 'decoder': []},
         }
+        skip_counts = {'full': 0, 'missing': 0}
+        consecutive_skips = 0
         epoch_start = time.time()
         fixed_diag_batch = None
         diag_stats = {}
@@ -199,8 +226,17 @@ def main():
             task.optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
                 loss, _, _, loss_stats = task.train_step(batch, forward_mode=route)
+            bad_state_after_forward = _check_model_finite(task.model)
+            if bad_state_after_forward is not None:
+                raise FloatingPointError(
+                    f'non-finite model state after forward: {bad_state_after_forward} '
+                    f'(step={global_batch_step}, batch={batch_idx}, route={route})'
+                )
             if not torch.isfinite(loss):
-                raise RuntimeError('loss became non-finite')
+                raise FloatingPointError(
+                    f'non-finite loss: step={global_batch_step}, '
+                    f'batch={batch_idx}, route={route}, value={loss.detach()}'
+                )
 
             if task.scaler.is_enabled():
                 task.scaler.scale(loss).backward()
@@ -208,10 +244,39 @@ def main():
             else:
                 loss.backward()
 
-            grads[route]['enc_ct'].append(module_grad_norm(task.model.enc_ct))
-            grads[route]['ct_align'].append(module_grad_norm(task.model.ct_align))
-            grads[route]['decoder'].append(module_grad_norm(task.model.decoder))
-            total_grad_norm = torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip)) if float(cfg.grad_clip) > 0 else 0.0
+            bad_grad = None
+            for name, parameter in task.model.named_parameters():
+                grad = parameter.grad
+                if grad is not None and not torch.isfinite(grad).all():
+                    finite = grad.detach()[torch.isfinite(grad.detach())]
+                    stats = {'min': None, 'max': None}
+                    if finite.numel() > 0:
+                        stats = {'min': float(finite.min().item()), 'max': float(finite.max().item())}
+                    bad_grad = (name, grad, stats)
+                    break
+            if bad_grad is not None:
+                name, grad, stats = bad_grad
+                if task.scaler.is_enabled():
+                    scale_before = float(task.scaler.get_scale())
+                    task.scaler.step(task.optimizer)
+                    task.scaler.update()
+                    scale_after = float(task.scaler.get_scale())
+                    print(f'[SKIP] non-finite grad at step={global_batch_step} batch={batch_idx} route={route} name={name} dtype={grad.dtype} shape={tuple(grad.shape)} nan={int(torch.isnan(grad).sum().item())} posinf={int(torch.isposinf(grad).sum().item())} neginf={int(torch.isneginf(grad).sum().item())} finite_min={stats["min"]} finite_max={stats["max"]} scale_before={scale_before} scale_after={scale_after}', flush=True)
+                    skip_counts[route] += 1
+                    consecutive_skips += 1
+                    if consecutive_skips > 20:
+                        raise FloatingPointError(f'too many consecutive skipped AMP steps: {consecutive_skips}')
+                else:
+                    raise FloatingPointError(
+                        f'non-finite gradient: step={global_batch_step}, batch={batch_idx}, route={route}, '
+                        f'name={name}, dtype={grad.dtype}, shape={tuple(grad.shape)}'
+                    )
+                task.optimizer.zero_grad(set_to_none=True)
+                global_batch_step += 1
+                task.global_batch_step = global_batch_step
+                continue
+
+            total_grad_norm = torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip), error_if_nonfinite=True) if float(cfg.grad_clip) > 0 else 0.0
             grad_norm_accum += float(total_grad_norm)
             grad_norm_steps += 1
 
@@ -220,6 +285,15 @@ def main():
                 task.scaler.update()
             else:
                 task.optimizer.step()
+            consecutive_skips = 0
+            skip_counts[route] += 0
+
+            bad_state = _check_model_finite(task.model)
+            if bad_state is not None:
+                raise FloatingPointError(
+                    f'non-finite model state after optimizer step: {bad_state} '
+                    f'(step={global_batch_step}, batch={batch_idx}, route={route})'
+                )
 
             task.scheduler.step()
 
