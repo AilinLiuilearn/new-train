@@ -31,14 +31,18 @@ def _make_cfg(**kwargs):
     return type('C', (), base)()
 
 
+def _text_embeddings():
+    return torch.nn.functional.normalize((torch.arange(64, dtype=torch.float32).reshape(2, 32) + 1), dim=-1)
+
+
 def test_model_imports():
-    model = DualSharedAddPETCTBaseline()
-    assert hasattr(model, 'apsf')
-    assert not hasattr(model, 'fusion_legacy')
+    model = DualSharedAddPETCTBaseline(fusion_text_embeddings=_text_embeddings(), ct_pretrained_path=None, pet_pretrained_path=None)
+    assert hasattr(model, 'fusion')
+    assert not hasattr(model, 'apsf')
 
 
 def test_forward_full_missing_shapes():
-    model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
+    model = DualSharedAddPETCTBaseline(fusion_text_embeddings=_text_embeddings(), ct_pretrained_path=None, pet_pretrained_path=None, use_deep_supervision=False)
     model.eval()
     ct = torch.randn(2, 1, 64, 64)
     pet = torch.randn(2, 1, 64, 64)
@@ -48,7 +52,7 @@ def test_forward_full_missing_shapes():
 
 
 def test_auto_forward_list_pet_available():
-    model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
+    model = DualSharedAddPETCTBaseline(fusion_text_embeddings=_text_embeddings(), ct_pretrained_path=None, pet_pretrained_path=None, use_deep_supervision=False)
     model.eval()
     ct = torch.randn(2, 1, 64, 64)
     pet = torch.randn(2, 1, 64, 64)
@@ -57,7 +61,7 @@ def test_auto_forward_list_pet_available():
 
 
 def test_auto_forward_cpu_tensor_pet_available():
-    model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
+    model = DualSharedAddPETCTBaseline(fusion_text_embeddings=_text_embeddings(), ct_pretrained_path=None, pet_pretrained_path=None, use_deep_supervision=False)
     model.eval()
     ct = torch.randn(2, 1, 64, 64)
     pet = torch.randn(2, 1, 64, 64)
@@ -67,7 +71,7 @@ def test_auto_forward_cpu_tensor_pet_available():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA not available')
 def test_auto_forward_cuda_cpu_pet_available():
-    model = DualSharedAddPETCTBaseline(use_deep_supervision=False).cuda()
+    model = DualSharedAddPETCTBaseline(fusion_text_embeddings=_text_embeddings(), ct_pretrained_path=None, pet_pretrained_path=None, use_deep_supervision=False).cuda()
     model.eval()
     ct = torch.randn(2, 1, 64, 64, device='cuda')
     pet = torch.randn(2, 1, 64, 64, device='cuda')
@@ -86,7 +90,7 @@ def test_bce_dice_loss_unpack():
 
 
 def test_task_train_step_unpacks_logits():
-    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(use_deep_supervision=False)}, _make_cfg())
+    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(fusion_text_embeddings=_text_embeddings(), ct_pretrained_path=None, pet_pretrained_path=None, use_deep_supervision=False)}, _make_cfg())
     batch = {'ct': torch.randn(1, 1, 64, 64), 'pet': torch.randn(1, 1, 64, 64), 'mask': torch.zeros(1, 1, 64, 64)}
     loss, logits, outputs, stats = task.train_step(batch, forward_mode='full')
     assert torch.is_tensor(loss)
@@ -97,8 +101,11 @@ def test_task_train_step_unpacks_logits():
 
 
 def test_build_teacher():
-    cfg = _make_cfg(ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, deep_supervision=False)
-    out = build_mdt_seg_teacher(cfg)
+    cfg = _make_cfg(ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, deep_supervision=False, fusion_prompt_embedding_path='/tmp/petct_fusion_prompts.pt')
+    from unittest.mock import patch
+    dummy_embeddings = torch.nn.functional.normalize((torch.arange(64, dtype=torch.float32).reshape(2, 32) + 1), dim=-1)
+    with patch('models.text_guided_ct_anchor_fusion.load_prompt_embeddings', return_value=(dummy_embeddings, {'full': 'a', 'missing': 'b'})):
+        out = build_mdt_seg_teacher(cfg)
     assert 'model' in out
 
 
@@ -127,7 +134,7 @@ def test_module_grad_norm_preserves_grad_and_value():
 
 
 def test_missing_path_pet_encoder_not_called(monkeypatch):
-    model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
+    model = DualSharedAddPETCTBaseline(fusion_text_embeddings=_text_embeddings(), ct_pretrained_path=None, pet_pretrained_path=None, use_deep_supervision=False)
     calls = {'n': 0}
     orig = model.enc_pet.forward
 
@@ -143,7 +150,7 @@ def test_missing_path_pet_encoder_not_called(monkeypatch):
 
 
 def test_auto_forward_invalid_states():
-    model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
+    model = DualSharedAddPETCTBaseline(fusion_text_embeddings=_text_embeddings(), ct_pretrained_path=None, pet_pretrained_path=None, use_deep_supervision=False)
     model.eval()
     ct = torch.randn(2, 1, 64, 64)
     pet = torch.randn(2, 1, 64, 64)
@@ -158,7 +165,7 @@ def test_auto_forward_invalid_states():
 
 
 def test_checkpoint_save_and_eval_config_contract(tmp_path):
-    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(use_deep_supervision=False)}, _make_cfg())
+    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(fusion_text_embeddings=_text_embeddings(), ct_pretrained_path=None, pet_pretrained_path=None, use_deep_supervision=False)}, _make_cfg())
     path = tmp_path / 'ckpt.pth.tar'
     task.save_checkpoint(str(path), 1, best_joint=0.1, best_full=0.2, best_missing=0.3, best_joint_epoch=1, val_full={'dice': 0.2}, val_missing={'dice': 0.3}, joint_dice=0.25)
     ckpt = torch.load(path, map_location='cpu')

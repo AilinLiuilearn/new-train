@@ -3,10 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.apsf_module import APSF
 from models.baseline_blocks import UNetStyleDecoder, _check_tensor, _check_tensor_list
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.mppc import MPPC
+from models.text_guided_ct_anchor_fusion import TextGuidedCTAnchorFusion
 
 
 class StageChannelAlign(nn.Module):
@@ -25,12 +25,27 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
-    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, **kwargs):
+    def __init__(
+        self,
+        ct_backbone='convnextv2_nano',
+        pet_backbone='mit_b1',
+        ct_pretrained_path=None,
+        pet_pretrained_path=None,
+        in_channels=3,
+        out_channels=1,
+        decoder_channels=(512, 256, 128, 64),
+        use_deep_supervision=False,
+        fusion_prompt_embedding_path=None,
+        fusion_text_embeddings=None,
+        **kwargs,
+    ):
         super().__init__()
         if kwargs:
             raise TypeError(f'Unexpected kwargs: {sorted(kwargs)}')
         if use_deep_supervision:
             raise ValueError('Deep supervision has been removed from this baseline.')
+        if fusion_prompt_embedding_path is not None and fusion_text_embeddings is not None:
+            raise ValueError('Provide only one of fusion_prompt_embedding_path or fusion_text_embeddings.')
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
         load_local_weights_safe(self.enc_ct, ct_pretrained_path, name='CT_Encoder')
@@ -39,7 +54,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pet_channels = list(self.enc_pet.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
         self.mppc = MPPC(channels=pet_channels, num_slots=3, momentum=0.9, temperature=0.1, gate_init_logit=-6.0)
-        self.apsf = APSF(channels=pet_channels)
+        if fusion_text_embeddings is not None:
+            self.fusion = TextGuidedCTAnchorFusion(text_embeddings=fusion_text_embeddings, channels=pet_channels)
+        elif fusion_prompt_embedding_path is not None:
+            self.fusion = TextGuidedCTAnchorFusion.from_embedding_file(fusion_prompt_embedding_path, channels=pet_channels)
+        else:
+            raise ValueError('fusion_prompt_embedding_path or fusion_text_embeddings is required for TextGuidedCTAnchorFusion.')
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=False)
 
     @staticmethod
@@ -65,13 +85,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return aligned
 
     def _fuse_features(self, ct_feats, aux_feats, forward_mode):
-        if forward_mode == 'full':
-            fused_feats = self.apsf.forward_full(ct_feats, aux_feats)
-        elif forward_mode == 'missing':
-            fused_feats = self.apsf.forward_missing(ct_feats, aux_feats)
-        else:
+        if forward_mode not in ('full', 'missing'):
             raise ValueError(f'Unsupported forward_mode={forward_mode!r}')
-        _check_tensor_list('apsf_fused_output', fused_feats)
+        fused_feats = self.fusion(ct_feats, aux_feats, mode=forward_mode)
+        _check_tensor_list('text_guided_ct_anchor_fused_output', fused_feats)
         return fused_feats
 
     def _decode(self, fused_feats, target_size):
@@ -87,8 +104,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
         aligned_ct = self._encode_ct(ct)
         pet_feats = self._align_pet_to_ct(aligned_ct, self._encode_pet(pet))
         with torch.autocast(device_type=aligned_ct[0].device.type, enabled=False):
-            pet_for_fusion = self.mppc(aligned_ct, pet_features=pet_feats, target=mask, mode='full', update_bank=self.training)
-        fused_feats = self._fuse_features(aligned_ct, pet_for_fusion, 'full')
+            pet_features = self.mppc(aligned_ct, pet_features=pet_feats, target=mask, mode='full', update_bank=self.training)
+        fused_feats = self._fuse_features(aligned_ct, pet_features, 'full')
         return self._decode(fused_feats, target_size)
 
     def _forward_missing(self, ct, target_size):
@@ -98,11 +115,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return self._decode(fused_feats, target_size)
 
     def _forward_auto(self, ct, pet, pet_available, target_size):
-        pet_available = torch.as_tensor(
-            pet_available,
-            device=ct.device,
-            dtype=torch.long,
-        ).view(-1)
+        pet_available = torch.as_tensor(pet_available, device=ct.device, dtype=torch.long).view(-1)
         if pet_available.numel() != ct.shape[0]:
             raise ValueError(f'pet_available length must match batch size, got {pet_available.numel()} vs {ct.shape[0]}')
         uniq = set(int(v) for v in pet_available.unique().tolist())
@@ -121,8 +134,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
         if full_idx.numel() > 0:
             ct_full = [feat.index_select(0, full_idx) for feat in aligned_ct]
             pet_full = self._align_pet_to_ct(ct_full, self._encode_pet(pet.index_select(0, full_idx)))
-            pet_for_fusion = self.mppc(ct_full, pet_features=pet_full, target=None, mode='full', update_bank=False)
-            fused_full = self._fuse_features(ct_full, pet_for_fusion, 'full')
+            pet_features = self.mppc(ct_full, pet_features=pet_full, target=None, mode='full', update_bank=False)
+            fused_full = self._fuse_features(ct_full, pet_features, 'full')
             for i, feat in enumerate(fused_full):
                 fused[i].index_copy_(0, full_idx, feat)
         if missing_idx.numel() > 0:

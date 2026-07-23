@@ -356,6 +356,7 @@ def build_mdt_seg_teacher(config):
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
         ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
         pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
+        fusion_prompt_embedding_path=getattr(config, 'fusion_prompt_embedding_path', None),
         in_channels=3,
         out_channels=1,
         decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
@@ -363,6 +364,6 @@ def build_mdt_seg_teacher(config):
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion=APSF missing_compensation=MPPC shared_decoder=UNetStyleDecoder'
+        f'fusion=TextGuidedCTAnchorFusion missing_compensation=MPPC shared_decoder=UNetStyleDecoder'
     )
     return {'model': model}

@@ -2,19 +2,18 @@
 
 Standalone PyTorch implementation for PET-optional CT-PET segmentation.
 
-The module is inserted after the existing CT/PET channel-alignment layers and
-before the existing element-wise SUM fusion.  It deliberately keeps the clean
-baseline fusion unchanged for complete (Full) batches:
+MPPC sits between the aligned CT/PET feature extractors and the downstream
+TextGuidedCTAnchorFusion module.  It does not perform the final fusion itself:
 
-    Full:    fused_s = ct_s + pet_s
-    Missing: fused_s = ct_s + mppc_s(ct_s)
+    Full:    MPPC returns the real PET features for downstream fusion.
+    Missing: MPPC returns PET compensation candidates for downstream fusion.
 
 For Full training batches, MPPC only writes paired CT-key/PET-value prototypes
 using the ground-truth segmentation mask.  For Missing batches, it never needs
 the PET image or PET features: local CT queries retrieve PET references through
 CT-to-CT similarity, while an EMA PET-to-PET consistency score estimates how
-trustworthy each paired prototype is.  Low-confidence reads produce a zero
-additive residual, so SUM fusion falls back to the unchanged CT representation.
+trustworthy each paired prototype is.  The downstream fusion module then turns
+those features into the final CT-anchored segmentation representation.
 
 No reconstruction, distillation, feature-alignment, or auxiliary loss is used.
 All prototype banks are FP32 buffers, are saved in ``state_dict``, and receive
@@ -25,15 +24,15 @@ Minimal integration
 -------------------
     mppc = MPPC(channels=(64, 128, 320, 512), num_slots=3)
 
-    # Full batch: real PET features pass through unchanged; the bank is updated.
-    pet_for_sum = mppc(
+    # Full batch: real PET features are returned unchanged; the bank is updated.
+    pet_features_out = mppc(
         ct_features, pet_features, target=mask, mode="full"
     )
-    fused_features = [c + p for c, p in zip(ct_features, pet_for_sum)]
+    fused_features = fusion(ct_features, pet_features_out, mode="full")
 
     # Missing batch: do not load PET and do not run the PET encoder.
-    pet_for_sum = mppc(ct_features, pet_features=None, mode="missing")
-    fused_features = [c + p for c, p in zip(ct_features, pet_for_sum)]
+    pet_proxy = mppc(ct_features, pet_features=None, mode="missing")
+    fused_features = fusion(ct_features, pet_proxy, mode="missing")
 
 Important training rules
 ------------------------
@@ -80,9 +79,9 @@ class MPPC(nn.Module):
         eps: Numerical stability constant.
 
     Input features must already be channel- and spatially aligned within every
-    CT/PET scale.  The module returns the additive feature used by the original
-    SUM fusion: real PET features in Full mode and a confidence-controlled PET
-    reference residual in Missing mode.
+    CT/PET scale.  The module returns the feature stream consumed by the
+    downstream fusion: real PET features in Full mode and a compensation
+    candidate in Missing mode.
     """
 
     _BANK_BUFFER_KINDS: Tuple[str, ...] = (

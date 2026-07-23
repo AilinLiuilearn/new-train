@@ -27,6 +27,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--pet_backbone', type=str, default='mit_b1')
         p.add_argument('--ct_pretrained_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano')
         p.add_argument('--pet_pretrained_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1')
+        p.add_argument('--fusion_prompt_embedding_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/biomedclip_model/petct_fusion_prompts.pt')
         p.add_argument('--decoder_channels', type=int, nargs=4, default=[512, 256, 128, 64])
         p.add_argument('--joint_full_weight', type=float, default=0.5)
         p.add_argument('--joint_missing_weight', type=float, default=0.5)
