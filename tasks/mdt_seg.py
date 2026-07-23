@@ -41,13 +41,8 @@ class MDTSegTeacher:
         amp_init_scale = float(getattr(config, 'amp_init_scale', 4096.0))
         if amp_init_scale <= 0:
             raise ValueError('amp_init_scale must be positive')
-        self.scaler = torch.cuda.amp.GradScaler(
-            enabled=bool(config.mixed_precision),
-            init_scale=amp_init_scale,
-        )
+        self.scaler = torch.cuda.amp.GradScaler(enabled=bool(config.mixed_precision), init_scale=amp_init_scale)
         self.global_batch_step = 0
-        if float(getattr(config, 'dci_dist_weight', 1e-3)) < 0:
-            raise ValueError('dci_dist_weight must be non-negative')
         self.criterion = BCEDiceLoss(smooth=config.loss_smooth, bce_weight=config.bce_weight, dice_weight=config.dice_weight)
         self.metrics = SegmentationMetricsCIPA()
 
@@ -58,29 +53,15 @@ class MDTSegTeacher:
         ct = batch['ct'].to(self.device, non_blocking=True)
         pet = batch['pet'].to(self.device, non_blocking=True) if forward_mode == 'full' else None
         mask = batch['mask'].to(self.device, non_blocking=True).float()
-
-        outputs = self.model(
-            ct,
-            pet=pet,
-            forward_mode=forward_mode,
-            mask=mask if forward_mode == 'full' else None,
-        )
+        outputs = self.model(ct, pet=pet, forward_mode=forward_mode, mask=mask if forward_mode == 'full' else None)
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
         loss_seg, loss_stats = self.criterion(logits, mask)
         _check_loss('loss_seg', loss_seg, forward_mode, self.global_batch_step)
-        if isinstance(outputs, dict):
-            loss_dci_dist = outputs.get('loss_dci_dist', loss_seg.new_zeros((), dtype=torch.float32))
-        else:
-            loss_dci_dist = loss_seg.new_zeros((), dtype=torch.float32)
-        if loss_dci_dist.ndim != 0:
-            loss_dci_dist = loss_dci_dist.mean()
-        _check_loss('loss_dci_dist', loss_dci_dist, forward_mode, self.global_batch_step)
-        loss = loss_seg + float(self.config.dci_dist_weight) * loss_dci_dist
+        loss = loss_seg
         _check_loss('loss_total', loss, forward_mode, self.global_batch_step)
         stats = {
             'loss_total': loss.detach(),
             'loss_seg': loss_seg.detach(),
-            'loss_dci_dist': loss_dci_dist.detach(),
             'loss_boundary': torch.tensor(0.0, device=loss.device),
         }
         return loss, logits, outputs, stats
@@ -143,11 +124,11 @@ class MDTSegTeacher:
             mask = batch['mask'][:max_samples].to(self.device, non_blocking=True).float()
             pet = batch['pet'][:max_samples].to(self.device, non_blocking=True)
             if torch.isnan(ct).any() or torch.isinf(ct).any():
-                raise RuntimeError("CT input contains NaN/Inf in gradient diagnostics")
+                raise RuntimeError('CT input contains NaN/Inf in gradient diagnostics')
             if torch.isnan(mask).any() or torch.isinf(mask).any():
-                raise RuntimeError("Mask contains NaN/Inf in gradient diagnostics")
+                raise RuntimeError('Mask contains NaN/Inf in gradient diagnostics')
             if torch.isnan(pet).any() or torch.isinf(pet).any():
-                raise RuntimeError("PET input contains NaN/Inf in gradient diagnostics")
+                raise RuntimeError('PET input contains NaN/Inf in gradient diagnostics')
             params_shared = list(self.model.enc_ct.parameters()) + list(self.model.ct_align.parameters()) + list(self.model.decoder.parameters())
             params_ct = list(self.model.enc_ct.parameters())
             params_align = list(self.model.ct_align.parameters())

@@ -1,6 +1,12 @@
 import copy
+import os
+import sys
 
 import torch
+
+ROOT = os.path.dirname(os.path.dirname(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from configs.seg_mdt import SegMDTConfig
 from datasets.pclt20k_seg import PCLT20KSegDataset
@@ -28,10 +34,13 @@ def _make_cfg(**kwargs):
 def test_model_imports():
     model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
     assert model.decoder.use_deep_supervision is False
+    assert hasattr(model, 'apsf')
+    assert not hasattr(model, 'fusion_legacy')
 
 
 def test_forward_full_missing_shapes():
     model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
+    model.eval()
     ct = torch.randn(2, 1, 64, 64)
     pet = torch.randn(2, 1, 64, 64)
     out_full = model(ct, pet, forward_mode='full')
@@ -55,7 +64,8 @@ def test_task_train_step_unpacks_logits():
     assert torch.is_tensor(loss)
     assert isinstance(outputs, dict)
     assert 'logits' in outputs
-    assert 'loss_total' in stats
+    assert torch.allclose(stats['loss_total'], stats['loss_seg'])
+    assert 'loss_aux_apsf' not in stats
 
 
 def test_build_teacher():

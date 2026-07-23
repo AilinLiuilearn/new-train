@@ -138,9 +138,9 @@ def _write_reproducibility(cfg):
         'torch_version': torch.__version__,
         'cuda_version': torch.version.cuda,
         'cudnn_version': torch.backends.cudnn.version(),
-        'use_dci': getattr(cfg, 'use_dci', True),
-        'dci_dist_weight': getattr(cfg, 'dci_dist_weight', 1e-3),
-        'dci_sample_during_training': getattr(cfg, 'dci_sample_during_training', True),
+        'fusion_module': 'APSF',
+        'missing_compensation': 'MPPC',
+        'apsf_auxiliary_loss': False,
         'amp_init_scale': getattr(cfg, 'amp_init_scale', 4096.0),
         'mppc_params': {'num_slots': 3, 'momentum': 0.9, 'temperature': 0.1, 'gate_init_logit': -6.0},
         'ct_backbone': getattr(cfg, 'ct_backbone', 'convnextv2_nano'),
@@ -171,8 +171,9 @@ def main():
 
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
     total_params, trainable_params = _count_parameters(task.model)
-    dci_params = sum(p.numel() for p in task.model.dci_fusion.parameters()) if getattr(task.model, 'dci_fusion', None) is not None else 0
-    print(f'[INFO] use_dci={getattr(cfg, "use_dci", True)} dci_dist_weight={getattr(cfg, "dci_dist_weight", 1e-3)} dci_sample_during_training={getattr(cfg, "dci_sample_during_training", True)} random_state={cfg.random_state} params_total={total_params} dci_params={dci_params} params_trainable={trainable_params}', flush=True)
+    mppc_params = sum(p.numel() for p in task.model.mppc.parameters()) if getattr(task.model, 'mppc', None) is not None else 0
+    apsf_params = sum(p.numel() for p in task.model.apsf.parameters()) if getattr(task.model, 'apsf', None) is not None else 0
+    print(f'[INFO] random_state={cfg.random_state} params_total={total_params} params_trainable={trainable_params} mppc_params={mppc_params} apsf_params={apsf_params}', flush=True)
     task.scheduler = get_cosine_scheduler(
         task.optimizer,
         epochs=cfg.epochs,
@@ -183,7 +184,7 @@ def main():
     )
 
     extra_headers = [
-        'train_full_loss', 'train_missing_loss', 'train_overall_loss', 'train_dci_dist', 'train_full_dci_dist', 'train_missing_dci_dist',
+        'train_full_loss', 'train_missing_loss', 'train_overall_loss',
         'full_train_batches', 'missing_train_batches',
         'val_full_loss', 'val_full_dice', 'val_full_iou', 'val_full_acc', 'val_full_acc_pixel', 'val_full_hd95',
         'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
@@ -207,8 +208,6 @@ def main():
         task.model.train()
         full_n = missing_n = 0
         full_loss = missing_loss = 0.0
-        full_dci_loss = missing_dci_loss = 0.0
-        route_dci_loss = []
         grad_norm_accum = 0.0
         grad_norm_steps = 0
         grads = {
@@ -297,19 +296,15 @@ def main():
 
             task.scheduler.step()
 
-            dci_loss_value = float(loss_stats['loss_dci_dist'].detach()) if isinstance(loss_stats, dict) and 'loss_dci_dist' in loss_stats else 0.0
-            route_dci_loss.append((route, dci_loss_value))
             if (batch_idx + 1) % 100 == 0:
-                print(f'[BATCH {batch_idx + 1}] route={route} total={float(loss.detach()):.6f} seg={float(loss_stats["loss_seg"].detach()):.6f} dci_dist={dci_loss_value:.6f}', flush=True)
+                print(f'[BATCH {batch_idx + 1}] route={route} total={float(loss.detach()):.6f} seg={float(loss_stats["loss_seg"].detach()):.6f}', flush=True)
 
             if route == 'full':
                 full_n += 1
                 full_loss += float(loss.detach())
-                full_dci_loss += dci_loss_value
             else:
                 missing_n += 1
                 missing_loss += float(loss.detach())
-                missing_dci_loss += dci_loss_value
 
             global_batch_step += 1
             task.global_batch_step = global_batch_step
@@ -368,9 +363,7 @@ def main():
                 'train_full_loss': full_loss / max(1, full_n),
                 'train_missing_loss': missing_loss / max(1, missing_n),
                 'train_overall_loss': train_loss,
-                'train_dci_dist': (full_dci_loss + missing_dci_loss) / max(1, full_n + missing_n),
-                'train_full_dci_dist': full_dci_loss / max(1, full_n),
-                'train_missing_dci_dist': missing_dci_loss / max(1, missing_n),
+
                 'full_train_batches': full_n,
                 'missing_train_batches': missing_n,
                 'val_full_loss': val_full['total_loss'],

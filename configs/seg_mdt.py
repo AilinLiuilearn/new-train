@@ -35,8 +35,6 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--enable_gradient_diagnostics', type=str2bool, default=False)
         p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
-        p.add_argument('--use_dci', type=str2bool, default=True)
-        p.add_argument('--dci_sample_during_training', type=str2bool, default=True)
         return p
 
     @staticmethod
@@ -74,7 +72,6 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--bce_weight', type=float, default=1.0)
         p.add_argument('--dice_weight', type=float, default=1.0)
         p.add_argument('--boundary_loss_weight', type=float, default=0.0)
-        p.add_argument('--dci_dist_weight', type=float, default=1e-3)
         return p
 
     @classmethod
@@ -83,7 +80,5 @@ class SegMDTConfig(ConfigBase):
         parser = argparse.ArgumentParser(add_help=True, parents=parents)
         config = cls()
         parser.parse_args(namespace=config)
-        if float(config.dci_dist_weight) < 0:
-            raise ValueError('dci_dist_weight must be >= 0')
         config._ensure_hash()
         return config
