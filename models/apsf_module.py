@@ -2,83 +2,59 @@
 APSF: Asymmetric PET-Surrogate Fusion
 ======================================
 
-面向 2D PET-CT 肿瘤分割的独立四尺度特征融合模块。
+三步结构（与设计图一致）
+------------------------
+1. 路径专用可靠性 R_s（连续、全 token）：
+   Full:    R = max(r_pet, r_task)
+   Missing: R = r_ct * r_agree
+   R 控制辅助信息的全部进入，而不是只缩放一条残差。
 
-设计边界
---------
-1. Full 路径只接收 CT 特征与真实 PET 特征。
-2. Missing 路径只接收 CT 特征与 MPPC 已生成的补偿特征。
-3. APSF 不读取 MPPC 的 memory、置信度、检索结果或其他内部状态。
-4. 不需要分割标签，不引入辅助损失，也没有需要搜索的标量超参数。
-5. Full/Missing 使用各自的前端整形，之后进入同一个共享融合核。
-6. 三个输出投影采用零初始化，因此初始化时严格退化为原始 SUM：
+2. 把辅助信息迁移到 CT 表征空间：
+   Q = W_q LN(C),  K = W_k LN(A),  V = W_v LN(A)
+   M = Softmax( (√R Q)^T (√R K) )   # [B, d, d]
+   Z = V M^T                        # [B, N, d]
 
-       Full:    fused = CT + PET
-       Missing: fused = CT + PET_proxy
+3. 辅助证据生成 CT 状态修正（无 +A 直通）：
+   [γ, β] = W_m(Z)
+   U = tanh(γ) ⊙ Q + β
+   F = C + W_o( R ⊙ U )
 
+初始化：W_o 全零 ⇒ F ≡ C；无 +A 直通，PET/proxy 只经可靠性→跨协方差→仿射路径影响。
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Sequence, Tuple, Union
+from typing import Dict, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 FeaturePyramid = Sequence[Tensor]
 DebugInfo = Dict[str, Tensor]
 
 
-def sparsemax(logits: Tensor, dim: int = -1) -> Tensor:
-    if dim < 0:
-        dim += logits.ndim
-    if dim != logits.ndim - 1:
-        logits = logits.transpose(dim, -1)
-        restore_dim = dim
-    else:
-        restore_dim = None
-    original_dtype = logits.dtype
-    z = logits.float()
-    z = z - z.max(dim=-1, keepdim=True).values
-    z_sorted = torch.sort(z, dim=-1, descending=True).values
-    z_cumsum = z_sorted.cumsum(dim=-1)
-    rank_shape = [1] * z.ndim
-    rank_shape[-1] = z.shape[-1]
-    ranks = torch.arange(1, z.shape[-1] + 1, device=z.device, dtype=z.dtype).view(rank_shape)
-    support = 1.0 + ranks * z_sorted > z_cumsum
-    support_size = support.sum(dim=-1, keepdim=True).clamp_min(1)
-    tau_sum = z_cumsum.gather(dim=-1, index=support_size - 1)
-    tau = (tau_sum - 1.0) / support_size.to(z.dtype)
-    probabilities = torch.clamp(z - tau, min=0.0).to(original_dtype)
-    if restore_dim is not None:
-        probabilities = probabilities.transpose(restore_dim, -1)
-    return probabilities
-
-
-def unit_sparsemax(logits: Tensor) -> Tensor:
-    probabilities = sparsemax(logits, dim=-1)
-    eps = torch.finfo(probabilities.dtype).eps
-    return probabilities / probabilities.amax(dim=-1, keepdim=True).clamp_min(eps)
-
-
 def standardize_scores(scores: Tensor) -> Tensor:
+    """按样本在空间 token 维度做无可调参数的标准化（FP32 均值/方差，无排序）。"""
     scores_fp32 = scores.float()
     mean = scores_fp32.mean(dim=-1, keepdim=True)
     variance = (scores_fp32 - mean).square().mean(dim=-1, keepdim=True)
-    eps = torch.finfo(scores_fp32.dtype).eps
-    return ((scores_fp32 - mean) * torch.rsqrt(variance + eps)).to(scores.dtype)
+    # Larger than finfo.eps: under AMP, near-zero spatial variance used to explode.
+    return ((scores_fp32 - mean) * torch.rsqrt(variance + 1e-5)).to(scores.dtype)
 
 
 def map_to_tokens(feature: Tensor) -> Tensor:
+    """[B, C, H, W] -> [B, H*W, C]."""
     return feature.flatten(2).transpose(1, 2).contiguous()
 
 
 def tokens_to_map(tokens: Tensor, height: int, width: int) -> Tensor:
+    """[B, H*W, C] -> [B, C, H, W]."""
     batch, token_count, channels = tokens.shape
     if token_count != height * width:
-        raise ValueError(f"Token count mismatch: got {token_count}, expected {height * width}.")
+        raise ValueError(
+            f"Token count mismatch: got {token_count}, expected {height * width}."
+        )
     return tokens.transpose(1, 2).reshape(batch, channels, height, width)
 
 
@@ -91,144 +67,235 @@ def zero_init_linear(layer: nn.Linear) -> None:
 class APSFStage(nn.Module):
     def __init__(self, channels: int) -> None:
         super().__init__()
+        if channels <= 0:
+            raise ValueError(f"channels must be positive, got {channels}.")
         self.channels = int(channels)
+        self.inner_dim = min(64, max(8, self.channels // 4))
         self.attention_scale = self.channels ** -0.5
+
         self.task_token = nn.Parameter(torch.empty(1, self.channels))
         self.ct_norm = nn.LayerNorm(self.channels)
         self.real_pet_norm = nn.LayerNorm(self.channels)
         self.proxy_norm = nn.LayerNorm(self.channels)
         self.query_norm = nn.LayerNorm(self.channels)
-        self.real_refine = nn.Linear(self.channels, self.channels)
-        self.proxy_refine = nn.Linear(self.channels, self.channels)
-        self.ct_from_aux_scale = nn.Parameter(torch.ones(self.channels))
-        self.ct_from_aux_bias = nn.Parameter(torch.zeros(self.channels))
-        self.aux_from_ct_scale = nn.Parameter(torch.ones(self.channels))
-        self.aux_from_ct_bias = nn.Parameter(torch.zeros(self.channels))
-        self.q_proj = nn.Linear(self.channels, self.channels, bias=False)
-        self.k_proj = nn.Linear(self.channels, self.channels, bias=False)
-        self.v_proj = nn.Linear(self.channels, self.channels, bias=False)
-        self.out_proj = nn.Linear(self.channels, self.channels, bias=False)
+
+        # Step 2 projections
+        self.q_proj = nn.Linear(self.channels, self.inner_dim, bias=False)
+        self.k_proj = nn.Linear(self.channels, self.inner_dim, bias=False)
+        self.v_proj = nn.Linear(self.channels, self.inner_dim, bias=False)
+        # Step 3: low-dim affine from Z → [γ, β]
+        self.mod_proj = nn.Linear(self.inner_dim, 2 * self.inner_dim, bias=True)
+        # Step 3: map back to channel space (zero-init → CT identity at start)
+        self.out_proj = nn.Linear(self.inner_dim, self.channels, bias=False)
+
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         nn.init.trunc_normal_(self.task_token, std=0.02)
-        for norm in (self.ct_norm, self.real_pet_norm, self.proxy_norm, self.query_norm):
+        for norm in (
+            self.ct_norm,
+            self.real_pet_norm,
+            self.proxy_norm,
+            self.query_norm,
+        ):
             nn.init.ones_(norm.weight)
             nn.init.zeros_(norm.bias)
-        for projection in (self.q_proj, self.k_proj, self.v_proj):
+        for projection in (self.q_proj, self.k_proj, self.v_proj, self.mod_proj):
             nn.init.xavier_uniform_(projection.weight)
-        zero_init_linear(self.real_refine)
-        zero_init_linear(self.proxy_refine)
+            if projection.bias is not None:
+                nn.init.zeros_(projection.bias)
         zero_init_linear(self.out_proj)
 
     @staticmethod
     def _validate_pair(ct: Tensor, auxiliary: Tensor) -> None:
         if ct.ndim != 4 or auxiliary.ndim != 4 or ct.shape != auxiliary.shape:
-            raise ValueError(f"CT and auxiliary features must be aligned 4D maps, got {tuple(ct.shape)} and {tuple(auxiliary.shape)}.")
+            raise ValueError(
+                "CT and auxiliary features must be aligned 4D maps, "
+                f"got {tuple(ct.shape)} and {tuple(auxiliary.shape)}."
+            )
 
     def _ct_conditioned_query(self, ct_tokens: Tensor) -> Tuple[Tensor, Tensor]:
         normalized_ct = self.ct_norm(ct_tokens)
         task = self.task_token.expand(normalized_ct.shape[0], -1)
         attn = (task[:, None, :] * normalized_ct).sum(dim=-1) * self.attention_scale
         attn = attn.softmax(dim=-1)
-        ct_context = torch.einsum('bn,bnd->bd', attn, normalized_ct)
+        ct_context = torch.einsum("bn,bnd->bd", attn, normalized_ct)
         return self.query_norm(task + ct_context), normalized_ct
 
-    def _full_frontend(self, ct_tokens: Tensor, pet_tokens: Tensor) -> Tuple[Tensor, Tensor]:
-        query, _ = self._ct_conditioned_query(ct_tokens)
+    def _full_frontend(
+        self,
+        ct_tokens: Tensor,
+        pet_tokens: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """R_full = max(r_pet, r_task); 同时返回 LN(C), LN(A)."""
+        query, normalized_ct = self._ct_conditioned_query(ct_tokens)
         normalized_pet = self.real_pet_norm(pet_tokens)
         pet_global = normalized_pet.mean(dim=1)
-        self_scores = torch.einsum('bd,bnd->bn', pet_global, normalized_pet) * self.attention_scale
-        task_scores = torch.einsum('bd,bnd->bn', query, normalized_pet) * self.attention_scale
-        selection = torch.maximum(unit_sparsemax(self_scores), unit_sparsemax(task_scores))
-        refined_pet = pet_tokens + self.real_refine((2.0 * selection.unsqueeze(-1) - 1.0) * normalized_pet)
-        return refined_pet, selection
+        self_scores = (
+            torch.einsum("bd,bnd->bn", pet_global, normalized_pet)
+            * self.attention_scale
+        )
+        task_scores = (
+            torch.einsum("bd,bnd->bn", query, normalized_pet) * self.attention_scale
+        )
+        self_relevance = torch.sigmoid(standardize_scores(self_scores))
+        task_relevance = torch.sigmoid(standardize_scores(task_scores))
+        relevance = torch.maximum(self_relevance, task_relevance)
+        return normalized_ct, normalized_pet, relevance
 
-    def _missing_frontend(self, ct_tokens: Tensor, proxy_tokens: Tensor) -> Tuple[Tensor, Tensor]:
+    def _missing_frontend(
+        self,
+        ct_tokens: Tensor,
+        proxy_tokens: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """R_miss = r_ct * r_agree; 同时返回 LN(C), LN(A)."""
         query, normalized_ct = self._ct_conditioned_query(ct_tokens)
         normalized_proxy = self.proxy_norm(proxy_tokens)
-        ct_task_scores = torch.einsum('bd,bnd->bn', query, normalized_ct) * self.attention_scale
-        local_agreement_scores = (normalized_ct * normalized_proxy).sum(dim=-1) * self.attention_scale
-        selection = unit_sparsemax(0.5 * (standardize_scores(ct_task_scores) + standardize_scores(local_agreement_scores)))
-        refined_proxy = proxy_tokens + self.proxy_refine((2.0 * selection.unsqueeze(-1) - 1.0) * normalized_proxy)
-        return refined_proxy, selection
+        ct_task_scores = (
+            torch.einsum("bd,bnd->bn", query, normalized_ct) * self.attention_scale
+        )
+        agreement_scores = (
+            normalized_ct * normalized_proxy
+        ).sum(dim=-1) * self.attention_scale
+        ct_relevance = torch.sigmoid(standardize_scores(ct_task_scores))
+        agreement_relevance = torch.sigmoid(standardize_scores(agreement_scores))
+        relevance = ct_relevance * agreement_relevance
+        return normalized_ct, normalized_proxy, relevance
 
-    @staticmethod
-    def _selected_indices(selection: Tensor) -> Tensor:
-        support = selection > 0
-        if not bool(support.any()):
-            support = torch.zeros_like(support)
-            support[selection.argmax(dim=-1)] = True
-        idx = torch.nonzero(support, as_tuple=False).squeeze(1)
-        if idx.ndim != 1:
-            idx = idx.reshape(-1)
-        return idx
+    def _reliability_xcov_ct_update(
+        self,
+        ct_tokens: Tensor,
+        normalized_ct: Tensor,
+        normalized_auxiliary: Tensor,
+        relevance: Tensor,
+    ) -> Tensor:
+        """
+        Step2–3:
+          Q,K,V ∈ [B,N,d]
+          M = Softmax((√R Q)^T (√R K)) ∈ [B,d,d]  (FP32; L2-norm over N for AMP stability)
+          Z = V M^T
+          [γ,β] = W_m(Z)
+          F = C + W_o( R ⊙ (tanh(γ) ⊙ Q + β) )
+        初始化时 W_o=0 ⇒ F ≡ C（无辅助直通）。
+        """
+        # Keep structure F=C+W_o(R⊙U). Compute the low-dim xcov path in FP32 so
+        # that N≈H*W matmuls under AMP cannot produce Inf before softmax.
+        q = self.q_proj(normalized_ct).float()
+        k = self.k_proj(normalized_auxiliary).float()
+        v = self.v_proj(normalized_auxiliary).float()
+        relevance_f = relevance.float().clamp(0.0, 1.0)
 
-    @staticmethod
-    def _masked_mean_single(tokens: Tensor, idx: Tensor) -> Tensor:
-        return tokens.index_select(0, idx).mean(dim=0, keepdim=True)
+        # √R 约束：控制辅助信息进入跨协方差
+        root_r = relevance_f.clamp_min(1e-6).sqrt().unsqueeze(-1)  # [B,N,1]
+        q_w = q * root_r
+        k_w = k * root_r
 
-    def _attend_chunked(self, q: Tensor, k: Tensor, v: Tensor, chunk: int = 256) -> Tensor:
-        chunks = []
-        for start in range(0, q.shape[1], chunk):
-            q_chunk = q[:, start:min(start + chunk, q.shape[1])]
-            if hasattr(F, 'scaled_dot_product_attention'):
-                out = F.scaled_dot_product_attention(q_chunk.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), attn_mask=None, dropout_p=0.0, is_causal=False).squeeze(1)
-            else:
-                attn = torch.matmul(q_chunk, k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
-                out = torch.matmul(attn.softmax(dim=-1), v)
-            chunks.append(out)
-        return torch.cat(chunks, dim=1)
+        # Normalize over spatial tokens so M stays O(1) when N is large (e.g. 128^2).
+        # Shapes remain [B,d,N] / [B,d,d] — never form [B,N,N].
+        q_channel = F.normalize(q_w.transpose(1, 2), p=2, dim=-1, eps=1e-6)
+        k_channel = F.normalize(k_w.transpose(1, 2), p=2, dim=-1, eps=1e-6)
+        channel_relation = torch.matmul(q_channel, k_channel.transpose(-2, -1))
+        channel_relation = channel_relation.softmax(dim=-1)
 
-    def _shared_fusion_single(self, ct_tokens: Tensor, auxiliary_tokens: Tensor, selection: Tensor) -> Tuple[Tensor, Tensor]:
-        fused_list = []
-        support_list = []
-        batch = ct_tokens.shape[0]
-        for b in range(batch):
-            idx = self._selected_indices(selection[b])
-            ct_selected = ct_tokens[b:b+1].index_select(1, idx)
-            aux_selected = auxiliary_tokens[b:b+1].index_select(1, idx)
-            ct_global = ct_selected.mean(dim=1, keepdim=True)
-            aux_global = aux_selected.mean(dim=1, keepdim=True)
-            ct_gate = torch.sigmoid(aux_global * self.ct_from_aux_scale + self.ct_from_aux_bias)
-            aux_gate = torch.sigmoid(ct_global * self.aux_from_ct_scale + self.aux_from_ct_bias)
-            ct_modulated = ct_selected * ct_gate
-            aux_modulated = aux_selected * aux_gate
-            q = self.q_proj(ct_modulated)
-            k = self.k_proj(aux_modulated)
-            v = self.v_proj(aux_modulated)
-            attended = self._attend_chunked(q, k, v)
-            residual = torch.zeros_like(ct_tokens[b:b+1])
-            residual.scatter_add_(1, idx.view(1, -1, 1).expand(1, -1, ct_tokens.shape[-1]), self.out_proj(attended))
-            fused_list.append(ct_tokens[b:b+1] + auxiliary_tokens[b:b+1] + residual)
-            support_list.append(torch.tensor(idx.numel(), device=ct_tokens.device, dtype=torch.long))
-        return torch.cat(fused_list, dim=0), torch.stack(support_list)
+        # Z = V M^T → [B,N,d]
+        z = torch.matmul(v, channel_relation.transpose(-2, -1))
 
-    def _forward_stage(self, ct: Tensor, aux: Tensor, mode: str) -> Tuple[Tensor, Tensor]:
+        # [γ, β] = W_m(Z)
+        gamma, beta = self.mod_proj(z).chunk(2, dim=-1)
+        # Soft clamp affine params so residual cannot explode after out_proj grows.
+        gamma = gamma.clamp(-20.0, 20.0)
+        beta = beta.clamp(-50.0, 50.0)
+        # U = tanh(γ) ⊙ Q + β
+        u = torch.tanh(gamma) * q + beta
+
+        residual = self.out_proj(relevance_f.unsqueeze(-1) * u)
+        residual = residual.to(dtype=ct_tokens.dtype)
+        residual = torch.nan_to_num(residual, nan=0.0, posinf=0.0, neginf=0.0)
+        # No auxiliary passthrough: F = C + W_o(R ⊙ U)
+        return ct_tokens + residual
+
+    def _forward_stage(
+        self,
+        ct: Tensor,
+        aux: Tensor,
+        mode: str,
+    ) -> Tuple[Tensor, Tensor]:
         self._validate_pair(ct, aux)
+        height, width = ct.shape[-2:]
         ct_tokens = map_to_tokens(ct)
         aux_tokens = map_to_tokens(aux)
-        if mode == 'full':
-            aux_tokens, selection = self._full_frontend(ct_tokens, aux_tokens)
+
+        if mode == "full":
+            norm_ct, norm_aux, relevance = self._full_frontend(ct_tokens, aux_tokens)
+        elif mode == "missing":
+            norm_ct, norm_aux, relevance = self._missing_frontend(ct_tokens, aux_tokens)
         else:
-            aux_tokens, selection = self._missing_frontend(ct_tokens, aux_tokens)
-        fused_tokens, support_count = self._shared_fusion_single(ct_tokens, aux_tokens, selection)
-        return tokens_to_map(fused_tokens, ct.shape[-2], ct.shape[-1]), support_count
+            raise ValueError(f"Unsupported mode={mode!r}")
 
-    def forward_full(self, ct: Tensor, pet: Tensor, return_debug: bool = False):
-        fused, support = self._forward_stage(ct, pet, 'full')
-        if return_debug:
-            return fused, [{'selection_map': torch.zeros_like(ct[:, :1]), 'support_count': support}]
-        return fused
+        fused_tokens = self._reliability_xcov_ct_update(
+            ct_tokens,
+            norm_ct,
+            norm_aux,
+            relevance,
+        )
+        fused = tokens_to_map(fused_tokens, height, width)
+        return fused, relevance
 
-    def forward_missing(self, ct: Tensor, proxy: Tensor, return_debug: bool = False):
-        fused, support = self._forward_stage(ct, proxy, 'missing')
-        if return_debug:
-            return fused, [{'selection_map': torch.zeros_like(ct[:, :1]), 'support_count': support}]
-        return fused
+    def forward_full(
+        self,
+        ct: Tensor,
+        pet: Tensor,
+        return_debug: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, DebugInfo]]:
+        if ct.shape[1] != self.channels:
+            raise ValueError(
+                f"Stage was built for {self.channels} channels, but received {ct.shape[1]}."
+            )
+        fused, relevance = self._forward_stage(ct, pet, "full")
+        if not return_debug:
+            return fused
+        reliability_map = tokens_to_map(
+            relevance.unsqueeze(-1),
+            ct.shape[-2],
+            ct.shape[-1],
+        )
+        debug = {
+            "reliability_map": reliability_map,
+            "selection_map": reliability_map,
+            "support_count": relevance.float().sum(dim=-1),
+        }
+        return fused, debug
+
+    def forward_missing(
+        self,
+        ct: Tensor,
+        proxy: Tensor,
+        return_debug: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, DebugInfo]]:
+        if ct.shape[1] != self.channels:
+            raise ValueError(
+                f"Stage was built for {self.channels} channels, but received {ct.shape[1]}."
+            )
+        fused, relevance = self._forward_stage(ct, proxy, "missing")
+        if not return_debug:
+            return fused
+        reliability_map = tokens_to_map(
+            relevance.unsqueeze(-1),
+            ct.shape[-2],
+            ct.shape[-1],
+        )
+        debug = {
+            "reliability_map": reliability_map,
+            "selection_map": reliability_map,
+            "support_count": relevance.float().sum(dim=-1),
+        }
+        return fused, debug
 
     def extra_repr(self) -> str:
-        return f"channels={self.channels}, selection=sparsemax, heads=1"
+        return (
+            f"channels={self.channels}, inner_dim={self.inner_dim}, "
+            f"selection=continuous, fusion=xcov_ct_update"
+        )
 
 
 class APSF(nn.Module):
@@ -238,33 +305,64 @@ class APSF(nn.Module):
         self.stages = nn.ModuleList([APSFStage(v) for v in self.channels])
 
     def _run(self, fn, ct_features, aux_features, return_debug=False):
-        outs = []
+        if len(ct_features) != len(self.stages):
+            raise ValueError(
+                f"Expected {len(self.stages)} CT scales, got {len(ct_features)}."
+            )
+        if len(aux_features) != len(self.stages):
+            raise ValueError(
+                f"Expected {len(self.stages)} aux scales, got {len(aux_features)}."
+            )
+
+        outputs = []
         debugs = []
         for stage, ct, aux in zip(self.stages, ct_features, aux_features):
-            if self.training and torch.is_grad_enabled() and not return_debug:
-                out = checkpoint(lambda a, b, s=stage: fn(s, a, b, False), ct, aux, use_reentrant=False)
-            else:
-                out = fn(stage, ct, aux, return_debug)
+            result = fn(stage, ct, aux, return_debug)
             if return_debug:
-                fused, debug = out
-                outs.append(fused)
+                fused, debug = result
+                outputs.append(fused)
                 debugs.append(debug)
             else:
-                outs.append(out)
-        return (outs, debugs) if return_debug else outs
+                outputs.append(result)
+        if return_debug:
+            return outputs, debugs
+        return outputs
 
     def forward_full(self, ct_features, pet_features, return_debug=False):
-        return self._run(lambda stage, ct, aux, rd: stage.forward_full(ct, aux, rd), ct_features, pet_features, return_debug)
+        return self._run(
+            lambda stage, ct, aux, rd: stage.forward_full(ct, aux, rd),
+            ct_features,
+            pet_features,
+            return_debug,
+        )
 
     def forward_missing(self, ct_features, proxy_features, return_debug=False):
-        return self._run(lambda stage, ct, aux, rd: stage.forward_missing(ct, aux, rd), ct_features, proxy_features, return_debug)
+        return self._run(
+            lambda stage, ct, aux, rd: stage.forward_missing(ct, aux, rd),
+            ct_features,
+            proxy_features,
+            return_debug,
+        )
 
     def trainable_parameter_count(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     torch.manual_seed(7)
-    module = APSF(channels=(16, 32, 64, 128))
-    print('APSF self-test passed.')
-    print(f'Default trainable parameters: {module.trainable_parameter_count():,}')
+    module = APSF(channels=(64, 128, 320, 512))
+    print("APSF three-step CT-update self-test")
+    print(f"  trainable parameters: {module.trainable_parameter_count():,}")
+    print(f"  inner_dims: {[s.inner_dim for s in module.stages]}")
+    ct = [
+        torch.randn(2, c, h, w)
+        for c, (h, w) in zip(
+            (64, 128, 320, 512),
+            ((32, 32), (16, 16), (8, 8), (4, 4)),
+        )
+    ]
+    pet = [t.clone() for t in ct]
+    full = module.forward_full(ct, pet)
+    for o, a in zip(full, ct):
+        torch.testing.assert_close(o, a, rtol=1e-6, atol=1e-6)
+    print("  init F≡C (W_o=0, no +A): OK")

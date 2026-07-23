@@ -26,10 +26,10 @@ def test_apsf_shapes_and_sum_equivalence():
     assert len(full) == 4 and len(missing) == 4
     for out, a, b in zip(full, ct, pet):
         assert out.shape == a.shape == b.shape
-        torch.testing.assert_close(out, a + b, rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(out, a, rtol=1e-6, atol=1e-6)
     for out, a, b in zip(missing, ct, proxy):
         assert out.shape == a.shape == b.shape
-        torch.testing.assert_close(out, a + b, rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(out, a, rtol=1e-6, atol=1e-6)
 
 
 def test_apsf_parameter_count():
