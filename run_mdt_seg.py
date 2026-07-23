@@ -60,13 +60,8 @@ def _loaders(cfg):
 
 def _assert_baseline(cfg):
     assert cfg.accumulation_steps == 1
-    assert float(cfg.train_pet_drop_prob) == 0.0
-    assert float(cfg.missing_loss_weight) == 1.0
     assert float(cfg.joint_full_weight) == 0.5
     assert float(cfg.joint_missing_weight) == 0.5
-    assert bool(cfg.use_deep_supervision) is False
-    assert bool(cfg.deep_supervision) is False
-    assert float(cfg.boundary_loss_weight) == 0.0
 
 
 def module_grad_norm(module):
@@ -217,9 +212,6 @@ def main():
         skip_counts = {'full': 0, 'missing': 0}
         consecutive_skips = 0
         epoch_start = time.time()
-        fixed_diag_batch = None
-        diag_stats = {}
-
         for batch_idx, batch in enumerate(train_loader):
             route = 'full' if global_batch_step % 2 == 0 else 'missing'
             task.optimizer.zero_grad(set_to_none=True)
@@ -308,15 +300,6 @@ def main():
 
             global_batch_step += 1
             task.global_batch_step = global_batch_step
-            if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is None:
-                fixed_diag_batch = {
-                    'ct': batch['ct'][:1].detach().cpu(),
-                    'pet': batch['pet'][:1].detach().cpu(),
-                    'mask': batch['mask'][:1].detach().cpu(),
-                }
-
-        if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is not None and epoch % int(cfg.gradient_diagnostics_interval) == 0:
-            diag_stats = task.gradient_diagnostics(fixed_diag_batch, max_samples=min(1, int(cfg.gradient_diagnostics_num_samples))) or {}
 
         val_full = task.evaluate(val_loader, eval_mode='full', tag='val_full')
         val_missing = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_missing')
@@ -388,7 +371,6 @@ def main():
                 'grad_full_decoder': float(np.mean(grads['full']['decoder'])) if grads['full']['decoder'] else 0.0,
                 'grad_missing_decoder': float(np.mean(grads['missing']['decoder'])) if grads['missing']['decoder'] else 0.0,
                 'epoch_time': time.time() - epoch_start,
-                **{f'diag_{k}': v for k, v in diag_stats.items()},
             },
         )
 

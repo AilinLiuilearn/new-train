@@ -32,7 +32,10 @@ class ConcatConvFusion(nn.Module):
 class PETCTBaselineUNet(nn.Module):
     def __init__(self, ct_backbone='mit_b1', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), fusion_type='concat_conv', use_deep_supervision=False, **kwargs):
         super().__init__()
-        self.use_deep_supervision = bool(use_deep_supervision)
+        if kwargs:
+            raise TypeError(f'Unexpected kwargs: {sorted(kwargs)}')
+        if use_deep_supervision:
+            raise ValueError('Deep supervision has been removed from this baseline.')
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
         load_local_weights_safe(self.enc_ct, ct_pretrained_path, name='CT_Encoder')
@@ -43,7 +46,7 @@ class PETCTBaselineUNet(nn.Module):
             self.fusion = AddFusion()
         else:
             self.fusion = ConcatConvFusion(ct_channels, pet_channels, out_channels=ct_channels)
-        self.decoder = UNetStyleDecoder(ct_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
+        self.decoder = UNetStyleDecoder(ct_channels, decoder_channels=decoder_channels, out_channels=out_channels)
 
     @staticmethod
     def _to_3ch(x):

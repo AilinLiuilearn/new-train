@@ -28,13 +28,8 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--ct_pretrained_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano')
         p.add_argument('--pet_pretrained_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1')
         p.add_argument('--decoder_channels', type=int, nargs=4, default=[512, 256, 128, 64])
-        p.add_argument('--use_deep_supervision', type=str2bool, default=False)
-        p.add_argument('--deep_supervision', type=str2bool, default=False)
         p.add_argument('--joint_full_weight', type=float, default=0.5)
         p.add_argument('--joint_missing_weight', type=float, default=0.5)
-        p.add_argument('--enable_gradient_diagnostics', type=str2bool, default=False)
-        p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
-        p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
         return p
 
     @staticmethod
@@ -45,7 +40,6 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--accumulation_steps', type=int, default=1)
         p.add_argument('--optimizer', type=str, default='adamw', choices=('adamw', 'sgd'))
         p.add_argument('--learning_rate', type=float, default=8e-5)
-        p.add_argument('--decoder_lr', type=float, default=8e-5)
         p.add_argument('--weight_decay', type=float, default=1e-4)
         p.add_argument('--cosine_warmup', type=int, default=3)
         p.add_argument('--cosine_min_lr', type=float, default=1e-6)
@@ -56,13 +50,6 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--early_stop_patience', type=int, default=10)
         p.add_argument('--validation_frequency', type=int, default=1)
         p.add_argument('--random_state', type=int, default=2023)
-        p.add_argument('--final_test_missing_rates', type=float, nargs='+', default=[0.0, 0.25, 0.5, 0.75, 1.0])
-        p.add_argument('--train_pet_drop_prob', type=float, default=0.0)
-        p.add_argument('--missing_loss_weight', type=float, default=1.0)
-        p.add_argument('--vis_every_epoch', type=str2bool, default=False)
-        p.add_argument('--eval_full_pet', type=str2bool, default=True)
-        p.add_argument('--eval_fixed_missing_pet', type=str2bool, default=True)
-        p.add_argument('--eval_random_missing_pet', type=str2bool, default=False)
         return p
 
     @staticmethod
@@ -71,7 +58,6 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--loss_smooth', type=float, default=1.0)
         p.add_argument('--bce_weight', type=float, default=1.0)
         p.add_argument('--dice_weight', type=float, default=1.0)
-        p.add_argument('--boundary_loss_weight', type=float, default=0.0)
         return p
 
     @classmethod

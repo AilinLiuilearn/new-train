@@ -22,9 +22,10 @@ def _sanitize(x):
 class UNetStyleDecoder(nn.Module):
     def __init__(self, encoder_channels=(64, 128, 320, 512), decoder_channels=(512, 256, 128, 64), out_channels=1, use_deep_supervision=False):
         super().__init__()
+        if use_deep_supervision:
+            raise ValueError('Deep supervision has been removed from this baseline decoder.')
         c1, c2, c3, c4 = encoder_channels
         d4, d3, d2, d1 = decoder_channels
-        self.use_deep_supervision = bool(use_deep_supervision)
         self.proj4 = ConvBNAct(c4, d4, kernel_size=1)
         self.proj3 = ConvBNAct(c3, d3, kernel_size=1)
         self.proj2 = ConvBNAct(c2, d2, kernel_size=1)
@@ -33,10 +34,6 @@ class UNetStyleDecoder(nn.Module):
         self.fuse2 = nn.Sequential(ConvBNAct(d3 + d2, d2, kernel_size=3), ConvBNAct(d2, d2, kernel_size=3))
         self.fuse1 = nn.Sequential(ConvBNAct(d2 + d1, d1, kernel_size=3), ConvBNAct(d1, d1, kernel_size=3))
         self.seg_head = nn.Conv2d(d1, out_channels, kernel_size=1)
-        if self.use_deep_supervision:
-            self.aux_head_d2 = nn.Conv2d(d2, out_channels, kernel_size=1)
-            self.aux_head_d3 = nn.Conv2d(d3, out_channels, kernel_size=1)
-            self.aux_head_d4 = nn.Conv2d(d4, out_channels, kernel_size=1)
 
     def forward(self, features, target_size):
         x1, x2, x3, x4 = features
@@ -49,9 +46,7 @@ class UNetStyleDecoder(nn.Module):
         d1 = self.fuse1(torch.cat([F.interpolate(d2, size=s1.shape[-2:], mode='bilinear', align_corners=False), s1], dim=1))
         logits = self.seg_head(d1)
         final_logits = F.interpolate(logits, size=target_size, mode='bilinear', align_corners=False)
-        if not self.use_deep_supervision:
-            return {'logits': final_logits}
-        return {'logits': final_logits, 'aux_logits': [self.aux_head_d2(d2), self.aux_head_d3(d3), self.aux_head_d4(d4)]}
+        return {'logits': final_logits}
 
 
 class AddFusion(nn.Module):

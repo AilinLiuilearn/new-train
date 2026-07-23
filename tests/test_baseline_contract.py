@@ -32,8 +32,7 @@ def _make_cfg(**kwargs):
 
 
 def test_model_imports():
-    model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
-    assert model.decoder.use_deep_supervision is False
+    model = DualSharedAddPETCTBaseline()
     assert hasattr(model, 'apsf')
     assert not hasattr(model, 'fusion_legacy')
 

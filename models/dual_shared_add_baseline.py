@@ -25,9 +25,12 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
-    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False):
+    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, **kwargs):
         super().__init__()
-        self.use_deep_supervision = bool(use_deep_supervision)
+        if kwargs:
+            raise TypeError(f'Unexpected kwargs: {sorted(kwargs)}')
+        if use_deep_supervision:
+            raise ValueError('Deep supervision has been removed from this baseline.')
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
         load_local_weights_safe(self.enc_ct, ct_pretrained_path, name='CT_Encoder')
@@ -37,7 +40,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
         self.mppc = MPPC(channels=pet_channels, num_slots=3, momentum=0.9, temperature=0.1, gate_init_logit=-6.0)
         self.apsf = APSF(channels=pet_channels)
-        self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
+        self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=False)
 
     @staticmethod
     def _to_3ch(x):
