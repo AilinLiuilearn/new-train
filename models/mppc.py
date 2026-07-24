@@ -3,22 +3,29 @@
 Standalone PyTorch implementation for PET-optional CT-PET segmentation.
 
 MPPC sits between the aligned CT/PET feature extractors and the downstream
-TextGuidedCTAnchorFusion module.  It does not perform the final fusion itself:
+TextGuidedCTAnchorFusion (TGCAF) module.  It does **not** fuse into CT itself:
 
     Full:    MPPC returns the real PET features for downstream fusion.
-    Missing: MPPC returns PET compensation candidates for downstream fusion.
+    Missing: MPPC returns PET **candidates** ``ρ_s * R_s`` for TGCAF.
 
 For Full training batches, MPPC only writes paired CT-key/PET-value prototypes
 using the ground-truth segmentation mask.  For Missing batches, it never needs
 the PET image or PET features: local CT queries retrieve PET references through
 CT-to-CT similarity, while an EMA PET-to-PET consistency score estimates how
-trustworthy each paired prototype is.  The downstream fusion module then turns
-those features into the final CT-anchored segmentation representation.
+trustworthy each paired prototype is.  Reliability ``ρ`` gates the retrieved PET
+values ``R``; there is **no** learnable residual scale ``λ`` inside MPPC.
+
+Two experimental roles (do not mix their math):
+
+    MPPC + TGCAF (this code): Φ_s(C_s, ρ_s * R_s)
+
+TGCAF is the only place that decides how much candidate PET evidence to accept
+(null attention, acceptance weights, and its own residual scale).  Callers must
+**not** apply ``CT + candidate`` outside TGCAF.
 
 No reconstruction, distillation, feature-alignment, or auxiliary loss is used.
 All prototype banks are FP32 buffers, are saved in ``state_dict``, and receive
-no gradient.  Only one near-zero-initialized residual scale per feature level is
-learnable.
+no gradient.  MPPC has **no** trainable parameters by default.
 
 Minimal integration
 -------------------
@@ -31,8 +38,8 @@ Minimal integration
     fused_features = fusion(ct_features, pet_features_out, mode="full")
 
     # Missing batch: do not load PET and do not run the PET encoder.
-    pet_proxy = mppc(ct_features, pet_features=None, mode="missing")
-    fused_features = fusion(ct_features, pet_proxy, mode="missing")
+    pet_candidates = mppc(ct_features, pet_features=None, mode="missing")
+    fused_features = fusion(ct_features, pet_candidates, mode="missing")
 
 Important training rules
 ------------------------
@@ -64,7 +71,7 @@ Ablation = Literal["normal", "off", "shuffle_values"]
 
 
 class MPPC(nn.Module):
-    """Four-scale paired-prototype compensation for optional PET features.
+    """Four-scale paired-prototype PET candidates for optional PET features.
 
     Args:
         channels: Aligned CT/PET channel count at every feature scale.
@@ -73,15 +80,12 @@ class MPPC(nn.Module):
         num_slots: Number of paired CT-key/PET-value slots per class and scale.
         momentum: EMA momentum used to update keys, values, and pair consistency.
         temperature: Softmax temperature for local CT-to-CT retrieval.
-        gate_init_logit: Initial logit of each learnable residual scale. ``-6``
-            gives sigmoid(-6) ~= 0.0025 and therefore starts close to the clean
-            CT-only Missing path.
         eps: Numerical stability constant.
 
     Input features must already be channel- and spatially aligned within every
-    CT/PET scale.  The module returns the feature stream consumed by the
-    downstream fusion: real PET features in Full mode and a compensation
-    candidate in Missing mode.
+    CT/PET scale.  The module returns the auxiliary stream for TGCAF: real PET
+    features in Full mode and reliability-gated candidates ``ρ_s R_s`` in
+    Missing mode (same shapes as CT at each scale).
     """
 
     _BANK_BUFFER_KINDS: Tuple[str, ...] = (
@@ -99,7 +103,6 @@ class MPPC(nn.Module):
         num_slots: int = 3,
         momentum: float = 0.9,
         temperature: float = 0.1,
-        gate_init_logit: float = -6.0,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -124,12 +127,6 @@ class MPPC(nn.Module):
         self.momentum = float(momentum)
         self.temperature = float(temperature)
         self.eps = float(eps)
-
-        # One conservative residual strength per scale.  There is intentionally
-        # no learned spatial/channel gate and no CT-to-PET generator.
-        self.residual_gate_logits = nn.Parameter(
-            torch.full((self.num_scales,), float(gate_init_logit), dtype=torch.float32)
-        )
 
         # Each scale has [semantic class, slot, channel] paired buffers.
         for scale_idx, channel_count in enumerate(self.channels):
@@ -169,7 +166,7 @@ class MPPC(nn.Module):
         return_diagnostics: bool = False,
         return_maps: bool = False,
     ) -> Union[List[Tensor], Tuple[List[Tensor], Dict[str, Any]]]:
-        """Return features to be added to CT by the existing SUM fusion.
+        """Return auxiliary features for TGCAF (not CT+SUM residuals).
 
         Args:
             ct_features: Multi-scale aligned CT features ``[B, C_s, H_s, W_s]``.
@@ -183,8 +180,9 @@ class MPPC(nn.Module):
             update_bank: Allow a Full *training* call to update buffers. The bank
                 never updates in eval mode, regardless of this flag.
             ablation:
-                - ``"normal"``: standard MPPC read.
-                - ``"off"``: zero additive residual in Missing mode.
+                - ``"normal"``: standard MPPC read (``ρ_s R_s`` candidates).
+                - ``"off"``: zero candidates in Missing mode (pure CT via TGCAF
+                  null / empty auxiliary).
                 - ``"shuffle_values"``: circularly permute active PET values
                   before reading, breaking CT-key/PET-value pairing for a
                   falsification experiment without changing the stored bank.
@@ -195,8 +193,10 @@ class MPPC(nn.Module):
         Returns:
             A list with the same shapes as ``ct_features``. In Full mode these
             are the original PET tensors (gradient path preserved). In Missing
-            mode these are confidence-controlled additive residuals. If
-            diagnostics are requested, returns ``(features, diagnostics)``.
+            mode these are reliability-gated PET **candidates** ``ρ_s R_s``
+            intended as TGCAF ``auxiliary_features``. Callers must not apply
+            ``CT + λ * candidate`` outside fusion. If diagnostics are requested,
+            returns ``(features, diagnostics)``.
         """
 
         if mode is None:
@@ -318,7 +318,6 @@ class MPPC(nn.Module):
         """Return lightweight per-scale bank statistics for logging."""
 
         summary: List[Dict[str, Any]] = []
-        gates = torch.sigmoid(self.residual_gate_logits.detach())
         for scale_idx in range(self.num_scales):
             initialized = self._bank(scale_idx, "slot_initialized")
             counts = self._bank(scale_idx, "slot_counts")
@@ -337,13 +336,12 @@ class MPPC(nn.Module):
                         if active_consistency.numel() > 0
                         else 0.0
                     ),
-                    "residual_scale": float(gates[scale_idx].item()),
                 }
             )
         return summary
 
     def trainable_parameter_count(self) -> int:
-        """Number of trainable MPPC parameters (normally one scalar per scale)."""
+        """Number of trainable MPPC parameters (normally zero)."""
 
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
@@ -364,28 +362,24 @@ class MPPC(nn.Module):
             initialized = self._bank(scale_idx, "slot_initialized").reshape(-1)
             active_indices = initialized.nonzero(as_tuple=False).flatten()
             active_count = int(active_indices.numel())
-            residual_scale = torch.sigmoid(self.residual_gate_logits[scale_idx])
-
             base_diag: Dict[str, Any] = {
                 "scale": scale_idx,
                 "channels": self.channels[scale_idx],
                 "active_slots": active_count,
                 "total_slots": self.num_classes * self.num_slots,
-                "residual_scale": residual_scale.detach(),
             }
-
-            # This is a zero additive residual, not a fake zero PET input. SUM
-            # therefore gives exactly the unchanged CT representation.
+            # If nothing is active, TGCAF will see an empty/zero candidate and
+            # its own null branch can keep the output close to CT.
             if ablation == "off" or active_count == 0:
-                residual = torch.zeros_like(ct)
-                outputs.append(residual)
+                candidate = torch.zeros_like(ct)
+                outputs.append(candidate)
                 base_diag.update(
                     {
                         "mean_max_similarity": 0.0,
                         "mean_entropy_confidence": 0.0,
                         "mean_pair_confidence": 0.0,
                         "mean_reliability": 0.0,
-                        "compensation_to_ct_norm": 0.0,
+                        "candidate_to_ct_norm": 0.0,
                     }
                 )
                 if return_maps:
@@ -448,27 +442,23 @@ class MPPC(nn.Module):
             ).clamp(min=0.0, max=1.0)
 
             retrieved_pet = torch.matmul(attention, values)
-            residual_tokens = (
-                residual_scale.float()
-                * reliability.unsqueeze(-1)
-                * retrieved_pet
-            )
-            residual = residual_tokens.transpose(1, 2).reshape(
+            candidate_tokens = reliability.unsqueeze(-1) * retrieved_pet
+            candidate = candidate_tokens.transpose(1, 2).reshape(
                 batch_size, channels, height, width
             )
-            residual = residual.to(dtype=ct.dtype)
-            outputs.append(residual)
+            candidate = candidate.to(dtype=ct.dtype)
+            outputs.append(candidate)
 
             ct_norm = ct.detach().float().flatten(1).norm(dim=1).mean()
-            residual_norm = residual.detach().float().flatten(1).norm(dim=1).mean()
-            norm_ratio = residual_norm / ct_norm.clamp_min(self.eps)
+            candidate_norm = candidate.detach().float().flatten(1).norm(dim=1).mean()
+            norm_ratio = candidate_norm / ct_norm.clamp_min(self.eps)
             base_diag.update(
                 {
                     "mean_max_similarity": max_similarity.detach().mean(),
                     "mean_entropy_confidence": entropy_confidence.detach().mean(),
                     "mean_pair_confidence": pair_confidence.detach().mean(),
                     "mean_reliability": reliability.detach().mean(),
-                    "compensation_to_ct_norm": norm_ratio.detach(),
+                    "candidate_to_ct_norm": norm_ratio.detach(),
                 }
             )
 
@@ -802,13 +792,13 @@ def _standalone_self_test() -> None:
     fused = [c + residual for c, residual in zip(ct, missing_output)]
     loss = sum(x.square().mean() for x in fused)
     loss.backward()
-    assert module.residual_gate_logits.grad is not None
+    assert module.trainable_parameter_count() == 0
     assert all(not buffer.requires_grad for buffer in module.buffers())
 
-    # Off ablation must be exact identity after the caller's SUM.
+    # Off ablation must return zero candidates for TGCAF.
     off_output = module(ct, mode="missing", ablation="off")
     assert all(torch.count_nonzero(x).item() == 0 for x in off_output)
-    assert all(torch.equal(c + x, c) for c, x in zip(ct, off_output))
+    assert all(torch.equal(x, torch.zeros_like(x)) for x in off_output)
 
     # Eval Full calls do not mutate the bank.
     module.eval()
