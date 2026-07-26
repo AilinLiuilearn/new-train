@@ -1,31 +1,30 @@
 # -*- coding: utf-8 -*-
+import hashlib
 import json
 import os
 import random
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
 
 from configs.seg_mdt import SegMDTConfig
+from datasets.pclt20k_seg import get_pclt20k_loaders_cipa_aligned
 from models.build_mdt_seg import build_mdt_seg_teacher
 from tasks.mdt_seg import MDTSegTeacher
 from utils.optimization import get_cosine_scheduler
+from utils.reproducibility import configure_reproducibility, describe_reproducibility_env
 from utils.train_logger import append_epoch_log, init_train_log
 
 
 def _seed(cfg):
-    random.seed(cfg.random_state)
-    np.random.seed(cfg.random_state)
-    torch.manual_seed(cfg.random_state)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(cfg.random_state)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    return configure_reproducibility(cfg.random_state, getattr(cfg, 'deterministic_mode', 'balanced'))
 
 
 def _loaders(cfg):
-    from datasets.pclt20k_seg import get_pclt20k_loaders_cipa_aligned
     return get_pclt20k_loaders_cipa_aligned(
         cfg.root,
         cfg.image_size_2d,
@@ -78,19 +77,48 @@ def _count_parameters(model):
     return total, trainable
 
 
+def _sha256_text(text):
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def _write_manifest(cfg, train_loader, val_loader, test_loader, env_state, task):
+    manifest = {
+        'git_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+        'git_branch': subprocess.check_output(['git', 'branch', '--show-current'], text=True).strip(),
+        'argv': sys.argv,
+        'config': vars(cfg),
+        'random_seed': cfg.random_state,
+        'deterministic_mode': getattr(cfg, 'deterministic_mode', 'balanced'),
+        'python_version': sys.version,
+        'torch_version': torch.__version__,
+        'cuda_version': torch.version.cuda,
+        'cudnn_version': torch.backends.cudnn.version(),
+        'gpu_name': torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu',
+        'numpy_version': np.__version__,
+        'env': env_state,
+        'dataloader': {'batch_size': cfg.batch_size, 'num_workers': cfg.num_workers, 'pin_memory': cfg.pin_memory},
+    }
+    for name, loader in [('train', train_loader), ('val', val_loader), ('test', test_loader)]:
+        manifest[f'{name}_samples'] = len(loader.dataset)
+    with open(os.path.join(cfg.checkpoint_dir, 'reproducibility_manifest.json'), 'w') as f:
+        json.dump(manifest, f, indent=2, default=str)
+
+
 def main():
     print('[INFO] starting baseline training', flush=True)
     cfg = SegMDTConfig.parse_arguments()
     _assert_baseline(cfg)
-    _seed(cfg)
+    env_state = _seed(cfg)
+    print(json.dumps(env_state, indent=2, default=str), flush=True)
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
         json.dump(vars(cfg), f, indent=2, default=str)
 
-    train_loader, val_loader, _ = _loaders(cfg)
+    train_loader, val_loader, test_loader = _loaders(cfg)
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)}', flush=True)
 
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
+    _write_manifest(cfg, train_loader, val_loader, test_loader, env_state, task)
     total_params, trainable_params = _count_parameters(task.model)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
     task.scheduler = get_cosine_scheduler(
@@ -125,6 +153,8 @@ def main():
 
     for epoch in range(1, cfg.epochs + 1):
         task.model.train()
+        if hasattr(train_loader.dataset, 'set_epoch'):
+            train_loader.dataset.set_epoch(epoch)
         full_n = missing_n = 0
         full_loss = missing_loss = 0.0
         grad_norm_accum = 0.0

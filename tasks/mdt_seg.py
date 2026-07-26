@@ -1,6 +1,8 @@
+import copy
 import json
 import os
 import random
+from dataclasses import asdict
 
 import numpy as np
 import torch
@@ -30,7 +32,7 @@ class MDTSegTeacher:
         self.scaler = torch.cuda.amp.GradScaler(enabled=bool(config.mixed_precision))
         self.global_batch_step = 0
         self.criterion = BCEDiceLoss(smooth=config.loss_smooth, bce_weight=config.bce_weight, dice_weight=config.dice_weight)
-        self.metrics = SegmentationMetricsCIPA()
+        self.metrics = SegmentationMetricsCIPA(hd95_backend=getattr(config, 'hd95_backend', 'scipy'))
 
     def trainable_parameters(self):
         return [p for p in self.model.parameters() if p.requires_grad]
@@ -49,37 +51,62 @@ class MDTSegTeacher:
         }
         return loss, logits, outputs, stats
 
-    @torch.no_grad()
+    def _state_digest(self):
+        return {
+            'params': {k: v.detach().clone() for k, v in self.model.named_parameters()},
+            'buffers': {k: v.detach().clone() for k, v in self.model.named_buffers()},
+        }
+
+    def _compare_state_digest(self, before, after):
+        diffs = {'params': [], 'buffers': []}
+        for kind in ('params', 'buffers'):
+            before_map = before[kind]
+            after_map = after[kind]
+            all_keys = set(before_map) | set(after_map)
+            for k in sorted(all_keys):
+                bv = before_map.get(k)
+                av = after_map.get(k)
+                if bv is None or av is None or not torch.equal(bv.cpu(), av.cpu()):
+                    diffs[kind].append(k)
+        return diffs
+
+    @torch.inference_mode()
     def evaluate(self, loader, eval_mode='full', tag='val'):
         was_training = self.model.training
+        before_state = self._state_digest()
         self.model.eval()
         total_loss = 0.0
         sample_count = 0
         self.metrics.reset()
-        for batch in loader:
-            ct = batch['ct'].to(self.device, non_blocking=True)
-            mask = batch['mask'].to(self.device, non_blocking=True).float()
-            batch_size = ct.shape[0]
-            if eval_mode == 'full':
-                pet = batch['pet'].to(self.device, non_blocking=True)
-                forward_mode = 'full'
-                pet_available = None
-            elif eval_mode == 'fixed_missing':
-                pet = None
-                forward_mode = 'missing'
-                pet_available = None
-            else:
-                pet = batch['pet'].to(self.device, non_blocking=True)
-                forward_mode = 'auto'
-                pet_available = batch.get('pet_available')
-            outputs = self.model(ct, pet=pet, pet_available=pet_available, forward_mode=forward_mode)
-            logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-            loss, _ = self.criterion(logits, mask)
-            self.metrics.update(logits, mask)
-            total_loss += float(loss) * batch_size
-            sample_count += batch_size
+        with torch.autocast(device_type=self.device.type, enabled=False):
+            for batch in loader:
+                ct = batch['ct'].to(self.device, non_blocking=True)
+                mask = batch['mask'].to(self.device, non_blocking=True).float()
+                batch_size = ct.shape[0]
+                if eval_mode == 'full':
+                    pet = batch['pet'].to(self.device, non_blocking=True)
+                    forward_mode = 'full'
+                    pet_available = None
+                elif eval_mode == 'fixed_missing':
+                    pet = None
+                    forward_mode = 'missing'
+                    pet_available = None
+                else:
+                    pet = batch['pet'].to(self.device, non_blocking=True)
+                    forward_mode = 'auto'
+                    pet_available = batch.get('pet_available')
+                outputs = self.model(ct, pet=pet, pet_available=pet_available, forward_mode=forward_mode)
+                logits = outputs['logits'] if isinstance(outputs, dict) else outputs
+                loss, _ = self.criterion(logits, mask)
+                self.metrics.update(logits, mask)
+                total_loss += float(loss) * batch_size
+                sample_count += batch_size
         out = self.metrics.compute()
         out['total_loss'] = total_loss / max(1, sample_count)
+        after_state = self._state_digest()
+        state_diff = self._compare_state_digest(before_state, after_state)
+        if getattr(self.config, 'assert_eval_state_unchanged', False) and (state_diff['params'] or state_diff['buffers']):
+            raise RuntimeError(f'evaluate modified state: {state_diff}')
         self.model.train(was_training)
         return out
 
@@ -167,3 +194,24 @@ class MDTSegTeacher:
         if torch.cuda.is_available():
             payload['random_state_cuda'] = torch.cuda.get_rng_state_all()
         torch.save(payload, path)
+
+    def load_checkpoint(self, path, strict=True, restore_rng=True):
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(ckpt['model'], strict=strict)
+        if 'optimizer' in ckpt and ckpt['optimizer'] is not None:
+            self.optimizer.load_state_dict(ckpt['optimizer'])
+        if self.scheduler is not None and 'scheduler' in ckpt and ckpt['scheduler'] is not None:
+            self.scheduler.load_state_dict(ckpt['scheduler'])
+        if 'scaler' in ckpt and ckpt['scaler'] is not None:
+            self.scaler.load_state_dict(ckpt['scaler'])
+        self.global_batch_step = int(ckpt.get('global_batch_step', 0))
+        if restore_rng:
+            if ckpt.get('random_state_python') is not None:
+                random.setstate(ckpt['random_state_python'])
+            if ckpt.get('random_state_numpy') is not None:
+                np.random.set_state(ckpt['random_state_numpy'])
+            if ckpt.get('random_state_torch') is not None:
+                torch.set_rng_state(ckpt['random_state_torch'].cpu())
+            if torch.cuda.is_available() and ckpt.get('random_state_cuda') is not None:
+                torch.cuda.set_rng_state_all(ckpt['random_state_cuda'])
+        return ckpt

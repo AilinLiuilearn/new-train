@@ -3,21 +3,27 @@ import numpy as np
 import math
 
 
+def _get_rng(rng=None):
+    return np.random if rng is None else rng
+
+
 def randomShiftScaleRotate(image, mask,
                            shift_limit=(-0.15, 0.15),
                            scale_limit=(-0.12, 0.12),
                            aspect_limit=(-0.1, 0.1),
                            rotate_limit=(-45, 45),
-                           borderMode=cv2.BORDER_CONSTANT, u=0.7):
-    if np.random.random() < u:
+                           borderMode=cv2.BORDER_CONSTANT, u=0.7,
+                           rng=None):
+    rng = _get_rng(rng)
+    if rng.random() < u:
         height, width, channel = image.shape
-        angle = np.random.uniform(rotate_limit[0], rotate_limit[1])
-        scale = np.random.uniform(1 + scale_limit[0], 1 + scale_limit[1])
-        aspect = np.random.uniform(1 + aspect_limit[0], 1 + aspect_limit[1])
+        angle = rng.uniform(rotate_limit[0], rotate_limit[1])
+        scale = rng.uniform(1 + scale_limit[0], 1 + scale_limit[1])
+        aspect = rng.uniform(1 + aspect_limit[0], 1 + aspect_limit[1])
         sx = scale * aspect / (aspect ** 0.5)
         sy = scale / (aspect ** 0.5)
-        dx = round(np.random.uniform(shift_limit[0], shift_limit[1]) * width)
-        dy = round(np.random.uniform(shift_limit[0], shift_limit[1]) * height)
+        dx = round(rng.uniform(shift_limit[0], shift_limit[1]) * width)
+        dy = round(rng.uniform(shift_limit[0], shift_limit[1]) * height)
         rad = angle / 180.0 * math.pi
         cc = math.cos(rad) * sx
         ss = math.sin(rad) * sy
@@ -33,28 +39,31 @@ def randomShiftScaleRotate(image, mask,
     return image, mask
 
 
-def randomHorizontalFlip(image, mask, u=0.5):
-    if np.random.random() < u:
+def randomHorizontalFlip(image, mask, u=0.5, rng=None):
+    rng = _get_rng(rng)
+    if rng.random() < u:
         image = cv2.flip(image, 1)
         mask = cv2.flip(mask, 1)
     return image, mask
 
 
-def randomVerticalFlip(image, mask, u=0.5):
-    if np.random.random() < u:
+def randomVerticalFlip(image, mask, u=0.5, rng=None):
+    rng = _get_rng(rng)
+    if rng.random() < u:
         image = cv2.flip(image, 0)
         mask = cv2.flip(mask, 0)
     return image, mask
 
 
-def randomcrop(image, mask, u=0.6):
-    crop_rate = np.random.uniform(0.7, 0.9)
+def randomcrop(image, mask, u=0.6, rng=None):
+    rng = _get_rng(rng)
+    crop_rate = rng.uniform(0.7, 0.9)
     height = np.int32(image.shape[0] * crop_rate)
     width = height
-    if np.random.random() < u:
+    if rng.random() < u:
         h, w, c = image.shape
-        y = np.random.randint(0, max(0, h - height + 1))
-        x = np.random.randint(0, max(0, w - width + 1))
+        y = rng.randint(0, max(0, h - height + 1))
+        x = rng.randint(0, max(0, w - width + 1))
         image = cv2.resize(image[y:y + height, x:x + width, :], (w, h), interpolation=cv2.INTER_CUBIC)
         mask_crop = mask[y:y + height, x:x + width]
         mask = cv2.resize(mask_crop, (w, h), interpolation=cv2.INTER_CUBIC)

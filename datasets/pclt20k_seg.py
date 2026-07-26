@@ -16,6 +16,10 @@ except Exception:
 
 from utils.image_augmentation import randomHorizontalFlip, randomShiftScaleRotate, randomcrop
 
+
+def _stable_sample_seed(base_seed, epoch, idx):
+    return int((int(base_seed) * 1_000_003 + int(epoch) * 10_007 + int(idx)) % (2 ** 32))
+
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
 
@@ -57,7 +61,11 @@ class PCLT20KSegDataset(Dataset):
         self.train = train
         self.aug_mode = aug_mode
         self.norm_mode = norm_mode
-        self.rng = random.Random(random_state)
+        self.base_seed = int(random_state)
+        self.current_epoch = 0
+
+    def set_epoch(self, epoch):
+        self.current_epoch = int(epoch)
 
     def __len__(self):
         return len(self.records)
@@ -75,9 +83,10 @@ class PCLT20KSegDataset(Dataset):
             mask = _resize_gray(mask, self.image_size, nearest=True)
         if self.train and self.aug_mode == 'cipa':
             image = np.stack([ct, pet], axis=-1)
-            image, mask = randomShiftScaleRotate(image, mask)
-            image, mask = randomHorizontalFlip(image, mask)
-            image, mask = randomcrop(image, mask)
+            rng = np.random.RandomState(_stable_sample_seed(self.base_seed, self.current_epoch, idx))
+            image, mask = randomShiftScaleRotate(image, mask, rng=rng)
+            image, mask = randomHorizontalFlip(image, mask, rng=rng)
+            image, mask = randomcrop(image, mask, rng=rng)
             ct, pet = image[..., 0], image[..., 1]
         ct_t = torch.tensor(_normalize_ch(ct, self.norm_mode), dtype=torch.float32)
         pet_t = torch.tensor(_normalize_ch(pet, self.norm_mode), dtype=torch.float32)
@@ -98,11 +107,26 @@ def _seed_worker(worker_id):
     worker_seed = torch.initial_seed() % (2 ** 32)
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
 
 
 def _make_loader(dataset, batch_size, num_workers, shuffle, drop_last, seed, pin_memory=True):
-    g = torch.Generator(); g.manual_seed(int(seed))
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, drop_last=drop_last, pin_memory=pin_memory, worker_init_fn=_seed_worker, generator=g)
+    g = torch.Generator()
+    g.manual_seed(int(seed))
+    kwargs = dict(
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        drop_last=drop_last,
+        pin_memory=pin_memory,
+        worker_init_fn=_seed_worker,
+        generator=g,
+        persistent_workers=False,
+    )
+    try:
+        return DataLoader(dataset, in_order=True, **kwargs)
+    except TypeError:
+        return DataLoader(dataset, **kwargs)
 
 
 def _records_from_ids(root, ids):
@@ -122,10 +146,27 @@ def _split_summary(records):
     return {'case_count': len(by_case), 'slice_count': len(records)}
 
 
+def _sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _print_split_preview(name, ids):
+    preview = ids[:10]
+    print(f'[SPLIT] {name}: count={len(ids)} preview={preview}', flush=True)
+
+
 def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_workers=4, random_state=2023, pin_memory=True, aug_mode='cipa', norm_mode='cipa', train_split_file='train.txt', val_split_file='val.txt', test_split_file='test.txt', checkpoint_dir=None):
-    train_ids = _read_list(os.path.join(root, train_split_file))
-    val_ids = _read_list(os.path.join(root, val_split_file))
-    test_ids = _read_list(os.path.join(root, test_split_file))
+    train_split_path = os.path.join(root, train_split_file)
+    val_split_path = os.path.join(root, val_split_file)
+    test_split_path = os.path.join(root, test_split_file)
+    train_ids = _read_list(train_split_path)
+    val_ids = _read_list(val_split_path)
+    test_ids = _read_list(test_split_path)
     if train_ids is None or val_ids is None or test_ids is None:
         raise FileNotFoundError(root)
     train_records = _records_from_ids(root, train_ids)
@@ -139,13 +180,35 @@ def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_wor
     train_cases = {r['case_id'] for r in train_records}
     val_cases = {r['case_id'] for r in val_records}
     test_cases = {r['case_id'] for r in test_records}
-    if train_cases & val_cases or train_cases & test_cases:
+    dup_summary = {}
+    for name, recs in [('train', train_records), ('val', val_records), ('test', test_records)]:
+        ids = [r['image_id'] for r in recs]
+        dup_summary[name] = len(ids) != len(set(ids))
+        print(f'[SPLIT] {name}: duplicate_image_id={dup_summary[name]}', flush=True)
+    train_val_overlap = train_cases & val_cases
+    train_test_overlap = train_cases & test_cases
+    val_test_overlap = val_cases & test_cases
+    print(f'[SPLIT] train_case_ids={sorted(train_cases)[:10]}', flush=True)
+    print(f'[SPLIT] val_case_ids={sorted(val_cases)[:10]}', flush=True)
+    print(f'[SPLIT] test_case_ids={sorted(test_cases)[:10]}', flush=True)
+    print(f'[SPLIT] overlap_train_val={sorted(train_val_overlap)[:10]}', flush=True)
+    print(f'[SPLIT] overlap_train_test={sorted(train_test_overlap)[:10]}', flush=True)
+    print(f'[SPLIT] overlap_val_test={sorted(val_test_overlap)[:10]}', flush=True)
+    if train_val_overlap or train_test_overlap:
         raise ValueError('train split overlaps with val/test on case_id')
     split_summary = {
-        'train': {**_split_summary(train_records), 'case_ids': sorted(train_cases)},
-        'val': {**_split_summary(val_records), 'case_ids': sorted(val_cases)},
-        'test': {**_split_summary(test_records), 'case_ids': sorted(test_cases)},
+        'train': {**_split_summary(train_records), 'case_ids': sorted(train_cases), 'dup_image_id': dup_summary['train']},
+        'val': {**_split_summary(val_records), 'case_ids': sorted(val_cases), 'dup_image_id': dup_summary['val']},
+        'test': {**_split_summary(test_records), 'case_ids': sorted(test_cases), 'dup_image_id': dup_summary['test']},
+        'split_sha256': {
+            'train': _sha256_file(train_split_path),
+            'val': _sha256_file(val_split_path),
+            'test': _sha256_file(test_split_path),
+        },
     }
+    _print_split_preview('train', train_ids)
+    _print_split_preview('val', val_ids)
+    _print_split_preview('test', test_ids)
     if checkpoint_dir is None:
         checkpoint_dir = root
     os.makedirs(checkpoint_dir, exist_ok=True)

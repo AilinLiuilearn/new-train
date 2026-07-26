@@ -4,7 +4,7 @@
 - IoU / Dice / Sensitivity / Specificity / Precision / F1
 - Acc：与 CIPA 一致 mean(TP/(TP+FN), TN/(TN+FP))，即 (Sens+Spec)/2，避免像素 Acc 虚高 ~98%
 - Acc_pixel：像素准确率 (TP+TN)/全部，仅作参考
-- HD95：逐图计算后取平均；优先 medpy，否则 scipy 边界距离近似
+- HD95：固定使用 SciPy backend
 """
 
 import numpy as np
@@ -79,18 +79,13 @@ def _hd95_numpy_fallback(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
     return float(np.percentile(np.concatenate(dists), 95))
 
 
-def compute_hd95_pair(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
-    """单张 2D 二值图 HD95；优先 medpy，其次 scipy，最后 numpy fallback。"""
-    pred_bin = pred_bin.astype(bool)
-    gt_bin = gt_bin.astype(bool)
-    try:
-        from medpy.metric.binary import hd95 as medpy_hd95
-        return float(medpy_hd95(pred_bin.astype(np.uint8), gt_bin.astype(np.uint8)))
-    except Exception:
-        try:
-            return _hd95_scipy(pred_bin, gt_bin)
-        except Exception:
-            return _hd95_numpy_fallback(pred_bin, gt_bin)
+def compute_hd95_pair(pred_bin: np.ndarray, gt_bin: np.ndarray, backend='scipy') -> float:
+    """单张 2D 二值图 HD95；固定 backend，默认 SciPy。"""
+    pred_bin = np.asarray(pred_bin).astype(bool)
+    gt_bin = np.asarray(gt_bin).astype(bool)
+    if backend != 'scipy':
+        raise ValueError(f'Unsupported hd95 backend: {backend!r}')
+    return _hd95_scipy(pred_bin, gt_bin)
 
 
 def _compute_metrics_from_counts(tp, fp, fn, tn):
@@ -197,9 +192,10 @@ def segmentation_metrics_cipa(pred_logits, target, threshold=0.5):
 class SegmentationMetricsCIPA(torch.nn.Module):
     """累积 TP/FP/FN/TN + 逐样本 HD95（与 CIPA 测试脚本一致）。"""
 
-    def __init__(self, threshold=0.5):
+    def __init__(self, threshold=0.5, hd95_backend='scipy'):
         super().__init__()
         self.threshold = threshold
+        self.hd95_backend = hd95_backend
         self.reset()
 
     def reset(self):
@@ -229,10 +225,16 @@ class SegmentationMetricsCIPA(torch.nn.Module):
         self.fn += ((1 - pred_flat) * target_flat).sum().item()
         self.tn += ((1 - pred_flat) * (1 - target_flat)).sum().item()
 
-        pb = pred_bin.cpu().numpy()
-        tb = target.cpu().numpy()
+        pb = pred_bin.detach().cpu()
+        tb = target.detach().cpu()
         for b in range(pb.shape[0]):
-            self.hd95_list.append(compute_hd95_pair(pb[b] > 0.5, tb[b] > 0.5))
+            self.hd95_list.append(
+                compute_hd95_pair(
+                    (pb[b] > 0.5).to(torch.bool).tolist(),
+                    (tb[b] > 0.5).to(torch.bool).tolist(),
+                    backend=self.hd95_backend,
+                )
+            )
 
     def compute(self):
         denom_iou = self.tp + self.fp + self.fn
