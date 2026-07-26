@@ -37,7 +37,7 @@ class MDTSegTeacher:
 
     def train_step(self, batch, forward_mode='full'):
         ct = batch['ct'].to(self.device, non_blocking=True)
-        pet = batch['pet'].to(self.device, non_blocking=True) if forward_mode == 'full' else None
+        pet = batch['pet'].to(self.device, non_blocking=True)
         mask = batch['mask'].to(self.device, non_blocking=True).float()
         outputs = self.model(ct, pet=pet, forward_mode=forward_mode)
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
@@ -65,13 +65,15 @@ class MDTSegTeacher:
                 forward_mode = 'full'
                 pet_available = None
             elif eval_mode == 'fixed_missing':
-                pet = None
+                pet = batch['pet'].to(self.device, non_blocking=True)
                 forward_mode = 'missing'
                 pet_available = None
             else:
                 pet = batch['pet'].to(self.device, non_blocking=True)
                 forward_mode = 'auto'
                 pet_available = batch.get('pet_available')
+                if pet_available is not None:
+                    pet_available = pet_available.to(self.device, non_blocking=True)
             outputs = self.model(ct, pet=pet, pet_available=pet_available, forward_mode=forward_mode)
             logits = outputs['logits'] if isinstance(outputs, dict) else outputs
             loss, _ = self.criterion(logits, mask)
@@ -103,7 +105,7 @@ class MDTSegTeacher:
             params_align = list(self.model.ct_align.parameters())
             params_dec = list(self.model.decoder.parameters())
             outputs_full = self.model(ct, pet=pet, forward_mode='full')
-            outputs_missing = self.model(ct, pet=None, forward_mode='missing')
+            outputs_missing = self.model(ct, pet=pet, forward_mode='missing')
             logits_full = outputs_full['logits'] if isinstance(outputs_full, dict) else outputs_full
             logits_missing = outputs_missing['logits'] if isinstance(outputs_missing, dict) else outputs_missing
             loss_full, _ = self.criterion(logits_full.float(), mask.float())

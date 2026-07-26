@@ -44,6 +44,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return self.ct_align(ct_feats)
 
     def _encode_pet(self, pet):
+        if pet is None:
+            raise ValueError('API-style baseline requires PET input before fusion-time masking')
         pet_feats = self.enc_pet(self._to_3ch(pet))
         _check_tensor_list('pet_feats', pet_feats)
         return pet_feats
@@ -56,27 +58,32 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return out
 
     def _forward_full(self, ct, pet, target_size):
-        return self._decode(self.fusion(self._encode_ct(ct), self._encode_pet(pet), None), target_size)
+        ct_feats = self._encode_ct(ct)
+        pet_feats = self._encode_pet(pet)
+        fused_feats = self.fusion(ct_feats, pet_feats, None)
+        return self._decode(fused_feats, target_size)
 
-    def _forward_missing(self, ct, target_size):
-        return self._decode(self._encode_ct(ct), target_size)
+    def _forward_missing(self, ct, pet, target_size):
+        ct_feats = self._encode_ct(ct)
+        pet_feats_real = self._encode_pet(pet)
+        pet_feats_masked = [torch.zeros_like(feat) for feat in pet_feats_real]
+        fused_feats = self.fusion(ct_feats, pet_feats_masked, None)
+        return self._decode(fused_feats, target_size)
 
     def _forward_auto(self, ct, pet, pet_available, target_size):
-        pet_available = pet_available.long().view(-1)
-        if torch.all(pet_available == 1):
-            return self._forward_full(ct, pet, target_size)
-        if torch.all(pet_available == 0):
-            return self._forward_missing(ct, target_size)
-        aligned_ct = self._encode_ct(ct)
-        fused = list(aligned_ct)
-        full_idx = torch.nonzero(pet_available == 1, as_tuple=False).flatten()
-        if full_idx.numel() > 0:
-            pet_full = pet.index_select(0, full_idx)
-            pet_feats = self._encode_pet(pet_full)
-            fused_full = self.fusion([feat.index_select(0, full_idx) for feat in aligned_ct], pet_feats, None)
-            for i, feat in enumerate(fused_full):
-                fused[i] = fused[i].clone(); fused[i].index_copy_(0, full_idx, feat)
-        return self._decode(fused, target_size)
+        ct_feats = self._encode_ct(ct)
+        pet_feats_real = self._encode_pet(pet)
+        pet_available = pet_available.to(device=ct.device).long().view(-1)
+        if pet_available.numel() != ct.shape[0]:
+            raise ValueError('pet_available must contain one state per sample')
+        if not torch.all((pet_available == 0) | (pet_available == 1)):
+            raise ValueError('pet_available values must be 0 or 1')
+        pet_feats_masked = []
+        for feat in pet_feats_real:
+            availability_mask = pet_available.to(device=feat.device, dtype=feat.dtype).view(-1, 1, 1, 1)
+            pet_feats_masked.append(feat * availability_mask)
+        fused_feats = self.fusion(ct_feats, pet_feats_masked, None)
+        return self._decode(fused_feats, target_size)
 
     def forward(self, ct, pet, pet_available=None, target_size=None, forward_mode='auto'):
         if target_size is None:
@@ -84,7 +91,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         if forward_mode == 'full':
             return self._forward_full(ct, pet, target_size)
         if forward_mode == 'missing':
-            return self._forward_missing(ct, target_size)
+            return self._forward_missing(ct, pet, target_size)
         if forward_mode == 'auto':
             if pet_available is None:
                 pet_available = torch.ones(ct.shape[0], device=ct.device, dtype=torch.long)
