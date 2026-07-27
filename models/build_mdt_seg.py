@@ -360,11 +360,17 @@ def build_mdt_seg_teacher(config):
         out_channels=1,
         decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
         use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
+        use_ssppc=bool(getattr(config, 'use_ssppc', True)),
+        ssppc_outlier_ratio=float(getattr(config, 'ssppc_outlier_ratio', 0.05)),
+        ssppc_cache_on_cpu=bool(getattr(config, 'ssppc_cache_on_cpu', True)),
     )
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
         f'fusion=add shared_decoder=UNetStyleDecoder '
-        f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
+        f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))} '
+        f'use_ssppc={bool(getattr(config, "use_ssppc", True))} '
+        f'ssppc_outlier_ratio={float(getattr(config, "ssppc_outlier_ratio", 0.05))} '
+        f'ssppc_cache_on_cpu={bool(getattr(config, "ssppc_cache_on_cpu", True))}'
     )
     return {'model': model}

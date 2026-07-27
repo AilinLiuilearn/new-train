@@ -136,6 +136,14 @@ def main():
         epoch_start = time.time()
         fixed_diag_batch = None
         diag_stats = {}
+        fixed_vis_batch = None
+        if getattr(cfg, 'use_ssppc', True) and getattr(cfg, 'vis_every_epoch', False):
+            first_val_batch = next(iter(val_loader))
+            fixed_vis_batch = {
+                'ct': first_val_batch['ct'][:1].clone(),
+                'pet': first_val_batch['pet'][:1].clone(),
+                'mask': first_val_batch['mask'][:1].clone(),
+            }
 
         for batch_idx, batch in enumerate(train_loader):
             route = 'full' if global_batch_step % 2 == 0 else 'missing'
@@ -188,6 +196,22 @@ def main():
         if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is not None and epoch % int(cfg.gradient_diagnostics_interval) == 0:
             diag_stats = task.gradient_diagnostics(fixed_diag_batch, max_samples=min(1, int(cfg.gradient_diagnostics_num_samples))) or {}
 
+        prototype_report = {}
+        prototype_diag = {}
+        if getattr(cfg, 'use_ssppc', True) and getattr(task.model, 'ssppc', None) is not None:
+            prototype_report = task.model.ssppc.finalize_epoch()
+            prototype_diag = task.model.ssppc.prototype_diagnostics()
+            with open(os.path.join(cfg.checkpoint_dir, 'ssppc_prototype_log.jsonl'), 'a') as f:
+                f.write(json.dumps({'epoch': epoch, 'report': prototype_report, 'diagnostics': prototype_diag}) + '\n')
+            print(f'[SSPPC] epoch={epoch} report={prototype_report}', flush=True)
+            print(f'[SSPPC] epoch={epoch} diagnostics={prototype_diag}', flush=True)
+        if getattr(cfg, 'use_ssppc', True) and getattr(cfg, 'vis_every_epoch', False) and fixed_vis_batch is not None and getattr(task.model, 'ssppc', None) is not None:
+            task.visualize_ssppc(
+                batch=fixed_vis_batch,
+                output_dir=os.path.join(cfg.checkpoint_dir, 'ssppc_visualizations'),
+                prefix=f'epoch_{epoch:03d}',
+                sample_index=0,
+            )
         val_full = task.evaluate(val_loader, eval_mode='full', tag='val_full')
         val_missing = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_missing')
         joint_dice = float(cfg.joint_full_weight) * val_full['dice'] + float(cfg.joint_missing_weight) * val_missing['dice']

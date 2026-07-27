@@ -1,6 +1,6 @@
-__pycache__/
-*.py[cod]
-.pytest_cache/
-checkpoints_new/
-outputs/
-wandb/
+pretrained/
+*.pt
+*.pth
+*.ckpt
+*.bin
+train.log

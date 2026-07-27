@@ -39,7 +39,7 @@ class MDTSegTeacher:
         ct = batch['ct'].to(self.device, non_blocking=True)
         pet = batch['pet'].to(self.device, non_blocking=True)
         mask = batch['mask'].to(self.device, non_blocking=True).float()
-        outputs = self.model(ct, pet=pet, forward_mode=forward_mode)
+        outputs = self.model(ct, pet=pet, mask=mask, forward_mode=forward_mode)
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
         loss, loss_stats = self.criterion(logits, mask)
         stats = {
@@ -74,7 +74,7 @@ class MDTSegTeacher:
                 pet_available = batch.get('pet_available')
                 if pet_available is not None:
                     pet_available = pet_available.to(self.device, non_blocking=True)
-            outputs = self.model(ct, pet=pet, pet_available=pet_available, forward_mode=forward_mode)
+            outputs = self.model(ct, pet=pet, pet_available=pet_available, mask=None, forward_mode=forward_mode)
             logits = outputs['logits'] if isinstance(outputs, dict) else outputs
             loss, _ = self.criterion(logits, mask)
             self.metrics.update(logits, mask)
@@ -141,6 +141,34 @@ class MDTSegTeacher:
         finally:
             for m, state in bn_states:
                 m.track_running_stats = state
+            self.model.train(was_training)
+
+    @torch.no_grad()
+    def visualize_ssppc(self, batch, output_dir, prefix, sample_index=0):
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            if getattr(self.model, 'ssppc', None) is None or not getattr(self.config, 'use_ssppc', True):
+                return []
+            ct = batch['ct'].to(self.device, non_blocking=True)
+            pet = batch['pet'].to(self.device, non_blocking=True)
+            mask = batch['mask'].to(self.device, non_blocking=True).float()
+            outputs = self.model(ct, pet=pet, mask=None, forward_mode='missing', return_ssppc_debug=True)
+            debug = outputs.get('ssppc_debug', None) if isinstance(outputs, dict) else None
+            if debug is None:
+                return []
+            return self.model.ssppc.save_visualizations(
+                debug_list=debug,
+                output_dir=output_dir,
+                prefix=prefix,
+                sample_index=sample_index,
+                ct_image=ct,
+                pet_image=pet,
+                gt_mask=mask,
+                scales=[0, 1, 2, 3],
+                save_tensor_data=True,
+            )
+        finally:
             self.model.train(was_training)
 
     def save_checkpoint(self, path, epoch, best_joint=None, best_full=None, best_missing=None, best_joint_epoch=None, val_full=None, val_missing=None, joint_dice=None):
