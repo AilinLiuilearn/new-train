@@ -39,7 +39,7 @@ class MDTSegTeacher:
         ct = batch['ct'].to(self.device, non_blocking=True)
         pet = batch['pet'].to(self.device, non_blocking=True)
         mask = batch['mask'].to(self.device, non_blocking=True).float()
-        outputs = self.model(ct, pet=pet, forward_mode=forward_mode)
+        outputs = self.model(ct, pet=pet, forward_mode=forward_mode, mask=mask, collect_memory=True)
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
         loss, loss_stats = self.criterion(logits, mask)
         stats = {
@@ -74,7 +74,7 @@ class MDTSegTeacher:
                 pet_available = batch.get('pet_available')
                 if pet_available is not None:
                     pet_available = pet_available.to(self.device, non_blocking=True)
-            outputs = self.model(ct, pet=pet, pet_available=pet_available, forward_mode=forward_mode)
+            outputs = self.model(ct, pet=pet, pet_available=pet_available, forward_mode=forward_mode, mask=mask, collect_memory=False)
             logits = outputs['logits'] if isinstance(outputs, dict) else outputs
             loss, _ = self.criterion(logits, mask)
             self.metrics.update(logits, mask)
@@ -104,8 +104,8 @@ class MDTSegTeacher:
             params_ct = list(self.model.enc_ct.parameters())
             params_align = list(self.model.ct_align.parameters())
             params_dec = list(self.model.decoder.parameters())
-            outputs_full = self.model(ct, pet=pet, forward_mode='full')
-            outputs_missing = self.model(ct, pet=pet, forward_mode='missing')
+            outputs_full = self.model(ct, pet=pet, forward_mode='full', mask=mask, collect_memory=False)
+            outputs_missing = self.model(ct, pet=pet, forward_mode='missing', mask=mask, collect_memory=False)
             logits_full = outputs_full['logits'] if isinstance(outputs_full, dict) else outputs_full
             logits_missing = outputs_missing['logits'] if isinstance(outputs_missing, dict) else outputs_missing
             loss_full, _ = self.criterion(logits_full.float(), mask.float())
@@ -143,6 +143,27 @@ class MDTSegTeacher:
                 m.track_running_stats = state
             self.model.train(was_training)
 
+    def finalize_cipm_epoch(self):
+        if hasattr(self.model, 'finalize_cipm_epoch'):
+            return self.model.finalize_cipm_epoch(sync_distributed=False)
+        return []
+
+    def print_cipm_report(self):
+        if hasattr(self.model, 'print_cipm_report'):
+            self.model.print_cipm_report(print_per_slot=bool(getattr(self.config, 'cipm_print_per_slot', True)))
+
+    def reset_cipm_query_stats(self):
+        if hasattr(self.model, 'reset_cipm_query_stats'):
+            self.model.reset_cipm_query_stats()
+
+    @torch.no_grad()
+    def visualize_cipm(self, batch, save_dir, sample_index=0):
+        if not getattr(self.model, 'cipm_ready', False):
+            return []
+        ct = batch['ct'].to(self.device, non_blocking=True)
+        mask = batch['mask'].to(self.device, non_blocking=True)
+        return self.model.visualize_cipm(ct, mask, save_dir, sample_index=sample_index)
+
     def save_checkpoint(self, path, epoch, best_joint=None, best_full=None, best_missing=None, best_joint_epoch=None, val_full=None, val_missing=None, joint_dice=None):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         payload = {
@@ -169,3 +190,24 @@ class MDTSegTeacher:
         if torch.cuda.is_available():
             payload['random_state_cuda'] = torch.cuda.get_rng_state_all()
         torch.save(payload, path)
+
+    def finalize_cipm_epoch(self):
+        if hasattr(self.model, 'finalize_cipm_epoch'):
+            return self.model.finalize_cipm_epoch(sync_distributed=False)
+        return []
+
+    def print_cipm_report(self):
+        if hasattr(self.model, 'print_cipm_report'):
+            self.model.print_cipm_report()
+
+    def reset_cipm_query_stats(self):
+        if hasattr(self.model, 'reset_cipm_query_stats'):
+            self.model.reset_cipm_query_stats()
+
+    @torch.no_grad()
+    def visualize_cipm(self, batch, save_dir, sample_index=0):
+        if not getattr(self.model, 'use_cipm', False):
+            return []
+        ct = batch['ct'].to(self.device, non_blocking=True)
+        mask = batch['mask'].to(self.device, non_blocking=True)
+        return self.model.visualize_cipm(ct=ct, mask=mask, save_dir=save_dir, sample_index=sample_index)

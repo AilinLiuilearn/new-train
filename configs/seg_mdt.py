@@ -35,6 +35,18 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--enable_gradient_diagnostics', type=str2bool, default=False)
         p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
+        p.add_argument('--use_cipm', type=str2bool, default=False)
+        p.add_argument('--cipm_num_slots', type=int, default=16)
+        p.add_argument('--cipm_max_tokens_per_batch', type=int, default=4096)
+        p.add_argument('--cipm_max_cached_tokens', type=int, default=50000)
+        p.add_argument('--cipm_positive_fraction', type=float, default=0.5)
+        p.add_argument('--cipm_mask_threshold', type=float, default=0.5)
+        p.add_argument('--cipm_outlier_fraction', type=float, default=0.05)
+        p.add_argument('--cipm_init_kmeans_iters', type=int, default=20)
+        p.add_argument('--cipm_update_kmeans_iters', type=int, default=3)
+        p.add_argument('--cipm_print_per_slot', type=str2bool, default=True)
+        p.add_argument('--cipm_vis_interval', type=int, default=1)
+        p.add_argument('--cipm_enable_visualization', type=str2bool, default=True)
         return p
 
     @staticmethod

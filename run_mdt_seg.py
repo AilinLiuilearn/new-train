@@ -78,6 +78,15 @@ def _count_parameters(model):
     return total, trainable
 
 
+def _maybe_visualize(task, val_loader, cfg, epoch):
+    if not (cfg.use_cipm and cfg.cipm_enable_visualization and epoch % int(cfg.cipm_vis_interval) == 0 and getattr(task.model, 'cipm_ready', False)):
+        return
+    batch = next(iter(val_loader))
+    save_dir = os.path.join(cfg.checkpoint_dir, 'cipm_visualization', f'epoch_{epoch:03d}')
+    task.visualize_cipm(batch, save_dir, sample_index=0)
+    task.reset_cipm_query_stats()
+
+
 def main():
     print('[INFO] starting baseline training', flush=True)
     cfg = SegMDTConfig.parse_arguments()
@@ -110,6 +119,8 @@ def main():
         'joint_dice', 'best_joint', 'best_joint_epoch',
         'grad_full_enc_ct', 'grad_missing_enc_ct', 'grad_full_ct_align', 'grad_missing_ct_align', 'grad_full_decoder', 'grad_missing_decoder',
         'epoch_time',
+        'cipm_ready', 'cipm_active_slots_s1', 'cipm_active_slots_s2', 'cipm_active_slots_s3', 'cipm_active_slots_s4',
+        'cipm_mean_query_entropy_s1', 'cipm_mean_query_entropy_s2', 'cipm_mean_query_entropy_s3', 'cipm_mean_query_entropy_s4',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
 
@@ -124,7 +135,11 @@ def main():
     paths = _checkpoint_paths(cfg.checkpoint_dir)
 
     for epoch in range(1, cfg.epochs + 1):
+        if getattr(cfg, 'use_cipm', False):
+            task.reset_cipm_query_stats()
         task.model.train()
+        if cfg.use_cipm:
+            task.reset_cipm_query_stats()
         full_n = missing_n = 0
         full_loss = missing_loss = 0.0
         grad_norm_accum = 0.0
@@ -136,6 +151,8 @@ def main():
         epoch_start = time.time()
         fixed_diag_batch = None
         diag_stats = {}
+        if getattr(cfg, 'use_cipm', False):
+            task.reset_cipm_query_stats()
 
         for batch_idx, batch in enumerate(train_loader):
             route = 'full' if global_batch_step % 2 == 0 else 'missing'
@@ -188,6 +205,21 @@ def main():
         if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is not None and epoch % int(cfg.gradient_diagnostics_interval) == 0:
             diag_stats = task.gradient_diagnostics(fixed_diag_batch, max_samples=min(1, int(cfg.gradient_diagnostics_num_samples))) or {}
 
+        if cfg.use_cipm:
+            cipm_update_report = task.finalize_cipm_epoch()
+            task.print_cipm_report()
+        else:
+            cipm_update_report = []
+
+        _maybe_visualize(task, val_loader, cfg, epoch)
+
+        cipm_update_report = []
+        if getattr(cfg, 'use_cipm', False):
+            cipm_update_report = task.finalize_cipm_epoch()
+            task.print_cipm_report()
+        if getattr(cfg, 'use_cipm', False):
+            task.finalize_cipm_epoch()
+            task.print_cipm_report()
         val_full = task.evaluate(val_loader, eval_mode='full', tag='val_full')
         val_missing = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_missing')
         joint_dice = float(cfg.joint_full_weight) * val_full['dice'] + float(cfg.joint_missing_weight) * val_missing['dice']
@@ -213,6 +245,12 @@ def main():
         if missing_improved:
             task.save_checkpoint(paths['best_missing'], epoch, best_joint, best_full, best_missing, best_joint_epoch, val_full, val_missing, joint_dice)
         task.save_checkpoint(paths['last'], epoch, best_joint, best_full, best_missing, best_joint_epoch, val_full, val_missing, joint_dice)
+        if getattr(cfg, 'use_cipm', False) and getattr(cfg, 'cipm_enable_visualization', True) and epoch % int(cfg.cipm_vis_interval) == 0 and getattr(task.model, 'cipm_ready', False):
+            vis_dir = os.path.join(cfg.checkpoint_dir, 'cipm_visualization', f'epoch_{epoch:03d}')
+            os.makedirs(vis_dir, exist_ok=True)
+            fixed_batch = next(iter(val_loader))
+            task.visualize_cipm(fixed_batch, vis_dir, sample_index=0)
+            task.reset_cipm_query_stats()
 
         train_loss = (full_loss + missing_loss) / max(1, full_n + missing_n)
         val_loss = 0.5 * val_full['total_loss'] + 0.5 * val_missing['total_loss']
@@ -222,6 +260,7 @@ def main():
         val_acc_pixel = 0.5 * val_full.get('acc_pixel', 0.0) + 0.5 * val_missing.get('acc_pixel', 0.0)
         val_hd95 = 0.5 * val_full['hd95'] + 0.5 * val_missing['hd95']
         avg_grad_norm = grad_norm_accum / max(1, grad_norm_steps)
+        cipm_reports = task.model.cipm.build_memory_reports() if getattr(task.model, 'cipm_ready', False) else []
         append_epoch_log(
             os.path.join(cfg.checkpoint_dir, 'train_log.csv'),
             epoch,
@@ -257,6 +296,15 @@ def main():
                 'grad_full_decoder': float(np.mean(grads['full']['decoder'])) if grads['full']['decoder'] else 0.0,
                 'grad_missing_decoder': float(np.mean(grads['missing']['decoder'])) if grads['missing']['decoder'] else 0.0,
                 'epoch_time': time.time() - epoch_start,
+                'cipm_ready': float(getattr(task.model, 'cipm_ready', False)),
+                'cipm_active_slots_s1': cipm_reports[0].active_slots if len(cipm_reports) > 0 else 0,
+                'cipm_active_slots_s2': cipm_reports[1].active_slots if len(cipm_reports) > 1 else 0,
+                'cipm_active_slots_s3': cipm_reports[2].active_slots if len(cipm_reports) > 2 else 0,
+                'cipm_active_slots_s4': cipm_reports[3].active_slots if len(cipm_reports) > 3 else 0,
+                'cipm_mean_query_entropy_s1': cipm_reports[0].mean_query_entropy if len(cipm_reports) > 0 else 0.0,
+                'cipm_mean_query_entropy_s2': cipm_reports[1].mean_query_entropy if len(cipm_reports) > 1 else 0.0,
+                'cipm_mean_query_entropy_s3': cipm_reports[2].mean_query_entropy if len(cipm_reports) > 2 else 0.0,
+                'cipm_mean_query_entropy_s4': cipm_reports[3].mean_query_entropy if len(cipm_reports) > 3 else 0.0,
                 **{f'diag_{k}': v for k, v in diag_stats.items()},
             },
         )

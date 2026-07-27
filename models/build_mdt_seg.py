@@ -360,11 +360,26 @@ def build_mdt_seg_teacher(config):
         out_channels=1,
         decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
         use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
+        use_cipm=bool(getattr(config, 'use_cipm', False)),
+        cipm_num_slots=getattr(config, 'cipm_num_slots', 16),
+        cipm_max_tokens_per_batch=getattr(config, 'cipm_max_tokens_per_batch', 4096),
+        cipm_max_cached_tokens=getattr(config, 'cipm_max_cached_tokens', 50000),
+        cipm_positive_fraction=getattr(config, 'cipm_positive_fraction', 0.5),
+        cipm_mask_threshold=getattr(config, 'cipm_mask_threshold', 0.5),
+        cipm_outlier_fraction=getattr(config, 'cipm_outlier_fraction', 0.05),
+        cipm_init_kmeans_iters=getattr(config, 'cipm_init_kmeans_iters', 20),
+        cipm_update_kmeans_iters=getattr(config, 'cipm_update_kmeans_iters', 3),
+        cipm_seed=getattr(config, 'random_state', 2023),
     )
+    ct_channels = list(model.enc_ct.feature_info.channels())
+    pet_channels = list(model.enc_pet.feature_info.channels())
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
         f'fusion=add shared_decoder=UNetStyleDecoder '
-        f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
+        f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))} '
+        f'use_cipm={bool(getattr(config, "use_cipm", False))} '
+        f'cipm_num_slots={getattr(config, "cipm_num_slots", 16)} '
+        f'ct_channels={ct_channels} pet_channels={pet_channels}'
     )
     return {'model': model}
