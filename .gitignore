@@ -3,4 +3,5 @@ __pycache__/
 .pytest_cache/
 checkpoints_new/
 outputs/
+pretrained/
 wandb/
