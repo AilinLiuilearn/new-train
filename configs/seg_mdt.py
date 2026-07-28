@@ -37,6 +37,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
         p.add_argument('--use_cipm', type=str2bool, default=False)
         p.add_argument('--cipm_num_slots', type=int, default=16)
+        p.add_argument('--cipm_retrieval_temperature', type=float, default=0.1)
         p.add_argument('--cipm_max_tokens_per_batch', type=int, default=4096)
         p.add_argument('--cipm_max_cached_tokens', type=int, default=50000)
         p.add_argument('--cipm_positive_fraction', type=float, default=0.5)

@@ -21,6 +21,7 @@ CIPM: CT-Indexed Paired Modality Memory
     memory = CTIndexedPairedModalityMemory(
         channels=[64, 128, 320, 512],
         num_slots=16,
+        retrieval_temperature=0.1,
     )
 
     # Full batch
@@ -130,6 +131,7 @@ class PairedPrototypeMemoryScale(nn.Module):
         channels: int,
         num_slots: int = 16,
         *,
+        retrieval_temperature: float = 0.1,
         max_tokens_per_batch: int = 4096,
         max_cached_tokens: int = 50000,
         positive_fraction: float = 0.5,
@@ -604,7 +606,7 @@ class PairedPrototypeMemoryScale(nn.Module):
             device=ct_feature.device, dtype=ct_feature.dtype
         )
 
-        similarity = query @ keys.t()
+        similarity = (query @ keys.t()) / self.retrieval_temperature
         weights = torch.softmax(similarity, dim=-1)
         pet_flat = weights @ values
         pet_proxy = (
@@ -734,14 +736,20 @@ class CTIndexedPairedModalityMemory(nn.Module):
         init_kmeans_iters: int = 20,
         update_kmeans_iters: int = 3,
         seed: int = 2026,
+        retrieval_temperature: float = 0.1,
     ) -> None:
         super().__init__()
         if len(channels) == 0:
             raise ValueError("channels 至少包含一个尺度。")
+        if retrieval_temperature <= 0:
+            raise ValueError("retrieval_temperature 必须大于 0。")
+
+        self.retrieval_temperature = float(retrieval_temperature)
 
         self.channels = tuple(int(c) for c in channels)
         self.num_scales = len(self.channels)
         self.num_slots = int(num_slots)
+        self.retrieval_temperature = float(retrieval_temperature)
         self.memories = nn.ModuleList(
             [
                 PairedPrototypeMemoryScale(
@@ -755,6 +763,7 @@ class CTIndexedPairedModalityMemory(nn.Module):
                     init_kmeans_iters=init_kmeans_iters,
                     update_kmeans_iters=update_kmeans_iters,
                     seed=seed + i * 1000,
+                    retrieval_temperature=retrieval_temperature,
                 )
                 for i, c in enumerate(self.channels)
             ]

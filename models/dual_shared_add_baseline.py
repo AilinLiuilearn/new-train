@@ -22,7 +22,7 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
-    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, use_cipm=False, cipm_num_slots=16, cipm_max_tokens_per_batch=4096, cipm_max_cached_tokens=50000, cipm_positive_fraction=0.5, cipm_mask_threshold=0.5, cipm_outlier_fraction=0.05, cipm_init_kmeans_iters=20, cipm_update_kmeans_iters=3, cipm_seed=2026):
+    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, use_cipm=False, cipm_num_slots=16, cipm_retrieval_temperature=0.1, cipm_max_tokens_per_batch=4096, cipm_max_cached_tokens=50000, cipm_positive_fraction=0.5, cipm_mask_threshold=0.5, cipm_outlier_fraction=0.05, cipm_init_kmeans_iters=20, cipm_update_kmeans_iters=3, cipm_seed=2026):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
@@ -39,6 +39,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
             self.cipm = CTIndexedPairedModalityMemory(
                 channels=pet_channels,
                 num_slots=cipm_num_slots,
+                retrieval_temperature=cipm_retrieval_temperature,
                 max_tokens_per_batch=cipm_max_tokens_per_batch,
                 max_cached_tokens=cipm_max_cached_tokens,
                 positive_fraction=cipm_positive_fraction,
