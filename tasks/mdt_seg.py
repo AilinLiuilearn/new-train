@@ -173,4 +173,6 @@ class MDTSegTeacher:
         }
         if torch.cuda.is_available():
             payload['random_state_cuda'] = torch.cuda.get_rng_state_all()
-        torch.save(payload, path)
+        tmp_path = f'{path}.tmp'
+        torch.save(payload, tmp_path, _use_new_zipfile_serialization=False)
+        os.replace(tmp_path, path)

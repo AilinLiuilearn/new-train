@@ -613,15 +613,27 @@ class PETAffineActionMemory(nn.Module):
             # 即使 route=missing，也可计算真实 PET 仿射作用用于未来记忆，
             # 但不会进入当前 Missing 融合。
             if pet_features is not None:
-                gamma_star, beta_star = writer(ct, pet_features[idx])
-                _, true_exec = executor(ct, gamma_star, beta_star)
-                if update_memory:
-                    write_report = memory.collect(
-                        query_map=query,
-                        gamma_star=gamma_star,
-                        beta_star=beta_star,
-                        gate_star=true_exec["gate"],
-                    )
+                if route == "missing":
+                    with torch.no_grad():
+                        gamma_star, beta_star = writer(ct.detach(), pet_features[idx].detach())
+                        _, true_exec = executor(ct.detach(), gamma_star, beta_star)
+                        if update_memory:
+                            write_report = memory.collect(
+                                query_map=query.detach(),
+                                gamma_star=gamma_star,
+                                beta_star=beta_star,
+                                gate_star=true_exec["gate"],
+                            )
+                else:
+                    gamma_star, beta_star = writer(ct, pet_features[idx])
+                    _, true_exec = executor(ct, gamma_star, beta_star)
+                    if update_memory:
+                        write_report = memory.collect(
+                            query_map=query,
+                            gamma_star=gamma_star,
+                            beta_star=beta_star,
+                            gate_star=true_exec["gate"],
+                        )
 
             if route == "full":
                 assert gamma_star is not None and beta_star is not None
@@ -789,8 +801,11 @@ class PETAffineActionMemory(nn.Module):
             json.dump(diagnostics, f, ensure_ascii=False, indent=2)
 
         saved: Dict[str, str] = {"json": str(json_path)}
-
         if self._last_visual_maps:
+            bigfig_path = out / f"{stem}_paam_visual_summary.png"
+            self._save_big_figure(bigfig_path, stem)
+            saved["bigfig"] = str(bigfig_path)
+
             arrays: Dict[str, np.ndarray] = {}
             for scale_name, maps in self._last_visual_maps.items():
                 for map_name, tensor in maps.items():
@@ -798,33 +813,6 @@ class PETAffineActionMemory(nn.Module):
             npz_path = out / f"{stem}_paam_maps.npz"
             np.savez_compressed(npz_path, **arrays)
             saved["npz"] = str(npz_path)
-
-            for scale_name, maps in self._last_visual_maps.items():
-                for map_name, tensor in maps.items():
-                    path = out / f"{stem}_{scale_name}_{map_name}.png"
-                    self._save_map(tensor, path, title=f"{scale_name.upper()} {map_name}")
-                    saved[f"{scale_name}_{map_name}"] = str(path)
-
-        for idx, memory in enumerate(self.memories, start=1):
-            usage = memory._retrieval_slot_hits.detach().cpu().numpy()
-            usage_path = out / f"{stem}_s{idx}_slot_usage.png"
-            self._save_bar(usage, usage_path, title=f"S{idx} retrieval slot usage")
-            saved[f"s{idx}_slot_usage"] = str(usage_path)
-
-            if bool(memory.memory_ready.item()):
-                key = F.normalize(memory.keys.detach().float().cpu(), dim=1)
-                key_path = out / f"{stem}_s{idx}_key_cosine.png"
-                self._save_map(key @ key.t(), key_path, title=f"S{idx} key cosine")
-                saved[f"s{idx}_key_cosine"] = str(key_path)
-
-                action = torch.cat([
-                    memory.gamma_proto.detach().float().cpu(),
-                    memory.beta_proto.detach().float().cpu(),
-                ], dim=1)
-                action = F.normalize(action, dim=1)
-                action_path = out / f"{stem}_s{idx}_action_cosine.png"
-                self._save_map(action @ action.t(), action_path, title=f"S{idx} affine-action cosine")
-                saved[f"s{idx}_action_cosine"] = str(action_path)
 
         manifest_path = out / f"{stem}_manifest.json"
         with manifest_path.open("w", encoding="utf-8") as f:
@@ -835,30 +823,42 @@ class PETAffineActionMemory(nn.Module):
         print(f"[PAAM] 可视化目录：{out}")
         return saved
 
-    @staticmethod
-    def _save_map(tensor: torch.Tensor, path: Path, title: str) -> None:
-        arr = tensor.detach().float().cpu().numpy()
-        plt.figure(figsize=(6, 5))
-        plt.imshow(arr)
-        plt.title(title)
-        plt.axis("off")
-        plt.colorbar()
+    def _save_big_figure(self, path: Path, stem: str) -> None:
+        scales = list(self._last_visual_maps.keys())
+        metric_order = [
+            ("gate", "Gate"),
+            ("correction_norm", "Correction Norm"),
+            ("used_gamma_norm", "Used Gamma Norm"),
+            ("used_beta_norm", "Used Beta Norm"),
+            ("reliability", "Reliability"),
+            ("effective_slots", "Effective Slots"),
+            ("raw_gamma_norm", "Raw Gamma Norm"),
+            ("safe_gamma_norm", "Safe Gamma Norm"),
+            ("raw_beta_norm", "Raw Beta Norm"),
+            ("safe_beta_norm", "Safe Beta Norm"),
+        ]
+        rows = len(scales)
+        cols = len(metric_order)
+        fig, axes = plt.subplots(rows, cols, figsize=(4.2 * cols, 3.6 * rows))
+        if rows == 1:
+            axes = np.expand_dims(axes, axis=0)
+        for r, scale_name in enumerate(scales):
+            maps = self._last_visual_maps[scale_name]
+            for c, (key, title) in enumerate(metric_order):
+                ax = axes[r, c]
+                if key in maps:
+                    arr = maps[key].detach().float().cpu().numpy()
+                    im = ax.imshow(arr)
+                    ax.set_title(f"{scale_name.upper()} {title}")
+                    ax.axis("off")
+                    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                else:
+                    ax.axis("off")
+                    ax.set_title(f"{scale_name.upper()} {title} (NA)")
+        fig.suptitle(f"PAAM Visual Summary | {stem}", fontsize=16)
         plt.tight_layout()
         plt.savefig(path, dpi=180, bbox_inches="tight")
-        plt.close()
-
-    @staticmethod
-    def _save_bar(values: np.ndarray, path: Path, title: str) -> None:
-        plt.figure(figsize=(7, 4))
-        x = np.arange(len(values))
-        plt.bar(x, values)
-        plt.title(title)
-        plt.xlabel("Slot")
-        plt.ylabel("Top-1 retrieval count")
-        plt.xticks(x)
-        plt.tight_layout()
-        plt.savefig(path, dpi=180, bbox_inches="tight")
-        plt.close()
+        plt.close(fig)
 
 
 def _seed_everything(seed: int = 2026) -> None:

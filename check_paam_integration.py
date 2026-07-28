@@ -78,6 +78,40 @@ def test_full_forward():
     assert out['paam_info']['scales'][0]['used_affine_source'] == 'current_real_pet_affine'
 
 
+def test_missing_gradients():
+    model = patch_light_model(DualSharedAddPAAMPETCT(paam_k=8))
+    model.train()
+    ct, pet, _ = make_inputs(batch=1)
+    model.paam.begin_epoch(1)
+    _ = model(ct, pet=pet, forward_mode='full')
+    model.finalize_epoch_memory()
+    mem0 = model.paam.memories[0]
+    mem0.memory_ready.fill_(True)
+    mem0.keys[0].fill_(1.0)
+    mem0.gamma_proto[0].fill_(1.0)
+    mem0.beta_proto[0].fill_(1.0)
+    out = model(ct, pet=None, forward_mode='missing')
+    loss = out['logits'].sum()
+    loss.backward()
+    assert any(p.grad is not None and torch.count_nonzero(p.grad).item() > 0 for p in model.enc_ct.parameters())
+    assert all(p.grad is None for p in model.enc_pet.parameters())
+    assert all(p.grad is None for p in model.paam.writers.parameters())
+    assert model.paam.memories[0].query_proj.weight.grad is not None and torch.count_nonzero(model.paam.memories[0].query_proj.weight.grad).item() > 0
+    assert any(p.grad is not None and torch.count_nonzero(p.grad).item() > 0 for p in model.paam.executors.parameters())
+    assert any(p.grad is not None and torch.count_nonzero(p.grad).item() > 0 for p in model.decoder.parameters())
+
+
+def test_full_gradients():
+    model = patch_light_model(DualSharedAddPAAMPETCT(paam_k=8))
+    model.train()
+    ct, pet, _ = make_inputs(batch=1)
+    out = model(ct, pet=pet, forward_mode='full')
+    loss = out['logits'].sum()
+    loss.backward()
+    assert any(p.grad is not None for p in model.enc_pet.parameters())
+    assert any(p.grad is not None for p in model.paam.writers.parameters())
+
+
 def test_epoch1_missing():
     model = patch_light_model(DualSharedAddPAAMPETCT(paam_k=8))
     model.paam.begin_epoch(1)
@@ -137,6 +171,8 @@ def test_baseline_unchanged():
 def main():
     test_build()
     test_full_forward()
+    test_missing_gradients()
+    test_full_gradients()
     test_epoch1_missing()
     test_delayed_update()
     test_real_missing_eval()

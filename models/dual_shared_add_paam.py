@@ -20,7 +20,8 @@ class DualSharedAddPAAMPETCT(DualSharedAddPETCTBaseline):
         if route == 'full':
             pet_feats = self._encode_pet(pet)
         elif self.training and pet is not None:
-            pet_feats = self._encode_pet(pet)
+            with torch.no_grad():
+                pet_feats = self._encode_pet(pet)
         fused_feats, paam_info = self.paam(
             ct_features=ct_feats,
             pet_features=pet_feats,

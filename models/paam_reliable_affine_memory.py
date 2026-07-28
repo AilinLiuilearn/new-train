@@ -279,8 +279,8 @@ class PETReliableAffineActionMemory(nn.Module):
                 with torch.no_grad():
                     gamma_star, beta_star = writer(ct.detach(), pet_features[idx].detach())
                     _, true_exec = executor(ct.detach(), gamma_star, beta_star)
-                if update_memory:
-                    write_report = memory.collect(query.detach(), gamma_star, beta_star, true_exec['gate'], query_stats=q_stats)
+                    if update_memory:
+                        write_report = memory.collect(query.detach(), gamma_star, beta_star, true_exec['gate'], query_stats=q_stats)
             if route == 'full':
                 used_gamma, used_beta = gamma_star, beta_star
                 retrieval_info = None
@@ -332,13 +332,27 @@ class PETReliableAffineActionMemory(nn.Module):
         with json_path.open('w', encoding='utf-8') as f:
             import json
             json.dump(_json_ready(self.diagnostics()), f, ensure_ascii=False, indent=2)
+        saved = {'json': str(json_path)}
         if self._last_visual_maps:
-            for scale_name, maps in self._last_visual_maps.items():
-                for name, tensor in maps.items():
-                    path = out / f'{stem}_{scale_name}_{name}.png'
-                    self._save_map(tensor, path, f'{scale_name} {name}')
-        return {'json': str(json_path)}
+            fig_path = out / f'{stem}_paam_reliable_visual_summary.png'
+            self._save_big_figure(fig_path, stem)
+            saved['bigfig'] = str(fig_path)
+        return saved
 
-    @staticmethod
-    def _save_map(tensor, path, title):
-        arr = tensor.detach().float().cpu().numpy(); plt.figure(figsize=(6, 5)); plt.imshow(arr); plt.title(title); plt.axis('off'); plt.colorbar(); plt.tight_layout(); plt.savefig(path, dpi=180, bbox_inches='tight'); plt.close()
+    def _save_big_figure(self, path, stem):
+        scales = list(self._last_visual_maps.keys())
+        metric_order = [('gate', 'Gate'), ('correction_norm', 'Correction Norm'), ('used_gamma_norm', 'Used Gamma Norm'), ('used_beta_norm', 'Used Beta Norm'), ('reliability', 'Reliability'), ('effective_slots', 'Effective Slots'), ('raw_gamma_norm', 'Raw Gamma Norm'), ('safe_gamma_norm', 'Safe Gamma Norm'), ('raw_beta_norm', 'Raw Beta Norm'), ('safe_beta_norm', 'Safe Beta Norm')]
+        rows, cols = len(scales), len(metric_order)
+        fig, axes = plt.subplots(rows, cols, figsize=(4.2 * cols, 3.6 * rows))
+        if rows == 1:
+            axes = np.expand_dims(axes, axis=0)
+        for r, scale_name in enumerate(scales):
+            maps = self._last_visual_maps[scale_name]
+            for c, (key, title) in enumerate(metric_order):
+                ax = axes[r, c]
+                if key in maps:
+                    arr = maps[key].detach().float().cpu().numpy(); im = ax.imshow(arr); ax.set_title(f'{scale_name.upper()} {title}'); ax.axis('off'); fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                else:
+                    ax.axis('off'); ax.set_title(f'{scale_name.upper()} {title} (NA)')
+        fig.suptitle(f'PAAM-Reliable Visual Summary | {stem}', fontsize=16)
+        plt.tight_layout(); plt.savefig(path, dpi=180, bbox_inches='tight'); plt.close(fig)
