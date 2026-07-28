@@ -22,7 +22,7 @@ class SegMDTConfig(ConfigBase):
     @staticmethod
     def model_parser():
         p = argparse.ArgumentParser('Model', add_help=False)
-        p.add_argument('--model_arch', type=str, default='dual_shared_add_baseline', choices=('dual_shared_add_baseline', 'dual_shared_add_paam'))
+        p.add_argument('--model_arch', type=str, default='dual_shared_add_baseline', choices=('dual_shared_add_baseline', 'dual_shared_add_paam', 'dual_shared_add_paam_reliable'))
         p.add_argument(
             '--paam_k',
             type=int,
