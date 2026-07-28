@@ -154,6 +154,7 @@ class PairedPrototypeMemoryScale(nn.Module):
 
         self.channels = int(channels)
         self.num_slots = int(num_slots)
+        self.retrieval_temperature = float(retrieval_temperature)
         self.max_tokens_per_batch = int(max_tokens_per_batch)
         self.max_cached_tokens = int(max_cached_tokens)
         self.positive_fraction = float(positive_fraction)
