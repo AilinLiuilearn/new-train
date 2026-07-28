@@ -56,16 +56,18 @@ class MDTSegTeacher:
         total_loss = 0.0
         sample_count = 0
         self.metrics.reset()
-        for batch in loader:
+        is_paam = hasattr(self.model, 'paam')
+        for batch_idx, batch in enumerate(loader):
             ct = batch['ct'].to(self.device, non_blocking=True)
             mask = batch['mask'].to(self.device, non_blocking=True).float()
             batch_size = ct.shape[0]
+            capture_paam_visuals = bool(is_paam and eval_mode == 'fixed_missing' and batch_idx == 0)
             if eval_mode == 'full':
                 pet = batch['pet'].to(self.device, non_blocking=True)
                 forward_mode = 'full'
                 pet_available = None
             elif eval_mode == 'fixed_missing':
-                pet = batch['pet'].to(self.device, non_blocking=True)
+                pet = None if is_paam else batch['pet'].to(self.device, non_blocking=True)
                 forward_mode = 'missing'
                 pet_available = None
             else:
@@ -74,7 +76,10 @@ class MDTSegTeacher:
                 pet_available = batch.get('pet_available')
                 if pet_available is not None:
                     pet_available = pet_available.to(self.device, non_blocking=True)
-            outputs = self.model(ct, pet=pet, pet_available=pet_available, forward_mode=forward_mode)
+            kwargs = {'ct': ct, 'pet': pet, 'pet_available': pet_available, 'forward_mode': forward_mode}
+            if is_paam:
+                kwargs['capture_paam_visuals'] = capture_paam_visuals
+            outputs = self.model(**kwargs)
             logits = outputs['logits'] if isinstance(outputs, dict) else outputs
             loss, _ = self.criterion(logits, mask)
             self.metrics.update(logits, mask)

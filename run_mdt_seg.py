@@ -53,6 +53,11 @@ def _assert_baseline(cfg):
     assert float(cfg.boundary_loss_weight) == 0.0
 
 
+def _get_paam(model):
+    core = model.module if hasattr(model, 'module') else model
+    return getattr(core, 'paam', None)
+
+
 def module_grad_norm(module):
     total = None
     for p in module.parameters():
@@ -124,6 +129,9 @@ def main():
     paths = _checkpoint_paths(cfg.checkpoint_dir)
 
     for epoch in range(1, cfg.epochs + 1):
+        paam = _get_paam(task.model)
+        if paam is not None:
+            paam.begin_epoch(epoch)
         task.model.train()
         full_n = missing_n = 0
         full_loss = missing_loss = 0.0
@@ -185,11 +193,25 @@ def main():
                     'mask': batch['mask'][:1].detach().cpu(),
                 }
 
+        if paam is not None:
+            memory_report = paam.finalize_epoch_memory()
+            os.makedirs(os.path.join(cfg.checkpoint_dir, 'paam_diagnostics'), exist_ok=True)
+            memory_path = os.path.join(cfg.checkpoint_dir, 'paam_diagnostics', f'epoch_{epoch:03d}_memory_build.json')
+            with open(memory_path, 'w', encoding='utf-8') as f:
+                json.dump(memory_report, f, ensure_ascii=False, indent=2)
+
         if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is not None and epoch % int(cfg.gradient_diagnostics_interval) == 0:
             diag_stats = task.gradient_diagnostics(fixed_diag_batch, max_samples=min(1, int(cfg.gradient_diagnostics_num_samples))) or {}
 
         val_full = task.evaluate(val_loader, eval_mode='full', tag='val_full')
         val_missing = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_missing')
+        if paam is not None:
+            paam.print_diagnostics()
+            paam.export_diagnostics(
+                output_dir=os.path.join(cfg.checkpoint_dir, 'paam_diagnostics'),
+                epoch=epoch,
+                split='val_missing',
+            )
         joint_dice = float(cfg.joint_full_weight) * val_full['dice'] + float(cfg.joint_missing_weight) * val_missing['dice']
 
         joint_improved = joint_dice > best_joint

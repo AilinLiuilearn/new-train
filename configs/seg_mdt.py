@@ -22,7 +22,13 @@ class SegMDTConfig(ConfigBase):
     @staticmethod
     def model_parser():
         p = argparse.ArgumentParser('Model', add_help=False)
-        p.add_argument('--model_arch', type=str, default='dual_shared_add_baseline', choices=('dual_shared_add_baseline',))
+        p.add_argument('--model_arch', type=str, default='dual_shared_add_baseline', choices=('dual_shared_add_baseline', 'dual_shared_add_paam'))
+        p.add_argument(
+            '--paam_k',
+            type=int,
+            default=8,
+            help='Number of affine-action prototypes per scale; the only tunable PAAM hyperparameter.',
+        )
         p.add_argument('--ct_backbone', type=str, default='convnextv2_nano')
         p.add_argument('--pet_backbone', type=str, default='mit_b1')
         p.add_argument('--ct_pretrained_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano')
