@@ -2,5 +2,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 checkpoints_new/
+pretrained/
 outputs/
 wandb/
