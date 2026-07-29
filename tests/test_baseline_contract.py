@@ -88,20 +88,34 @@ def test_module_grad_norm_preserves_grad_and_value():
         assert torch.allclose(b, a)
 
 
-def test_missing_path_pet_encoder_not_called(monkeypatch):
+def test_missing_path_pet_encoder_called_and_masked_before_fusion(monkeypatch):
     model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
-    calls = {'n': 0}
+    calls = {'n': 0, 'feats': None}
     orig = model.enc_pet.forward
 
     def wrapped(*args, **kwargs):
         calls['n'] += 1
-        return orig(*args, **kwargs)
+        out = orig(*args, **kwargs)
+        calls['feats'] = [x.detach().clone() for x in out]
+        return out
+
+    captured = {}
+    orig_fusion = model.fusion.forward
+
+    def wrapped_fusion(ct_feats, pet_feats, pet_available=None):
+        captured['pet_feats'] = [x.detach().clone() for x in pet_feats]
+        return orig_fusion(ct_feats, pet_feats, pet_available)
 
     monkeypatch.setattr(model.enc_pet, 'forward', wrapped)
+    monkeypatch.setattr(model.fusion, 'forward', wrapped_fusion)
     ct = torch.randn(1, 1, 64, 64)
-    out = model(ct, None, forward_mode='missing')
+    pet = torch.randn(1, 1, 64, 64)
+    out = model(ct, pet, forward_mode='missing')
     assert 'logits' in out
-    assert calls['n'] == 0
+    assert calls['n'] == 1
+    assert captured['pet_feats'] is not None
+    assert all(torch.allclose(x, torch.zeros_like(x)) for x in captured['pet_feats'])
+    assert torch.isfinite(out['logits']).all()
 
 
 def test_checkpoint_save_and_eval_config_contract(tmp_path):

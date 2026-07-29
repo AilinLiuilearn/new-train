@@ -38,7 +38,7 @@ class UNetStyleDecoder(nn.Module):
             self.aux_head_d3 = nn.Conv2d(d3, out_channels, kernel_size=1)
             self.aux_head_d4 = nn.Conv2d(d4, out_channels, kernel_size=1)
 
-    def forward(self, features, target_size):
+    def forward(self, features, target_size, return_intermediates=False):
         x1, x2, x3, x4 = features
         d4 = self.proj4(x4)
         s3 = self.proj3(x3)
@@ -49,9 +49,13 @@ class UNetStyleDecoder(nn.Module):
         d1 = self.fuse1(torch.cat([F.interpolate(d2, size=s1.shape[-2:], mode='bilinear', align_corners=False), s1], dim=1))
         logits = self.seg_head(d1)
         final_logits = F.interpolate(logits, size=target_size, mode='bilinear', align_corners=False)
-        if not self.use_deep_supervision:
-            return {'logits': final_logits}
-        return {'logits': final_logits, 'aux_logits': [self.aux_head_d2(d2), self.aux_head_d3(d3), self.aux_head_d4(d4)]}
+        out = {'logits': final_logits}
+        if self.use_deep_supervision:
+            out['aux_logits'] = [self.aux_head_d2(d2), self.aux_head_d3(d3), self.aux_head_d4(d4)]
+        if return_intermediates:
+            out['decoder_feature'] = d1
+            out['native_logits'] = logits
+        return out
 
 
 class AddFusion(nn.Module):

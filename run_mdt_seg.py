@@ -25,8 +25,8 @@ def _seed(cfg):
 
 
 def _loaders(cfg):
-    from datasets.pclt20k_seg import get_pclt20k_loaders_cipa_aligned
-    return get_pclt20k_loaders_cipa_aligned(
+    from datasets.pclt20k_seg import PCLT20KSegDataset, get_pclt20k_loaders_cipa_aligned, _make_loader
+    train_loader, val_loader, test_loader = get_pclt20k_loaders_cipa_aligned(
         cfg.root,
         cfg.image_size_2d,
         cfg.batch_size,
@@ -40,6 +40,18 @@ def _loaders(cfg):
         cfg.test_split_file,
         checkpoint_dir=cfg.checkpoint_dir,
     )
+    memory_loader = None
+    if cfg.model_arch == 'dual_shared_add_cpbdm':
+        memory_ds = PCLT20KSegDataset(
+            records=train_loader.dataset.records,
+            image_size=cfg.image_size_2d,
+            train=False,
+            random_state=cfg.random_state,
+            aug_mode='none',
+            norm_mode=cfg.norm_mode,
+        )
+        memory_loader = _make_loader(memory_ds, cfg.batch_size, cfg.num_workers, False, False, cfg.random_state + 97, cfg.pin_memory)
+    return train_loader, val_loader, test_loader, memory_loader
 
 
 def _assert_baseline(cfg):
@@ -87,7 +99,7 @@ def main():
     with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
         json.dump(vars(cfg), f, indent=2, default=str)
 
-    train_loader, val_loader, _ = _loaders(cfg)
+    train_loader, val_loader, _, memory_loader = _loaders(cfg)
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)}', flush=True)
 
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
@@ -188,6 +200,11 @@ def main():
         if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is not None and epoch % int(cfg.gradient_diagnostics_interval) == 0:
             diag_stats = task.gradient_diagnostics(fixed_diag_batch, max_samples=min(1, int(cfg.gradient_diagnostics_num_samples))) or {}
 
+        if cfg.model_arch == 'dual_shared_add_cpbdm' and memory_loader is not None:
+            build_report = task.rebuild_cpbdm_memory(memory_loader, epoch)
+            task.model.cpbdm.reset_retrieval_stats()
+        else:
+            build_report = {}
         val_full = task.evaluate(val_loader, eval_mode='full', tag='val_full')
         val_missing = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_missing')
         joint_dice = float(cfg.joint_full_weight) * val_full['dice'] + float(cfg.joint_missing_weight) * val_missing['dice']
@@ -222,6 +239,7 @@ def main():
         val_acc_pixel = 0.5 * val_full.get('acc_pixel', 0.0) + 0.5 * val_missing.get('acc_pixel', 0.0)
         val_hd95 = 0.5 * val_full['hd95'] + 0.5 * val_missing['hd95']
         avg_grad_norm = grad_norm_accum / max(1, grad_norm_steps)
+        cpbdm_diag = task.model.cpbdm_diagnostics() if cfg.model_arch == 'dual_shared_add_cpbdm' else {}
         append_epoch_log(
             os.path.join(cfg.checkpoint_dir, 'train_log.csv'),
             epoch,
@@ -256,6 +274,16 @@ def main():
                 'grad_missing_ct_align': float(np.mean(grads['missing']['ct_align'])) if grads['missing']['ct_align'] else 0.0,
                 'grad_full_decoder': float(np.mean(grads['full']['decoder'])) if grads['full']['decoder'] else 0.0,
                 'grad_missing_decoder': float(np.mean(grads['missing']['decoder'])) if grads['missing']['decoder'] else 0.0,
+                'cpbdm_memory_ready': float(cpbdm_diag.get('memory_ready', 0.0)) if cpbdm_diag else 0.0,
+                'cpbdm_key_pair_cos': float(cpbdm_diag.get('key_pairwise_cosine_mean', 0.0)) if cpbdm_diag else 0.0,
+                'cpbdm_retrieval_entropy': float(cpbdm_diag.get('retrieval_running', {}).get('entropy', 0.0)) if cpbdm_diag else 0.0,
+                'cpbdm_effective_slots': float(cpbdm_diag.get('retrieval_running', {}).get('effective_slots', 0.0)) if cpbdm_diag else 0.0,
+                'cpbdm_top1_weight': float(cpbdm_diag.get('retrieval_running', {}).get('top1_weight', 0.0)) if cpbdm_diag else 0.0,
+                'cpbdm_max_similarity': float(cpbdm_diag.get('retrieval_running', {}).get('max_similarity', 0.0)) if cpbdm_diag else 0.0,
+                'cpbdm_delta_abs_mean': float(cpbdm_diag.get('retrieval_running', {}).get('delta_abs_mean', 0.0)) if cpbdm_diag else 0.0,
+                'cpbdm_positive_ratio': float(np.mean(cpbdm_diag.get('pi_positive', [0.0]))) if cpbdm_diag else 0.0,
+                'cpbdm_negative_ratio': float(np.mean(cpbdm_diag.get('pi_negative', [0.0]))) if cpbdm_diag else 0.0,
+                'cpbdm_zero_ratio': float(np.mean(cpbdm_diag.get('pi_zero', [0.0]))) if cpbdm_diag else 0.0,
                 'epoch_time': time.time() - epoch_start,
                 **{f'diag_{k}': v for k, v in diag_stats.items()},
             },

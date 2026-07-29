@@ -350,21 +350,44 @@ class ConvBNAct(nn.Module):
 
 
 def build_mdt_seg_teacher(config):
-    from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
-    model = DualSharedAddPETCTBaseline(
-        ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
-        pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
-        ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
-        pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
-        in_channels=3,
-        out_channels=1,
-        decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
-        use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
-    )
-    print(
-        f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
-        f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion=add shared_decoder=UNetStyleDecoder '
-        f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
-    )
+    model_arch = getattr(config, 'model_arch', 'dual_shared_add_baseline')
+    if model_arch == 'dual_shared_add_baseline':
+        from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
+        model = DualSharedAddPETCTBaseline(
+            ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
+            pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
+            ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
+            pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
+            in_channels=3,
+            out_channels=1,
+            decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
+            use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
+        )
+        print(
+            f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
+            f'pet={getattr(config, "pet_backbone", "mit_b1")} '
+            f'fusion=add shared_decoder=UNetStyleDecoder '
+            f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
+        )
+    elif model_arch == 'dual_shared_add_cpbdm':
+        from models.dual_shared_add_cpbdm import DualSharedAddCPBDM
+        model = DualSharedAddCPBDM(
+            ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
+            pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
+            ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
+            pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
+            in_channels=3,
+            out_channels=1,
+            decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
+            use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
+            cpbdm_k=getattr(config, 'cpbdm_k', 8),
+            cpbdm_query_dim=getattr(config, 'cpbdm_query_dim', 16),
+        )
+        print(
+            f'[dual_shared_add_cpbdm] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
+            f'pet={getattr(config, "pet_backbone", "mit_b1")} '
+            f'K={getattr(config, "cpbdm_k", 8)} query_dim={getattr(config, "cpbdm_query_dim", 16)}'
+        )
+    else:
+        raise ValueError(f'Unsupported model_arch={model_arch!r}')
     return {'model': model}

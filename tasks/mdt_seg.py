@@ -32,6 +32,29 @@ class MDTSegTeacher:
         self.criterion = BCEDiceLoss(smooth=config.loss_smooth, bce_weight=config.bce_weight, dice_weight=config.dice_weight)
         self.metrics = SegmentationMetricsCIPA()
 
+    @torch.no_grad()
+    def rebuild_cpbdm_memory(self, memory_loader, epoch):
+        if not hasattr(self.model, 'cpbdm'):
+            return {}
+        was_training = self.model.training
+        self.model.eval()
+        self.model.cpbdm.clear_cache()
+        build_report = {}
+        total_candidates = 0
+        for batch in memory_loader:
+            ct = batch['ct'].to(self.device, non_blocking=True)
+            pet = batch['pet'].to(self.device, non_blocking=True)
+            mask = batch['mask'].to(self.device, non_blocking=True).float()
+            report = self.model.collect_cpbdm_candidates(ct=ct, pet=pet, target=mask)
+            total_candidates += int(report.get('fit_selected', 0))
+            build_report = report
+        build_report = self.model.cpbdm.finalize_memory()
+        build_report['epoch'] = int(epoch)
+        build_report['candidate_total'] = int(total_candidates)
+        self.model.cpbdm.print_diagnostics()
+        self.model.train(was_training)
+        return build_report
+
     def trainable_parameters(self):
         return [p for p in self.model.parameters() if p.requires_grad]
 
