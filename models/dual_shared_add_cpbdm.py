@@ -87,10 +87,15 @@ class DualSharedAddCPBDM(DualSharedAddPETCTBaseline):
             target_size = ct.shape[-2:]
         ct_feats = self._encode_ct(ct)
         pet_feats = self._encode_pet(pet)
-        full_out = self.decoder(self.fusion(ct_feats, pet_feats, None), target_size, return_intermediates=True)
+        full_fused = self.fusion(ct_feats, pet_feats, None)
+        full_out = self.decoder(full_fused, target_size, return_native_only=True)
+        full_native_logits = full_out['native_logits'].detach()
+        del full_out
+        del full_fused
         zero_pet_feats = [torch.zeros_like(x) for x in pet_feats]
-        ct_out = self.decoder(self.fusion(ct_feats, zero_pet_feats, None), target_size, return_intermediates=True)
-        return self.cpbdm.collect_from_pair(ct_out['decoder_feature'], ct_out['native_logits'], full_out['native_logits'], target)
+        ct_fused = self.fusion(ct_feats, zero_pet_feats, None)
+        ct_out = self.decoder(ct_fused, target_size, return_intermediates=True)
+        return self.cpbdm.collect_from_pair(ct_out['decoder_feature'], ct_out['native_logits'], full_native_logits, target)
 
     def clear_cpbdm_cache(self):
         return self.cpbdm.clear_cache()

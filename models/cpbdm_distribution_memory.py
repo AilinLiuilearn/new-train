@@ -250,6 +250,7 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
         self.register_buffer("slot_zero_counts", torch.zeros(self.K))
         self.register_buffer("slot_pos_counts", torch.zeros(self.K))
         self.register_buffer("slot_neg_counts", torch.zeros(self.K))
+        self.register_buffer("slot_weighted_mass", torch.zeros(self.K))
         self.register_buffer("memory_ready", torch.tensor(False, dtype=torch.bool))
 
         # 平衡 Key 拟合缓存。
@@ -262,11 +263,18 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
         self._stat_weight: List[torch.Tensor] = []
 
         self._retrieval_stats = {
+            "raw_entropy": RunningMean(),
             "entropy": RunningMean(),
+            "raw_effective_slots": RunningMean(),
             "effective_slots": RunningMean(),
+            "raw_top1_weight": RunningMean(),
             "top1_weight": RunningMean(),
             "max_similarity": RunningMean(),
+            "raw_delta_abs_mean": RunningMean(),
             "delta_abs_mean": RunningMean(),
+            "consensus_weight_change": RunningMean(),
+            "raw_delta_tv": RunningMean(),
+            "coherent_delta_tv": RunningMean(),
         }
         self._last_maps: Dict[str, torch.Tensor] = {}
 
@@ -306,6 +314,12 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
         }
 
     @staticmethod
+    def _assert_synced_cache_lengths(caches, names):
+        lengths = [sum(int(t.shape[0]) for t in cache) for cache in caches]
+        if len(set(lengths)) != 1:
+            raise RuntimeError(f'CPBDM synchronized cache mismatch: {dict(zip(names, lengths))}')
+
+    @staticmethod
     def _trim_synced_caches(caches: Sequence[List[torch.Tensor]], capacity: int) -> None:
         if not caches or not caches[0]:
             return
@@ -331,75 +345,65 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
         """
         query, q_aux = self.query_builder(ct_decoder_feature, ct_logits)
         events = self.compute_paired_events(ct_logits, full_logits, target)
-
         b, _, h, w = query.shape
         q_flat = query.permute(0, 2, 3, 1).reshape(b, h * w, self.query_dim)
         e_flat = events["event"].reshape(b, h * w)
         d_flat = events["delta_star"].reshape(b, h * w)
         g_flat = events["benefit"].reshape(b, h * w)
         entropy_flat = q_aux["entropy"].reshape(b, h * w)
-
-        fit_selected = 0
-        stat_selected = 0
+        fit_selected = stat_selected = 0
         raw_counts = {"zero": 0, "positive": 0, "negative": 0}
-
         for bi in range(b):
             all_idx = torch.arange(h * w, device=query.device)
-            zero_idx = all_idx[e_flat[bi] == self.EVENT_ZERO]
-            pos_idx = all_idx[e_flat[bi] == self.EVENT_POS]
-            neg_idx = all_idx[e_flat[bi] == self.EVENT_NEG]
-
-            raw_counts["zero"] += int(zero_idx.numel())
-            raw_counts["positive"] += int(pos_idx.numel())
-            raw_counts["negative"] += int(neg_idx.numel())
-
-            # A. 三类平衡采样拟合 CT Key。
+            zero_idx_all = all_idx[e_flat[bi] == self.EVENT_ZERO]
+            pos_idx_all = all_idx[e_flat[bi] == self.EVENT_POS]
+            neg_idx_all = all_idx[e_flat[bi] == self.EVENT_NEG]
+            raw_counts["zero"] += int(zero_idx_all.numel())
+            raw_counts["positive"] += int(pos_idx_all.numel())
+            raw_counts["negative"] += int(neg_idx_all.numel())
+            fit_zero_idx = zero_idx_all
+            fit_pos_idx = pos_idx_all
+            fit_neg_idx = neg_idx_all
             quota = max(1, self.max_fit_samples_per_image // 3)
-            if pos_idx.numel() > quota:
-                pos_idx = pos_idx[torch.topk(g_flat[bi, pos_idx], k=quota).indices]
-            if neg_idx.numel() > quota:
-                neg_idx = neg_idx[torch.topk(g_flat[bi, neg_idx], k=quota).indices]
-            if zero_idx.numel() > quota:
-                # 零事件优先覆盖 CT 不确定区域，避免全是普通背景。
-                zero_idx = zero_idx[torch.topk(entropy_flat[bi, zero_idx], k=quota).indices]
-
-            fit_idx = torch.cat([zero_idx, pos_idx, neg_idx], dim=0)
+            if fit_pos_idx.numel() > quota:
+                fit_pos_idx = fit_pos_idx[torch.topk(g_flat[bi, fit_pos_idx], k=quota).indices]
+            if fit_neg_idx.numel() > quota:
+                fit_neg_idx = fit_neg_idx[torch.topk(g_flat[bi, fit_neg_idx], k=quota).indices]
+            if fit_zero_idx.numel() > quota:
+                fit_zero_idx = fit_zero_idx[torch.topk(entropy_flat[bi, fit_zero_idx], k=quota).indices]
+            fit_idx = torch.cat([fit_zero_idx, fit_pos_idx, fit_neg_idx], dim=0)
             if fit_idx.numel() > 0:
                 self._fit_q.append(q_flat[bi, fit_idx].float().cpu())
                 fit_selected += int(fit_idx.numel())
-
-            # B. 近似均匀采样，估计真实零/正/负比例。
-                total_budget = self.max_stat_samples_per_image
+            total_budget = self.max_stat_samples_per_image
             pos_quota = total_budget // 3
             neg_quota = total_budget // 3
             zero_quota = total_budget - pos_quota - neg_quota
-
-            sampled_zero = deterministic_take(zero_idx, min(zero_quota, int(zero_idx.numel())))
-            sampled_pos = deterministic_take(pos_idx, min(pos_quota, int(pos_idx.numel())))
-            sampled_neg = deterministic_take(neg_idx, min(neg_quota, int(neg_idx.numel())))
-
+            sampled_zero = deterministic_take(zero_idx_all, min(zero_quota, int(zero_idx_all.numel())))
+            sampled_pos = deterministic_take(pos_idx_all, min(pos_quota, int(pos_idx_all.numel())))
+            sampled_neg = deterministic_take(neg_idx_all, min(neg_quota, int(neg_idx_all.numel())))
             stat_idx = torch.cat([sampled_zero, sampled_pos, sampled_neg], dim=0)
-            zero_sample_weight = zero_idx.numel() / max(sampled_zero.numel(), 1)
-            pos_sample_weight = pos_idx.numel() / max(sampled_pos.numel(), 1)
-            neg_sample_weight = neg_idx.numel() / max(sampled_neg.numel(), 1)
-            zero_weights = torch.full((sampled_zero.numel(),), float(zero_sample_weight), device=query.device, dtype=torch.float32)
-            pos_weights = torch.full((sampled_pos.numel(),), float(pos_sample_weight), device=query.device, dtype=torch.float32)
-            neg_weights = torch.full((sampled_neg.numel(),), float(neg_sample_weight), device=query.device, dtype=torch.float32)
-            stat_weight = torch.cat([zero_weights, pos_weights, neg_weights], dim=0)
+            zero_sample_weight = zero_idx_all.numel() / max(sampled_zero.numel(), 1)
+            pos_sample_weight = pos_idx_all.numel() / max(sampled_pos.numel(), 1)
+            neg_sample_weight = neg_idx_all.numel() / max(sampled_neg.numel(), 1)
+            stat_weight = torch.cat([
+                torch.full((sampled_zero.numel(),), float(zero_sample_weight), device=query.device),
+                torch.full((sampled_pos.numel(),), float(pos_sample_weight), device=query.device),
+                torch.full((sampled_neg.numel(),), float(neg_sample_weight), device=query.device),
+            ], dim=0)
             self._stat_q.append(q_flat[bi, stat_idx].float().cpu())
             self._stat_event.append(e_flat[bi, stat_idx].cpu())
             self._stat_delta.append(d_flat[bi, stat_idx].float().cpu())
             self._stat_benefit.append(g_flat[bi, stat_idx].float().cpu())
             self._stat_weight.append(stat_weight.detach().float().cpu())
-            assert self._stat_q[-1].shape[0] == self._stat_event[-1].shape[0] == self._stat_delta[-1].shape[0] == self._stat_benefit[-1].shape[0] == self._stat_weight[-1].shape[0]
             stat_selected += int(stat_idx.numel())
-
+            self._assert_synced_cache_lengths([self._stat_q, self._stat_event, self._stat_delta, self._stat_benefit, self._stat_weight], ["stat_q", "stat_event", "stat_delta", "stat_benefit", "stat_weight"])
+        self._assert_synced_cache_lengths([self._stat_q, self._stat_event, self._stat_delta, self._stat_benefit, self._stat_weight], ["stat_q", "stat_event", "stat_delta", "stat_benefit", "stat_weight"])
+        self._assert_synced_cache_lengths([self._fit_q], ["fit_q"])
         self._trim_synced_caches([self._fit_q], self.fit_cache_capacity)
-        self._trim_synced_caches(
-            [self._stat_q, self._stat_event, self._stat_delta, self._stat_benefit, self._stat_weight],
-            self.stat_cache_capacity,
-        )
-
+        self._assert_synced_cache_lengths([self._stat_q, self._stat_event, self._stat_delta, self._stat_benefit, self._stat_weight], ["stat_q", "stat_event", "stat_delta", "stat_benefit", "stat_weight"])
+        self._trim_synced_caches([self._stat_q, self._stat_event, self._stat_delta, self._stat_benefit, self._stat_weight], self.stat_cache_capacity)
+        self._assert_synced_cache_lengths([self._stat_q, self._stat_event, self._stat_delta, self._stat_benefit, self._stat_weight], ["stat_q", "stat_event", "stat_delta", "stat_benefit", "stat_weight"])
         return {
             "fit_selected": fit_selected,
             "stat_selected": stat_selected,
@@ -462,6 +466,7 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
         if not self._fit_q or not self._stat_q:
             return {"updated": False, "reason": "empty_cache", "memory_ready": bool(self.memory_ready)}
 
+        self._assert_synced_cache_lengths([self._stat_q, self._stat_event, self._stat_delta, self._stat_benefit, self._stat_weight], ["stat_q", "stat_event", "stat_delta", "stat_benefit", "stat_weight"])
         fit_q = torch.cat(self._fit_q, dim=0).float()
         stat_q = torch.cat(self._stat_q, dim=0).float()
         stat_event = torch.cat(self._stat_event, dim=0).long()
@@ -538,6 +543,7 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
         self.slot_zero_counts.copy_(values["zero_count"].to(device))
         self.slot_pos_counts.copy_(values["pos_count"].to(device))
         self.slot_neg_counts.copy_(values["neg_count"].to(device))
+        self.slot_weighted_mass.copy_(values["weighted_mass"].to(device))
         self.memory_ready.fill_(True)
 
         report = {
@@ -570,9 +576,9 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
                 "negative": float((stat_weight * (stat_event == self.EVENT_NEG).float()).sum()),
             },
             "weighted_event_ratio": {
-                "zero": float((stat_weight * (stat_event == self.EVENT_ZERO).float()).sum() / stat_weight.sum().clamp_min(1.0)),
-                "positive": float((stat_weight * (stat_event == self.EVENT_POS).float()).sum() / stat_weight.sum().clamp_min(1.0)),
-                "negative": float((stat_weight * (stat_event == self.EVENT_NEG).float()).sum() / stat_weight.sum().clamp_min(1.0)),
+                "zero": float((values["weighted_mass"] * values["pi_zero"]).sum() / values["weighted_mass"].sum().clamp_min(1e-8)),
+                "positive": float((values["weighted_mass"] * values["pi_pos"]).sum() / values["weighted_mass"].sum().clamp_min(1e-8)),
+                "negative": float((values["weighted_mass"] * values["pi_neg"]).sum() / values["weighted_mass"].sum().clamp_min(1e-8)),
             },
             "global_event_counts": {
                 "zero": int((stat_event == self.EVENT_ZERO).sum()),
@@ -591,10 +597,42 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
         self._stat_event.clear()
         self._stat_delta.clear()
         self._stat_benefit.clear()
+        self._stat_weight.clear()
 
     def slot_expected_delta(self) -> torch.Tensor:
-        # 零纠偏概率乘以 0，因此无需额外门控。
         return self.pi_pos * self.mu_pos + self.pi_neg * self.mu_neg
+
+    @staticmethod
+    def _spatial_tv(x):
+        horizontal = (x[..., :, 1:] - x[..., :, :-1]).abs().mean()
+        vertical = (x[..., 1:, :] - x[..., :-1, :]).abs().mean()
+        return horizontal + vertical
+
+    def _ct_guided_local_consensus(self, query, weights_flat):
+        b, d, h, w = query.shape
+        query_map = torch.nan_to_num(F.normalize(query.float(), dim=1, eps=1e-6), nan=0.0, posinf=0.0, neginf=0.0)
+        raw_weights_map = weights_flat.reshape(b, h, w, self.K).permute(0, 3, 1, 2).float()
+        query_pad = F.pad(query_map, (1, 1, 1, 1), mode='replicate')
+        local_logits = []
+        local_scale = math.sqrt(float(d))
+        for oy in range(3):
+            for ox in range(3):
+                neighbor_query = query_pad[:, :, oy:oy + h, ox:ox + w]
+                local_cosine = (query_map * neighbor_query).sum(dim=1, keepdim=True)
+                local_logits.append(local_cosine * local_scale)
+        local_affinity = torch.softmax(torch.cat(local_logits, dim=1), dim=1)
+        local_affinity = torch.nan_to_num(local_affinity, nan=1.0 / 9.0, posinf=0.0, neginf=0.0)
+        weights_pad = F.pad(raw_weights_map, (1, 1, 1, 1), mode='replicate')
+        coherent_weights = torch.zeros_like(raw_weights_map)
+        nid = 0
+        for oy in range(3):
+            for ox in range(3):
+                neighbor_weights = weights_pad[:, :, oy:oy + h, ox:ox + w]
+                coherent_weights = coherent_weights + neighbor_weights * local_affinity[:, nid:nid + 1]
+                nid += 1
+        coherent_weights = torch.nan_to_num(coherent_weights, nan=0.0, posinf=0.0, neginf=0.0)
+        coherent_weights = coherent_weights / coherent_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        return raw_weights_map, coherent_weights, local_affinity
 
     def retrieve(
         self,
@@ -605,62 +643,94 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
         query, q_aux = self.query_builder(ct_decoder_feature, ct_logits)
         b, _, h, w = query.shape
         ct_prob = torch.sigmoid(ct_logits.float()).to(ct_logits.dtype)
-
         if not bool(self.memory_ready.item()):
             info = {
                 "memory_ready": False,
+                "raw_retrieval_entropy_mean": 0.0,
                 "retrieval_entropy_mean": 0.0,
+                "raw_effective_slots_mean": 1.0,
                 "effective_slots_mean": 1.0,
+                "raw_top1_weight_mean": 0.0,
                 "top1_weight_mean": 0.0,
                 "max_similarity_mean": 0.0,
+                "raw_delta_abs_mean": 0.0,
                 "delta_abs_mean": 0.0,
+                "consensus_weight_change_mean": 0.0,
+                "raw_delta_tv": 0.0,
+                "coherent_delta_tv": 0.0,
             }
             return RetrievalResult(torch.zeros_like(ct_logits), ct_prob, ct_logits, info)
-
         q = torch.nan_to_num(F.normalize(query.float().permute(0, 2, 3, 1).reshape(-1, self.query_dim), dim=1, eps=1e-6), nan=0.0, posinf=0.0, neginf=0.0)
         keys = torch.nan_to_num(F.normalize(self.keys.float(), dim=1, eps=1e-6), nan=0.0, posinf=0.0, neginf=0.0)
         similarity = torch.nan_to_num(q @ keys.t(), nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
         scale = self.logit_scale.exp().clamp(1.0, 20.0)
         weights = torch.softmax(similarity * scale, dim=1)
         weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-
-        delta_flat = weights @ self.slot_expected_delta().float()
-        delta = delta_flat.reshape(b, 1, h, w).to(ct_logits.dtype)
+        raw_weights_map, coherent_weights, local_affinity = self._ct_guided_local_consensus(query, weights)
+        slot_values = self.slot_expected_delta().float().view(1, self.K, 1, 1)
+        raw_delta = (raw_weights_map * slot_values).sum(dim=1, keepdim=True)
+        coherent_delta = (coherent_weights * slot_values).sum(dim=1, keepdim=True)
+        delta = coherent_delta.to(ct_logits.dtype)
         delta = torch.nan_to_num(delta, nan=0.0, posinf=0.25, neginf=-0.25).clamp(-0.25, 0.25)
         corrected_prob = (ct_prob + delta).clamp(1e-3, 1.0 - 1e-3)
-        # Explicit log-odds in fp32 has bounded derivatives after clamping and is
-        # more stable than an autocast fp16 logit backward.
         corrected_logits = torch.log(corrected_prob) - torch.log1p(-corrected_prob)
         corrected_logits = torch.nan_to_num(corrected_logits, nan=0.0, posinf=7.0, neginf=-7.0).clamp(-7.0, 7.0)
-
-        p = weights.clamp_min(1e-8)
-        entropy = -(p * p.log()).sum(dim=1)
-        effective = entropy.exp()
-        top1_weight, top1_slot = weights.max(dim=1)
-        max_similarity = similarity.max(dim=1).values
+        raw_p = raw_weights_map.clamp_min(1e-8)
+        coherent_p = coherent_weights.clamp_min(1e-8)
+        raw_entropy_map = -(raw_p * raw_p.log()).sum(dim=1)
+        coherent_entropy_map = -(coherent_p * coherent_p.log()).sum(dim=1)
+        raw_effective_map = raw_entropy_map.exp()
+        coherent_effective_map = coherent_entropy_map.exp()
+        raw_top1_weight, _ = raw_weights_map.max(dim=1)
+        top1_weight, top1_slot = coherent_weights.max(dim=1)
+        max_similarity = similarity.max(dim=1).values.reshape(b, h, w)
+        consensus_weight_change = (coherent_weights - raw_weights_map).abs().mean()
+        raw_delta_tv = self._spatial_tv(raw_delta)
+        coherent_delta_tv = self._spatial_tv(coherent_delta)
         with torch.no_grad():
-            n = int(entropy.numel())
-            for name, value in [("entropy", entropy.mean()), ("effective_slots", effective.mean()), ("top1_weight", top1_weight.mean()), ("max_similarity", max_similarity.mean()), ("delta_abs_mean", delta.abs().mean())]:
-                self._retrieval_stats[name].update(to_float(value), n=n)
+            for name, value in [
+                ("raw_entropy", raw_entropy_map.mean()),
+                ("entropy", coherent_entropy_map.mean()),
+                ("raw_effective_slots", raw_effective_map.mean()),
+                ("effective_slots", coherent_effective_map.mean()),
+                ("raw_top1_weight", raw_top1_weight.mean()),
+                ("top1_weight", top1_weight.mean()),
+                ("max_similarity", max_similarity.mean()),
+                ("raw_delta_abs_mean", raw_delta.abs().mean()),
+                ("delta_abs_mean", coherent_delta.abs().mean()),
+                ("consensus_weight_change", consensus_weight_change),
+                ("raw_delta_tv", raw_delta_tv),
+                ("coherent_delta_tv", coherent_delta_tv),
+            ]:
+                self._retrieval_stats[name].update(to_float(value), n=int(value.numel() if value.ndim else 1))
             if capture_maps:
-                entropy_map = entropy.reshape(b, 1, h, w)
-                effective_map = effective.reshape(b, 1, h, w)
-                top1_weight_map = top1_weight.reshape(b, 1, h, w)
-                top1_slot_map = top1_slot.reshape(b, 1, h, w)
-                max_similarity_map = max_similarity.reshape(b, 1, h, w)
                 self._last_maps = {
                     "ct_probability": ct_prob[0, 0].cpu(),
                     "ct_entropy": q_aux["entropy"][0, 0].cpu(),
                     "ct_boundary": q_aux["boundary"][0, 0].cpu(),
-                    "delta_probability": delta[0, 0].cpu(),
+                    "raw_delta_probability": raw_delta[0, 0].cpu(),
+                    "delta_probability": coherent_delta[0, 0].cpu(),
                     "corrected_probability": corrected_prob[0, 0].cpu(),
-                    "retrieval_entropy": entropy_map[0, 0].cpu(),
-                    "effective_slots": effective_map[0, 0].cpu(),
-                    "top1_weight": top1_weight_map[0, 0].cpu(),
-                    "top1_slot": top1_slot_map[0, 0].cpu(),
-                    "max_similarity": max_similarity_map[0, 0].cpu(),
+                    "retrieval_entropy": coherent_entropy_map[0].cpu(),
+                    "top1_slot": top1_slot[0].cpu(),
+                    "max_similarity": max_similarity[0].cpu(),
+                    "local_consensus_change": (coherent_weights - raw_weights_map).abs().mean(dim=1)[0].cpu(),
                 }
-        info = {"memory_ready": True, "retrieval_entropy_mean": to_float(entropy.mean()), "effective_slots_mean": to_float(effective.mean()), "top1_weight_mean": to_float(top1_weight.mean()), "max_similarity_mean": to_float(max_similarity.mean()), "delta_abs_mean": to_float(delta.abs().mean())}
+        info = {
+            "memory_ready": True,
+            "raw_retrieval_entropy_mean": to_float(raw_entropy_map.mean()),
+            "retrieval_entropy_mean": to_float(coherent_entropy_map.mean()),
+            "raw_effective_slots_mean": to_float(raw_effective_map.mean()),
+            "effective_slots_mean": to_float(coherent_effective_map.mean()),
+            "raw_top1_weight_mean": to_float(raw_top1_weight.mean()),
+            "top1_weight_mean": to_float(top1_weight.mean()),
+            "max_similarity_mean": to_float(max_similarity.mean()),
+            "raw_delta_abs_mean": to_float(raw_delta.abs().mean()),
+            "delta_abs_mean": to_float(coherent_delta.abs().mean()),
+            "consensus_weight_change_mean": to_float(consensus_weight_change),
+            "raw_delta_tv": to_float(raw_delta_tv),
+            "coherent_delta_tv": to_float(coherent_delta_tv),
+        }
         return RetrievalResult(delta, corrected_prob, corrected_logits, info)
 
     def forward(
@@ -703,6 +773,12 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
             "sigma_negative": self.sigma_neg.cpu().tolist(),
             "slot_expected_delta": self.slot_expected_delta().detach().cpu().tolist(),
             "retrieval_running": {k: v.mean for k, v in self._retrieval_stats.items()},
+            "slot_weighted_mass": self.slot_weighted_mass.cpu().tolist(),
+            "global_weighted_event_ratio": {
+                "zero": float((self.slot_weighted_mass.float() * self.pi_zero.float()).sum() / self.slot_weighted_mass.float().sum().clamp_min(1e-8)),
+                "positive": float((self.slot_weighted_mass.float() * self.pi_pos.float()).sum() / self.slot_weighted_mass.float().sum().clamp_min(1e-8)),
+                "negative": float((self.slot_weighted_mass.float() * self.pi_neg.float()).sum() / self.slot_weighted_mass.float().sum().clamp_min(1e-8)),
+            },
         }
 
     def print_diagnostics(self) -> None:

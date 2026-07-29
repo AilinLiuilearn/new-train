@@ -53,7 +53,6 @@ class MDTSegTeacher:
             build_report = self.model.cpbdm.finalize_memory()
             build_report['epoch'] = int(epoch)
             build_report['candidate_total'] = int(total_candidates)
-            self.model.cpbdm.print_diagnostics()
             return build_report
         finally:
             self.model.train(was_training)

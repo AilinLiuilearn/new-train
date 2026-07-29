@@ -35,7 +35,7 @@ def test_forward_full_missing_shapes():
     ct = torch.randn(2, 1, 64, 64)
     pet = torch.randn(2, 1, 64, 64)
     out_full = model(ct, pet, forward_mode='full')
-    out_missing = model(ct, None, forward_mode='missing')
+    out_missing = model(ct, pet, forward_mode='missing')
     assert out_full['logits'].shape == out_missing['logits'].shape
 
 
