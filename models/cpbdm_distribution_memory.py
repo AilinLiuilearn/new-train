@@ -627,9 +627,11 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
         delta_flat = weights @ self.slot_expected_delta().float()
         delta = delta_flat.reshape(b, 1, h, w).to(ct_logits.dtype)
         delta = torch.nan_to_num(delta, nan=0.0, posinf=0.25, neginf=-0.25).clamp(-0.25, 0.25)
-        corrected_prob = (ct_prob + delta).clamp(1e-4, 1.0 - 1e-4)
-        corrected_logits = torch.logit(corrected_prob.float()).to(ct_logits.dtype)
-        corrected_logits = torch.nan_to_num(corrected_logits, nan=0.0, posinf=10.0, neginf=-10.0)
+        corrected_prob = (ct_prob + delta).clamp(1e-3, 1.0 - 1e-3)
+        # Explicit log-odds in fp32 has bounded derivatives after clamping and is
+        # more stable than an autocast fp16 logit backward.
+        corrected_logits = torch.log(corrected_prob) - torch.log1p(-corrected_prob)
+        corrected_logits = torch.nan_to_num(corrected_logits, nan=0.0, posinf=7.0, neginf=-7.0).clamp(-7.0, 7.0)
 
         p = weights.clamp_min(1e-8)
         entropy = -(p * p.log()).sum(dim=1)

@@ -37,7 +37,13 @@ class DualSharedAddCPBDM(DualSharedAddPETCTBaseline):
         raw_out = self.decoder(fused_feats, target_size, return_intermediates=True)
         d_ct = raw_out['decoder_feature']
         z_ct_native = raw_out['native_logits']
-        z_corrected_native, cpbdm_info = self.cpbdm(d_ct, z_ct_native, capture_maps=capture_cpbdm_maps)
+        # Probability-space correction contains sigmoid/logit operations whose gradients are
+        # unsafe in fp16 near probability boundaries. Keep only CPBDM retrieval in fp32.
+        with torch.cuda.amp.autocast(enabled=False):
+            z_corrected_native, cpbdm_info = self.cpbdm(
+                d_ct.float(), z_ct_native.float(), capture_maps=capture_cpbdm_maps
+            )
+        z_corrected_native = z_corrected_native.to(z_ct_native.dtype)
         z_missing = F.interpolate(z_corrected_native, size=target_size, mode='bilinear', align_corners=False)
         out = {'logits': z_missing, 'pred': z_missing, 'aux': {'cpbdm_memory_ready': bool(self.cpbdm.memory_ready.item()), **{k: v for k, v in cpbdm_info.items() if isinstance(v, (bool, int, float, str))}}}
         return out
@@ -53,7 +59,9 @@ class DualSharedAddCPBDM(DualSharedAddPETCTBaseline):
         fused_feats = self.fusion(ct_feats, pet_feats_masked, None)
         raw_out = self.decoder(fused_feats, target_size, return_intermediates=True)
         z_native = raw_out['native_logits']
-        corrected_native, _ = self.cpbdm(raw_out['decoder_feature'], z_native, capture_maps=False)
+        with torch.cuda.amp.autocast(enabled=False):
+            corrected_native, _ = self.cpbdm(raw_out['decoder_feature'].float(), z_native.float(), capture_maps=False)
+        corrected_native = corrected_native.to(z_native.dtype)
         availability = pet_available.view(-1, 1, 1, 1).to(dtype=z_native.dtype)
         final_native = availability * z_native + (1 - availability) * corrected_native
         final_logits = F.interpolate(final_native, size=target_size, mode='bilinear', align_corners=False)
