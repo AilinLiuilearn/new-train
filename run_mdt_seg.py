@@ -101,6 +101,13 @@ def main():
 
     train_loader, val_loader, _, memory_loader = _loaders(cfg)
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)}', flush=True)
+    assert train_loader.batch_size == 16
+    assert val_loader.batch_size == 16
+    if memory_loader is not None:
+        assert memory_loader.batch_size == 16
+        print('[CPBDM] train_batch_size=16')
+        print('[CPBDM] memory_batch_size=16')
+        print('[CPBDM] val_batch_size=16')
 
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
     total_params, trainable_params = _count_parameters(task.model)
@@ -117,6 +124,7 @@ def main():
     extra_headers = [
         'train_full_loss', 'train_missing_loss', 'train_overall_loss',
         'full_train_batches', 'missing_train_batches',
+        'cpbdm_memory_ready', 'cpbdm_key_pair_cos', 'cpbdm_retrieval_entropy', 'cpbdm_effective_slots', 'cpbdm_top1_weight', 'cpbdm_max_similarity', 'cpbdm_delta_abs_mean', 'cpbdm_positive_ratio', 'cpbdm_negative_ratio', 'cpbdm_zero_ratio',
         'val_full_loss', 'val_full_dice', 'val_full_iou', 'val_full_acc', 'val_full_acc_pixel', 'val_full_hd95',
         'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
         'joint_dice', 'best_joint', 'best_joint_epoch',

@@ -92,7 +92,7 @@ def json_ready(obj: Any) -> Any:
 def pairwise_cosine_mean(x: torch.Tensor) -> float:
     if x.ndim != 2 or x.shape[0] < 2:
         return 0.0
-    x = torch.nan_to_num(F.normalize(x.float(), dim=1, eps=1e-6), nan=0.0, posinf=0.0, neginf=0.0)
+    x = F.normalize(x.float(), dim=1, eps=1e-6)
     sim = x @ x.t()
     mask = ~torch.eye(x.shape[0], dtype=torch.bool, device=x.device)
     return to_float(sim[mask].mean())
@@ -175,11 +175,11 @@ class QueryBuilder(nn.Module):
         entropy = binary_entropy(prob)
         boundary = probability_boundary(prob)
         state = torch.cat([decoder_feature, prob, entropy, boundary], dim=1)
-        raw = torch.nan_to_num(self.proj(state).float(), nan=0.0, posinf=1e4, neginf=-1e4)
+        raw = self.proj(state)
 
         # 去除每个病例的公共空间方向，缓解 Key 高度同向。
-        centered = torch.nan_to_num(raw - raw.mean(dim=(2, 3), keepdim=True), nan=0.0, posinf=1e4, neginf=-1e4)
-        query = torch.nan_to_num(F.normalize(centered, dim=1, eps=1e-6), nan=0.0, posinf=0.0, neginf=0.0)
+        centered = raw - raw.mean(dim=(2, 3), keepdim=True)
+        query = F.normalize(centered, dim=1, eps=1e-6)
         return query, {
             "probability": prob,
             "entropy": entropy,
@@ -415,12 +415,7 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
 
     @torch.no_grad()
     def _spherical_kmeans(self, q: torch.Tensor) -> torch.Tensor:
-        q = torch.nan_to_num(q.float(), nan=0.0, posinf=1e4, neginf=-1e4)
-        valid = torch.isfinite(q).all(dim=1) & (q.norm(dim=1) > 1e-6)
-        q = q[valid]
-        if q.shape[0] == 0:
-            raise RuntimeError('CPBDM has no finite non-zero query candidates')
-        q = torch.nan_to_num(F.normalize(q, dim=1, eps=1e-6), nan=0.0, posinf=0.0, neginf=0.0)
+        q = F.normalize(q.float(), dim=1, eps=1e-6)
         if q.shape[0] < self.K:
             q = q.repeat(math.ceil(self.K / max(q.shape[0], 1)), 1)[: self.K]
 
@@ -446,15 +441,12 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
                     max_sim = (q @ centers_t.t()).max(dim=1).values
                     center = q[max_sim.argmin()]
                 updated.append(center)
-            updated_t = torch.nan_to_num(torch.stack(updated, dim=0), nan=0.0, posinf=0.0, neginf=0.0)
+            updated_t = torch.stack(updated, dim=0)
             if torch.allclose(centers_t, updated_t, atol=1e-5, rtol=1e-4):
                 centers_t = updated_t
                 break
             centers_t = updated_t
-        centers_t = torch.nan_to_num(F.normalize(centers_t, dim=1, eps=1e-6), nan=0.0, posinf=0.0, neginf=0.0)
-        if not torch.isfinite(centers_t).all() or (centers_t.norm(dim=1) <= 1e-6).any():
-            raise RuntimeError('CPBDM k-means produced invalid centers')
-        return centers_t
+        return F.normalize(centers_t, dim=1, eps=1e-6)
 
     @torch.no_grad()
     def finalize_memory(self) -> Dict[str, Any]:
@@ -470,9 +462,7 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
         stat_weight = torch.cat(self._stat_weight, dim=0).float()
 
         centers = self._spherical_kmeans(fit_q)
-        stat_q = torch.nan_to_num(stat_q, nan=0.0, posinf=1e4, neginf=-1e4)
-        stat_q = torch.nan_to_num(F.normalize(stat_q, dim=1, eps=1e-6), nan=0.0, posinf=0.0, neginf=0.0)
-        assignment = (stat_q @ centers.t()).argmax(dim=1)
+        assignment = (F.normalize(stat_q, dim=1, eps=1e-6) @ centers.t()).argmax(dim=1)
 
         values = {name: torch.zeros(self.K) for name in [
             "pi_zero", "pi_pos", "pi_neg", "mu_pos", "sigma_pos",
@@ -517,13 +507,6 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
                 values["mu_neg"][k] = (neg_w * neg_d).sum() / neg_w.sum()
                 var_neg = (neg_w * (neg_d - values["mu_neg"][k]).square()).sum() / neg_w.sum()
                 values["sigma_neg"][k] = torch.sqrt(var_neg.clamp_min(0.0))
-
-        tensors_to_validate = [centers, values['pi_zero'], values['pi_pos'], values['pi_neg'], values['mu_pos'], values['mu_neg'], values['sigma_pos'], values['sigma_neg']]
-        if not all(torch.isfinite(x).all() for x in tensors_to_validate):
-            raise RuntimeError('CPBDM finalize_memory produced non-finite memory statistics')
-        pi_sum = values['pi_zero'] + values['pi_pos'] + values['pi_neg']
-        if not torch.allclose(pi_sum, torch.ones_like(pi_sum), atol=1e-5, rtol=0.0):
-            raise RuntimeError('CPBDM slot probabilities do not sum to one')
 
         device = self.keys.device
         self.keys.copy_(centers.to(device))
@@ -617,9 +600,9 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
             }
             return RetrievalResult(torch.zeros_like(ct_logits), ct_prob, ct_logits, info)
 
-        q = torch.nan_to_num(F.normalize(query.float().permute(0, 2, 3, 1).reshape(-1, self.query_dim), dim=1, eps=1e-6), nan=0.0, posinf=0.0, neginf=0.0)
-        keys = torch.nan_to_num(F.normalize(self.keys.float(), dim=1, eps=1e-6), nan=0.0, posinf=0.0, neginf=0.0)
-        similarity = torch.nan_to_num(q @ keys.t(), nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+        q = F.normalize(query.float().permute(0, 2, 3, 1).reshape(-1, self.query_dim), dim=1, eps=1e-6)
+        keys = F.normalize(self.keys.float(), dim=1, eps=1e-6)
+        similarity = q @ keys.t()
         scale = self.logit_scale.exp().clamp(1.0, 20.0)
         weights = torch.softmax(similarity * scale, dim=1)
         weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
@@ -669,9 +652,8 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         result = self.retrieve(ct_decoder_feature, ct_logits, capture_maps)
         info = dict(result.info)
-        if capture_maps:
-            info["delta_probability"] = result.delta_probability.detach()
-            info["corrected_probability"] = result.corrected_probability.detach()
+        info["delta_probability"] = result.delta_probability
+        info["corrected_probability"] = result.corrected_probability
         return result.corrected_logits, info
 
     def reset_retrieval_stats(self) -> None:

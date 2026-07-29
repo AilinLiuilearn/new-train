@@ -41,19 +41,22 @@ class MDTSegTeacher:
         self.model.cpbdm.clear_cache()
         build_report = {}
         total_candidates = 0
-        for batch in memory_loader:
-            ct = batch['ct'].to(self.device, non_blocking=True)
-            pet = batch['pet'].to(self.device, non_blocking=True)
-            mask = batch['mask'].to(self.device, non_blocking=True).float()
-            report = self.model.collect_cpbdm_candidates(ct=ct, pet=pet, target=mask)
-            total_candidates += int(report.get('fit_selected', 0))
-            build_report = report
-        build_report = self.model.cpbdm.finalize_memory()
-        build_report['epoch'] = int(epoch)
-        build_report['candidate_total'] = int(total_candidates)
-        self.model.cpbdm.print_diagnostics()
-        self.model.train(was_training)
-        return build_report
+        try:
+            for batch in memory_loader:
+                ct = batch['ct'].to(self.device, non_blocking=True)
+                pet = batch['pet'].to(self.device, non_blocking=True)
+                mask = batch['mask'].to(self.device, non_blocking=True).float()
+                with torch.cuda.amp.autocast(enabled=(bool(self.config.mixed_precision) and torch.cuda.is_available())):
+                    report = self.model.collect_cpbdm_candidates(ct=ct, pet=pet, target=mask)
+                total_candidates += int(report.get('fit_selected', 0))
+                build_report = report
+            build_report = self.model.cpbdm.finalize_memory()
+            build_report['epoch'] = int(epoch)
+            build_report['candidate_total'] = int(total_candidates)
+            self.model.cpbdm.print_diagnostics()
+            return build_report
+        finally:
+            self.model.train(was_training)
 
     def trainable_parameters(self):
         return [p for p in self.model.parameters() if p.requires_grad]
@@ -64,6 +67,8 @@ class MDTSegTeacher:
         mask = batch['mask'].to(self.device, non_blocking=True).float()
         outputs = self.model(ct, pet=pet, forward_mode=forward_mode)
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
+        if not torch.isfinite(logits).all():
+            raise RuntimeError(f'non-finite logits detected in {forward_mode} forward')
         loss, loss_stats = self.criterion(logits, mask)
         stats = {
             'loss_total': loss.detach(),
