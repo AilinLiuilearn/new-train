@@ -70,7 +70,7 @@ class PDTMRuntime(nn.Module):
         cov_term = torch.trace(cov + src_c - 2.0 * _matrix_sqrt(middle, self.eps))
         return (mean_term + cov_term).clamp_min(0.0)
 
-    def _apply(self, feat, slot):
+    def _transport(self, feat, slot):
         delta = self.delta_means[slot].to(dtype=feat.dtype, device=feat.device)
         op = self.operators[slot].to(dtype=torch.float32, device=feat.device)
         m = feat.mean(dim=(2, 3), keepdim=True)
@@ -97,7 +97,7 @@ class PDTMRuntime(nn.Module):
             slot = int(torch.argmin(dists).item())
             sorted_d = torch.sort(dists).values
             margin = float((sorted_d[1] - sorted_d[0]).item()) if sorted_d.numel() > 1 else 0.0
-        transported = self._apply(feat, slot)
+        transported = self._transport(feat, slot)
         ratio = float(torch.linalg.vector_norm((transported - feat).float()).item() / (torch.linalg.vector_norm(feat.float()).item() + self.eps))
         self._slot_hist[slot] += 1
         self._nearest.append(float(dists[slot].item()))
