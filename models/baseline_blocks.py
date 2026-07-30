@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.build_mdt_seg import ConvBNAct
-
 
 def _check_tensor(name, x):
     if torch.is_tensor(x) and not torch.isfinite(x).all():
@@ -17,6 +15,20 @@ def _check_tensor_list(name, xs):
 
 def _sanitize(x):
     return torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+
+
+class ConvBNAct(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, dilation=1):
+        super().__init__()
+        padding = (kernel_size // 2) * dilation
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
 
 
 class UNetStyleDecoder(nn.Module):
@@ -33,12 +45,8 @@ class UNetStyleDecoder(nn.Module):
         self.fuse2 = nn.Sequential(ConvBNAct(d3 + d2, d2, kernel_size=3), ConvBNAct(d2, d2, kernel_size=3))
         self.fuse1 = nn.Sequential(ConvBNAct(d2 + d1, d1, kernel_size=3), ConvBNAct(d1, d1, kernel_size=3))
         self.seg_head = nn.Conv2d(d1, out_channels, kernel_size=1)
-        if self.use_deep_supervision:
-            self.aux_head_d2 = nn.Conv2d(d2, out_channels, kernel_size=1)
-            self.aux_head_d3 = nn.Conv2d(d3, out_channels, kernel_size=1)
-            self.aux_head_d4 = nn.Conv2d(d4, out_channels, kernel_size=1)
 
-    def forward(self, features, target_size):
+    def forward(self, features, target_size, return_intermediates=False):
         x1, x2, x3, x4 = features
         d4 = self.proj4(x4)
         s3 = self.proj3(x3)
@@ -49,9 +57,9 @@ class UNetStyleDecoder(nn.Module):
         d1 = self.fuse1(torch.cat([F.interpolate(d2, size=s1.shape[-2:], mode='bilinear', align_corners=False), s1], dim=1))
         logits = self.seg_head(d1)
         final_logits = F.interpolate(logits, size=target_size, mode='bilinear', align_corners=False)
-        if not self.use_deep_supervision:
+        if not return_intermediates:
             return {'logits': final_logits}
-        return {'logits': final_logits, 'aux_logits': [self.aux_head_d2(d2), self.aux_head_d3(d3), self.aux_head_d4(d4)]}
+        return {'logits': final_logits, 'decoder_feature': d1, 'native_logits': logits}
 
 
 class AddFusion(nn.Module):

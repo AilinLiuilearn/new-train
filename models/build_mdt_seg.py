@@ -13,6 +13,7 @@ except ImportError:
     ConvNextModel = None
 
 
+
 def _unwrap_state_dict(state_dict):
     if isinstance(state_dict, dict):
         for key in ('state_dict', 'model', 'module'):
@@ -172,27 +173,14 @@ def load_local_weights_safe(model, path, name='Encoder'):
     ckpt_total = len(state_dict)
     if loadable:
         msg = model.load_state_dict(loadable, strict=False)
-        loaded_tensors = len(loadable)
-        loaded_elements = sum(v.numel() for v in loadable.values())
-        skipped_tensors = len(skipped)
-        skipped_elements = sum(v.numel() for k, v in state_dict.items() if k in skipped and torch.is_tensor(v))
         print(f'[PRETRAIN] {name}: success=True')
         print(f'[PRETRAIN] {name}: source={source_path}')
         print(f'[PRETRAIN] {name}: weight_file={path}')
         print(f'[PRETRAIN] {name}: checkpoint_tensors={ckpt_total}, model_tensors={model_total}')
-        print(f'[PRETRAIN] {name}: loaded_tensors={loaded_tensors}, loaded_elements={loaded_elements}')
-        print(f'[PRETRAIN] {name}: skipped_tensors={skipped_tensors}, skipped_elements={skipped_elements}')
+        print(f'[PRETRAIN] {name}: loaded_tensors={len(loadable)}, skipped_tensors={len(skipped)}')
         print(f'[PRETRAIN] {name}: missing_after_load={len(msg.missing_keys)}, unexpected_after_load={len(msg.unexpected_keys)}')
-        if skipped:
-            print(f'[PRETRAIN] {name}: skipped_examples={skipped[:8]}')
     else:
         print(f'[PRETRAIN] {name}: success=False')
-        print(f'[PRETRAIN] {name}: source={source_path}')
-        print(f'[PRETRAIN] {name}: weight_file={path}')
-        print(f'[PRETRAIN] {name}: checkpoint_tensors={ckpt_total}, model_tensors={model_total}')
-        print(f'[PRETRAIN] {name}: loaded_tensors=0, skipped_tensors={len(skipped)}')
-        if skipped:
-            print(f'[PRETRAIN] {name}: skipped_examples={skipped[:8]}')
         print(f'[-] {name}: no compatible tensors were loaded; training this encoder from scratch')
 
 
@@ -235,26 +223,9 @@ class SegformerFeatureBackbone(nn.Module):
         if variant not in mit_settings:
             raise ValueError(f'Unsupported MiT variant: {variant}')
         if SegformerConfig is None or SegformerModel is None:
-            raise ImportError('Segformer MiT backbone requires transformers. Install it with: pip install transformers')
+            raise ImportError('Segformer MiT backbone requires transformers.')
         settings = mit_settings[variant]
-        config = SegformerConfig(
-            num_channels=in_channels,
-            depths=settings['depths'],
-            sr_ratios=[8, 4, 2, 1],
-            hidden_sizes=settings['hidden_sizes'],
-            patch_sizes=[7, 3, 3, 3],
-            strides=[4, 2, 2, 2],
-            num_attention_heads=settings['num_attention_heads'],
-            mlp_ratios=[4, 4, 4, 4],
-            hidden_act='gelu',
-            hidden_dropout_prob=0.0,
-            attention_probs_dropout_prob=0.0,
-            classifier_dropout_prob=0.1,
-            initializer_range=0.02,
-            drop_path_rate=settings['drop_path_rate'],
-            reshape_last_stage=True,
-            output_hidden_states=True,
-        )
+        config = SegformerConfig(num_channels=in_channels, depths=settings['depths'], sr_ratios=[8, 4, 2, 1], hidden_sizes=settings['hidden_sizes'], patch_sizes=[7, 3, 3, 3], strides=[4, 2, 2, 2], num_attention_heads=settings['num_attention_heads'], mlp_ratios=[4, 4, 4, 4], hidden_act='gelu', hidden_dropout_prob=0.0, attention_probs_dropout_prob=0.0, classifier_dropout_prob=0.1, initializer_range=0.02, drop_path_rate=settings['drop_path_rate'], reshape_last_stage=True, output_hidden_states=True)
         self.model = SegformerModel(config)
         self.feature_info = SimpleFeatureInfo(config.hidden_sizes)
 
@@ -272,13 +243,11 @@ class ConvNextFeatureBackbone(nn.Module):
     def __init__(self, variant='convnext_tiny', in_channels=3):
         super().__init__()
         variant = _normalize_backbone_name(variant)
-        convnext_settings = {
-            'convnext_tiny': dict(depths=[3, 3, 9, 3], hidden_sizes=[96, 192, 384, 768]),
-        }
+        convnext_settings = {'convnext_tiny': dict(depths=[3, 3, 9, 3], hidden_sizes=[96, 192, 384, 768])}
         if variant not in convnext_settings:
             raise ValueError(f'Unsupported HuggingFace ConvNeXt variant: {variant}')
         if ConvNextConfig is None or ConvNextModel is None:
-            raise ImportError('HuggingFace ConvNeXt backbone requires transformers. Install it with: pip install transformers')
+            raise ImportError('HuggingFace ConvNeXt backbone requires transformers.')
         settings = convnext_settings[variant]
         config = ConvNextConfig(num_channels=in_channels, depths=settings['depths'], hidden_sizes=settings['hidden_sizes'], patch_size=4, out_features=['stage1', 'stage2', 'stage3', 'stage4'])
         self.model = ConvNextModel(config)
@@ -298,7 +267,7 @@ def _get_backbone_out_indices(backbone):
         return (0, 1, 2, 3)
     if backbone in ('convnext_tiny', 'convnext_nano', 'convnextv2_nano', 'convnextv2_atto', 'convnextv2_femto', 'convnextv2_pico'):
         return (0, 1, 2, 3)
-    raise ValueError(f'Unsupported backbone: {backbone}. Supported: pvt_v2_b1, mit_b0, mit_b1, convnext_tiny, convnext_nano, convnextv2_nano.')
+    raise ValueError(f'Unsupported backbone: {backbone}.')
 
 
 class FallbackFeatureBackbone(nn.Module):
@@ -350,6 +319,24 @@ class ConvBNAct(nn.Module):
 
 
 def build_mdt_seg_teacher(config):
+    model_arch = getattr(config, 'model_arch', 'dual_shared_add_baseline')
+    if model_arch == 'dual_shared_add_pdtm':
+        from models.dual_shared_add_pdtm import DualSharedAddPDTM
+        model = DualSharedAddPDTM(
+            ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
+            pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
+            ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
+            pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
+            in_channels=3,
+            out_channels=1,
+            decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
+            use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
+            pdtm_slots=getattr(config, 'pdtm_slots', 8),
+            pdtm_eps=getattr(config, 'pdtm_eps', 1e-4),
+            pdtm_max_pairs=getattr(config, 'pdtm_max_pairs', 256),
+        )
+        print(f'[dual_shared_add_pdtm] ct={getattr(config, "ct_backbone", "convnextv2_nano")} pet={getattr(config, "pet_backbone", "mit_b1")} fusion=add shared_decoder=UNetStyleDecoder transport_level=decoder_d1 slots={getattr(config, "pdtm_slots", 8)} eps={getattr(config, "pdtm_eps", 1e-4)} max_pairs={getattr(config, "pdtm_max_pairs", 256)}')
+        return {'model': model}
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
@@ -361,10 +348,5 @@ def build_mdt_seg_teacher(config):
         decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
         use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
     )
-    print(
-        f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
-        f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion=add shared_decoder=UNetStyleDecoder '
-        f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
-    )
+    print(f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} pet={getattr(config, "pet_backbone", "mit_b1")} fusion=add shared_decoder=UNetStyleDecoder deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}')
     return {'model': model}

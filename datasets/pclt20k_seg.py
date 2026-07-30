@@ -83,15 +83,7 @@ class PCLT20KSegDataset(Dataset):
         pet_t = torch.tensor(_normalize_ch(pet, self.norm_mode), dtype=torch.float32)
         mask = (mask.astype(np.float32) / 255.0)
         mask = (mask[None, ...] >= 0.5).astype(np.float32)
-        return {
-            'ct': ct_t,
-            'pet': pet_t,
-            'mask': torch.tensor(mask),
-            'image_id': record.get('image_id', str(idx)),
-            'case_id': record.get('case_id', str(idx)),
-            'slice_id': record.get('slice_id', record.get('image_id', str(idx))),
-            'idx': idx,
-        }
+        return {'ct': ct_t, 'pet': pet_t, 'mask': torch.tensor(mask), 'image_id': record.get('image_id', str(idx)), 'case_id': record.get('case_id', str(idx)), 'slice_id': record.get('slice_id', record.get('image_id', str(idx))), 'idx': idx}
 
 
 def _seed_worker(worker_id):
@@ -122,6 +114,15 @@ def _split_summary(records):
     return {'case_count': len(by_case), 'slice_count': len(records)}
 
 
+def get_pclt20k_memory_loader_cipa_aligned(root, image_size=512, batch_size=8, num_workers=4, random_state=2023, pin_memory=True, aug_mode='none', norm_mode='cipa', train_split_file='train.txt'):
+    train_ids = _read_list(os.path.join(root, train_split_file))
+    if train_ids is None:
+        raise FileNotFoundError(root)
+    train_records = _records_from_ids(root, train_ids)
+    train_ds = PCLT20KSegDataset(train_records, image_size=image_size, train=False, random_state=random_state, aug_mode='none', norm_mode=norm_mode)
+    return _make_loader(train_ds, batch_size, num_workers, False, False, random_state+11, pin_memory)
+
+
 def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_workers=4, random_state=2023, pin_memory=True, aug_mode='cipa', norm_mode='cipa', train_split_file='train.txt', val_split_file='val.txt', test_split_file='test.txt', checkpoint_dir=None):
     train_ids = _read_list(os.path.join(root, train_split_file))
     val_ids = _read_list(os.path.join(root, val_split_file))
@@ -131,26 +132,11 @@ def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_wor
     train_records = _records_from_ids(root, train_ids)
     val_records = _records_from_ids(root, val_ids)
     test_records = _records_from_ids(root, test_ids)
-    for name, recs in [('train', train_records), ('val', val_records), ('test', test_records)]:
-        if not recs:
-            raise ValueError(f'{name} split is empty')
-        if any(not (os.path.isfile(r['ct_path']) and os.path.isfile(r['pet_path']) and os.path.isfile(r['mask_path'])) for r in recs):
-            raise FileNotFoundError(f'{name} split contains missing PET/CT/mask files')
-    train_cases = {r['case_id'] for r in train_records}
-    val_cases = {r['case_id'] for r in val_records}
-    test_cases = {r['case_id'] for r in test_records}
-    if train_cases & val_cases or train_cases & test_cases:
-        raise ValueError('train split overlaps with val/test on case_id')
-    split_summary = {
-        'train': {**_split_summary(train_records), 'case_ids': sorted(train_cases)},
-        'val': {**_split_summary(val_records), 'case_ids': sorted(val_cases)},
-        'test': {**_split_summary(test_records), 'case_ids': sorted(test_cases)},
-    }
     if checkpoint_dir is None:
         checkpoint_dir = root
     os.makedirs(checkpoint_dir, exist_ok=True)
     with open(os.path.join(checkpoint_dir, 'split_summary.json'), 'w') as f:
-        json.dump(split_summary, f, indent=2)
+        json.dump({'train': _split_summary(train_records), 'val': _split_summary(val_records), 'test': _split_summary(test_records)}, f, indent=2)
     train_ds = PCLT20KSegDataset(train_records, image_size=image_size, train=True, random_state=random_state, aug_mode=aug_mode, norm_mode=norm_mode)
     val_ds = PCLT20KSegDataset(val_records, image_size=image_size, train=False, random_state=random_state, aug_mode='none', norm_mode=norm_mode)
     test_ds = PCLT20KSegDataset(test_records, image_size=image_size, train=False, random_state=random_state, aug_mode='none', norm_mode=norm_mode)
