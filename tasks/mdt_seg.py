@@ -39,7 +39,8 @@ class MDTSegTeacher:
         ct = batch['ct'].to(self.device, non_blocking=True)
         pet = batch['pet'].to(self.device, non_blocking=True)
         mask = batch['mask'].to(self.device, non_blocking=True).float()
-        outputs = self.model(ct, pet=pet, forward_mode=forward_mode)
+        pet_arg = None if forward_mode == 'missing' else pet
+        outputs = self.model(ct, pet=pet_arg, forward_mode=forward_mode)
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
         loss, loss_stats = self.criterion(logits, mask)
         stats = {
@@ -65,7 +66,7 @@ class MDTSegTeacher:
                 forward_mode = 'full'
                 pet_available = None
             elif eval_mode == 'fixed_missing':
-                pet = batch['pet'].to(self.device, non_blocking=True)
+                pet = None
                 forward_mode = 'missing'
                 pet_available = None
             else:

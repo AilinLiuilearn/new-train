@@ -47,6 +47,15 @@ def _checkpoint_paths(checkpoint_dir):
     return {k: os.path.join(checkpoint_dir, f'ckpt.{k}.pth.tar') for k in ('best_joint', 'best_full', 'best_missing', 'last')}
 
 
+def module_grad_norm(module):
+    total = 0.0
+    for p in module.parameters():
+        if p.grad is None:
+            continue
+        total += float(p.grad.detach().pow(2).sum().item())
+    return total ** 0.5
+
+
 def main():
     cfg = SegMDTConfig.parse_arguments()
     _assert_baseline(cfg)
