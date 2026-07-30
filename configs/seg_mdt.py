@@ -22,7 +22,12 @@ class SegMDTConfig(ConfigBase):
     @staticmethod
     def model_parser():
         p = argparse.ArgumentParser('Model', add_help=False)
-        p.add_argument('--model_arch', type=str, default='dual_shared_add_baseline', choices=('dual_shared_add_baseline',))
+        p.add_argument('--model_arch', type=str, default='dual_shared_add_baseline', choices=('dual_shared_add_baseline', 'dual_shared_add_pdtm'))
+        p.add_argument('--pdtm_slots', type=int, default=8)
+        p.add_argument('--pdtm_eps', type=float, default=1e-4)
+        p.add_argument('--pdtm_max_pairs', type=int, default=256)
+        p.add_argument('--pdtm_rebuild_interval', type=int, default=1)
+        p.add_argument('--pdtm_start_epoch', type=int, default=1)
         p.add_argument('--ct_backbone', type=str, default='convnextv2_nano')
         p.add_argument('--pet_backbone', type=str, default='mit_b1')
         p.add_argument('--ct_pretrained_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano')

@@ -157,5 +157,14 @@ def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_wor
     return _make_loader(train_ds, batch_size, num_workers, True, True, random_state+11, pin_memory), _make_loader(val_ds, batch_size, num_workers, False, False, random_state+17, pin_memory), _make_loader(test_ds, batch_size, num_workers, False, False, random_state+23, pin_memory)
 
 
+def get_pclt20k_memory_loader_cipa_aligned(root, image_size=512, batch_size=8, num_workers=4, random_state=2023, pin_memory=True, norm_mode='cipa', train_split_file='train_original.txt'):
+    train_ids = _read_list(os.path.join(root, train_split_file))
+    if train_ids is None:
+        raise FileNotFoundError(root)
+    train_records = _records_from_ids(root, train_ids)
+    train_ds = PCLT20KSegDataset(train_records, image_size=image_size, train=False, random_state=random_state, aug_mode='none', norm_mode=norm_mode)
+    return _make_loader(train_ds, batch_size, num_workers, False, False, random_state + 31, pin_memory)
+
+
 def get_pclt20k_loaders(*args, **kwargs):
     return get_pclt20k_loaders_cipa_aligned(*args, **kwargs)

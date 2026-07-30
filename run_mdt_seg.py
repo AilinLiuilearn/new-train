@@ -25,8 +25,8 @@ def _seed(cfg):
 
 
 def _loaders(cfg):
-    from datasets.pclt20k_seg import get_pclt20k_loaders_cipa_aligned
-    return get_pclt20k_loaders_cipa_aligned(
+    from datasets.pclt20k_seg import get_pclt20k_loaders_cipa_aligned, get_pclt20k_memory_loader_cipa_aligned
+    train_loader, val_loader, test_loader = get_pclt20k_loaders_cipa_aligned(
         cfg.root,
         cfg.image_size_2d,
         cfg.batch_size,
@@ -40,6 +40,17 @@ def _loaders(cfg):
         cfg.test_split_file,
         checkpoint_dir=cfg.checkpoint_dir,
     )
+    memory_loader = get_pclt20k_memory_loader_cipa_aligned(
+        cfg.root,
+        cfg.image_size_2d,
+        cfg.batch_size,
+        cfg.num_workers,
+        cfg.random_state,
+        cfg.pin_memory,
+        cfg.norm_mode,
+        cfg.train_split_file,
+    )
+    return train_loader, val_loader, test_loader, memory_loader
 
 
 def _assert_baseline(cfg):
@@ -78,6 +89,42 @@ def _count_parameters(model):
     return total, trainable
 
 
+def _maybe_rebuild_pdtm(cfg, task, memory_loader, epoch):
+    if getattr(cfg, 'model_arch', 'dual_shared_add_baseline') != 'dual_shared_add_pdtm':
+        return None
+    start_epoch = int(getattr(cfg, 'pdtm_start_epoch', 1))
+    interval = int(getattr(cfg, 'pdtm_rebuild_interval', 1))
+    if epoch < start_epoch or ((epoch - start_epoch) % interval) != 0:
+        return None
+    model = task.model
+    if not hasattr(model, 'clear_pdtm_cache'):
+        return None
+    was_training = model.training
+    model.eval()
+    model.clear_pdtm_cache()
+    collected = 0
+    max_pairs = int(getattr(cfg, 'pdtm_max_pairs', 256))
+    for batch in memory_loader:
+        model.collect_pdtm_pairs(batch['ct'].to(task.device), batch['pet'].to(task.device), batch.get('case_id'))
+        collected += batch['ct'].shape[0]
+        if collected >= max_pairs:
+            break
+    build_report = model.finalize_pdtm_memory()
+    diagnostics = model.pdtm_diagnostics()
+    pdtm_dir = os.path.join(cfg.checkpoint_dir, 'pdtm')
+    os.makedirs(pdtm_dir, exist_ok=True)
+    build_json = model.export_pdtm_json(pdtm_dir, f'epoch_{epoch:03d}_build')
+    viz_paths = model.save_pdtm_visualizations(pdtm_dir, f'epoch_{epoch:03d}')
+    model.train(was_training)
+    print(f'[PDTM] epoch={epoch} build={build_report} diag={diagnostics}', flush=True)
+    return {
+        'build_report': build_report,
+        'diagnostics': diagnostics,
+        'build_json': build_json,
+        'viz_paths': viz_paths,
+    }
+
+
 def main():
     print('[INFO] starting baseline training', flush=True)
     cfg = SegMDTConfig.parse_arguments()
@@ -87,7 +134,7 @@ def main():
     with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
         json.dump(vars(cfg), f, indent=2, default=str)
 
-    train_loader, val_loader, _ = _loaders(cfg)
+    train_loader, val_loader, test_loader, memory_loader = _loaders(cfg)
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)}', flush=True)
 
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
@@ -109,7 +156,7 @@ def main():
         'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
         'joint_dice', 'best_joint', 'best_joint_epoch',
         'grad_full_enc_ct', 'grad_missing_enc_ct', 'grad_full_ct_align', 'grad_missing_ct_align', 'grad_full_decoder', 'grad_missing_decoder',
-        'epoch_time',
+        'epoch_time', 'pdtm_memory_ready', 'pdtm_pair_count', 'pdtm_effective_slots', 'pdtm_paired_w2_mean', 'pdtm_retrieval_distance_mean', 'pdtm_feature_change_ratio',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
 
@@ -129,10 +176,7 @@ def main():
         full_loss = missing_loss = 0.0
         grad_norm_accum = 0.0
         grad_norm_steps = 0
-        grads = {
-            'full': {'enc_ct': [], 'ct_align': [], 'decoder': []},
-            'missing': {'enc_ct': [], 'ct_align': [], 'decoder': []},
-        }
+        grads = {'full': {'enc_ct': [], 'ct_align': [], 'decoder': []}, 'missing': {'enc_ct': [], 'ct_align': [], 'decoder': []}}
         epoch_start = time.time()
         fixed_diag_batch = None
         diag_stats = {}
@@ -144,50 +188,38 @@ def main():
                 loss, _, _, _ = task.train_step(batch, forward_mode=route)
             if not torch.isfinite(loss):
                 raise RuntimeError('loss became non-finite')
-
             if task.scaler.is_enabled():
                 task.scaler.scale(loss).backward()
                 task.scaler.unscale_(task.optimizer)
             else:
                 loss.backward()
-
             grads[route]['enc_ct'].append(module_grad_norm(task.model.enc_ct))
             grads[route]['ct_align'].append(module_grad_norm(task.model.ct_align))
             grads[route]['decoder'].append(module_grad_norm(task.model.decoder))
             total_grad_norm = torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip)) if float(cfg.grad_clip) > 0 else 0.0
             grad_norm_accum += float(total_grad_norm)
             grad_norm_steps += 1
-
             if task.scaler.is_enabled():
                 task.scaler.step(task.optimizer)
                 task.scaler.update()
             else:
                 task.optimizer.step()
-
             task.scheduler.step()
-
-            if (batch_idx + 1) % 100 == 0:
-                print(f'[BATCH {batch_idx + 1}] route={route} loss={float(loss.detach()):.6f}', flush=True)
-
             if route == 'full':
                 full_n += 1
                 full_loss += float(loss.detach())
             else:
                 missing_n += 1
                 missing_loss += float(loss.detach())
-
             global_batch_step += 1
             task.global_batch_step = global_batch_step
             if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is None:
-                fixed_diag_batch = {
-                    'ct': batch['ct'][:1].detach().cpu(),
-                    'pet': batch['pet'][:1].detach().cpu(),
-                    'mask': batch['mask'][:1].detach().cpu(),
-                }
+                fixed_diag_batch = {'ct': batch['ct'][:1].detach().cpu(), 'pet': batch['pet'][:1].detach().cpu(), 'mask': batch['mask'][:1].detach().cpu()}
 
         if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is not None and epoch % int(cfg.gradient_diagnostics_interval) == 0:
             diag_stats = task.gradient_diagnostics(fixed_diag_batch, max_samples=min(1, int(cfg.gradient_diagnostics_num_samples))) or {}
 
+        pdtm_stats = _maybe_rebuild_pdtm(cfg, task, memory_loader, epoch) or {}
         val_full = task.evaluate(val_loader, eval_mode='full', tag='val_full')
         val_missing = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_missing')
         joint_dice = float(cfg.joint_full_weight) * val_full['dice'] + float(cfg.joint_missing_weight) * val_missing['dice']
@@ -257,6 +289,12 @@ def main():
                 'grad_full_decoder': float(np.mean(grads['full']['decoder'])) if grads['full']['decoder'] else 0.0,
                 'grad_missing_decoder': float(np.mean(grads['missing']['decoder'])) if grads['missing']['decoder'] else 0.0,
                 'epoch_time': time.time() - epoch_start,
+                'pdtm_memory_ready': float(pdtm_stats.get('diagnostics', {}).get('memory_ready', False)),
+                'pdtm_pair_count': float(pdtm_stats.get('build_report', {}).get('pair_count', 0)),
+                'pdtm_effective_slots': float(pdtm_stats.get('build_report', {}).get('effective_slots', 0)),
+                'pdtm_paired_w2_mean': float(pdtm_stats.get('build_report', {}).get('paired_w2_mean', 0.0)),
+                'pdtm_retrieval_distance_mean': float(pdtm_stats.get('diagnostics', {}).get('nearest_distance_mean', 0.0)),
+                'pdtm_feature_change_ratio': float(pdtm_stats.get('diagnostics', {}).get('feature_change_ratio_mean', 0.0)),
                 **{f'diag_{k}': v for k, v in diag_stats.items()},
             },
         )

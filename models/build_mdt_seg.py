@@ -350,6 +350,30 @@ class ConvBNAct(nn.Module):
 
 
 def build_mdt_seg_teacher(config):
+    arch = getattr(config, 'model_arch', 'dual_shared_add_baseline')
+    if arch == 'dual_shared_add_pdtm':
+        from models.dual_shared_add_pdtm import DualSharedAddPDTM
+        model = DualSharedAddPDTM(
+            ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
+            pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
+            ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
+            pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
+            in_channels=3,
+            out_channels=1,
+            decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
+            use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
+            pdtm_slots=getattr(config, 'pdtm_slots', 8),
+            pdtm_eps=getattr(config, 'pdtm_eps', 1e-4),
+            pdtm_max_pairs=getattr(config, 'pdtm_max_pairs', 256),
+        )
+        print(
+            f'[dual_shared_add_pdtm] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
+            f'pet={getattr(config, "pet_backbone", "mit_b1")} '
+            f'fusion=add shared_decoder=UNetStyleDecoder transport_level=decoder_d1 '
+            f'slots={getattr(config, "pdtm_slots", 8)} eps={getattr(config, "pdtm_eps", 1e-4)} '
+            f'max_pairs={getattr(config, "pdtm_max_pairs", 256)}'
+        )
+        return {'model': model}
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
