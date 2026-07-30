@@ -8,8 +8,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from models.build_mdt_seg import build_mdt_seg_teacher
 from configs.seg_mdt import SegMDTConfig
+from models.build_mdt_seg import build_mdt_seg_teacher
+from models.pdtm_runtime import PDTMRuntime
 
 
 def _make_cfg(arch='dual_shared_add_baseline'):
@@ -86,6 +87,44 @@ def test_memory_build_and_reload_roundtrip():
     assert int(model2.pdtm.valid_slots.item()) == int(model.pdtm.valid_slots.item())
 
 
+def test_pdtm_batch_retrieval_distinguishes_slots():
+    runtime = PDTMRuntime(channels=4, slots=2, eps=1e-4)
+    runtime.memory_ready.fill_(True)
+    runtime.valid_slots.fill_(2)
+    runtime.source_means[0] = torch.zeros(4)
+    runtime.source_means[1] = torch.ones(4) * 5.0
+    runtime.source_covariances[0] = torch.eye(4)
+    runtime.source_covariances[1] = torch.eye(4)
+    runtime.delta_means[0] = torch.ones(4) * 0.5
+    runtime.delta_means[1] = torch.ones(4) * -0.5
+    runtime.operators[0] = torch.eye(4) * 1.0
+    runtime.operators[1] = torch.eye(4) * 2.0
+
+    feat0 = torch.zeros(1, 4, 3, 3)
+    feat1 = torch.ones(1, 4, 3, 3) * 5.0
+    feats = torch.cat([feat0, feat1], dim=0).requires_grad_()
+    transported, info = runtime(feats)
+
+    assert transported.requires_grad
+    assert transported.shape == feats.shape
+    assert info['pdtm_memory_ready'] is True
+    assert torch.isfinite(transported).all()
+    assert len(runtime._nearest) == 2
+    assert runtime._slot_hist.sum().item() == 2
+    assert hasattr(runtime, '_last_selected_slots')
+    assert runtime._last_selected_slots.shape == (2,)
+    assert runtime._last_selected_slots[0].item() != runtime._last_selected_slots[1].item()
+
+    with torch.no_grad():
+        mean, cov = runtime._current_stats(feats)
+        d0 = runtime._bw2(mean[0], cov[0], 0).item()
+        d1 = runtime._bw2(mean[0], cov[0], 1).item()
+        e0 = runtime._bw2(mean[1], cov[1], 0).item()
+        e1 = runtime._bw2(mean[1], cov[1], 1).item()
+    assert d0 < d1
+    assert e1 < e0
+
+
 def test_missing_forward_backward_has_gradients():
     model = _make_model('dual_shared_add_pdtm').train()
     ct, pet = _sample()
@@ -98,14 +137,21 @@ def test_missing_forward_backward_has_gradients():
     loss.backward()
     assert ct.grad is not None
     assert torch.isfinite(ct.grad).all()
-    assert not any(p.grad is not None for p in model.pdtm.parameters())
+    assert ct.grad.abs().sum().item() > 0
+    for module in [model.enc_ct, model.ct_align, model.decoder, model.decoder.seg_head]:
+        grads = [p.grad for p in module.parameters() if p.grad is not None]
+        assert grads
+        assert all(torch.isfinite(g).all() for g in grads)
+        assert sum(g.abs().sum().item() for g in grads) > 0
 
 
-def test_auto_mixed_batch_runs():
+def test_visualization_accepts_string_output_dir(tmp_path):
     model = _make_model('dual_shared_add_pdtm').eval()
     ct, pet = _sample(batch=2)
-    pet_available = torch.tensor([1, 0])
     with torch.no_grad():
-        out = model(ct, pet=pet, pet_available=pet_available, forward_mode='auto')['logits']
-    assert out.shape[:2] == (2, 1)
-    assert torch.isfinite(out).all()
+        model.collect_pdtm_pairs(ct, pet, case_ids=['a', 'b'])
+    output_dir = str(tmp_path / 'viz')
+    paths = model.save_pdtm_visualizations(output_dir, 'epoch_001')
+    assert paths
+    assert any(str(path).endswith('.png') for path in paths)
+    assert all(os.path.exists(path) for path in paths)

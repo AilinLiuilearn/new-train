@@ -110,16 +110,15 @@ def _maybe_rebuild_pdtm(cfg, task, memory_loader, epoch):
         if collected >= max_pairs:
             break
     build_report = model.finalize_pdtm_memory()
-    diagnostics = model.pdtm_diagnostics()
     pdtm_dir = os.path.join(cfg.checkpoint_dir, 'pdtm')
     os.makedirs(pdtm_dir, exist_ok=True)
     build_json = model.export_pdtm_json(pdtm_dir, f'epoch_{epoch:03d}_build')
     viz_paths = model.save_pdtm_visualizations(pdtm_dir, f'epoch_{epoch:03d}')
+    model.pdtm.reset_retrieval_stats()
     model.train(was_training)
-    print(f'[PDTM] epoch={epoch} build={build_report} diag={diagnostics}', flush=True)
+    print(f'[PDTM] epoch={epoch} build={build_report}', flush=True)
     return {
         'build_report': build_report,
-        'diagnostics': diagnostics,
         'build_json': build_json,
         'viz_paths': viz_paths,
     }
@@ -222,6 +221,10 @@ def main():
         pdtm_stats = _maybe_rebuild_pdtm(cfg, task, memory_loader, epoch) or {}
         val_full = task.evaluate(val_loader, eval_mode='full', tag='val_full')
         val_missing = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_missing')
+        retrieval_diag = task.model.pdtm_diagnostics()
+        pdtm_dir = os.path.join(cfg.checkpoint_dir, 'pdtm')
+        os.makedirs(pdtm_dir, exist_ok=True)
+        retrieval_json = task.model.export_pdtm_json(pdtm_dir, f'epoch_{epoch:03d}_retrieval')
         joint_dice = float(cfg.joint_full_weight) * val_full['dice'] + float(cfg.joint_missing_weight) * val_missing['dice']
 
         joint_improved = joint_dice > best_joint
@@ -289,12 +292,14 @@ def main():
                 'grad_full_decoder': float(np.mean(grads['full']['decoder'])) if grads['full']['decoder'] else 0.0,
                 'grad_missing_decoder': float(np.mean(grads['missing']['decoder'])) if grads['missing']['decoder'] else 0.0,
                 'epoch_time': time.time() - epoch_start,
-                'pdtm_memory_ready': float(pdtm_stats.get('diagnostics', {}).get('memory_ready', False)),
+                'pdtm_memory_ready': float(pdtm_stats.get('build_report', {}).get('memory_ready', False)),
                 'pdtm_pair_count': float(pdtm_stats.get('build_report', {}).get('pair_count', 0)),
                 'pdtm_effective_slots': float(pdtm_stats.get('build_report', {}).get('effective_slots', 0)),
                 'pdtm_paired_w2_mean': float(pdtm_stats.get('build_report', {}).get('paired_w2_mean', 0.0)),
-                'pdtm_retrieval_distance_mean': float(pdtm_stats.get('diagnostics', {}).get('nearest_distance_mean', 0.0)),
-                'pdtm_feature_change_ratio': float(pdtm_stats.get('diagnostics', {}).get('feature_change_ratio_mean', 0.0)),
+                'pdtm_retrieval_distance_mean': float(retrieval_diag.get('nearest_distance_mean', 0.0)),
+                'pdtm_feature_change_ratio': float(retrieval_diag.get('feature_change_ratio_mean', 0.0)),
+                'pdtm_retrieval_margin_mean': float(retrieval_diag.get('retrieval_margin_mean', 0.0)),
+                'pdtm_epoch_retrieval_json': retrieval_json,
                 **{f'diag_{k}': v for k, v in diag_stats.items()},
             },
         )

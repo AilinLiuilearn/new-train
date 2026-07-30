@@ -1,9 +1,7 @@
 import json
-from collections import Counter
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 def _symmetrize(x):
@@ -42,24 +40,21 @@ class PDTMRuntime(nn.Module):
         self.register_buffer('operators', eye.unsqueeze(0).repeat(self.slots, 1, 1).contiguous())
         self.register_buffer('paired_w2', torch.zeros(self.slots, dtype=torch.float32))
         self.register_buffer('cluster_sizes', torch.zeros(self.slots, dtype=torch.long))
-        self._reset_stats()
+        self.reset_retrieval_stats()
 
-    def _reset_stats(self):
+    def reset_retrieval_stats(self):
         self._slot_hist = torch.zeros(self.slots, dtype=torch.long)
         self._nearest = []
         self._margins = []
         self._change_ratios = []
 
-    def reset_retrieval_stats(self):
-        self._reset_stats()
-
-    def _current_cov(self, feat):
+    def _current_stats(self, feat):
         x = feat.detach().float().flatten(2).transpose(1, 2)
-        m = x.mean(dim=1, keepdim=True)
-        centered = x - m
+        mean = x.mean(dim=1)
+        centered = x - mean.unsqueeze(1)
         cov = centered.transpose(1, 2) @ centered / max(1, x.shape[1])
         eye = torch.eye(self.channels, device=feat.device, dtype=torch.float32)
-        return m.squeeze(1), _symmetrize(cov) + self.eps * eye
+        return mean, _symmetrize(cov) + self.eps * eye
 
     def _bw2(self, mean, cov, slot):
         src_m = self.source_means[slot].float()
@@ -70,45 +65,48 @@ class PDTMRuntime(nn.Module):
         cov_term = torch.trace(cov + src_c - 2.0 * _matrix_sqrt(middle, self.eps))
         return (mean_term + cov_term).clamp_min(0.0)
 
-    def _transport(self, feat, slot):
-        delta = self.delta_means[slot].to(dtype=feat.dtype, device=feat.device)
-        op = self.operators[slot].to(dtype=torch.float32, device=feat.device)
-        m = feat.mean(dim=(2, 3), keepdim=True)
-        centered = feat - m
-        transported = m + delta.view(1, -1, 1, 1) + torch.einsum('ij,bjhw->bihw', op, centered)
+    def _transport(self, feat, selected_slots):
+        delta = self.delta_means[selected_slots].to(dtype=feat.dtype, device=feat.device)
+        operators = self.operators[selected_slots].to(dtype=feat.dtype, device=feat.device)
+        live_mean = feat.mean(dim=(2, 3), keepdim=True)
+        centered = feat - live_mean
+        transported = live_mean + delta[:, :, None, None] + torch.einsum('bij,bjhw->bihw', operators, centered)
         return transported
 
     def forward(self, feat):
         if (not bool(self.memory_ready.item())) or int(self.valid_slots.item()) == 0:
-            info = {
+            return feat, {
                 'pdtm_memory_ready': False,
-                'pdtm_selected_slot_mean': -1,
+                'pdtm_selected_slot_mean': -1.0,
                 'pdtm_nearest_distance_mean': 0.0,
                 'pdtm_feature_change_ratio': 0.0,
             }
-            return feat, info
         with torch.no_grad(), torch.cuda.amp.autocast(enabled=False):
-            mean, cov = self._current_cov(feat)
+            mean, cov = self._current_stats(feat)
             valid = int(self.valid_slots.item())
-            dists = []
-            for k in range(valid):
-                dists.append(self._bw2(mean[0], cov[0], k))
-            dists = torch.stack(dists)
-            slot = int(torch.argmin(dists).item())
-            sorted_d = torch.sort(dists).values
-            margin = float((sorted_d[1] - sorted_d[0]).item()) if sorted_d.numel() > 1 else 0.0
-        transported = self._transport(feat, slot)
-        ratio = float(torch.linalg.vector_norm((transported - feat).float()).item() / (torch.linalg.vector_norm(feat.float()).item() + self.eps))
-        self._slot_hist[slot] += 1
-        self._nearest.append(float(dists[slot].item()))
-        self._margins.append(margin)
-        self._change_ratios.append(ratio)
+            dist_list = []
+            for b in range(feat.shape[0]):
+                dists_b = torch.stack([self._bw2(mean[b], cov[b], k) for k in range(valid)])
+                dist_list.append(dists_b)
+            dist_matrix = torch.stack(dist_list, dim=0)
+            selected_slots = dist_matrix.argmin(dim=1)
+            nearest = dist_matrix.gather(1, selected_slots[:, None]).squeeze(1)
+            sorted_dists = torch.sort(dist_matrix, dim=1).values
+            margins = sorted_dists[:, 1] - sorted_dists[:, 0] if valid > 1 else torch.zeros_like(nearest)
+        transported = self._transport(feat, selected_slots)
+        ratio = torch.linalg.vector_norm((transported - feat).float().reshape(feat.shape[0], -1), dim=1) / (torch.linalg.vector_norm(feat.float().reshape(feat.shape[0], -1), dim=1) + self.eps)
+        self._last_selected_slots = selected_slots.detach().clone()
+        for slot in selected_slots.tolist():
+            self._slot_hist[slot] += 1
+        self._nearest.extend([float(v) for v in nearest.detach().cpu().tolist()])
+        self._margins.extend([float(v) for v in margins.detach().cpu().tolist()])
+        self._change_ratios.extend([float(v) for v in ratio.detach().cpu().tolist()])
         info = {
             'pdtm_memory_ready': True,
-            'pdtm_selected_slot_mean': slot,
-            'pdtm_nearest_distance_mean': float(dists[slot].item()),
-            'pdtm_feature_change_ratio': ratio,
-            'pdtm_retrieval_margin_mean': margin,
+            'pdtm_selected_slot_mean': float(selected_slots.float().mean().item()),
+            'pdtm_nearest_distance_mean': float(nearest.float().mean().item()),
+            'pdtm_feature_change_ratio': float(ratio.float().mean().item()),
+            'pdtm_retrieval_margin_mean': float(margins.float().mean().item()),
         }
         return transported.to(dtype=feat.dtype), info
 
