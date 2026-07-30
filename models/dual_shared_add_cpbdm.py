@@ -45,7 +45,7 @@ class DualSharedAddCPBDM(DualSharedAddPETCTBaseline):
             )
         z_corrected_native = z_corrected_native.to(z_ct_native.dtype)
         z_missing = F.interpolate(z_corrected_native, size=target_size, mode='bilinear', align_corners=False)
-        out = {'logits': z_missing, 'pred': z_missing, 'aux': {'cpbdm_memory_ready': bool(self.cpbdm.memory_ready.item()), **{k: v for k, v in cpbdm_info.items() if isinstance(v, (bool, int, float, str))}}}
+        out = {'logits': z_missing, 'pred': z_missing, 'aux': {'cpbdm_memory_ready': bool(self.cpbdm.memory_ready.item()), **{k: v for k, v in cpbdm_info.items() if isinstance(v, (bool, int, float, str))}, 'effective_slots': cpbdm_info.get('effective_slots_mean', 0.0)}}
         return out
 
     def _forward_auto(self, ct, pet, pet_available, target_size):

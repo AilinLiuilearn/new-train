@@ -733,10 +733,10 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
         negative_total_final = negative_mass_final.sum(dim=(1, 2, 3), keepdim=True)
         positive_rel_err = torch.where(positive_total_raw > 1e-8, (positive_total_final - positive_total_raw).abs() / positive_total_raw.clamp_min(1e-8), torch.zeros_like(positive_total_raw))
         negative_rel_err = torch.where(negative_total_raw > 1e-8, (negative_total_final - negative_total_raw).abs() / negative_total_raw.clamp_min(1e-8), torch.zeros_like(negative_total_raw))
-        positive_peak_before = positive_mass_raw.view(b, -1).max(dim=1).values
-        positive_peak_after = positive_mass_final.view(b, -1).max(dim=1).values
-        negative_peak_before = negative_mass_raw.view(b, -1).max(dim=1).values
-        negative_peak_after = negative_mass_final.view(b, -1).max(dim=1).values
+        positive_peak_before = positive_mass_raw.reshape(b, -1).max(dim=1).values
+        positive_peak_after = positive_mass_final.reshape(b, -1).max(dim=1).values
+        negative_peak_before = negative_mass_raw.reshape(b, -1).max(dim=1).values
+        negative_peak_after = negative_mass_final.reshape(b, -1).max(dim=1).values
         with torch.no_grad():
             for name, value in [
                 ("raw_entropy", raw_entropy_map.mean()),
