@@ -117,6 +117,7 @@ def _maybe_rebuild_pdtm(cfg, task, memory_loader, epoch):
     model.pdtm.reset_retrieval_stats()
     model.train(was_training)
     print(f'[PDTM] epoch={epoch} build={build_report}', flush=True)
+    print(f'[PDTM] build_json={build_json}', flush=True)
     return {
         'build_report': build_report,
         'build_json': build_json,
@@ -155,7 +156,7 @@ def main():
         'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
         'joint_dice', 'best_joint', 'best_joint_epoch',
         'grad_full_enc_ct', 'grad_missing_enc_ct', 'grad_full_ct_align', 'grad_missing_ct_align', 'grad_full_decoder', 'grad_missing_decoder',
-        'epoch_time', 'pdtm_memory_ready', 'pdtm_pair_count', 'pdtm_effective_slots', 'pdtm_paired_w2_mean', 'pdtm_retrieval_distance_mean', 'pdtm_feature_change_ratio',
+        'epoch_time', 'pdtm_memory_ready', 'pdtm_pair_count', 'pdtm_effective_slots', 'pdtm_paired_w2_mean', 'pdtm_retrieval_distance_mean', 'pdtm_retrieval_margin_mean', 'pdtm_feature_change_ratio',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
 
@@ -225,6 +226,7 @@ def main():
         pdtm_dir = os.path.join(cfg.checkpoint_dir, 'pdtm')
         os.makedirs(pdtm_dir, exist_ok=True)
         retrieval_json = task.model.export_pdtm_json(pdtm_dir, f'epoch_{epoch:03d}_retrieval')
+        print(f'[PDTM] retrieval_json={retrieval_json}', flush=True)
         joint_dice = float(cfg.joint_full_weight) * val_full['dice'] + float(cfg.joint_missing_weight) * val_missing['dice']
 
         joint_improved = joint_dice > best_joint

@@ -1,3 +1,4 @@
+import csv
 import os
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ if str(ROOT) not in sys.path:
 from configs.seg_mdt import SegMDTConfig
 from models.build_mdt_seg import build_mdt_seg_teacher
 from models.pdtm_runtime import PDTMRuntime
+from utils.train_logger import append_epoch_log, init_train_log
 
 
 def _make_cfg(arch='dual_shared_add_baseline'):
@@ -155,3 +157,23 @@ def test_visualization_accepts_string_output_dir(tmp_path):
     assert paths
     assert any(str(path).endswith('.png') for path in paths)
     assert all(os.path.exists(path) for path in paths)
+
+
+def test_train_logger_extra_metrics_align(tmp_path):
+    csv_path = tmp_path / 'train_log.csv'
+    init_train_log(str(csv_path), extra_headers=['a', 'b', 'c'])
+    append_epoch_log(
+        str(csv_path),
+        1,
+        0.1,
+        {'total_loss': 0.2, 'dice': 0.3, 'iou': 0.4},
+        lr=1e-4,
+        grad_norm=0.5,
+        extra_metrics={'a': 1, 'b': 2, 'c': 3},
+    )
+    retrieval_json = str(tmp_path / 'epoch_001_retrieval.json')
+    assert retrieval_json not in open(csv_path, 'r').read()
+    with open(csv_path, newline='') as f:
+        rows = list(csv.reader(f))
+    assert len(rows) == 2
+    assert len(rows[0]) == len(rows[1])
