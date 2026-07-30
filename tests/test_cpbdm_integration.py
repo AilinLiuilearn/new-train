@@ -3,6 +3,7 @@ import json
 import torch
 
 from models.build_mdt_seg import build_mdt_seg_teacher
+from models.cpbdm_distribution_memory import CTConditionedPETBenefitDistributionMemory
 from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
 from models.dual_shared_add_cpbdm import DualSharedAddCPBDM
 
@@ -29,6 +30,19 @@ def _make_cfg(**kwargs):
     }
     base.update(kwargs)
     return type('C', (), base)()
+
+
+def _make_memory(query_dim=4, K=3):
+    mem = CTConditionedPETBenefitDistributionMemory(decoder_channels=4, query_dim=query_dim, K=K)
+    with torch.no_grad():
+        mem.keys.copy_(torch.eye(K, query_dim)[:K])
+        mem.pi_zero.zero_()
+        mem.pi_pos.fill_(0.5)
+        mem.pi_neg.fill_(0.5)
+        mem.mu_pos.copy_(torch.tensor([0.3, 0.2, 0.1]))
+        mem.mu_neg.copy_(torch.tensor([-0.1, -0.2, -0.3]))
+        mem.memory_ready.fill_(True)
+    return mem
 
 
 def test_cpbdm_import_and_builders():
@@ -70,6 +84,62 @@ def test_missing_matches_baseline_before_memory_ready():
     a = baseline(ct, pet, forward_mode='missing')['logits']
     b = cpbdm(ct, pet, forward_mode='missing')['logits']
     assert torch.allclose(a, b)
+
+
+def test_jordan_equivalence_and_nonnegativity():
+    torch.manual_seed(0)
+    mem = _make_memory(query_dim=4, K=3)
+    raw_weights_map = torch.softmax(torch.randn(2, 3, 5, 5), dim=1)
+    positive_slot_value = (mem.pi_pos.float() * mem.mu_pos.float().clamp_min(0.0)).view(1, 3, 1, 1)
+    negative_slot_value = (mem.pi_neg.float() * (-mem.mu_neg.float()).clamp_min(0.0)).view(1, 3, 1, 1)
+    positive_mass_raw = raw_weights_map * positive_slot_value
+    negative_mass_raw = raw_weights_map * negative_slot_value
+    expected = (raw_weights_map * mem.slot_expected_delta().view(1, 3, 1, 1)).sum(dim=1, keepdim=True)
+    jordan = positive_mass_raw.sum(dim=1, keepdim=True) - negative_mass_raw.sum(dim=1, keepdim=True)
+    assert torch.all(positive_mass_raw >= 0)
+    assert torch.all(negative_mass_raw >= 0)
+    assert torch.allclose(expected, jordan, atol=1e-6, rtol=1e-5)
+
+
+def test_mass_conserving_signed_diffusion_properties():
+    torch.manual_seed(1)
+    mem = _make_memory(query_dim=4, K=3)
+    query = torch.randn(2, 4, 5, 5)
+    weights_flat = torch.softmax(torch.randn(2, 25, 3), dim=2)
+    out = mem._ct_guided_signed_benefit_diffusion(query, weights_flat)
+    for key in ['positive_mass_raw', 'negative_mass_raw', 'positive_mass_final', 'negative_mass_final']:
+        assert torch.all(torch.isfinite(out[key]))
+        assert torch.all(out[key] >= 0)
+    assert torch.allclose(out['positive_mass_raw'].sum(dim=(1, 2, 3)), out['positive_mass_final'].sum(dim=(1, 2, 3)), atol=1e-6, rtol=1e-4)
+    assert torch.allclose(out['negative_mass_raw'].sum(dim=(1, 2, 3)), out['negative_mass_final'].sum(dim=(1, 2, 3)), atol=1e-6, rtol=1e-4)
+
+
+def test_zero_mass_safety_and_uniform_invariance():
+    torch.manual_seed(2)
+    mem = _make_memory(query_dim=4, K=3)
+    mem.pi_pos.zero_()
+    mem.mu_pos.zero_()
+    query = torch.randn(1, 4, 4, 4)
+    weights_flat = torch.full((1, 16, 3), 1 / 3)
+    out = mem._ct_guided_signed_benefit_diffusion(query, weights_flat)
+    assert torch.all(out['positive_mass_final'] == 0)
+    assert torch.isfinite(out['final_delta']).all()
+    assert torch.allclose(out['final_delta'], out['raw_delta'], atol=1e-6, rtol=1e-5)
+
+
+def test_query_boundary_protection_and_peak_spread():
+    torch.manual_seed(3)
+    mem = _make_memory(query_dim=4, K=3)
+    query = torch.zeros(1, 4, 5, 5)
+    query[:, :, :, :2] = 3.0
+    query[:, :, :, 2:] = -3.0
+    weights_flat = torch.zeros(1, 25, 3)
+    weights_flat[:, :, 0] = 1.0
+    out = mem._ct_guided_signed_benefit_diffusion(query, weights_flat)
+    assert out['positive_mass_final'].sum() > 0
+    assert out['positive_mass_final'].max() <= out['positive_mass_raw'].max() + 1e-6
+    assert out['local_affinity'].shape[1] == 9
+    assert out['final_delta'].abs().mean() <= out['raw_delta'].abs().mean() + 1e-6
 
 
 def test_collect_finalize_and_diagnostics(tmp_path):

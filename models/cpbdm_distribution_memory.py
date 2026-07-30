@@ -608,10 +608,14 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
         vertical = (x[..., 1:, :] - x[..., :-1, :]).abs().mean()
         return horizontal + vertical
 
-    def _ct_guided_local_consensus(self, query, weights_flat):
+    def _ct_guided_signed_benefit_diffusion(self, query, weights_flat):
         b, d, h, w = query.shape
         query_map = torch.nan_to_num(F.normalize(query.float(), dim=1, eps=1e-6), nan=0.0, posinf=0.0, neginf=0.0)
         raw_weights_map = weights_flat.reshape(b, h, w, self.K).permute(0, 3, 1, 2).float()
+        positive_slot_value = (self.pi_pos.float() * self.mu_pos.float().clamp_min(0.0)).view(1, self.K, 1, 1)
+        negative_slot_value = (self.pi_neg.float() * (-self.mu_neg.float()).clamp_min(0.0)).view(1, self.K, 1, 1)
+        positive_mass_raw = torch.nan_to_num(raw_weights_map * positive_slot_value, nan=0.0, posinf=0.0, neginf=0.0)
+        negative_mass_raw = torch.nan_to_num(raw_weights_map * negative_slot_value, nan=0.0, posinf=0.0, neginf=0.0)
         query_pad = F.pad(query_map, (1, 1, 1, 1), mode='replicate')
         local_logits = []
         local_scale = math.sqrt(float(d))
@@ -622,17 +626,47 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
                 local_logits.append(local_cosine * local_scale)
         local_affinity = torch.softmax(torch.cat(local_logits, dim=1), dim=1)
         local_affinity = torch.nan_to_num(local_affinity, nan=1.0 / 9.0, posinf=0.0, neginf=0.0)
-        weights_pad = F.pad(raw_weights_map, (1, 1, 1, 1), mode='replicate')
-        coherent_weights = torch.zeros_like(raw_weights_map)
+        positive_mass_pad = F.pad(positive_mass_raw, (1, 1, 1, 1), mode='replicate')
+        negative_mass_pad = F.pad(negative_mass_raw, (1, 1, 1, 1), mode='replicate')
+        positive_mass_diffused = torch.zeros_like(positive_mass_raw)
+        negative_mass_diffused = torch.zeros_like(negative_mass_raw)
         nid = 0
         for oy in range(3):
             for ox in range(3):
-                neighbor_weights = weights_pad[:, :, oy:oy + h, ox:ox + w]
-                coherent_weights = coherent_weights + neighbor_weights * local_affinity[:, nid:nid + 1]
+                neighbor_positive_mass = positive_mass_pad[:, :, oy:oy + h, ox:ox + w]
+                neighbor_negative_mass = negative_mass_pad[:, :, oy:oy + h, ox:ox + w]
+                affinity = local_affinity[:, nid:nid + 1]
+                positive_mass_diffused = positive_mass_diffused + neighbor_positive_mass * affinity
+                negative_mass_diffused = negative_mass_diffused + neighbor_negative_mass * affinity
                 nid += 1
-        coherent_weights = torch.nan_to_num(coherent_weights, nan=0.0, posinf=0.0, neginf=0.0)
-        coherent_weights = coherent_weights / coherent_weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
-        return raw_weights_map, coherent_weights, local_affinity
+        positive_mass_diffused = torch.nan_to_num(positive_mass_diffused, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        negative_mass_diffused = torch.nan_to_num(negative_mass_diffused, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        positive_total_raw = positive_mass_raw.sum(dim=(1, 2, 3), keepdim=True)
+        positive_total_diffused = positive_mass_diffused.sum(dim=(1, 2, 3), keepdim=True)
+        negative_total_raw = negative_mass_raw.sum(dim=(1, 2, 3), keepdim=True)
+        negative_total_diffused = negative_mass_diffused.sum(dim=(1, 2, 3), keepdim=True)
+        positive_scale = torch.where(positive_total_raw > 1e-8, positive_total_raw / positive_total_diffused.clamp_min(1e-8), torch.zeros_like(positive_total_raw))
+        negative_scale = torch.where(negative_total_raw > 1e-8, negative_total_raw / negative_total_diffused.clamp_min(1e-8), torch.zeros_like(negative_total_raw))
+        positive_mass_final = torch.nan_to_num(positive_mass_diffused * positive_scale, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        negative_mass_final = torch.nan_to_num(negative_mass_diffused * negative_scale, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        positive_mass_final = torch.where(positive_total_raw > 1e-8, positive_mass_final, torch.zeros_like(positive_mass_final))
+        negative_mass_final = torch.where(negative_total_raw > 1e-8, negative_mass_final, torch.zeros_like(negative_mass_final))
+        raw_delta = positive_mass_raw.sum(dim=1, keepdim=True) - negative_mass_raw.sum(dim=1, keepdim=True)
+        final_delta = positive_mass_final.sum(dim=1, keepdim=True) - negative_mass_final.sum(dim=1, keepdim=True)
+        total_mass_final = positive_mass_final + negative_mass_final
+        mass_sum = total_mass_final.sum(dim=1, keepdim=True)
+        final_mass_weights = torch.where(mass_sum > 1e-8, total_mass_final / mass_sum.clamp_min(1e-8), raw_weights_map)
+        return {
+            "raw_weights_map": raw_weights_map,
+            "local_affinity": local_affinity,
+            "positive_mass_raw": positive_mass_raw,
+            "negative_mass_raw": negative_mass_raw,
+            "positive_mass_final": positive_mass_final,
+            "negative_mass_final": negative_mass_final,
+            "raw_delta": raw_delta,
+            "final_delta": final_delta,
+            "final_mass_weights": final_mass_weights,
+        }
 
     def retrieve(
         self,
@@ -666,38 +700,54 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
         scale = self.logit_scale.exp().clamp(1.0, 20.0)
         weights = torch.softmax(similarity * scale, dim=1)
         weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
-        raw_weights_map, coherent_weights, local_affinity = self._ct_guided_local_consensus(query, weights)
-        slot_values = self.slot_expected_delta().float().view(1, self.K, 1, 1)
-        raw_delta = (raw_weights_map * slot_values).sum(dim=1, keepdim=True)
-        coherent_delta = (coherent_weights * slot_values).sum(dim=1, keepdim=True)
-        delta = coherent_delta.to(ct_logits.dtype)
+        diffusion = self._ct_guided_signed_benefit_diffusion(query, weights)
+        raw_weights_map = diffusion["raw_weights_map"]
+        local_affinity = diffusion["local_affinity"]
+        positive_mass_raw = diffusion["positive_mass_raw"]
+        negative_mass_raw = diffusion["negative_mass_raw"]
+        positive_mass_final = diffusion["positive_mass_final"]
+        negative_mass_final = diffusion["negative_mass_final"]
+        raw_delta = diffusion["raw_delta"]
+        final_delta = diffusion["final_delta"]
+        final_mass_weights = diffusion["final_mass_weights"]
+        delta = final_delta.to(ct_logits.dtype)
         delta = torch.nan_to_num(delta, nan=0.0, posinf=0.25, neginf=-0.25).clamp(-0.25, 0.25)
         corrected_prob = (ct_prob + delta).clamp(1e-3, 1.0 - 1e-3)
         corrected_logits = torch.log(corrected_prob) - torch.log1p(-corrected_prob)
         corrected_logits = torch.nan_to_num(corrected_logits, nan=0.0, posinf=7.0, neginf=-7.0).clamp(-7.0, 7.0)
         raw_p = raw_weights_map.clamp_min(1e-8)
-        coherent_p = coherent_weights.clamp_min(1e-8)
+        final_p = final_mass_weights.clamp_min(1e-8)
         raw_entropy_map = -(raw_p * raw_p.log()).sum(dim=1)
-        coherent_entropy_map = -(coherent_p * coherent_p.log()).sum(dim=1)
+        final_entropy_map = -(final_p * final_p.log()).sum(dim=1)
         raw_effective_map = raw_entropy_map.exp()
-        coherent_effective_map = coherent_entropy_map.exp()
+        final_effective_map = final_entropy_map.exp()
         raw_top1_weight, _ = raw_weights_map.max(dim=1)
-        top1_weight, top1_slot = coherent_weights.max(dim=1)
+        top1_weight, top1_slot = final_mass_weights.max(dim=1)
         max_similarity = similarity.max(dim=1).values.reshape(b, h, w)
-        consensus_weight_change = (coherent_weights - raw_weights_map).abs().mean()
+        consensus_weight_change = (final_mass_weights - raw_weights_map).abs().mean()
         raw_delta_tv = self._spatial_tv(raw_delta)
-        coherent_delta_tv = self._spatial_tv(coherent_delta)
+        coherent_delta_tv = self._spatial_tv(final_delta)
+        positive_total_raw = positive_mass_raw.sum(dim=(1, 2, 3), keepdim=True)
+        positive_total_final = positive_mass_final.sum(dim=(1, 2, 3), keepdim=True)
+        negative_total_raw = negative_mass_raw.sum(dim=(1, 2, 3), keepdim=True)
+        negative_total_final = negative_mass_final.sum(dim=(1, 2, 3), keepdim=True)
+        positive_rel_err = torch.where(positive_total_raw > 1e-8, (positive_total_final - positive_total_raw).abs() / positive_total_raw.clamp_min(1e-8), torch.zeros_like(positive_total_raw))
+        negative_rel_err = torch.where(negative_total_raw > 1e-8, (negative_total_final - negative_total_raw).abs() / negative_total_raw.clamp_min(1e-8), torch.zeros_like(negative_total_raw))
+        positive_peak_before = positive_mass_raw.view(b, -1).max(dim=1).values
+        positive_peak_after = positive_mass_final.view(b, -1).max(dim=1).values
+        negative_peak_before = negative_mass_raw.view(b, -1).max(dim=1).values
+        negative_peak_after = negative_mass_final.view(b, -1).max(dim=1).values
         with torch.no_grad():
             for name, value in [
                 ("raw_entropy", raw_entropy_map.mean()),
-                ("entropy", coherent_entropy_map.mean()),
+                ("entropy", final_entropy_map.mean()),
                 ("raw_effective_slots", raw_effective_map.mean()),
-                ("effective_slots", coherent_effective_map.mean()),
+                ("effective_slots", final_effective_map.mean()),
                 ("raw_top1_weight", raw_top1_weight.mean()),
                 ("top1_weight", top1_weight.mean()),
                 ("max_similarity", max_similarity.mean()),
                 ("raw_delta_abs_mean", raw_delta.abs().mean()),
-                ("delta_abs_mean", coherent_delta.abs().mean()),
+                ("delta_abs_mean", final_delta.abs().mean()),
                 ("consensus_weight_change", consensus_weight_change),
                 ("raw_delta_tv", raw_delta_tv),
                 ("coherent_delta_tv", coherent_delta_tv),
@@ -709,27 +759,41 @@ class CTConditionedPETBenefitDistributionMemory(nn.Module):
                     "ct_entropy": q_aux["entropy"][0, 0].cpu(),
                     "ct_boundary": q_aux["boundary"][0, 0].cpu(),
                     "raw_delta_probability": raw_delta[0, 0].cpu(),
-                    "delta_probability": coherent_delta[0, 0].cpu(),
+                    "delta_probability": final_delta[0, 0].cpu(),
                     "corrected_probability": corrected_prob[0, 0].cpu(),
-                    "retrieval_entropy": coherent_entropy_map[0].cpu(),
+                    "retrieval_entropy": final_entropy_map[0].cpu(),
                     "top1_slot": top1_slot[0].cpu(),
                     "max_similarity": max_similarity[0].cpu(),
-                    "local_consensus_change": (coherent_weights - raw_weights_map).abs().mean(dim=1)[0].cpu(),
+                    "local_consensus_change": (final_delta - raw_delta).abs()[0, 0].cpu(),
+                    "positive_mass_raw": positive_mass_raw.sum(dim=1)[0].cpu(),
+                    "positive_mass_final": positive_mass_final.sum(dim=1)[0].cpu(),
+                    "negative_mass_raw": negative_mass_raw.sum(dim=1)[0].cpu(),
+                    "negative_mass_final": negative_mass_final.sum(dim=1)[0].cpu(),
                 }
         info = {
             "memory_ready": True,
             "raw_retrieval_entropy_mean": to_float(raw_entropy_map.mean()),
-            "retrieval_entropy_mean": to_float(coherent_entropy_map.mean()),
+            "retrieval_entropy_mean": to_float(final_entropy_map.mean()),
             "raw_effective_slots_mean": to_float(raw_effective_map.mean()),
-            "effective_slots_mean": to_float(coherent_effective_map.mean()),
+            "effective_slots_mean": to_float(final_effective_map.mean()),
             "raw_top1_weight_mean": to_float(raw_top1_weight.mean()),
             "top1_weight_mean": to_float(top1_weight.mean()),
             "max_similarity_mean": to_float(max_similarity.mean()),
             "raw_delta_abs_mean": to_float(raw_delta.abs().mean()),
-            "delta_abs_mean": to_float(coherent_delta.abs().mean()),
+            "delta_abs_mean": to_float(final_delta.abs().mean()),
             "consensus_weight_change_mean": to_float(consensus_weight_change),
             "raw_delta_tv": to_float(raw_delta_tv),
             "coherent_delta_tv": to_float(coherent_delta_tv),
+            "raw_positive_mass": to_float(positive_total_raw.mean()),
+            "final_positive_mass": to_float(positive_total_final.mean()),
+            "raw_negative_mass": to_float(negative_total_raw.mean()),
+            "final_negative_mass": to_float(negative_total_final.mean()),
+            "positive_mass_relative_error": to_float(positive_rel_err.mean()),
+            "negative_mass_relative_error": to_float(negative_rel_err.mean()),
+            "positive_peak_before": to_float(positive_peak_before.mean()),
+            "positive_peak_after": to_float(positive_peak_after.mean()),
+            "negative_peak_before": to_float(negative_peak_before.mean()),
+            "negative_peak_after": to_float(negative_peak_after.mean()),
         }
         return RetrievalResult(delta, corrected_prob, corrected_logits, info)
 
