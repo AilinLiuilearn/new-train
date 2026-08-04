@@ -185,6 +185,24 @@ def main():
                     'mask': batch['mask'][:1].detach().cpu(),
                 }
 
+        cppi_report = task.model.finalize_cppi_epoch(
+            epoch=epoch,
+            save_json=True,
+            save_visualizations=(
+                epoch == 1
+                or epoch % 5 == 0
+                or epoch == cfg.epochs
+            ),
+            print_info=True,
+        )
+        print(
+            f"[CPPI EPOCH {epoch}]\n"
+            f"bank_version={cppi_report.get('bank_version_after', cppi_report.get('bank_version_before', 0))}\n"
+            f"ready_slots={cppi_report.get('ready_count', cppi_report.get('ready_slots', 0))}\n"
+            f"bg_candidates={cppi_report.get('classes', {}).get('background', {}).get('num_candidates', 0)}\n"
+            f"fg_candidates={cppi_report.get('classes', {}).get('foreground', {}).get('num_candidates', 0)}",
+            flush=True,
+        )
         if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is not None and epoch % int(cfg.gradient_diagnostics_interval) == 0:
             diag_stats = task.gradient_diagnostics(fixed_diag_batch, max_samples=min(1, int(cfg.gradient_diagnostics_num_samples))) or {}
 
@@ -222,6 +240,40 @@ def main():
         val_acc_pixel = 0.5 * val_full.get('acc_pixel', 0.0) + 0.5 * val_missing.get('acc_pixel', 0.0)
         val_hd95 = 0.5 * val_full['hd95'] + 0.5 * val_missing['hd95']
         avg_grad_norm = grad_norm_accum / max(1, grad_norm_steps)
+        extra_metrics = {
+            'train_full_loss': full_loss / max(1, full_n),
+            'train_missing_loss': missing_loss / max(1, missing_n),
+            'train_overall_loss': train_loss,
+            'full_train_batches': full_n,
+            'missing_train_batches': missing_n,
+            'val_full_loss': val_full['total_loss'],
+            'val_full_dice': val_full['dice'],
+            'val_full_iou': val_full['iou'],
+            'val_full_acc': val_full['acc'],
+            'val_full_acc_pixel': val_full.get('acc_pixel', 0.0),
+            'val_full_hd95': val_full['hd95'],
+            'val_missing_loss': val_missing['total_loss'],
+            'val_missing_dice': val_missing['dice'],
+            'val_missing_iou': val_missing['iou'],
+            'val_missing_acc': val_missing['acc'],
+            'val_missing_acc_pixel': val_missing.get('acc_pixel', 0.0),
+            'val_missing_hd95': val_missing['hd95'],
+            'joint_dice': joint_dice,
+            'best_joint': best_joint,
+            'best_joint_epoch': best_joint_epoch,
+            'grad_full_enc_ct': float(np.mean(grads['full']['enc_ct'])) if grads['full']['enc_ct'] else 0.0,
+            'grad_missing_enc_ct': float(np.mean(grads['missing']['enc_ct'])) if grads['missing']['enc_ct'] else 0.0,
+            'grad_full_ct_align': float(np.mean(grads['full']['ct_align'])) if grads['full']['ct_align'] else 0.0,
+            'grad_missing_ct_align': float(np.mean(grads['missing']['ct_align'])) if grads['missing']['ct_align'] else 0.0,
+            'grad_full_decoder': float(np.mean(grads['full']['decoder'])) if grads['full']['decoder'] else 0.0,
+            'grad_missing_decoder': float(np.mean(grads['missing']['decoder'])) if grads['missing']['decoder'] else 0.0,
+            'epoch_time': time.time() - epoch_start,
+            'cppi_bank_version': int(cppi_report.get('bank_version_after', cppi_report.get('bank_version_before', 0))),
+            'cppi_ready_slots': int(cppi_report.get('ready_count', cppi_report.get('ready_slots', 0))),
+            'cppi_bg_candidates': int(cppi_report.get('classes', {}).get('background', {}).get('num_candidates', 0)),
+            'cppi_fg_candidates': int(cppi_report.get('classes', {}).get('foreground', {}).get('num_candidates', 0)),
+            **{f'diag_{k}': v for k, v in diag_stats.items()},
+        }
         append_epoch_log(
             os.path.join(cfg.checkpoint_dir, 'train_log.csv'),
             epoch,
@@ -229,36 +281,7 @@ def main():
             {'total_loss': val_loss, 'dice': val_dice, 'iou': val_iou, 'acc': val_acc, 'acc_pixel': val_acc_pixel, 'hd95': val_hd95},
             lr=task.optimizer.param_groups[0]['lr'],
             grad_norm=avg_grad_norm,
-            extra_metrics={
-                'train_full_loss': full_loss / max(1, full_n),
-                'train_missing_loss': missing_loss / max(1, missing_n),
-                'train_overall_loss': train_loss,
-                'full_train_batches': full_n,
-                'missing_train_batches': missing_n,
-                'val_full_loss': val_full['total_loss'],
-                'val_full_dice': val_full['dice'],
-                'val_full_iou': val_full['iou'],
-                'val_full_acc': val_full['acc'],
-                'val_full_acc_pixel': val_full.get('acc_pixel', 0.0),
-                'val_full_hd95': val_full['hd95'],
-                'val_missing_loss': val_missing['total_loss'],
-                'val_missing_dice': val_missing['dice'],
-                'val_missing_iou': val_missing['iou'],
-                'val_missing_acc': val_missing['acc'],
-                'val_missing_acc_pixel': val_missing.get('acc_pixel', 0.0),
-                'val_missing_hd95': val_missing['hd95'],
-                'joint_dice': joint_dice,
-                'best_joint': best_joint,
-                'best_joint_epoch': best_joint_epoch,
-                'grad_full_enc_ct': float(np.mean(grads['full']['enc_ct'])) if grads['full']['enc_ct'] else 0.0,
-                'grad_missing_enc_ct': float(np.mean(grads['missing']['enc_ct'])) if grads['missing']['enc_ct'] else 0.0,
-                'grad_full_ct_align': float(np.mean(grads['full']['ct_align'])) if grads['full']['ct_align'] else 0.0,
-                'grad_missing_ct_align': float(np.mean(grads['missing']['ct_align'])) if grads['missing']['ct_align'] else 0.0,
-                'grad_full_decoder': float(np.mean(grads['full']['decoder'])) if grads['full']['decoder'] else 0.0,
-                'grad_missing_decoder': float(np.mean(grads['missing']['decoder'])) if grads['missing']['decoder'] else 0.0,
-                'epoch_time': time.time() - epoch_start,
-                **{f'diag_{k}': v for k, v in diag_stats.items()},
-            },
+            extra_metrics=extra_metrics,
         )
 
         print(f'[EPOCH {epoch}] joint_dice={joint_dice:.4f} best_joint={best_joint:.4f} lr={task.optimizer.param_groups[0]["lr"]:.8f}', flush=True)

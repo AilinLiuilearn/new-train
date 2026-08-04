@@ -1,0 +1,86 @@
+{
+  "status": "success",
+  "device": "cuda",
+  "seed": 2026,
+  "config": {
+    "channels": [
+      16,
+      32,
+      64,
+      96
+    ],
+    "num_clusters": 4,
+    "build_stage": 4,
+    "output_dir": "prototype_memory_demo_outputs"
+  },
+  "demo_loss": 4.206230163574219,
+  "gradients": [
+    {
+      "scale": 1,
+      "ct_grad_norm": 0.004117992706596851,
+      "pet_proxy_shape": [
+        4,
+        16,
+        64,
+        64
+      ],
+      "fused_shape": [
+        4,
+        16,
+        64,
+        64
+      ]
+    },
+    {
+      "scale": 2,
+      "ct_grad_norm": 0.0057301209308207035,
+      "pet_proxy_shape": [
+        4,
+        32,
+        32,
+        32
+      ],
+      "fused_shape": [
+        4,
+        32,
+        32,
+        32
+      ]
+    },
+    {
+      "scale": 3,
+      "ct_grad_norm": 0.00806222204118967,
+      "pet_proxy_shape": [
+        4,
+        64,
+        16,
+        16
+      ],
+      "fused_shape": [
+        4,
+        64,
+        16,
+        16
+      ]
+    },
+    {
+      "scale": 4,
+      "ct_grad_norm": 0.012860189191997051,
+      "pet_proxy_shape": [
+        4,
+        96,
+        8,
+        8
+      ],
+      "fused_shape": [
+        4,
+        96,
+        8,
+        8
+      ]
+    }
+  ],
+  "bank_report_file": "prototype_memory_demo_outputs/json/bank_epoch_1.json",
+  "retrieval_report_file": "prototype_memory_demo_outputs/json/retrieval_demo_missing.json",
+  "visualization_dir": "prototype_memory_demo_outputs/visualizations"
+}

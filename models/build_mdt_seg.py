@@ -351,6 +351,9 @@ class ConvBNAct(nn.Module):
 
 def build_mdt_seg_teacher(config):
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
+    cppi_num_clusters = getattr(config, 'cppi_num_clusters', 4)
+    cppi_build_stage = getattr(config, 'cppi_build_stage', 4)
+    cppi_output_dir = os.path.join(config.checkpoint_dir, 'cppi')
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
@@ -360,6 +363,9 @@ def build_mdt_seg_teacher(config):
         out_channels=1,
         decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
         use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
+        cppi_num_clusters=cppi_num_clusters,
+        cppi_build_stage=cppi_build_stage,
+        cppi_output_dir=cppi_output_dir,
     )
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
@@ -367,4 +373,8 @@ def build_mdt_seg_teacher(config):
         f'fusion=add shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
+    print(f'[CPPI] enabled=True')
+    print(f'[CPPI] num_clusters={cppi_num_clusters}')
+    print(f'[CPPI] build_stage={cppi_build_stage}')
+    print(f'[CPPI] output_dir={cppi_output_dir}')
     return {'model': model}

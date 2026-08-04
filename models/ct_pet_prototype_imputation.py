@@ -703,6 +703,10 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
 
     # -------------------------- missing retrieval --------------------------
 
+    @property
+    def bank_ready(self) -> bool:
+        return bool(self.prototype_ready.any())
+
     def retrieve(
         self,
         ct_feats: Sequence[torch.Tensor],
@@ -710,6 +714,7 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
         tag: str = "retrieval",
         visualize_batch_index: int = 0,
         print_info: bool = False,
+        compute_report: bool = False,
     ) -> Tuple[List[torch.Tensor], Dict]:
         """
         Retrieve PET proxy features for a Missing batch.
@@ -723,13 +728,15 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
         ready_flat = self.prototype_ready.flatten()
 
         outputs: List[torch.Tensor] = []
+        need_report = bool(compute_report or save_diagnostics or print_info)
         report = {
             "tag": tag,
             "bank_version": int(self.bank_version.item()),
             "ready_slots": int(ready_flat.sum().item()),
             "total_slots": int(ready_flat.numel()),
-            "scales": {},
         }
+        if need_report:
+            report["scales"] = {}
 
         for scale_idx, ct in enumerate(ct_feats):
             keys = getattr(self, f"ct_keys_s{scale_idx + 1}").reshape(
@@ -745,33 +752,28 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
             retrieved, attn = self.attention[scale_idx](ct, keys, values, ready)
             outputs.append(retrieved)
 
-            probs = attn.float().clamp_min(EPS)
-            entropy = -(probs * probs.log()).sum(dim=-1)
-            valid_slot_count = max(int(ready.sum().item()), 1)
-            max_entropy = math.log(valid_slot_count) if valid_slot_count > 1 else 1.0
-            normalized_entropy = entropy / max_entropy
-            confidence = 1.0 - normalized_entropy
-            top1 = attn.argmax(dim=-1)
-            usage = torch.bincount(
-                top1.flatten(),
-                minlength=2 * self.num_clusters,
-            )
-
-            ct_norm = ct.float().norm(dim=1).mean()
-            pet_norm = retrieved.float().norm(dim=1).mean()
-            norm_ratio = float(pet_norm / (ct_norm + EPS))
-
-            report["scales"][f"scale_{scale_idx + 1}"] = {
-                "ct_shape": list(ct.shape),
-                "retrieved_shape": list(retrieved.shape),
-                "attention_shape": list(attn.shape),
-                "entropy": _tensor_stats(normalized_entropy),
-                "confidence": _tensor_stats(confidence),
-                "top1_usage": usage.detach().cpu().tolist(),
-                "ct_mean_spatial_l2": float(ct_norm.detach().cpu()),
-                "retrieved_pet_mean_spatial_l2": float(pet_norm.detach().cpu()),
-                "retrieved_to_ct_norm_ratio": norm_ratio,
-            }
+            if need_report:
+                probs = attn.float().clamp_min(EPS)
+                entropy = -(probs * probs.log()).sum(dim=-1)
+                valid_slot_count = max(int(ready.sum().item()), 1)
+                max_entropy = math.log(valid_slot_count) if valid_slot_count > 1 else 1.0
+                normalized_entropy = entropy / max_entropy
+                confidence = 1.0 - normalized_entropy
+                top1 = attn.argmax(dim=-1)
+                usage = torch.bincount(top1.flatten(), minlength=2 * self.num_clusters)
+                ct_norm = ct.float().norm(dim=1).mean()
+                pet_norm = retrieved.float().norm(dim=1).mean()
+                report["scales"][f"scale_{scale_idx + 1}"] = {
+                    "ct_shape": list(ct.shape),
+                    "retrieved_shape": list(retrieved.shape),
+                    "attention_shape": list(attn.shape),
+                    "entropy": _tensor_stats(normalized_entropy),
+                    "confidence": _tensor_stats(confidence),
+                    "top1_usage": usage.detach().cpu().tolist(),
+                    "ct_mean_spatial_l2": float(ct_norm.detach().cpu()),
+                    "retrieved_pet_mean_spatial_l2": float(pet_norm.detach().cpu()),
+                    "retrieved_to_ct_norm_ratio": float(pet_norm / (ct_norm + EPS)),
+                }
 
             if save_diagnostics:
                 self._save_retrieval_scale_visualizations(
@@ -1230,7 +1232,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if not args.demo:
         parser.print_help()
-        print(
+        print( 
             "\nRun a verification demo with:\n"
             "python ct_pet_prototype_imputation.py --demo "
             "--num-clusters 4 --build-stage 4"

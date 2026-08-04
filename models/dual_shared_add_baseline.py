@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from models.baseline_blocks import AddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
+from models.ct_pet_prototype_imputation import CrossScaleCTPETPrototypeMemory
 
 
 class StageChannelAlign(nn.Module):
@@ -21,7 +22,7 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
-    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False):
+    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=4, cppi_build_stage=4, cppi_output_dir=None):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
@@ -33,6 +34,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
         self.fusion = AddFusion()
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
+        self.prototype_memory = CrossScaleCTPETPrototypeMemory(
+            channels=pet_channels,
+            num_clusters=cppi_num_clusters,
+            build_stage=cppi_build_stage,
+            output_dir=cppi_output_dir,
+        )
 
     @staticmethod
     def _to_3ch(x):
@@ -57,43 +64,85 @@ class DualSharedAddPETCTBaseline(nn.Module):
         out['aux'] = {}
         return out
 
-    def _forward_full(self, ct, pet, target_size):
-        ct_feats = self._encode_ct(ct)
-        pet_feats = self._encode_pet(pet)
-        fused_feats = self.fusion(ct_feats, pet_feats, None)
-        return self._decode(fused_feats, target_size)
+    def _collect_cppi(self, ct_feats, pet_feats_real, mask):
+        if self.training and mask is not None:
+            return self.prototype_memory.collect(
+                ct_feats=ct_feats,
+                pet_feats=pet_feats_real,
+                mask=mask,
+                print_info=False,
+            )
+        return None
 
-    def _forward_missing(self, ct, pet, target_size):
+    def _retrieve_cppi(self, ct_feats, compute_report=False, save_diagnostics=False, print_info=False):
+        return self.prototype_memory.retrieve(
+            ct_feats,
+            compute_report=compute_report,
+            save_diagnostics=save_diagnostics,
+            print_info=print_info,
+        )
+
+    def _forward_full(self, ct, pet, target_size, mask=None):
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
-        pet_feats_masked = [torch.zeros_like(feat) for feat in pet_feats_real]
-        fused_feats = self.fusion(ct_feats, pet_feats_masked, None)
+        self._collect_cppi(ct_feats, pet_feats_real, mask)
+        fused_feats = self.fusion(ct_feats, pet_feats_real, None)
         return self._decode(fused_feats, target_size)
 
-    def _forward_auto(self, ct, pet, pet_available, target_size):
+    def _forward_missing(self, ct, pet, target_size, mask=None):
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
+        self._collect_cppi(ct_feats, pet_feats_real, mask)
+        pet_feats_proxy, _ = self._retrieve_cppi(
+            ct_feats,
+            compute_report=False,
+            save_diagnostics=False,
+            print_info=False,
+        )
+        fused_feats = self.fusion(ct_feats, pet_feats_proxy, None)
+        return self._decode(fused_feats, target_size)
+
+    def _forward_auto(self, ct, pet, pet_available, target_size, mask=None):
+        ct_feats = self._encode_ct(ct)
+        pet_feats_real = self._encode_pet(pet)
+        self._collect_cppi(ct_feats, pet_feats_real, mask)
+        pet_feats_proxy, _ = self._retrieve_cppi(
+            ct_feats,
+            compute_report=False,
+            save_diagnostics=False,
+            print_info=False,
+        )
         pet_available = pet_available.to(device=ct.device).long().view(-1)
         if pet_available.numel() != ct.shape[0]:
             raise ValueError('pet_available must contain one state per sample')
         if not torch.all((pet_available == 0) | (pet_available == 1)):
             raise ValueError('pet_available values must be 0 or 1')
-        pet_feats_masked = []
-        for feat in pet_feats_real:
-            availability_mask = pet_available.to(device=feat.device, dtype=feat.dtype).view(-1, 1, 1, 1)
-            pet_feats_masked.append(feat * availability_mask)
-        fused_feats = self.fusion(ct_feats, pet_feats_masked, None)
+        pet_selected = []
+        availability = pet_available.view(-1, 1, 1, 1)
+        for feat_real, feat_proxy in zip(pet_feats_real, pet_feats_proxy):
+            availability_mask = availability.to(device=feat_real.device, dtype=feat_real.dtype)
+            pet_selected.append(feat_real * availability_mask + feat_proxy * (1.0 - availability_mask))
+        fused_feats = self.fusion(ct_feats, pet_selected, None)
         return self._decode(fused_feats, target_size)
 
-    def forward(self, ct, pet, pet_available=None, target_size=None, forward_mode='auto'):
+    @torch.no_grad()
+    def finalize_cppi_epoch(self, epoch, save_json=True, save_visualizations=False, print_info=True):
+        return self.prototype_memory.finalize_epoch(
+            epoch=epoch,
+            save_json=save_json,
+            save_visualizations=save_visualizations,
+            print_info=print_info,
+        )
+
+    def forward(self, ct, pet, pet_available=None, target_size=None, forward_mode='auto', mask=None):
         if target_size is None:
             target_size = ct.shape[-2:]
         if forward_mode == 'full':
-            return self._forward_full(ct, pet, target_size)
+            return self._forward_full(ct, pet, target_size, mask=mask)
         if forward_mode == 'missing':
-            return self._forward_missing(ct, pet, target_size)
+            return self._forward_missing(ct, pet, target_size, mask=mask)
         if forward_mode == 'auto':
             if pet_available is None:
                 pet_available = torch.ones(ct.shape[0], device=ct.device, dtype=torch.long)
-            return self._forward_auto(ct, pet, pet_available, target_size)
+            return self._forward_auto(ct, pet, pet_available, target_size, mask=mask)
         raise ValueError(f'Unsupported forward_mode={forward_mode!r}')

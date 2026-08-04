@@ -39,7 +39,7 @@ class MDTSegTeacher:
         ct = batch['ct'].to(self.device, non_blocking=True)
         pet = batch['pet'].to(self.device, non_blocking=True)
         mask = batch['mask'].to(self.device, non_blocking=True).float()
-        outputs = self.model(ct, pet=pet, forward_mode=forward_mode)
+        outputs = self.model(ct, pet=pet, mask=mask, forward_mode=forward_mode)
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
         loss, loss_stats = self.criterion(logits, mask)
         stats = {
@@ -74,7 +74,7 @@ class MDTSegTeacher:
                 pet_available = batch.get('pet_available')
                 if pet_available is not None:
                     pet_available = pet_available.to(self.device, non_blocking=True)
-            outputs = self.model(ct, pet=pet, pet_available=pet_available, forward_mode=forward_mode)
+            outputs = self.model(ct, pet=pet, pet_available=pet_available, forward_mode=forward_mode, mask=None)
             logits = outputs['logits'] if isinstance(outputs, dict) else outputs
             loss, _ = self.criterion(logits, mask)
             self.metrics.update(logits, mask)
@@ -104,8 +104,8 @@ class MDTSegTeacher:
             params_ct = list(self.model.enc_ct.parameters())
             params_align = list(self.model.ct_align.parameters())
             params_dec = list(self.model.decoder.parameters())
-            outputs_full = self.model(ct, pet=pet, forward_mode='full')
-            outputs_missing = self.model(ct, pet=pet, forward_mode='missing')
+            outputs_full = self.model(ct, pet=pet, forward_mode='full', mask=None)
+            outputs_missing = self.model(ct, pet=pet, forward_mode='missing', mask=None)
             logits_full = outputs_full['logits'] if isinstance(outputs_full, dict) else outputs_full
             logits_missing = outputs_missing['logits'] if isinstance(outputs_missing, dict) else outputs_missing
             loss_full, _ = self.criterion(logits_full.float(), mask.float())
