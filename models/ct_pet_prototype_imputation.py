@@ -465,6 +465,7 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
         pet_feats: Sequence[torch.Tensor],
         mask: torch.Tensor,
         print_info: bool = False,
+        compute_report: bool = False,
     ) -> Dict:
         """
         Collect real CT/PET slice prototypes BEFORE PET masking.
@@ -477,12 +478,14 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
             raise ValueError("mask batch size does not match feature batch size")
 
         batch_size = int(mask.shape[0])
+        need_report = bool(compute_report or print_info)
         call_info = {
             "batch_size": batch_size,
-            "scales": [],
             "valid_background": 0,
             "valid_foreground": 0,
         }
+        if need_report:
+            call_info["scales"] = []
 
         class_valid_at_build = {}
 
@@ -497,7 +500,7 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
                 "scale": scale_idx + 1,
                 "shape": list(ct.shape),
                 "classes": {},
-            }
+            } if need_report else None
 
             for class_idx, class_mask in enumerate(masks):
                 ct_proto, ct_valid = _masked_average_pool_2d(ct, class_mask)
@@ -520,13 +523,15 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
                         pet_proto[valid].detach().to("cpu", dtype=torch.float16)
                     )
 
-                scale_info["classes"][CLASS_NAMES[class_idx]] = {
-                    "valid_count": int(valid.sum().item()),
-                    "ct_proto_stats": _tensor_stats(ct_proto[valid]),
-                    "pet_proto_stats": _tensor_stats(pet_proto[valid]),
-                }
+                if need_report:
+                    scale_info["classes"][CLASS_NAMES[class_idx]] = {
+                        "valid_count": int(valid.sum().item()),
+                        "ct_proto_stats": _tensor_stats(ct_proto[valid]),
+                        "pet_proto_stats": _tensor_stats(pet_proto[valid]),
+                    }
 
-            call_info["scales"].append(scale_info)
+            if need_report:
+                call_info["scales"].append(scale_info)
 
         # Since validity is determined from the same slice mask, counts at build
         # stage represent records that will be aligned across all scales.

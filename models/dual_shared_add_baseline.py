@@ -71,6 +71,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 pet_feats=pet_feats_real,
                 mask=mask,
                 print_info=False,
+                compute_report=False,
             )
         return None
 

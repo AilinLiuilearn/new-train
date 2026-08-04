@@ -5,3 +5,4 @@ checkpoints_new/
 outputs/
 pretrained/
 wandb/
+prototype_memory_demo_outputs/
