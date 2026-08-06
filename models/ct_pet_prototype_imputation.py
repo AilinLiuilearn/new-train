@@ -101,6 +101,7 @@ import torch.nn.functional as F
 
 EPS = 1e-8
 CLASS_NAMES = ("background", "foreground")
+OUTLIER_DISCARD_RATE = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +202,47 @@ def _masked_average_pool_2d(
     proto = (feature * weight).sum(dim=(2, 3)) / denom.clamp_min(EPS)
     proto = torch.where(valid[:, None], proto, torch.zeros_like(proto))
     return proto, valid
+
+
+@torch.no_grad()
+def filter_cluster_member_indices(
+    build_features: torch.Tensor,
+    member_indices: torch.Tensor,
+    discard_rate: float = OUTLIER_DISCARD_RATE,
+) -> Tuple[torch.Tensor, Dict]:
+    if member_indices.ndim != 1:
+        raise ValueError("member_indices must be 1D")
+    member_indices = member_indices.long()
+    num_members = int(member_indices.numel())
+    if num_members == 0:
+        raise ValueError("member_indices cannot be empty")
+    if num_members <= 1:
+        kept = member_indices.clone().long()
+        return kept, {
+            "before_count": num_members,
+            "after_count": num_members,
+            "discarded_count": 0,
+            "discard_rate": float(discard_rate),
+            "distances": [],
+            "sorted_member_indices": kept.detach().cpu().tolist(),
+        }
+
+    cluster_features = build_features[member_indices]
+    center = cluster_features.mean(dim=0)
+    distances = torch.norm(cluster_features - center, dim=1)
+    sorted_local = torch.argsort(distances, dim=0, descending=False)
+    keep_num = max(1, int((1.0 - discard_rate) * num_members))
+    kept_local = sorted_local[:keep_num]
+    kept = member_indices[kept_local].long()
+    return kept, {
+        "before_count": num_members,
+        "after_count": int(kept.numel()),
+        "discarded_count": int(num_members - kept.numel()),
+        "discard_rate": float(discard_rate),
+        "distances": distances.detach().cpu().tolist(),
+        "sorted_member_indices": member_indices[sorted_local].detach().cpu().tolist(),
+        "kept_member_indices": kept.detach().cpu().tolist(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -594,7 +636,11 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
             class_report = {
                 "num_candidates": int(build_ct.shape[0]),
                 "num_effective_clusters": 0,
+                "cluster_counts_before_filter": [0] * self.num_clusters,
+                "cluster_counts_after_filter": [0] * self.num_clusters,
+                "cluster_discarded_counts": [0] * self.num_clusters,
                 "cluster_counts": [0] * self.num_clusters,
+                "discard_rate": float(OUTLIER_DISCARD_RATE),
             }
 
             if build_ct.shape[0] == 0:
@@ -607,6 +653,34 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
             )
             k_eff = int(centers.shape[0])
             class_report["num_effective_clusters"] = k_eff
+
+            cluster_member_cache = {}
+            for cluster_idx in range(k_eff):
+                member_indices = torch.nonzero(labels == cluster_idx, as_tuple=False).flatten().long()
+                before_count = int(member_indices.numel())
+                if before_count == 0:
+                    continue
+
+                kept_indices, filter_stats = filter_cluster_member_indices(
+                    build_features=build_ct.float(),
+                    member_indices=member_indices,
+                    discard_rate=OUTLIER_DISCARD_RATE,
+                )
+                kept_indices = kept_indices.long()
+                after_count = int(kept_indices.numel())
+                discarded_count = before_count - after_count
+                cluster_member_cache[cluster_idx] = {
+                    "member_indices": member_indices,
+                    "kept_indices": kept_indices,
+                    "filter_stats": filter_stats,
+                    "before_count": before_count,
+                    "after_count": after_count,
+                    "discarded_count": discarded_count,
+                }
+                class_report["cluster_counts_before_filter"][cluster_idx] = before_count
+                class_report["cluster_counts_after_filter"][cluster_idx] = after_count
+                class_report["cluster_discarded_counts"][cluster_idx] = discarded_count
+                class_report["cluster_counts"][cluster_idx] = after_count
 
             # Cache lists are appended with the same valid slice ordering at
             # every scale. Check alignment before aggregating.
@@ -621,13 +695,14 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
                     )
 
                 for cluster_idx in range(k_eff):
-                    member_mask = labels == cluster_idx
-                    count = int(member_mask.sum().item())
-                    if count == 0:
+                    cache_item = cluster_member_cache.get(cluster_idx)
+                    if cache_item is None:
                         continue
+                    kept_indices = cache_item["kept_indices"]
+                    after_count = cache_item["after_count"]
 
-                    ct_key = ct_all[member_mask].mean(dim=0)
-                    pet_value = pet_all[member_mask].mean(dim=0)
+                    ct_key = ct_all[kept_indices].mean(dim=0)
+                    pet_value = pet_all[kept_indices].mean(dim=0)
 
                     new_keys[scale_idx][class_idx, cluster_idx] = F.normalize(
                         ct_key, dim=0, eps=EPS
@@ -636,8 +711,7 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
 
                     if scale_idx == self.build_stage_idx:
                         new_ready[class_idx, cluster_idx] = True
-                        new_count[class_idx, cluster_idx] = count
-                        class_report["cluster_counts"][cluster_idx] = count
+                        new_count[class_idx, cluster_idx] = after_count
 
             report["classes"][class_name] = class_report
 
@@ -812,7 +886,7 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
 
         # Separate cluster-count plots for background and foreground.
         for class_idx, class_name in enumerate(CLASS_NAMES):
-            counts = self.prototype_count[class_idx].detach().cpu().numpy()
+            counts = np.array(self.prototype_count[class_idx].detach().cpu().tolist())
             fig = plt.figure(figsize=(7, 4))
             ax = fig.add_subplot(111)
             ax.bar(np.arange(self.num_clusters), counts)
@@ -831,8 +905,8 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
         for scale_idx in range(self.num_scales):
             keys = getattr(self, f"ct_keys_s{scale_idx + 1}").detach().cpu()
             values = getattr(self, f"pet_values_s{scale_idx + 1}").detach().cpu()
-            key_norm = keys.norm(dim=-1).reshape(-1).numpy()
-            value_norm = values.norm(dim=-1).reshape(-1).numpy()
+            key_norm = np.array(keys.norm(dim=-1).reshape(-1).detach().cpu().tolist())
+            value_norm = np.array(values.norm(dim=-1).reshape(-1).detach().cpu().tolist())
             labels = [
                 f"{CLASS_NAMES[c][0].upper()}{k}"
                 for c in range(2)
@@ -861,7 +935,7 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
             # CT-key cosine similarity heatmap.
             flat_keys = keys.reshape(-1, keys.shape[-1])
             flat_keys = _normalize_rows(flat_keys)
-            similarity = (flat_keys @ flat_keys.t()).numpy()
+            similarity = np.array((flat_keys @ flat_keys.t()).detach().cpu().tolist())
 
             fig = plt.figure(figsize=(6, 5))
             ax = fig.add_subplot(111)
@@ -895,13 +969,13 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
         attn_i = attn[idx].detach().float().cpu()  # [H*W,M]
         probs = attn_i.clamp_min(EPS)
 
-        top1 = probs.argmax(dim=-1).reshape(h, w).numpy()
+        top1 = np.array(probs.argmax(dim=-1).reshape(h, w).detach().cpu().tolist())
         entropy = -(probs * probs.log()).sum(dim=-1)
         valid_count = max(int(self.prototype_ready.sum().item()), 1)
         max_entropy = math.log(valid_count) if valid_count > 1 else 1.0
-        entropy = (entropy / max_entropy).reshape(h, w).numpy()
-        pet_norm = retrieved[idx].detach().float().cpu().norm(dim=0).numpy()
-        mean_usage = probs.mean(dim=0).numpy()
+        entropy = np.array((entropy / max_entropy).reshape(h, w).detach().cpu().tolist())
+        pet_norm = np.array(retrieved[idx].detach().float().cpu().norm(dim=0).tolist())
+        mean_usage = np.array(probs.mean(dim=0).detach().cpu().tolist())
 
         fig = plt.figure(figsize=(6, 5))
         ax = fig.add_subplot(111)
@@ -970,11 +1044,10 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
         )
         for class_name in CLASS_NAMES:
             item = report["classes"][class_name]
-            print(
-                f"  {class_name:10s}: candidates={item['num_candidates']:5d} "
-                f"effective_clusters={item['num_effective_clusters']} "
-                f"counts={item['cluster_counts']}"
-            )
+            print(f"  {class_name:10s}: candidates={item['num_candidates']:5d} effective_clusters={item['num_effective_clusters']}")
+            print(f"    before={item['cluster_counts_before_filter']}")
+            print(f"    after={item['cluster_counts_after_filter']}")
+            print(f"    discarded={item['cluster_discarded_counts']}")
         for scale_name, item in report["scales"].items():
             print(
                 f"  {scale_name}: C={item['channels']} "
@@ -1102,6 +1175,97 @@ def _make_synthetic_features(
     return ct_feats, pet_feats
 
 
+@torch.no_grad()
+def _run_outlier_filter_sanity_check() -> Dict:
+    build_features = torch.tensor(
+        [
+            [0.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [20.0, 20.0],
+        ],
+        dtype=torch.float32,
+    )
+    member_indices = torch.arange(build_features.shape[0], dtype=torch.long)
+    kept_indices, stats = filter_cluster_member_indices(
+        build_features=build_features,
+        member_indices=member_indices,
+        discard_rate=OUTLIER_DISCARD_RATE,
+    )
+    assert int(stats["before_count"]) == 5
+    assert int(stats["after_count"]) == 4
+    assert int(stats["discarded_count"]) == 1
+    assert kept_indices.dtype == torch.long
+    assert 4 not in kept_indices.tolist()
+    print(
+        "[OutlierFilterDemo] before=5 after=4 discarded=1 kept_indices=",
+        kept_indices.tolist(),
+    )
+    return stats
+
+
+@torch.no_grad()
+def _run_deterministic_bank_build_check(seed: int, channels: Sequence[int], spatial_sizes: Sequence[int], num_clusters: int, build_stage: int, device: torch.device) -> Dict:
+    def _build_once(run_seed: int):
+        random.seed(run_seed)
+        np.random.seed(run_seed)
+        torch.manual_seed(run_seed)
+        memory = CrossScaleCTPETPrototypeMemory(
+            channels=channels,
+            num_clusters=num_clusters,
+            build_stage=build_stage,
+            output_dir=str(Path("/tmp") / f"cppi_det_{run_seed}"),
+        ).to(device)
+        memory.train()
+        local_rng = random.Random(run_seed)
+        for _ in range(3):
+            mask = _make_small_lesion_masks(
+                batch_size=4,
+                image_size=128,
+                rng=local_rng,
+                device=device,
+            )
+            ct_feats, pet_feats = _make_synthetic_features(
+                mask=mask,
+                channels=channels,
+                spatial_sizes=spatial_sizes,
+                device=device,
+            )
+            memory.collect(
+                ct_feats=ct_feats,
+                pet_feats=pet_feats,
+                mask=mask,
+                print_info=False,
+                compute_report=False,
+            )
+        report = memory.finalize_epoch(
+            epoch=1,
+            save_json=False,
+            save_visualizations=False,
+            print_info=False,
+        )
+        return memory, report
+
+    mem1, rep1 = _build_once(seed)
+    mem2, rep2 = _build_once(seed)
+
+    comparisons = {}
+    for scale_idx in range(len(channels)):
+        k1 = getattr(mem1, f"ct_keys_s{scale_idx + 1}")
+        k2 = getattr(mem2, f"ct_keys_s{scale_idx + 1}")
+        v1 = getattr(mem1, f"pet_values_s{scale_idx + 1}")
+        v2 = getattr(mem2, f"pet_values_s{scale_idx + 1}")
+        comparisons[f"scale_{scale_idx + 1}"] = {
+            "ct_keys_close": bool(torch.allclose(k1, k2)),
+            "pet_values_close": bool(torch.allclose(v1, v2)),
+        }
+    assert rep1["bank_version_after"] == rep2["bank_version_after"]
+    assert mem1.bank_ready == mem2.bank_ready
+    print("[DeterminismDemo] repeated bank build produced identical keys/values")
+    return {"report1": rep1, "report2": rep2, "comparisons": comparisons}
+
+
 def run_demo(args: argparse.Namespace) -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -1116,6 +1280,16 @@ def run_demo(args: argparse.Namespace) -> None:
     channels = (16, 32, 64, 96)
     spatial_sizes = (64, 32, 16, 8)
     output_dir = Path(args.output_dir)
+
+    _run_outlier_filter_sanity_check()
+    _run_deterministic_bank_build_check(
+        seed=args.seed,
+        channels=(8, 16, 32, 48),
+        spatial_sizes=(32, 16, 8, 4),
+        num_clusters=3,
+        build_stage=4,
+        device=device,
+    )
 
     memory = CrossScaleCTPETPrototypeMemory(
         channels=channels,
@@ -1146,6 +1320,7 @@ def run_demo(args: argparse.Namespace) -> None:
             pet_feats=pet_feats,
             mask=mask,
             print_info=True,
+            compute_report=True,
         )
         collect_reports.append(info)
 
@@ -1155,6 +1330,8 @@ def run_demo(args: argparse.Namespace) -> None:
         save_visualizations=True,
         print_info=True,
     )
+    assert memory.bank_ready
+    assert int(memory.bank_version.item()) >= 1
 
     # One missing retrieval pass.
     mask = _make_small_lesion_masks(
@@ -1175,7 +1352,12 @@ def run_demo(args: argparse.Namespace) -> None:
         tag="demo_missing",
         visualize_batch_index=0,
         print_info=True,
+        compute_report=True,
     )
+    assert len(pet_proxy) == len(ct_feats)
+    for idx, (proxy, ct_feat) in enumerate(zip(pet_proxy, ct_feats)):
+        assert proxy.shape == ct_feat.shape
+        assert fused[idx].shape == ct_feat.shape
 
     # Verify differentiability through CT query and attention projections.
     demo_loss = sum(x.square().mean() for x in fused)

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from models.baseline_blocks import AddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
+from models.baseline_blocks import StateAwareWeightedAddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.ct_pet_prototype_imputation import CrossScaleCTPETPrototypeMemory
 
@@ -22,7 +22,7 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
-    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=4, cppi_build_stage=4, cppi_output_dir=None):
+    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=6, cppi_build_stage=3, cppi_output_dir=None):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
@@ -32,7 +32,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         ct_channels = list(self.enc_ct.feature_info.channels())
         pet_channels = list(self.enc_pet.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
-        self.fusion = AddFusion()
+        self.fusion = StateAwareWeightedAddFusion(num_scales=len(pet_channels))
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
         self.prototype_memory = CrossScaleCTPETPrototypeMemory(
             channels=pet_channels,
@@ -87,7 +87,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
         self._collect_cppi(ct_feats, pet_feats_real, mask)
-        fused_feats = self.fusion(ct_feats, pet_feats_real, None)
+        fused_feats = self.fusion(ct_feats, pet_feats_real, mode='full')
         return self._decode(fused_feats, target_size)
 
     def _forward_missing(self, ct, pet, target_size, mask=None):
@@ -100,7 +100,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
             save_diagnostics=False,
             print_info=False,
         )
-        fused_feats = self.fusion(ct_feats, pet_feats_proxy, None)
+        fused_feats = self.fusion(ct_feats, pet_feats_proxy, mode='missing')
         return self._decode(fused_feats, target_size)
 
     def _forward_auto(self, ct, pet, pet_available, target_size, mask=None):
@@ -123,7 +123,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
         for feat_real, feat_proxy in zip(pet_feats_real, pet_feats_proxy):
             availability_mask = availability.to(device=feat_real.device, dtype=feat_real.dtype)
             pet_selected.append(feat_real * availability_mask + feat_proxy * (1.0 - availability_mask))
-        fused_feats = self.fusion(ct_feats, pet_selected, None)
+        fused_feats = self.fusion(
+            ct_feats,
+            pet_selected,
+            mode='auto',
+            pet_available=pet_available,
+        )
         return self._decode(fused_feats, target_size)
 
     @torch.no_grad()

@@ -62,3 +62,58 @@ class AddFusion(nn.Module):
                 pet_feat = F.interpolate(pet_feat, size=ct_feat.shape[-2:], mode='bilinear', align_corners=False)
             fused.append(_sanitize(ct_feat + pet_feat))
         return fused
+
+
+class StateAwareWeightedAddFusion(nn.Module):
+    def __init__(self, num_scales=4):
+        super().__init__()
+        self.num_scales = int(num_scales)
+        self.raw_alpha_full = nn.Parameter(torch.zeros(self.num_scales))
+        self.raw_alpha_missing = nn.Parameter(
+            torch.full((self.num_scales,), -2.944)
+        )
+
+    @property
+    def alpha_full(self):
+        return 2.0 * torch.sigmoid(self.raw_alpha_full)
+
+    @property
+    def alpha_missing(self):
+        return 2.0 * torch.sigmoid(self.raw_alpha_missing)
+
+    def forward(self, ct_feats, pet_feats, mode, pet_available=None):
+        if len(ct_feats) != self.num_scales or len(pet_feats) != self.num_scales:
+            raise ValueError(
+                f'Expected {self.num_scales} CT/PET scales, got '
+                f'{len(ct_feats)} and {len(pet_feats)}'
+            )
+        if mode == 'full':
+            alpha = self.alpha_full
+        elif mode == 'missing':
+            alpha = self.alpha_missing
+        elif mode == 'auto':
+            if pet_available is None:
+                raise ValueError('pet_available is required for auto fusion')
+            pet_available = pet_available.view(-1, 1, 1, 1)
+            alpha = None
+        else:
+            raise ValueError(f'Unsupported fusion mode: {mode}')
+
+        fused = []
+        for scale_idx, (ct_feat, pet_feat) in enumerate(zip(ct_feats, pet_feats)):
+            if pet_feat.shape[-2:] != ct_feat.shape[-2:]:
+                pet_feat = F.interpolate(
+                    pet_feat,
+                    size=ct_feat.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False,
+                )
+            if mode == 'auto':
+                availability = pet_available.to(device=ct_feat.device, dtype=ct_feat.dtype)
+                full_weight = self.alpha_full[scale_idx].to(device=ct_feat.device, dtype=ct_feat.dtype)
+                missing_weight = self.alpha_missing[scale_idx].to(device=ct_feat.device, dtype=ct_feat.dtype)
+                weight = availability * full_weight + (1.0 - availability) * missing_weight
+            else:
+                weight = alpha[scale_idx].to(device=ct_feat.device, dtype=ct_feat.dtype)
+            fused.append(_sanitize(ct_feat + weight * pet_feat))
+        return fused
