@@ -43,6 +43,8 @@ def _loaders(cfg):
 
 
 def _assert_baseline(cfg):
+    if getattr(cfg, 'model_arch', 'dual_shared_add_baseline') == 'ct_only_baseline':
+        return
     assert cfg.accumulation_steps == 1
     assert float(cfg.train_pet_drop_prob) == 0.0
     assert float(cfg.missing_loss_weight) == 1.0
@@ -78,6 +80,88 @@ def _count_parameters(model):
     return total, trainable
 
 
+def _run_ct_only_training(cfg, train_loader, val_loader, task):
+    total_params, trainable_params = _count_parameters(task.model)
+    print(f'[INFO] ct_only params_total={total_params} params_trainable={trainable_params}', flush=True)
+    task.scheduler = get_cosine_scheduler(
+        task.optimizer,
+        epochs=cfg.epochs,
+        warmup_steps=cfg.cosine_warmup * len(train_loader),
+        min_lr=cfg.cosine_min_lr,
+        steps_per_epoch=len(train_loader),
+        flat_ratio=cfg.lr_flat_ratio,
+    )
+    log_path = os.path.join(cfg.checkpoint_dir, 'train_ct_only_log.csv')
+    init_train_log(log_path)
+    paths = _checkpoint_paths(cfg.checkpoint_dir)
+    best_dice = -1.0
+    no_improve = 0
+    amp_enabled = bool(cfg.mixed_precision)
+
+    for epoch in range(1, cfg.epochs + 1):
+        task.model.train()
+        total_loss = 0.0
+        batch_count = 0
+        grad_norm_accum = 0.0
+        epoch_start = time.time()
+        for batch_idx, batch in enumerate(train_loader):
+            task.optimizer.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
+                loss, _, _, _ = task.train_ct_only_step(batch)
+            if not torch.isfinite(loss):
+                raise RuntimeError('CT-only loss became non-finite')
+            if task.scaler.is_enabled():
+                task.scaler.scale(loss).backward()
+                task.scaler.unscale_(task.optimizer)
+            else:
+                loss.backward()
+            total_grad_norm = torch.nn.utils.clip_grad_norm_(
+                task.trainable_parameters(), float(cfg.grad_clip)
+            ) if float(cfg.grad_clip) > 0 else torch.tensor(0.0, device=loss.device)
+            grad_norm_accum += float(total_grad_norm)
+            if task.scaler.is_enabled():
+                task.scaler.step(task.optimizer)
+                task.scaler.update()
+            else:
+                task.optimizer.step()
+            task.scheduler.step()
+            total_loss += float(loss.detach())
+            batch_count += 1
+            if (batch_idx + 1) % 100 == 0:
+                print(f'[CT-ONLY BATCH {batch_idx + 1}] loss={float(loss.detach()):.6f}', flush=True)
+
+        val_ct = task.evaluate_ct_only(val_loader)
+        train_loss = total_loss / max(1, batch_count)
+        avg_grad_norm = grad_norm_accum / max(1, batch_count)
+        improved = val_ct['dice'] > best_dice
+        if improved:
+            best_dice = val_ct['dice']
+            no_improve = 0
+            task.save_checkpoint(paths['best_joint'], epoch, best_dice, best_dice, best_dice, epoch, val_ct, val_ct, best_dice)
+        else:
+            no_improve += 1
+        task.save_checkpoint(paths['last'], epoch, best_dice, best_dice, best_dice, epoch, val_ct, val_ct, best_dice)
+        append_epoch_log(
+            log_path,
+            epoch,
+            train_loss,
+            val_ct,
+            lr=task.optimizer.param_groups[0]['lr'],
+            grad_norm=avg_grad_norm,
+        )
+        print(
+            f'[CT-ONLY EPOCH {epoch}] train_loss={train_loss:.4f} '
+            f'val_loss={val_ct["total_loss"]:.4f} val_dice={val_ct["dice"]:.4f} '
+            f'best_dice={best_dice:.4f} lr={task.optimizer.param_groups[0]["lr"]:.8f} '
+            f'time={time.time() - epoch_start:.1f}s',
+            flush=True,
+        )
+        if no_improve >= int(cfg.early_stop_patience):
+            print(f'[CT-ONLY EARLY STOP] no improvement for {cfg.early_stop_patience} epochs', flush=True)
+            break
+    print('[CT-ONLY] done', flush=True)
+
+
 def main():
     print('[INFO] starting baseline training', flush=True)
     cfg = SegMDTConfig.parse_arguments()
@@ -91,6 +175,9 @@ def main():
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)}', flush=True)
 
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
+    if getattr(cfg, 'model_arch', 'dual_shared_add_baseline') == 'ct_only_baseline':
+        _run_ct_only_training(cfg, train_loader, val_loader, task)
+        return
     total_params, trainable_params = _count_parameters(task.model)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
     task.scheduler = get_cosine_scheduler(

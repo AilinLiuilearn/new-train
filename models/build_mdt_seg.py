@@ -350,6 +350,23 @@ class ConvBNAct(nn.Module):
 
 
 def build_mdt_seg_teacher(config):
+    if getattr(config, 'model_arch', 'dual_shared_add_baseline') == 'ct_only_baseline':
+        from models.ct_only_baseline import CTOnlyUNetStyle
+        model = CTOnlyUNetStyle(
+            ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
+            ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
+            in_channels=3,
+            out_channels=1,
+            decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
+            use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
+        )
+        print(
+            f'[ct_only_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
+            f'decoder=UNetStyleDecoder '
+            f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
+        )
+        return {'model': model}
+
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
     cppi_num_clusters = getattr(config, 'cppi_num_clusters', 6)
     cppi_build_stage = getattr(config, 'cppi_build_stage', 3)

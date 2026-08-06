@@ -49,6 +49,19 @@ class MDTSegTeacher:
         }
         return loss, logits, outputs, stats
 
+    def train_ct_only_step(self, batch):
+        ct = batch['ct'].to(self.device, non_blocking=True)
+        mask = batch['mask'].to(self.device, non_blocking=True).float()
+        outputs = self.model(ct, forward_mode='ct_only')
+        logits = outputs['logits'] if isinstance(outputs, dict) else outputs
+        loss, loss_stats = self.criterion(logits, mask)
+        stats = {
+            'loss_total': loss.detach(),
+            'loss_seg': loss_stats.get('loss_dice', loss.detach()),
+            'loss_boundary': torch.tensor(0.0, device=loss.device),
+        }
+        return loss, logits, outputs, stats
+
     @torch.no_grad()
     def evaluate(self, loader, eval_mode='full', tag='val'):
         was_training = self.model.training
@@ -77,6 +90,28 @@ class MDTSegTeacher:
             outputs = self.model(ct, pet=pet, pet_available=pet_available, forward_mode=forward_mode, mask=None)
             logits = outputs['logits'] if isinstance(outputs, dict) else outputs
             loss, _ = self.criterion(logits, mask)
+            self.metrics.update(logits, mask)
+            total_loss += float(loss) * batch_size
+            sample_count += batch_size
+        out = self.metrics.compute()
+        out['total_loss'] = total_loss / max(1, sample_count)
+        self.model.train(was_training)
+        return out
+
+    @torch.no_grad()
+    def evaluate_ct_only(self, loader, tag='val_ct_only'):
+        was_training = self.model.training
+        self.model.eval()
+        total_loss = 0.0
+        sample_count = 0
+        self.metrics.reset()
+        for batch in loader:
+            ct = batch['ct'].to(self.device, non_blocking=True)
+            mask = batch['mask'].to(self.device, non_blocking=True).float()
+            outputs = self.model(ct, forward_mode='ct_only')
+            logits = outputs['logits'] if isinstance(outputs, dict) else outputs
+            loss, _ = self.criterion(logits, mask)
+            batch_size = ct.shape[0]
             self.metrics.update(logits, mask)
             total_loss += float(loss) * batch_size
             sample_count += batch_size
