@@ -412,9 +412,10 @@ class MemoryConfig:
             raise ValueError("channels cannot be empty")
         if self.num_clusters < 1:
             raise ValueError("num_clusters must be >= 1")
-        if not (1 <= self.build_stage <= len(self.channels)):
+        max_build_stage = len(self.channels) + 1
+        if not (1 <= self.build_stage <= max_build_stage):
             raise ValueError(
-                f"build_stage must be within [1,{len(self.channels)}], got {self.build_stage}"
+                f"build_stage must be within [1,{max_build_stage}], got {self.build_stage}"
             )
 
 
@@ -446,7 +447,11 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
         self.channels = self.config.channels
         self.num_scales = len(self.channels)
         self.num_clusters = self.config.num_clusters
-        self.build_stage_idx = self.config.build_stage - 1
+        self.build_stage_idx = (
+            self.config.build_stage - 1
+            if self.config.build_stage <= self.num_scales
+            else None
+        )
         self.output_dir = _ensure_dir(Path(self.config.output_dir))
         self.json_dir = _ensure_dir(self.output_dir / "json")
         self.vis_dir = _ensure_dir(self.output_dir / "visualizations")
@@ -554,7 +559,10 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
                     original_fg_valid = mask.flatten(1).sum(dim=1) > EPS
                     valid = valid & original_fg_valid
 
-                if scale_idx == self.build_stage_idx:
+                if (
+                    scale_idx == self.build_stage_idx
+                    or (self.build_stage_idx is None and scale_idx == 0)
+                ):
                     class_valid_at_build[class_idx] = valid.detach().cpu()
 
                 if valid.any():
@@ -616,6 +624,16 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
             "bank_version_before": int(self.bank_version.item()),
             "classes": {},
             "scales": {},
+            "build_mode": (
+                "concatenated_multiscale"
+                if self.build_stage_idx is None
+                else f"single_scale_{self.build_stage_idx + 1}"
+            ),
+            "build_feature_channels": (
+                int(sum(self.channels))
+                if self.build_stage_idx is None
+                else int(self.channels[self.build_stage_idx])
+            ),
         }
 
         # Build temporary banks first, so incomplete classes do not corrupt
@@ -632,7 +650,24 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
         new_count = torch.zeros_like(self.prototype_count, device="cpu")
 
         for class_idx, class_name in enumerate(CLASS_NAMES):
-            build_ct = self._concat_cache(class_idx, "ct", self.build_stage_idx)
+            if self.build_stage_idx is None:
+                scale_ct = [
+                    self._concat_cache(class_idx, "ct", scale_idx).float()
+                    for scale_idx in range(self.num_scales)
+                ]
+                candidate_counts = [int(features.shape[0]) for features in scale_ct]
+                if len(set(candidate_counts)) != 1:
+                    raise RuntimeError(
+                        "Cross-scale CT cache alignment failed for concatenated build mode: "
+                        f"class={class_name}, counts={candidate_counts}"
+                    )
+                build_ct = (
+                    torch.cat(scale_ct, dim=-1)
+                    if candidate_counts[0] > 0
+                    else torch.empty(0, sum(self.channels), dtype=torch.float32)
+                )
+            else:
+                build_ct = self._concat_cache(class_idx, "ct", self.build_stage_idx)
             class_report = {
                 "num_candidates": int(build_ct.shape[0]),
                 "num_effective_clusters": 0,
@@ -709,7 +744,10 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
                     )
                     new_values[scale_idx][class_idx, cluster_idx] = pet_value
 
-                    if scale_idx == self.build_stage_idx:
+                    if (
+                        scale_idx == self.build_stage_idx
+                        or (self.build_stage_idx is None and scale_idx == 0)
+                    ):
                         new_ready[class_idx, cluster_idx] = True
                         new_count[class_idx, cluster_idx] = after_count
 
