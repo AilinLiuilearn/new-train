@@ -832,6 +832,7 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
         visualize_batch_index: int = 0,
         print_info: bool = False,
         compute_report: bool = False,
+        return_ct_reference: bool = False,
     ) -> Tuple[List[torch.Tensor], Dict]:
         """
         Retrieve PET proxy features for a Missing batch.
@@ -845,6 +846,7 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
         ready_flat = self.prototype_ready.flatten()
 
         outputs: List[torch.Tensor] = []
+        ct_references: List[torch.Tensor] = []
         need_report = bool(compute_report or save_diagnostics or print_info)
         report = {
             "tag": tag,
@@ -868,6 +870,10 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
 
             retrieved, attn = self.attention[scale_idx](ct, keys, values, ready)
             outputs.append(retrieved)
+            if return_ct_reference:
+                ct_reference_tokens = torch.matmul(attn, keys)
+                ct_reference = ct_reference_tokens.transpose(1, 2).reshape_as(ct)
+                ct_references.append(ct_reference)
 
             if need_report:
                 probs = attn.float().clamp_min(EPS)
@@ -905,6 +911,8 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
             _save_json(report, self.json_dir / f"retrieval_{tag}.json")
         if print_info:
             self._print_retrieval_report(report)
+        if return_ct_reference:
+            return outputs, ct_references, report
         return outputs, report
 
     def fuse_missing(

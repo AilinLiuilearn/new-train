@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from models.baseline_blocks import StateAwareWeightedAddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
+from models.baseline_blocks import PrototypeReferencedPETAffineCalibration, StateAwareWeightedAddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.ct_pet_prototype_imputation import CrossScaleCTPETPrototypeMemory
 
@@ -32,6 +32,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         ct_channels = list(self.enc_ct.feature_info.channels())
         pet_channels = list(self.enc_pet.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
+        self.pet_calibration = PrototypeReferencedPETAffineCalibration(channels=pet_channels)
         self.fusion = StateAwareWeightedAddFusion(num_scales=len(pet_channels))
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
         self.prototype_memory = CrossScaleCTPETPrototypeMemory(
@@ -75,54 +76,93 @@ class DualSharedAddPETCTBaseline(nn.Module):
             )
         return None
 
-    def _retrieve_cppi(self, ct_feats, compute_report=False, save_diagnostics=False, print_info=False):
+    def _retrieve_cppi(self, ct_feats, compute_report=False, save_diagnostics=False, print_info=False, return_ct_reference=False):
         return self.prototype_memory.retrieve(
             ct_feats,
             compute_report=compute_report,
             save_diagnostics=save_diagnostics,
             print_info=print_info,
+            return_ct_reference=return_ct_reference,
         )
 
     def _forward_full(self, ct, pet, target_size, mask=None):
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
         self._collect_cppi(ct_feats, pet_feats_real, mask)
-        fused_feats = self.fusion(ct_feats, pet_feats_real, mode='full')
+        if self.prototype_memory.bank_ready:
+            _, ct_reference_feats, _ = self._retrieve_cppi(
+                ct_feats,
+                compute_report=False,
+                save_diagnostics=False,
+                print_info=False,
+                return_ct_reference=True,
+            )
+            ct_reference_feats = [x.detach() for x in ct_reference_feats]
+            pet_feats_cal = self.pet_calibration(
+                ct_feats,
+                pet_feats_real,
+                ct_reference_feats,
+                reference_valid=True,
+            )
+        else:
+            pet_feats_cal = self.pet_calibration(
+                ct_feats,
+                pet_feats_real,
+                None,
+                reference_valid=False,
+            )
+        fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='full')
         return self._decode(fused_feats, target_size)
 
     def _forward_missing(self, ct, pet, target_size, mask=None):
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
         self._collect_cppi(ct_feats, pet_feats_real, mask)
-        pet_feats_proxy, _ = self._retrieve_cppi(
+        pet_feats_proxy, ct_reference_feats, _ = self._retrieve_cppi(
             ct_feats,
             compute_report=False,
             save_diagnostics=False,
             print_info=False,
+            return_ct_reference=True,
         )
-        fused_feats = self.fusion(ct_feats, pet_feats_proxy, mode='missing')
+        ct_reference_feats = [x.detach() for x in ct_reference_feats]
+        pet_feats_cal = self.pet_calibration(
+            ct_feats,
+            pet_feats_proxy,
+            ct_reference_feats,
+            reference_valid=self.prototype_memory.bank_ready,
+        )
+        fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='missing')
         return self._decode(fused_feats, target_size)
 
     def _forward_auto(self, ct, pet, pet_available, target_size, mask=None):
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
         self._collect_cppi(ct_feats, pet_feats_real, mask)
-        pet_feats_proxy, _ = self._retrieve_cppi(
+        pet_feats_proxy, ct_reference_feats, _ = self._retrieve_cppi(
             ct_feats,
             compute_report=False,
             save_diagnostics=False,
             print_info=False,
+            return_ct_reference=True,
         )
-        pet_available = pet_available.to(device=ct.device).long().view(-1)
-        if pet_available.numel() != ct.shape[0]:
-            raise ValueError('pet_available must contain one state per sample')
-        if not torch.all((pet_available == 0) | (pet_available == 1)):
-            raise ValueError('pet_available values must be 0 or 1')
+        ct_reference_feats = [x.detach() for x in ct_reference_feats]
         pet_selected = []
-        availability = pet_available.view(-1, 1, 1, 1)
+        availability = pet_available.to(device=ct.device).long().view(-1)
+        if availability.numel() != ct.shape[0]:
+            raise ValueError('pet_available must contain one state per sample')
+        if not torch.all((availability == 0) | (availability == 1)):
+            raise ValueError('pet_available values must be 0 or 1')
+        availability = availability.view(-1, 1, 1, 1)
         for feat_real, feat_proxy in zip(pet_feats_real, pet_feats_proxy):
             availability_mask = availability.to(device=feat_real.device, dtype=feat_real.dtype)
             pet_selected.append(feat_real * availability_mask + feat_proxy * (1.0 - availability_mask))
+        pet_selected = self.pet_calibration(
+            ct_feats,
+            pet_selected,
+            ct_reference_feats,
+            reference_valid=self.prototype_memory.bank_ready,
+        )
         fused_feats = self.fusion(
             ct_feats,
             pet_selected,

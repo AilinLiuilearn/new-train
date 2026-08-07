@@ -72,6 +72,18 @@ def _checkpoint_paths(checkpoint_dir):
     }
 
 
+def _load_state_dict_with_report(model, checkpoint_path):
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    state_dict = checkpoint.get('model', checkpoint)
+    result = model.load_state_dict(state_dict, strict=False)
+    missing_keys = list(result.missing_keys)
+    unexpected_keys = list(result.unexpected_keys)
+    print(f'[RESUME] checkpoint={checkpoint_path}', flush=True)
+    print(f'[RESUME] missing_keys={missing_keys}', flush=True)
+    print(f'[RESUME] unexpected_keys={unexpected_keys}', flush=True)
+    return checkpoint
+
+
 def _count_parameters(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -91,6 +103,8 @@ def main():
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)}', flush=True)
 
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
+    if getattr(cfg, 'resume_checkpoint', None):
+        _load_state_dict_with_report(task.model, cfg.resume_checkpoint)
     total_params, trainable_params = _count_parameters(task.model)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
     task.scheduler = get_cosine_scheduler(

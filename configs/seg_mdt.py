@@ -37,6 +37,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--enable_gradient_diagnostics', type=str2bool, default=False)
         p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
+        p.add_argument('--resume_checkpoint', type=str, default=None)
         return p
 
     @staticmethod

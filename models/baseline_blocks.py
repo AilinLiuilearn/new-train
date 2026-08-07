@@ -117,3 +117,65 @@ class StateAwareWeightedAddFusion(nn.Module):
                 weight = alpha[scale_idx].to(device=ct_feat.device, dtype=ct_feat.dtype)
             fused.append(_sanitize(ct_feat + weight * pet_feat))
         return fused
+
+
+class PrototypeReferencedPETAffineCalibration(nn.Module):
+    """PET representation calibration layer, not the final PET-CT fusion module.
+
+    Its role is to reuse CPPI retrieval attention, reconstruct a CT prototype
+    reference, estimate current-patient CT-to-prototype discrepancy, and use
+    that discrepancy to affine-calibrate either real PET or retrieved PET
+    proxy. Full and Missing share the same calibration parameters.
+    """
+
+    def __init__(self, channels):
+        super().__init__()
+        self.channels = list(int(c) for c in channels)
+        self.heads = nn.ModuleList()
+        for c in self.channels:
+            hidden = max(c // 4, 16)
+            head = nn.Sequential(
+                nn.Linear(c, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, 2 * c),
+            )
+            nn.init.zeros_(head[-1].weight)
+            nn.init.zeros_(head[-1].bias)
+            self.heads.append(head)
+
+    def forward(self, ct_feats, pet_evidence_feats, ct_reference_feats, reference_valid=True):
+        if not reference_valid:
+            return [_sanitize(pet) for pet in pet_evidence_feats]
+        if ct_reference_feats is None:
+            return [_sanitize(pet) for pet in pet_evidence_feats]
+        if len(ct_feats) != len(pet_evidence_feats) or len(ct_feats) != len(ct_reference_feats):
+            raise ValueError('CT, PET evidence, and CT reference must have the same scale count')
+
+        calibrated = []
+        for scale_idx, (ct, pet, ct_ref) in enumerate(zip(ct_feats, pet_evidence_feats, ct_reference_feats)):
+            if ct.shape != pet.shape:
+                if pet.shape[-2:] != ct.shape[-2:]:
+                    pet = F.interpolate(pet, size=ct.shape[-2:], mode='bilinear', align_corners=False)
+                if ct_ref.shape[-2:] != ct.shape[-2:]:
+                    ct_ref = F.interpolate(ct_ref, size=ct.shape[-2:], mode='bilinear', align_corners=False)
+            if ct.shape != pet.shape or ct.shape != ct_ref.shape:
+                raise ValueError(
+                    f'Shape mismatch at scale {scale_idx + 1}: '
+                    f'ct={tuple(ct.shape)}, pet={tuple(pet.shape)}, ref={tuple(ct_ref.shape)}'
+                )
+
+            ct_tokens = F.normalize(ct.flatten(2).transpose(1, 2), p=2, dim=-1, eps=1e-6)
+            ref_tokens = F.normalize(ct_ref.flatten(2).transpose(1, 2), p=2, dim=-1, eps=1e-6)
+            delta = (ct_tokens - ref_tokens).mean(dim=1)
+            affine = self.heads[scale_idx](delta)
+            raw_gamma, raw_beta = affine.chunk(2, dim=-1)
+            gamma = torch.tanh(raw_gamma).view(ct.shape[0], ct.shape[1], 1, 1)
+            beta = torch.tanh(raw_beta).view(ct.shape[0], ct.shape[1], 1, 1)
+
+            mu = pet.mean(dim=(2, 3), keepdim=True)
+            var = (pet - mu).pow(2).mean(dim=(2, 3), keepdim=True)
+            sigma = torch.sqrt(var + 1e-6)
+            normalized_pet = (pet - mu) / sigma
+            pet_calibrated = mu + sigma * ((1.0 + gamma) * normalized_pet + beta)
+            calibrated.append(_sanitize(pet_calibrated))
+        return calibrated
