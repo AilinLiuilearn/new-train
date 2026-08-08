@@ -153,6 +153,8 @@ class PrototypeReferencedPETAffineCalibration(nn.Module):
 
         calibrated = []
         for scale_idx, (ct, pet, ct_ref) in enumerate(zip(ct_feats, pet_evidence_feats, ct_reference_feats)):
+            ct = ct.detach()
+            ct_ref = ct_ref.detach()
             if ct.shape != pet.shape:
                 if pet.shape[-2:] != ct.shape[-2:]:
                     pet = F.interpolate(pet, size=ct.shape[-2:], mode='bilinear', align_corners=False)
@@ -172,10 +174,6 @@ class PrototypeReferencedPETAffineCalibration(nn.Module):
             gamma = torch.tanh(raw_gamma).view(ct.shape[0], ct.shape[1], 1, 1)
             beta = torch.tanh(raw_beta).view(ct.shape[0], ct.shape[1], 1, 1)
 
-            mu = pet.mean(dim=(2, 3), keepdim=True)
-            var = (pet - mu).pow(2).mean(dim=(2, 3), keepdim=True)
-            sigma = torch.sqrt(var + 1e-6)
-            normalized_pet = (pet - mu) / sigma
-            pet_calibrated = mu + sigma * ((1.0 + gamma) * normalized_pet + beta)
+            pet_calibrated = pet + gamma * (pet - pet.mean(dim=(2, 3), keepdim=True)) + beta
             calibrated.append(_sanitize(pet_calibrated))
         return calibrated

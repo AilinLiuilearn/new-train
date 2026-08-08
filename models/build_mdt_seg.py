@@ -354,11 +354,12 @@ def build_mdt_seg_teacher(config):
     cppi_num_clusters = getattr(config, 'cppi_num_clusters', 6)
     cppi_build_stage = getattr(config, 'cppi_build_stage', 3)
     cppi_output_dir = os.path.join(config.checkpoint_dir, 'cppi')
+    no_encoder_pretrained = bool(getattr(config, 'no_encoder_pretrained', False))
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
-        ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
-        pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
+        ct_pretrained_path=None if no_encoder_pretrained else getattr(config, 'ct_pretrained_path', None),
+        pet_pretrained_path=None if no_encoder_pretrained else getattr(config, 'pet_pretrained_path', None),
         in_channels=3,
         out_channels=1,
         decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),

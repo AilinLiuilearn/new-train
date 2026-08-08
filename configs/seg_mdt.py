@@ -27,6 +27,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--pet_backbone', type=str, default='mit_b1')
         p.add_argument('--ct_pretrained_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano')
         p.add_argument('--pet_pretrained_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1')
+        p.add_argument('--no_encoder_pretrained', type=str2bool, default=False)
         p.add_argument('--decoder_channels', type=int, nargs=4, default=[512, 256, 128, 64])
         p.add_argument('--use_deep_supervision', type=str2bool, default=False)
         p.add_argument('--deep_supervision', type=str2bool, default=False)
