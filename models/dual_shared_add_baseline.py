@@ -33,23 +33,41 @@ class DualSharedAddPETCTBaseline(nn.Module):
         load_local_weights_safe(self.enc_pet, pet_pretrained_path, name='PET_Encoder')
         ct_channels = list(self.enc_ct.feature_info.channels())
         pet_channels = list(self.enc_pet.feature_info.channels())
-        if len(ct_channels) != len(pet_channels):
-            raise ValueError(f'CT and PET encoders must expose the same number of scales, got {len(ct_channels)} and {len(pet_channels)}')
+        if len(ct_channels) != 4 or len(pet_channels) != 4:
+            raise ValueError(
+                f'CT and PET encoders must each expose exactly 4 scales, got '
+                f'{len(ct_channels)} and {len(pet_channels)}'
+            )
+        cdr_heads = (2, 4, 8, 16)
+        cdr_groups = (1, 2, 4, 8)
+        cdr_sampling_strides = (8, 4, 2, 1)
+        if not (
+            len(pet_channels) == len(cdr_heads) == len(cdr_groups) == len(cdr_sampling_strides) == 4
+        ):
+            raise ValueError(
+                'CDR fusion configuration must have exactly four scales '
+                'with matching heads, groups, and sampling strides'
+            )
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
         self.pet_calibration = PrototypeReferencedPETAffineCalibration(channels=pet_channels)
         self.fusion = nn.ModuleList([
             CDRDSCFFusion2D(
                 in_channels=channels,
                 low_rank_ratio=0.125,
-                num_heads=4,
-                num_groups=4,
-                sampling_stride=4,
+                num_heads=heads,
+                num_groups=groups,
+                sampling_stride=stride,
                 offset_kernel_size=5,
                 use_position_bias=True,
                 attention_residual_init=1e-3,
                 dropout=0.0,
             )
-            for channels in pet_channels
+            for channels, heads, groups, stride in zip(
+                pet_channels,
+                cdr_heads,
+                cdr_groups,
+                cdr_sampling_strides,
+            )
         ])
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
         self.prototype_memory = CrossScaleCTPETPrototypeMemory(

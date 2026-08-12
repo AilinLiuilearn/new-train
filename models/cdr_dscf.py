@@ -36,7 +36,10 @@ from typing import Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
+
+_MAX_POSITION_WORK_ELEMENTS = 32 * 1024 * 1024
 
 
 @dataclass
@@ -67,11 +70,7 @@ class LayerNorm2d(nn.Module):
 
 
 class OffsetPredictor(nn.Module):
-    """Predict grouped 2-D offsets in ``(dy, dx)`` channel order.
-
-    Modality groups are folded into the batch dimension before this module is
-    called, matching the grouped offset prediction used by the reference DSCF.
-    """
+    """Predict grouped 2-D offsets in ``(dy, dx)`` channel order."""
 
     def __init__(self, group_channels: int, kernel_size: int, stride: int) -> None:
         super().__init__()
@@ -99,12 +98,7 @@ class OffsetPredictor(nn.Module):
 
 
 class ContinuousRelativePositionBias(nn.Module):
-    """Continuous relative-position bias for sparse sampled coordinates.
-
-    This is a resolution-independent version of the continuous position-bias
-    branch used by deformable attention. It maps normalized ``(dy, dx)``
-    displacements to one bias per attention head within a sampling group.
-    """
+    """Continuous relative-position bias for sparse sampled coordinates."""
 
     def __init__(self, heads_per_group: int, hidden_dim: int = 32) -> None:
         super().__init__()
@@ -115,8 +109,6 @@ class ContinuousRelativePositionBias(nn.Module):
         )
 
     def forward(self, displacement: Tensor) -> Tensor:
-        # Log compression prevents large normalized displacements from
-        # dominating the attention logits.
         displacement = (
             torch.sign(displacement)
             * torch.log2(torch.abs(displacement) + 1.0)
@@ -126,38 +118,7 @@ class ContinuousRelativePositionBias(nn.Module):
 
 
 class CDRDeformableSparseAttention2D(nn.Module):
-    """CDR-regulated dynamic sparse cross-modal attention.
-
-    Parameters
-    ----------
-    channels:
-        Channel count after the outer low-rank projections.
-    num_heads:
-        Number of sparse-attention heads.
-    num_groups:
-        Number of grouped offset fields. ``channels`` and ``num_heads`` must
-        both be divisible by this value.
-    sampling_stride:
-        Spatial stride of the sparse offset predictors.
-    offset_kernel_size:
-        Kernel size used by each depth-wise offset predictor.
-    use_position_bias:
-        Add continuous relative-position bias to sparse attention.
-    attention_residual_init:
-        Initial scale of the deformable-attention residual branch. A small
-        value reproduces the conservative early-stage behavior of DSCF.
-    dropout:
-        Dropout probability applied to attention weights and output features.
-
-    Notes
-    -----
-    For every group and coordinate direction, CDR learns
-
-        alpha = 1 + tanh(alpha_logit),  0 < alpha < 2.
-
-    Zero initialization gives alpha=1, making regulated offsets exactly equal
-    to the two raw offsets at initialization (the original DSCF behavior).
-    """
+    """CDR-regulated dynamic sparse cross-modal attention."""
 
     def __init__(
         self,
@@ -200,11 +161,8 @@ class CDRDeformableSparseAttention2D(nn.Module):
             self.group_channels, offset_kernel_size, sampling_stride
         )
 
-        # One bounded controller for each group and coordinate direction.
-        # Shape: [1, G, (dy, dx), 1, 1].
         self.alpha_logit = nn.Parameter(torch.zeros(1, num_groups, 2, 1, 1))
 
-        # Full-resolution bimodal query/identity feature.
         self.query_fusion = nn.Sequential(
             nn.Conv2d(2 * channels, channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
@@ -212,7 +170,6 @@ class CDRDeformableSparseAttention2D(nn.Module):
         )
         self.query_projection = nn.Conv2d(channels, channels, kernel_size=1)
 
-        # Point-wise competition between CT and PET at the sampled locations.
         self.modal_gate = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=1),
             nn.ReLU(inplace=True),
@@ -233,14 +190,12 @@ class CDRDeformableSparseAttention2D(nn.Module):
         self.attention_dropout = nn.Dropout(dropout)
         self.output_dropout = nn.Dropout(dropout)
 
-        # Per-channel residual mixing, retained from DSCF.
         self.attention_weight = nn.Parameter(
             torch.full((channels,), float(attention_residual_init))
         )
         self.identity_weight = nn.Parameter(torch.ones(channels))
 
     def alpha(self) -> Tensor:
-        """Return bounded CDR coefficients with shape ``[1,G,2,1,1]``."""
         return 1.0 + torch.tanh(self.alpha_logit)
 
     @staticmethod
@@ -251,7 +206,6 @@ class CDRDeformableSparseAttention2D(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
     ) -> Tensor:
-        """Create a normalized grid in ``(y, x)`` order."""
         if height == 1:
             y = torch.zeros(1, dtype=dtype, device=device)
         else:
@@ -260,7 +214,6 @@ class CDRDeformableSparseAttention2D(nn.Module):
             x = torch.zeros(1, dtype=dtype, device=device)
         else:
             x = torch.linspace(-1.0, 1.0, width, dtype=dtype, device=device)
-
         yy, xx = torch.meshgrid(y, x, indexing="ij")
         reference = torch.stack((yy, xx), dim=-1)
         return reference.unsqueeze(0).expand(batch_groups, -1, -1, -1)
@@ -268,7 +221,6 @@ class CDRDeformableSparseAttention2D(nn.Module):
     def _predict_and_regulate_offsets(
         self, ct: Tensor, pet: Tensor
     ) -> Tuple[Tensor, Tensor, Dict[str, Tensor]]:
-        """Predict raw offsets and apply consensus-difference regulation."""
         b, c, h, w = ct.shape
         g = self.num_groups
 
@@ -310,11 +262,6 @@ class CDRDeformableSparseAttention2D(nn.Module):
         )
 
     def _sample(self, feature: Tensor, position_yx: Tensor) -> Tensor:
-        """Group-wise bilinear sampling.
-
-        ``feature`` is BCHW. ``position_yx`` has shape ``[B*G,Hs,Ws,2]``
-        in ``(y,x)`` order. The returned tensor is ``[B,C,1,Hs*Ws]``.
-        """
         b, _, h, w = feature.shape
         g = self.num_groups
         feature = feature.reshape(b, g, self.group_channels, h, w).reshape(
@@ -323,7 +270,7 @@ class CDRDeformableSparseAttention2D(nn.Module):
 
         sampled = F.grid_sample(
             feature,
-            position_yx[..., (1, 0)],  # grid_sample expects (x, y)
+            position_yx[..., (1, 0)],
             mode="bilinear",
             padding_mode="zeros",
             align_corners=True,
@@ -332,100 +279,74 @@ class CDRDeformableSparseAttention2D(nn.Module):
         sampled = sampled.reshape(b, g, self.group_channels, hs * ws)
         return sampled.reshape(b, self.channels, 1, hs * ws)
 
-    def _relative_position_bias(
+    def _relative_position_bias_chunk(
         self,
-        query_h: int,
-        query_w: int,
-        ct_position: Tensor,
-        pet_position: Tensor,
+        query_grid_chunk: Tensor,
+        sampled_positions: Tensor,
         batch_size: int,
     ) -> Tensor:
-        """Return bias with shape ``[B*num_heads, HW, 2*Ns]``."""
         if self.position_bias is None:
             raise RuntimeError("position bias is disabled")
 
-        bg = batch_size * self.num_groups
-        query_grid = self._reference_grid(
-            query_h,
-            query_w,
-            bg,
-            ct_position.dtype,
-            ct_position.device,
-        ).reshape(bg, query_h * query_w, 2)
-
-        sampled_positions = torch.cat(
-            [
-                ct_position.reshape(bg, -1, 2),
-                pet_position.reshape(bg, -1, 2),
-            ],
-            dim=1,
-        )
-        displacement = query_grid.unsqueeze(2) - sampled_positions.unsqueeze(1)
+        displacement = query_grid_chunk.unsqueeze(2) - sampled_positions.unsqueeze(1)
         bias = self.position_bias(displacement)
-
-        # [B*G, HW, 2Ns, heads/group]
+        query_count = query_grid_chunk.shape[1]
+        num_samples = sampled_positions.shape[1]
         bias = bias.reshape(
             batch_size,
             self.num_groups,
-            query_h * query_w,
-            sampled_positions.shape[1],
+            query_count,
+            num_samples,
             self.heads_per_group,
         )
         bias = bias.permute(0, 1, 4, 2, 3).contiguous()
         return bias.reshape(
             batch_size * self.num_heads,
-            query_h * query_w,
-            sampled_positions.shape[1],
+            query_count,
+            num_samples,
         )
 
-    def forward(
+    def _attend_query_chunk(
+        self,
+        query_chunk: Tensor,
+        key: Tensor,
+        value: Tensor,
+        query_grid_chunk: Tensor,
+        sampled_positions: Tensor,
+        batch_size: int,
+    ) -> Tensor:
+        attention_chunk = torch.einsum("bcq,bcn->bqn", query_chunk, key) * self.scale
+        attention_chunk = attention_chunk + self._relative_position_bias_chunk(
+            query_grid_chunk,
+            sampled_positions,
+            batch_size,
+        )
+        attention_chunk = torch.softmax(attention_chunk, dim=-1)
+        attention_chunk = self.attention_dropout(attention_chunk)
+        return torch.einsum("bqn,bcn->bcq", attention_chunk, value)
+
+    def _forward_reference(
         self,
         ct: Tensor,
         pet: Tensor,
-        return_debug: bool = False,
-    ) -> Union[Tensor, Tuple[Tensor, CDRDSCFDebugOutput]]:
-        """Fuse two same-shaped BCHW feature maps."""
-        if ct.ndim != 4 or pet.ndim != 4:
-            raise ValueError("ct and pet must both be 4-D BCHW tensors")
-        if ct.shape != pet.shape:
-            raise ValueError(
-                f"ct and pet must have identical shapes, got {ct.shape} and {pet.shape}"
-            )
-        if ct.shape[1] != self.channels:
-            raise ValueError(
-                f"expected {self.channels} channels, got {ct.shape[1]}"
-            )
-
+    ) -> Tuple[Tensor, CDRDSCFDebugOutput]:
         b, c, h, w = ct.shape
         identity = self.query_fusion(torch.cat([ct, pet], dim=1))
         query_map = self.query_projection(identity)
 
-        ct_offset, pet_offset, debug_dict = self._predict_and_regulate_offsets(
-            ct, pet
-        )
+        ct_offset, pet_offset, debug_dict = self._predict_and_regulate_offsets(ct, pet)
         hs, ws = ct_offset.shape[-2:]
         bg = b * self.num_groups
-        reference = self._reference_grid(
-            hs, ws, bg, ct.dtype, ct.device
-        )
+        reference = self._reference_grid(hs, ws, bg, ct.dtype, ct.device)
 
-        # Offsets are predicted in normalized-grid units, as in the default
-        # clamp-based branch of the reference deformable attention.
-        ct_position = (
-            reference + ct_offset.permute(0, 2, 3, 1)
-        ).clamp(-1.0, 1.0)
-        pet_position = (
-            reference + pet_offset.permute(0, 2, 3, 1)
-        ).clamp(-1.0, 1.0)
+        ct_position = (reference + ct_offset.permute(0, 2, 3, 1)).clamp(-1.0, 1.0)
+        pet_position = (reference + pet_offset.permute(0, 2, 3, 1)).clamp(-1.0, 1.0)
 
-        # Four cross-grid samples: each modality is read at both coordinate sets.
         ct_at_ct = self._sample(ct, ct_position)
         pet_at_ct = self._sample(pet, ct_position)
         ct_at_pet = self._sample(ct, pet_position)
         pet_at_pet = self._sample(pet, pet_position)
 
-        # Query samples determine point-wise CT/PET competition separately on
-        # the CT-proposed and PET-proposed coordinate sets.
         query_at_ct = self._sample(query_map, ct_position)
         query_at_pet = self._sample(query_map, pet_position)
         sampled_query = torch.cat([query_at_ct, query_at_pet], dim=-1)
@@ -435,15 +356,13 @@ class CDRDeformableSparseAttention2D(nn.Module):
 
         ct_samples = torch.cat([ct_at_ct, ct_at_pet], dim=-1)
         pet_samples = torch.cat([pet_at_ct, pet_at_pet], dim=-1)
-        sparse_samples = (
-            modal_weights[:, 0:1] * ct_samples
-            + modal_weights[:, 1:2] * pet_samples
-        )
+        sparse_samples = modal_weights[:, 0:1] * ct_samples + modal_weights[:, 1:2] * pet_samples
 
+        num_queries = h * w
         num_samples = 2 * hs * ws
-        query = query_map.reshape(
-            b, self.num_heads, self.head_channels, h * w
-        ).reshape(b * self.num_heads, self.head_channels, h * w)
+        query = query_map.reshape(b, self.num_heads, self.head_channels, num_queries).reshape(
+            b * self.num_heads, self.head_channels, num_queries
+        )
         key = self.key_projection(sparse_samples).reshape(
             b, self.num_heads, self.head_channels, num_samples
         ).reshape(b * self.num_heads, self.head_channels, num_samples)
@@ -451,14 +370,163 @@ class CDRDeformableSparseAttention2D(nn.Module):
             b, self.num_heads, self.head_channels, num_samples
         ).reshape(b * self.num_heads, self.head_channels, num_samples)
 
-        attention = torch.einsum("bcm,bcn->bmn", query, key) * self.scale
-        if self.position_bias is not None:
-            attention = attention + self._relative_position_bias(
-                h, w, ct_position, pet_position, b
-            )
-        attention = self.attention_dropout(torch.softmax(attention, dim=-1))
+        query_grid = self._reference_grid(h, w, bg, ct.dtype, ct.device).reshape(bg, num_queries, 2)
+        sampled_positions = torch.cat(
+            [
+                ct_position.reshape(bg, -1, 2),
+                pet_position.reshape(bg, -1, 2),
+            ],
+            dim=1,
+        )
 
-        output = torch.einsum("bmn,bcn->bcm", attention, value)
+        attention = torch.einsum("bcq,bcn->bqn", query, key) * self.scale
+        attention = attention + self._relative_position_bias_chunk(
+            query_grid, sampled_positions, b
+        )
+        attention = self.attention_dropout(torch.softmax(attention, dim=-1))
+        output = torch.einsum("bqn,bcn->bcq", attention, value)
+        output = output.reshape(b, c, h, w)
+        output = self.output_dropout(self.output_projection(output))
+        output = self.attention_weight.view(1, c, 1, 1) * output + self.identity_weight.view(1, c, 1, 1) * identity
+
+        debug_output = CDRDSCFDebugOutput(
+            alpha=debug_dict["alpha"].detach(),
+            ct_raw_offset=debug_dict["ct_raw_offset"].detach(),
+            pet_raw_offset=debug_dict["pet_raw_offset"].detach(),
+            consensus_offset=debug_dict["consensus_offset"].detach(),
+            difference_offset=debug_dict["difference_offset"].detach(),
+            ct_regulated_offset=debug_dict["ct_regulated_offset"].detach(),
+            pet_regulated_offset=debug_dict["pet_regulated_offset"].detach(),
+            modal_weights=modal_weights.detach(),
+        )
+        return output, debug_output
+
+    def forward(
+        self,
+        ct: Tensor,
+        pet: Tensor,
+        return_debug: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, CDRDSCFDebugOutput]]:
+        if ct.ndim != 4 or pet.ndim != 4:
+            raise ValueError("ct and pet must both be 4-D BCHW tensors")
+        if ct.shape != pet.shape:
+            raise ValueError(
+                f"ct and pet must have identical shapes, got {ct.shape} and {pet.shape}"
+            )
+        if ct.shape[1] != self.channels:
+            raise ValueError(f"expected {self.channels} channels, got {ct.shape[1]}")
+
+        b, c, h, w = ct.shape
+        identity = self.query_fusion(torch.cat([ct, pet], dim=1))
+        query_map = self.query_projection(identity)
+
+        ct_offset, pet_offset, debug_dict = self._predict_and_regulate_offsets(ct, pet)
+        hs, ws = ct_offset.shape[-2:]
+        bg = b * self.num_groups
+        reference = self._reference_grid(hs, ws, bg, ct.dtype, ct.device)
+
+        ct_position = (reference + ct_offset.permute(0, 2, 3, 1)).clamp(-1.0, 1.0)
+        pet_position = (reference + pet_offset.permute(0, 2, 3, 1)).clamp(-1.0, 1.0)
+
+        ct_at_ct = self._sample(ct, ct_position)
+        pet_at_ct = self._sample(pet, ct_position)
+        ct_at_pet = self._sample(ct, pet_position)
+        pet_at_pet = self._sample(pet, pet_position)
+
+        query_at_ct = self._sample(query_map, ct_position)
+        query_at_pet = self._sample(query_map, pet_position)
+        sampled_query = torch.cat([query_at_ct, query_at_pet], dim=-1)
+
+        modal_logits = self.modal_gate(sampled_query)
+        modal_weights = torch.softmax(modal_logits, dim=1)
+
+        ct_samples = torch.cat([ct_at_ct, ct_at_pet], dim=-1)
+        pet_samples = torch.cat([pet_at_ct, pet_at_pet], dim=-1)
+        sparse_samples = modal_weights[:, 0:1] * ct_samples + modal_weights[:, 1:2] * pet_samples
+
+        num_queries = h * w
+        num_samples = 2 * hs * ws
+        query = query_map.reshape(b, self.num_heads, self.head_channels, num_queries).reshape(
+            b * self.num_heads, self.head_channels, num_queries
+        )
+        key = self.key_projection(sparse_samples).reshape(
+            b, self.num_heads, self.head_channels, num_samples
+        ).reshape(b * self.num_heads, self.head_channels, num_samples)
+        value = self.value_projection(sparse_samples).reshape(
+            b, self.num_heads, self.head_channels, num_samples
+        ).reshape(b * self.num_heads, self.head_channels, num_samples)
+
+        full_query_grid = self._reference_grid(
+            h,
+            w,
+            bg,
+            ct.dtype,
+            ct.device,
+        ).reshape(bg, num_queries, 2)
+        sampled_positions = torch.cat(
+            [
+                ct_position.reshape(bg, -1, 2),
+                pet_position.reshape(bg, -1, 2),
+            ],
+            dim=1,
+        )
+
+        hidden_dim = 0 if self.position_bias is None else int(self.position_bias.mlp[0].out_features)
+        elements_per_query = bg * num_samples * (2 + hidden_dim + self.heads_per_group)
+        query_chunk_size = max(
+            1,
+            min(
+                num_queries,
+                _MAX_POSITION_WORK_ELEMENTS // max(1, elements_per_query),
+            ),
+        )
+        num_chunks = (num_queries + query_chunk_size - 1) // query_chunk_size
+        should_checkpoint = num_chunks > 1 and self.training and torch.is_grad_enabled()
+
+        output_chunks = []
+
+        def chunk_forward(
+            query_chunk: Tensor,
+            key_tensor: Tensor,
+            value_tensor: Tensor,
+            query_grid_chunk: Tensor,
+            sampled_positions_tensor: Tensor,
+        ) -> Tensor:
+            return self._attend_query_chunk(
+                query_chunk,
+                key_tensor,
+                value_tensor,
+                query_grid_chunk,
+                sampled_positions_tensor,
+                batch_size=b,
+            )
+
+        for start in range(0, num_queries, query_chunk_size):
+            end = min(start + query_chunk_size, num_queries)
+            query_chunk = query[:, :, start:end]
+            query_grid_chunk = full_query_grid[:, start:end]
+            if should_checkpoint:
+                output_chunk = checkpoint(
+                    chunk_forward,
+                    query_chunk,
+                    key,
+                    value,
+                    query_grid_chunk,
+                    sampled_positions,
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                )
+            else:
+                output_chunk = chunk_forward(
+                    query_chunk,
+                    key,
+                    value,
+                    query_grid_chunk,
+                    sampled_positions,
+                )
+            output_chunks.append(output_chunk)
+
+        output = torch.cat(output_chunks, dim=-1)
         output = output.reshape(b, c, h, w)
         output = self.output_dropout(self.output_projection(output))
 
@@ -483,22 +551,7 @@ class CDRDeformableSparseAttention2D(nn.Module):
 
 
 class CDRDSCFFusion2D(nn.Module):
-    """Independent two-input/one-output CDR-DSCF fusion block.
-
-    Input and output shapes are all ``[B, in_channels, H, W]``. Separate 1x1
-    projections reproduce DSCF's modality-specific low-rank linear mappings;
-    the final projection restores the original channel count.
-
-    Example
-    -------
-    >>> block = CDRDSCFFusion2D(128, low_rank_ratio=0.125,
-    ...                         num_heads=4, num_groups=4)
-    >>> ct = torch.randn(2, 128, 32, 32)
-    >>> pet = torch.randn(2, 128, 32, 32)
-    >>> fused = block(ct, pet)
-    >>> fused.shape
-    torch.Size([2, 128, 32, 32])
-    """
+    """Independent two-input/one-output CDR-DSCF fusion block."""
 
     def __init__(
         self,
@@ -532,7 +585,6 @@ class CDRDSCFFusion2D(nn.Module):
         self.in_channels = in_channels
         self.low_channels = low_channels
 
-        # Linear projection on tokens is equivalent to 1x1 convolution on BCHW.
         self.ct_down = nn.Conv2d(in_channels, low_channels, kernel_size=1)
         self.pet_down = nn.Conv2d(in_channels, low_channels, kernel_size=1)
 
@@ -549,7 +601,6 @@ class CDRDSCFFusion2D(nn.Module):
         self.channel_up = nn.Conv2d(low_channels, in_channels, kernel_size=1)
 
     def get_alpha(self, detach: bool = True) -> Tensor:
-        """Return ``[1,G,2,1,1]`` CDR coefficients for inspection."""
         alpha = self.sparse_fusion.alpha()
         return alpha.detach() if detach else alpha
 
@@ -565,21 +616,17 @@ class CDRDSCFFusion2D(nn.Module):
             raise ValueError("CT and PET features must have identical shapes")
         if ct_feature.shape[1] != self.in_channels:
             raise ValueError(
-                f"expected {self.in_channels} input channels, "
-                f"got {ct_feature.shape[1]}"
+                f"expected {self.in_channels} input channels, got {ct_feature.shape[1]}"
             )
 
         ct_low = self.ct_down(ct_feature)
         pet_low = self.pet_down(pet_feature)
 
+        fused_low, debug = self.sparse_fusion(ct_low, pet_low, return_debug=True)
+        fused = self.channel_up(fused_low)
         if return_debug:
-            fused_low, debug = self.sparse_fusion(
-                ct_low, pet_low, return_debug=True
-            )
-            return self.channel_up(fused_low), debug
-
-        fused_low = self.sparse_fusion(ct_low, pet_low, return_debug=False)
-        return self.channel_up(fused_low)
+            return fused, debug
+        return fused
 
 
 def _count_parameters(module: nn.Module) -> int:
@@ -587,7 +634,7 @@ def _count_parameters(module: nn.Module) -> int:
 
 
 def _self_test() -> None:
-    """Run lightweight Full/Missing, equivalence, and gradient checks."""
+    """Run lightweight equivalence, gradient, and smoke checks."""
     torch.manual_seed(7)
 
     block = CDRDSCFFusion2D(
@@ -598,53 +645,85 @@ def _self_test() -> None:
         sampling_stride=4,
         offset_kernel_size=5,
         use_position_bias=True,
+        dropout=0.0,
     )
-    block.train()
+    block.eval()
 
     ct = torch.randn(2, 64, 16, 16, requires_grad=True)
     real_pet = torch.randn(2, 64, 16, 16, requires_grad=True)
-    compensated_pet = (
-        F.avg_pool2d(torch.randn(2, 64, 18, 18), kernel_size=3, stride=1)
-        .contiguous()
-        .requires_grad_()
-    )
+    compensated_pet = torch.randn(2, 64, 16, 16, requires_grad=True)
 
-    full_output, full_debug = block(ct, real_pet, return_debug=True)
+    ct_low = block.ct_down(ct)
+    real_pet_low = block.pet_down(real_pet)
+    dense_output, dense_debug = block.sparse_fusion._forward_reference(
+        ct_low, real_pet_low
+    )
+    dense_output = block.channel_up(dense_output)
+    chunked_output, chunked_debug = block(ct, real_pet, return_debug=True)
     missing_output = block(ct, compensated_pet)
 
     expected_shape = ct.shape
-    assert full_output.shape == expected_shape
+    assert dense_output.shape == expected_shape
+    assert chunked_output.shape == expected_shape
     assert missing_output.shape == expected_shape
 
-    # alpha=1 at initialization must exactly recover each raw offset.
-    ct_equivalence_error = (
-        full_debug.ct_regulated_offset - full_debug.ct_raw_offset
+    max_output_error = (dense_output - chunked_output).abs().max()
+    max_alpha_error = (dense_debug.alpha - chunked_debug.alpha).abs().max()
+    max_ct_offset_error = (
+        dense_debug.ct_regulated_offset - chunked_debug.ct_regulated_offset
     ).abs().max()
-    pet_equivalence_error = (
-        full_debug.pet_regulated_offset - full_debug.pet_raw_offset
+    max_pet_offset_error = (
+        dense_debug.pet_regulated_offset - chunked_debug.pet_regulated_offset
     ).abs().max()
-    assert ct_equivalence_error.item() < 1e-6
-    assert pet_equivalence_error.item() < 1e-6
+    max_modal_error = (
+        dense_debug.modal_weights - chunked_debug.modal_weights
+    ).abs().max()
 
-    loss = full_output.square().mean() + missing_output.square().mean()
+    assert max_output_error.item() < 1e-5
+    assert max_alpha_error.item() < 1e-6
+    assert max_ct_offset_error.item() < 1e-6
+    assert max_pet_offset_error.item() < 1e-6
+    assert max_modal_error.item() < 1e-6
+
+    block.train()
+    ct_train = torch.randn(2, 64, 16, 16, requires_grad=True)
+    pet_train = torch.randn(2, 64, 16, 16, requires_grad=True)
+    fused_train = block(ct_train, pet_train)
+    loss = fused_train.square().mean()
     loss.backward()
 
-    alpha_grad = block.sparse_fusion.alpha_logit.grad
-    assert alpha_grad is not None
-    assert torch.isfinite(alpha_grad).all()
+    required_grads = {
+        "ct_down": block.ct_down.weight.grad,
+        "pet_down": block.pet_down.weight.grad,
+        "ct_offset_predictor": block.sparse_fusion.ct_offset_predictor.net[0].weight.grad,
+        "pet_offset_predictor": block.sparse_fusion.pet_offset_predictor.net[0].weight.grad,
+        "alpha_logit": block.sparse_fusion.alpha_logit.grad,
+        "modal_gate": block.sparse_fusion.modal_gate[0].weight.grad,
+        "query_projection": block.sparse_fusion.query_projection.weight.grad,
+        "key_projection": block.sparse_fusion.key_projection.weight.grad,
+        "value_projection": block.sparse_fusion.value_projection.weight.grad,
+        "output_projection": block.sparse_fusion.output_projection.weight.grad,
+        "channel_up": block.channel_up.weight.grad,
+    }
+    for name, grad in required_grads.items():
+        assert grad is not None, name
+        assert torch.isfinite(grad).all(), name
 
     print("CDR-DSCF standalone self-test passed")
-    print(f"  parameters: { _count_parameters(block):,}")
-    print(f"  Full output shape:    {tuple(full_output.shape)}")
+    print(f"  parameters: {_count_parameters(block):,}")
+    print(f"  Full output shape:    {tuple(chunked_output.shape)}")
     print(f"  Missing output shape: {tuple(missing_output.shape)}")
     print(f"  alpha shape: {tuple(block.get_alpha().shape)}")
     print(
         "  initial alpha (group x [dy, dx]):\n",
         block.get_alpha().squeeze(0).squeeze(-1).squeeze(-1),
     )
-    print(f"  max CT offset equivalence error:  {ct_equivalence_error.item():.3e}")
-    print(f"  max PET offset equivalence error: {pet_equivalence_error.item():.3e}")
-    print(f"  alpha gradient L1: {alpha_grad.abs().sum().item():.3e}")
+    print(f"  max output error:              {max_output_error.item():.3e}")
+    print(f"  max alpha error:               {max_alpha_error.item():.3e}")
+    print(f"  max CT offset error:           {max_ct_offset_error.item():.3e}")
+    print(f"  max PET offset error:          {max_pet_offset_error.item():.3e}")
+    print(f"  max modal weight error:        {max_modal_error.item():.3e}")
+    print(f"  alpha gradient L1: {block.sparse_fusion.alpha_logit.grad.abs().sum().item():.3e}")
 
 
 if __name__ == "__main__":
