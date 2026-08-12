@@ -39,7 +39,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
 
-_MAX_POSITION_WORK_ELEMENTS = 32 * 1024 * 1024
+_MAX_POSITION_WORK_ELEMENTS = 128 * 1024 * 1024
 
 
 @dataclass
@@ -288,23 +288,44 @@ class CDRDeformableSparseAttention2D(nn.Module):
         if self.position_bias is None:
             raise RuntimeError("position bias is disabled")
 
-        displacement = query_grid_chunk.unsqueeze(2) - sampled_positions.unsqueeze(1)
-        bias = self.position_bias(displacement)
         query_count = query_grid_chunk.shape[1]
         num_samples = sampled_positions.shape[1]
-        bias = bias.reshape(
-            batch_size,
-            self.num_groups,
-            query_count,
-            num_samples,
-            self.heads_per_group,
+        hidden_dim = int(self.position_bias.mlp[0].out_features)
+        batch_groups = batch_size * self.num_groups
+        elements_per_sample = batch_groups * query_count * (2 + hidden_dim + self.heads_per_group)
+        sample_chunk_size = max(
+            1,
+            min(
+                num_samples,
+                _MAX_POSITION_WORK_ELEMENTS // max(1, elements_per_sample),
+            ),
         )
-        bias = bias.permute(0, 1, 4, 2, 3).contiguous()
-        return bias.reshape(
-            batch_size * self.num_heads,
-            query_count,
-            num_samples,
-        )
+
+        bias_blocks = []
+        for start in range(0, num_samples, sample_chunk_size):
+            end = min(start + sample_chunk_size, num_samples)
+            displacement = (
+                query_grid_chunk.unsqueeze(2)
+                - sampled_positions[:, start:end].unsqueeze(1)
+            )
+            bias = self.position_bias(displacement)
+            bias = bias.reshape(
+                batch_size,
+                self.num_groups,
+                query_count,
+                end - start,
+                self.heads_per_group,
+            )
+            bias = bias.permute(0, 1, 4, 2, 3).contiguous()
+            bias_blocks.append(
+                bias.reshape(
+                    batch_size * self.num_heads,
+                    query_count,
+                    end - start,
+                )
+            )
+
+        return torch.cat(bias_blocks, dim=-1) if len(bias_blocks) > 1 else bias_blocks[0]
 
     def _attend_query_chunk(
         self,
@@ -316,14 +337,59 @@ class CDRDeformableSparseAttention2D(nn.Module):
         batch_size: int,
     ) -> Tensor:
         attention_chunk = torch.einsum("bcq,bcn->bqn", query_chunk, key) * self.scale
-        attention_chunk = attention_chunk + self._relative_position_bias_chunk(
-            query_grid_chunk,
-            sampled_positions,
-            batch_size,
-        )
+        if self.position_bias is not None:
+            attention_chunk = attention_chunk + self._relative_position_bias_chunk(
+                query_grid_chunk,
+                sampled_positions,
+                batch_size,
+            )
         attention_chunk = torch.softmax(attention_chunk, dim=-1)
         attention_chunk = self.attention_dropout(attention_chunk)
         return torch.einsum("bqn,bcn->bcq", attention_chunk, value)
+
+    def _compute_query_chunk_size(
+        self,
+        num_queries: int,
+        num_samples: int,
+        batch_groups: int,
+        max_position_work_elements: Optional[int] = None,
+    ) -> int:
+        hidden_dim = 0 if self.position_bias is None else int(self.position_bias.mlp[0].out_features)
+        elements_per_query = batch_groups * num_samples * (2 + hidden_dim + self.heads_per_group)
+        work_budget = _MAX_POSITION_WORK_ELEMENTS if max_position_work_elements is None else int(max_position_work_elements)
+        return max(
+            1,
+            min(
+                num_queries,
+                work_budget // max(1, elements_per_query),
+            ),
+        )
+
+    def _chunked_attention(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        full_query_grid: Tensor,
+        sampled_positions: Tensor,
+        batch_size: int,
+        query_chunk_size: int,
+    ) -> Tensor:
+        num_queries = query.shape[-1]
+        output_chunks = []
+        for start in range(0, num_queries, query_chunk_size):
+            end = min(start + query_chunk_size, num_queries)
+            output_chunks.append(
+                self._attend_query_chunk(
+                    query[:, :, start:end],
+                    key,
+                    value,
+                    full_query_grid[:, start:end],
+                    sampled_positions,
+                    batch_size,
+                )
+            )
+        return torch.cat(output_chunks, dim=-1)
 
     def _forward_reference(
         self,
@@ -380,9 +446,12 @@ class CDRDeformableSparseAttention2D(nn.Module):
         )
 
         attention = torch.einsum("bcq,bcn->bqn", query, key) * self.scale
-        attention = attention + self._relative_position_bias_chunk(
-            query_grid, sampled_positions, b
-        )
+        if self.position_bias is not None:
+            attention = attention + self._relative_position_bias_chunk(
+                query_grid,
+                sampled_positions,
+                b,
+            )
         attention = self.attention_dropout(torch.softmax(attention, dim=-1))
         output = torch.einsum("bqn,bcn->bcq", attention, value)
         output = output.reshape(b, c, h, w)
@@ -470,63 +539,46 @@ class CDRDeformableSparseAttention2D(nn.Module):
             ],
             dim=1,
         )
-
-        hidden_dim = 0 if self.position_bias is None else int(self.position_bias.mlp[0].out_features)
-        elements_per_query = bg * num_samples * (2 + hidden_dim + self.heads_per_group)
-        query_chunk_size = max(
-            1,
-            min(
-                num_queries,
-                _MAX_POSITION_WORK_ELEMENTS // max(1, elements_per_query),
-            ),
-        )
+        query_chunk_size = self._compute_query_chunk_size(num_queries, num_samples, bg)
         num_chunks = (num_queries + query_chunk_size - 1) // query_chunk_size
         should_checkpoint = num_chunks > 1 and self.training and torch.is_grad_enabled()
 
-        output_chunks = []
-
-        def chunk_forward(
-            query_chunk: Tensor,
+        def full_chunked_attention(
+            query_tensor: Tensor,
             key_tensor: Tensor,
             value_tensor: Tensor,
-            query_grid_chunk: Tensor,
+            query_grid_tensor: Tensor,
             sampled_positions_tensor: Tensor,
         ) -> Tensor:
-            return self._attend_query_chunk(
-                query_chunk,
-                key_tensor,
-                value_tensor,
-                query_grid_chunk,
-                sampled_positions_tensor,
+            return self._chunked_attention(
+                query=query_tensor,
+                key=key_tensor,
+                value=value_tensor,
+                full_query_grid=query_grid_tensor,
+                sampled_positions=sampled_positions_tensor,
                 batch_size=b,
+                query_chunk_size=query_chunk_size,
             )
 
-        for start in range(0, num_queries, query_chunk_size):
-            end = min(start + query_chunk_size, num_queries)
-            query_chunk = query[:, :, start:end]
-            query_grid_chunk = full_query_grid[:, start:end]
-            if should_checkpoint:
-                output_chunk = checkpoint(
-                    chunk_forward,
-                    query_chunk,
-                    key,
-                    value,
-                    query_grid_chunk,
-                    sampled_positions,
-                    use_reentrant=False,
-                    preserve_rng_state=True,
-                )
-            else:
-                output_chunk = chunk_forward(
-                    query_chunk,
-                    key,
-                    value,
-                    query_grid_chunk,
-                    sampled_positions,
-                )
-            output_chunks.append(output_chunk)
-
-        output = torch.cat(output_chunks, dim=-1)
+        if should_checkpoint:
+            output = checkpoint(
+                full_chunked_attention,
+                query,
+                key,
+                value,
+                full_query_grid,
+                sampled_positions,
+                use_reentrant=False,
+                preserve_rng_state=True,
+            )
+        else:
+            output = full_chunked_attention(
+                query,
+                key,
+                value,
+                full_query_grid,
+                sampled_positions,
+            )
         output = output.reshape(b, c, h, w)
         output = self.output_dropout(self.output_projection(output))
 
@@ -622,11 +674,12 @@ class CDRDSCFFusion2D(nn.Module):
         ct_low = self.ct_down(ct_feature)
         pet_low = self.pet_down(pet_feature)
 
-        fused_low, debug = self.sparse_fusion(ct_low, pet_low, return_debug=True)
-        fused = self.channel_up(fused_low)
         if return_debug:
-            return fused, debug
-        return fused
+            fused_low, debug = self.sparse_fusion(ct_low, pet_low, return_debug=True)
+            return self.channel_up(fused_low), debug
+
+        fused_low = self.sparse_fusion(ct_low, pet_low, return_debug=False)
+        return self.channel_up(fused_low)
 
 
 def _count_parameters(module: nn.Module) -> int:
@@ -655,10 +708,10 @@ def _self_test() -> None:
 
     ct_low = block.ct_down(ct)
     real_pet_low = block.pet_down(real_pet)
-    dense_output, dense_debug = block.sparse_fusion._forward_reference(
-        ct_low, real_pet_low
-    )
+
+    dense_output, dense_debug = block.sparse_fusion._forward_reference(ct_low, real_pet_low)
     dense_output = block.channel_up(dense_output)
+
     chunked_output, chunked_debug = block(ct, real_pet, return_debug=True)
     missing_output = block(ct, compensated_pet)
 
@@ -684,6 +737,38 @@ def _self_test() -> None:
     assert max_ct_offset_error.item() < 1e-6
     assert max_pet_offset_error.item() < 1e-6
     assert max_modal_error.item() < 1e-6
+
+    # Force multi-chunk behavior for the internal query loop.
+    query = torch.randn(2 * 4, 4, 16 * 16)
+    key = torch.randn(2 * 4, 4, 2 * 4 * 4)
+    value = torch.randn(2 * 4, 4, 2 * 4 * 4)
+    query_grid = block.sparse_fusion._reference_grid(16, 16, 2 * 4, ct.dtype, ct.device).reshape(2 * 4, 16 * 16, 2)
+    sampled_positions = torch.randn(2 * 4, 2 * 4 * 4, 2)
+    forced_chunk_size = block.sparse_fusion._compute_query_chunk_size(
+        num_queries=16 * 16,
+        num_samples=2 * 4 * 4,
+        batch_groups=2 * 4,
+        max_position_work_elements=1024,
+    )
+    assert (16 * 16 + forced_chunk_size - 1) // forced_chunk_size > 1
+    chunked_direct = block.sparse_fusion._chunked_attention(
+        query=query,
+        key=key,
+        value=value,
+        full_query_grid=query_grid,
+        sampled_positions=sampled_positions,
+        batch_size=2,
+        query_chunk_size=forced_chunk_size,
+    )
+    dense_direct = torch.einsum("bcq,bcn->bqn", query, key) * block.sparse_fusion.scale
+    dense_direct = dense_direct + block.sparse_fusion._relative_position_bias_chunk(
+        query_grid,
+        sampled_positions,
+        batch_size=2,
+    )
+    dense_direct = torch.softmax(dense_direct, dim=-1)
+    dense_direct = torch.einsum("bqn,bcn->bcq", dense_direct, value)
+    assert (dense_direct - chunked_direct).abs().max().item() < 1e-5
 
     block.train()
     ct_train = torch.randn(2, 64, 16, 16, requires_grad=True)
