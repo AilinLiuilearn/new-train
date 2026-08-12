@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from models.baseline_blocks import PrototypeReferencedPETAffineCalibration, StateAwareWeightedAddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
+from models.baseline_blocks import PrototypeReferencedPETAffineCalibration, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
+from models.cdr_dscf import CDRDSCFFusion2D
 from models.ct_pet_prototype_imputation import CrossScaleCTPETPrototypeMemory
 
 
@@ -31,9 +33,24 @@ class DualSharedAddPETCTBaseline(nn.Module):
         load_local_weights_safe(self.enc_pet, pet_pretrained_path, name='PET_Encoder')
         ct_channels = list(self.enc_ct.feature_info.channels())
         pet_channels = list(self.enc_pet.feature_info.channels())
+        if len(ct_channels) != len(pet_channels):
+            raise ValueError(f'CT and PET encoders must expose the same number of scales, got {len(ct_channels)} and {len(pet_channels)}')
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
         self.pet_calibration = PrototypeReferencedPETAffineCalibration(channels=pet_channels)
-        self.fusion = StateAwareWeightedAddFusion(num_scales=len(pet_channels))
+        self.fusion = nn.ModuleList([
+            CDRDSCFFusion2D(
+                in_channels=channels,
+                low_rank_ratio=0.125,
+                num_heads=4,
+                num_groups=4,
+                sampling_stride=4,
+                offset_kernel_size=5,
+                use_position_bias=True,
+                attention_residual_init=1e-3,
+                dropout=0.0,
+            )
+            for channels in pet_channels
+        ])
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
         self.prototype_memory = CrossScaleCTPETPrototypeMemory(
             channels=pet_channels,
@@ -57,6 +74,30 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pet_feats = self.enc_pet(self._to_3ch(pet))
         _check_tensor_list('pet_feats', pet_feats)
         return pet_feats
+
+    def _fuse_features(self, ct_feats, pet_feats):
+        if len(ct_feats) != len(pet_feats) or len(ct_feats) != len(self.fusion):
+            raise ValueError(
+                f'Expected {len(self.fusion)} CT/PET scales, got '
+                f'{len(ct_feats)} and {len(pet_feats)}'
+            )
+        fused_feats = []
+        for scale_idx, (ct_feat, pet_feat, fusion_block) in enumerate(zip(ct_feats, pet_feats, self.fusion)):
+            if ct_feat.shape[0] != pet_feat.shape[0]:
+                raise ValueError(
+                    f'Batch mismatch at scale {scale_idx + 1}: '
+                    f'ct={tuple(ct_feat.shape)}, pet={tuple(pet_feat.shape)}'
+                )
+            if ct_feat.shape[1] != pet_feat.shape[1]:
+                raise ValueError(
+                    f'Channel mismatch at scale {scale_idx + 1}: '
+                    f'ct={tuple(ct_feat.shape)}, pet={tuple(pet_feat.shape)}'
+                )
+            if pet_feat.shape[-2:] != ct_feat.shape[-2:]:
+                pet_feat = F.interpolate(pet_feat, size=ct_feat.shape[-2:], mode='bilinear', align_corners=False)
+            fused_feats.append(_sanitize(fusion_block(ct_feat, pet_feat)))
+        _check_tensor_list('fused_feats', fused_feats)
+        return fused_feats
 
     def _decode(self, fused_feats, target_size):
         out = self.decoder(fused_feats, target_size)
@@ -111,7 +152,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 None,
                 reference_valid=False,
             )
-        fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='full')
+        fused_feats = self._fuse_features(ct_feats, pet_feats_cal)
         return self._decode(fused_feats, target_size)
 
     def _forward_missing(self, ct, pet, target_size, mask=None):
@@ -132,7 +173,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
             ct_reference_feats,
             reference_valid=self.prototype_memory.bank_ready,
         )
-        fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='missing')
+        fused_feats = self._fuse_features(ct_feats, pet_feats_cal)
         return self._decode(fused_feats, target_size)
 
     def _forward_auto(self, ct, pet, pet_available, target_size, mask=None):
@@ -155,6 +196,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
             raise ValueError('pet_available values must be 0 or 1')
         availability = availability.view(-1, 1, 1, 1)
         for feat_real, feat_proxy in zip(pet_feats_real, pet_feats_proxy):
+            if feat_proxy.shape[-2:] != feat_real.shape[-2:]:
+                feat_proxy = F.interpolate(feat_proxy, size=feat_real.shape[-2:], mode='bilinear', align_corners=False)
             availability_mask = availability.to(device=feat_real.device, dtype=feat_real.dtype)
             pet_selected.append(feat_real * availability_mask + feat_proxy * (1.0 - availability_mask))
         pet_selected = self.pet_calibration(
@@ -163,12 +206,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
             ct_reference_feats,
             reference_valid=self.prototype_memory.bank_ready,
         )
-        fused_feats = self.fusion(
-            ct_feats,
-            pet_selected,
-            mode='auto',
-            pet_available=pet_available,
-        )
+        fused_feats = self._fuse_features(ct_feats, pet_selected)
         return self._decode(fused_feats, target_size)
 
     @torch.no_grad()

@@ -25,7 +25,7 @@ def _unwrap_state_dict(state_dict):
 def _map_convnext_hf_to_timm_key(key):
     if not key.startswith('convnext.'):
         return None
-    key = key[len('convnext.'):]
+    key = key[len('convnext.'):] 
     if key in ('stem_weight', 'embeddings.patch_embeddings.weight'):
         return 'stem_0.weight'
     if key in ('stem_bias', 'embeddings.patch_embeddings.bias'):
@@ -371,7 +371,7 @@ def build_mdt_seg_teacher(config):
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion=state_aware_weighted_add shared_decoder=UNetStyleDecoder '
+        f'fusion=cdr_dscf shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
     print(f'[CPPI] enabled=True')
