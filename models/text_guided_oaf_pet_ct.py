@@ -371,15 +371,22 @@ class MultiScaleTextGuidedOAF(nn.Module):
         if len(channels) == 0:
             raise ValueError("channels must be a non-empty sequence")
         self.channels = list(channels)
+        self.compressed_channels = [
+            max(int(c) // 4, 32)
+            for c in self.channels
+        ]
         self.blocks = nn.ModuleList(
             [
                 TextGuidedOAF(
-                    channels=c,
+                    channels=int(c),
                     text_embeddings=text_embeddings,
-                    compressed_channels=c,
+                    compressed_channels=int(hidden_c),
                     kernel_size=kernel_size,
                 )
-                for c in self.channels
+                for c, hidden_c in zip(
+                    self.channels,
+                    self.compressed_channels,
+                )
             ]
         )
 

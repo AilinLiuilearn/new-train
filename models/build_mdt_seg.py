@@ -393,6 +393,32 @@ def build_mdt_seg_teacher(config):
         f'text_encoder=offline_local_frozen '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
+    fusion_trainable_params = sum(
+        p.numel()
+        for p in model.fusion.parameters()
+        if p.requires_grad
+    )
+    fusion_buffer_elements = sum(
+        b.numel()
+        for b in model.fusion.buffers()
+    )
+    print(
+        f'[TextOAF] trainable_params='
+        f'{fusion_trainable_params:,} '
+        f'({fusion_trainable_params / 1e6:.3f}M)'
+    )
+    print(
+        f'[TextOAF] buffer_elements='
+        f'{fusion_buffer_elements:,}'
+    )
+    print(
+        f'[TextOAF] channels='
+        f'{model.fusion.channels}'
+    )
+    print(
+        f'[TextOAF] compressed_channels='
+        f'{model.fusion.compressed_channels}'
+    )
     print(f'[CPPI] enabled=True')
     print(f'[CPPI] num_clusters={cppi_num_clusters}')
     print(f'[CPPI] build_stage={cppi_build_stage}')
