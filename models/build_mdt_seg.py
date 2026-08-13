@@ -371,7 +371,7 @@ def build_mdt_seg_teacher(config):
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion=state_aware_weighted_add shared_decoder=UNetStyleDecoder '
+        f'fusion=multiscale_cmgf shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
     print(f'[CPPI] enabled=True')
