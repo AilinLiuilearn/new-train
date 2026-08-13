@@ -10,6 +10,7 @@ import torch
 from configs.seg_mdt import SegMDTConfig
 from models.build_mdt_seg import build_mdt_seg_teacher
 from tasks.mdt_seg import MDTSegTeacher
+from utils.finetune import create_finetune_optimizer, sync_frozen_modules_eval
 from utils.optimization import get_cosine_scheduler
 from utils.train_logger import append_epoch_log, init_train_log
 
@@ -105,6 +106,7 @@ def main():
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
     if getattr(cfg, 'resume_checkpoint', None):
         _load_state_dict_with_report(task.model, cfg.resume_checkpoint)
+    task.set_optimizer(create_finetune_optimizer(task.model, cfg))
     total_params, trainable_params = _count_parameters(task.model)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
     task.scheduler = get_cosine_scheduler(
@@ -140,6 +142,7 @@ def main():
 
     for epoch in range(1, cfg.epochs + 1):
         task.model.train()
+        sync_frozen_modules_eval(task.model, getattr(cfg, 'finetune_mode', 'none'))
         full_n = missing_n = 0
         full_loss = missing_loss = 0.0
         grad_norm_accum = 0.0
@@ -299,7 +302,11 @@ def main():
             extra_metrics=extra_metrics,
         )
 
-        print(f'[EPOCH {epoch}] joint_dice={joint_dice:.4f} best_joint={best_joint:.4f} lr={task.optimizer.param_groups[0]["lr"]:.8f}', flush=True)
+        group_lrs = ', '.join(
+            f"{g.get('name', i)}={g['lr']:.8f}"
+            for i, g in enumerate(task.optimizer.param_groups)
+        )
+        print(f'[EPOCH {epoch}] joint_dice={joint_dice:.4f} best_joint={best_joint:.4f} lr=[{group_lrs}]', flush=True)
         if no_improve >= patience:
             print(f'[EARLY STOP] no improvement for {patience} epochs', flush=True)
             break

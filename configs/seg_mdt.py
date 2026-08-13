@@ -39,6 +39,17 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
         p.add_argument('--resume_checkpoint', type=str, default=None)
+        p.add_argument(
+            '--finetune_mode',
+            type=str,
+            default='none',
+            choices=('none', 'cmgf_only', 'joint_diff_lr'),
+            help=(
+                'none: train all with learning_rate; '
+                'cmgf_only: freeze encoder/CPPI/calibration/decoder, train fusion only; '
+                'joint_diff_lr: unfreeze all with backbone/fusion/decoder lrs'
+            ),
+        )
         return p
 
     @staticmethod
@@ -49,6 +60,8 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--accumulation_steps', type=int, default=1)
         p.add_argument('--optimizer', type=str, default='adamw', choices=('adamw', 'sgd'))
         p.add_argument('--learning_rate', type=float, default=8e-5)
+        p.add_argument('--backbone_lr', type=float, default=None, help='Used by joint_diff_lr; defaults to learning_rate')
+        p.add_argument('--fusion_lr', type=float, default=None, help='CMGF lr; defaults to learning_rate')
         p.add_argument('--decoder_lr', type=float, default=8e-5)
         p.add_argument('--weight_decay', type=float, default=1e-4)
         p.add_argument('--cosine_warmup', type=int, default=3)

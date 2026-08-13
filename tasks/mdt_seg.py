@@ -35,6 +35,9 @@ class MDTSegTeacher:
     def trainable_parameters(self):
         return [p for p in self.model.parameters() if p.requires_grad]
 
+    def set_optimizer(self, optimizer):
+        self.optimizer = optimizer
+
     def train_step(self, batch, forward_mode='full'):
         ct = batch['ct'].to(self.device, non_blocking=True)
         pet = batch['pet'].to(self.device, non_blocking=True)
