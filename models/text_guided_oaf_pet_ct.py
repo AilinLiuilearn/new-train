@@ -27,12 +27,24 @@ and is used only once to export the two fixed text embeddings offline.
 from __future__ import annotations
 
 import argparse
+import gc
+import os
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+
+
+BIOMEDCLIP_MODEL_PATH = (
+    "/root/autodl-tmp/mkd-main/new-train/"
+    "pretrained/biomedclip_model"
+)
+BIOMEDBERT_TEXT_TOWER_PATH = (
+    "/root/autodl-tmp/mkd-main/new-train/"
+    "pretrained/biomedbert_text_tower"
+)
 
 
 REAL_PET_PROMPT = (
@@ -342,17 +354,173 @@ class TextGuidedOAF(nn.Module):
         return fused, diagnostics
 
 
-@torch.no_grad()
-def export_fixed_text_bank(
-    model_name_or_path: str,
-    output_path: Union[str, Path],
-    device: str = "cpu",
-) -> Path:
-    """Encode the two prompts once with a frozen Hugging Face text model.
+class MultiScaleTextGuidedOAF(nn.Module):
+    """Apply TextGuidedOAF independently at every encoder scale.
 
-    This function is an offline utility.  The resulting ``.pt`` file is loaded
-    by ``TextGuidedOAF.from_text_bank``; the language model is not present in
-    the segmentation training graph.
+    Compatible with the existing baseline fusion call signature:
+        fusion(ct_feats, pet_feats, mode="full"|"missing"|"auto", pet_available=...)
+    """
+
+    def __init__(
+        self,
+        channels: Sequence[int],
+        text_embeddings: Tensor,
+        kernel_size: int = 3,
+    ) -> None:
+        super().__init__()
+        if len(channels) == 0:
+            raise ValueError("channels must be a non-empty sequence")
+        self.channels = list(channels)
+        self.blocks = nn.ModuleList(
+            [
+                TextGuidedOAF(
+                    channels=c,
+                    text_embeddings=text_embeddings,
+                    compressed_channels=c,
+                    kernel_size=kernel_size,
+                )
+                for c in self.channels
+            ]
+        )
+
+    def _resolve_state_ids(
+        self,
+        mode: str,
+        batch_size: int,
+        device: torch.device,
+        pet_available: Optional[Tensor],
+    ) -> Tensor:
+        if mode == "full":
+            return torch.zeros(batch_size, dtype=torch.long, device=device)
+        if mode == "missing":
+            return torch.ones(batch_size, dtype=torch.long, device=device)
+        if mode == "auto":
+            if pet_available is None:
+                raise ValueError("pet_available is required for auto fusion")
+            # Project convention: pet_available=1 -> real PET, 0 -> proxy PET.
+            # TextGuidedOAF convention: 0=real, 1=proxy (inverted).
+            state_ids = 1 - pet_available.to(device=device, dtype=torch.long).view(-1)
+            if state_ids.numel() != batch_size:
+                raise ValueError(
+                    f"pet_available has {state_ids.numel()} values, "
+                    f"but batch size is {batch_size}"
+                )
+            if not torch.all((state_ids == 0) | (state_ids == 1)):
+                raise ValueError(
+                    "auto fusion state_ids must contain only 0 (real) or 1 (proxy)"
+                )
+            return state_ids
+        raise ValueError(f"Unsupported fusion mode: {mode!r}")
+
+    def forward(
+        self,
+        ct_feats: Sequence[Tensor],
+        pet_feats: Sequence[Tensor],
+        mode: str,
+        pet_available: Optional[Tensor] = None,
+        return_diagnostics: bool = False,
+    ) -> Union[List[Tensor], Tuple[List[Tensor], Dict[str, object]]]:
+        if not (len(ct_feats) == len(pet_feats) == len(self.blocks)):
+            raise ValueError(
+                "Expected matching scale counts, got "
+                f"ct={len(ct_feats)}, pet={len(pet_feats)}, blocks={len(self.blocks)}"
+            )
+
+        batch_size = ct_feats[0].shape[0]
+        device = ct_feats[0].device
+        state_ids = self._resolve_state_ids(mode, batch_size, device, pet_available)
+
+        fused_feats: List[Tensor] = []
+        routing_weights: List[Tensor] = []
+        pet_text_bias: List[Tensor] = []
+
+        for block, ct_feat, pet_feat in zip(self.blocks, ct_feats, pet_feats):
+            if pet_feat.shape[1] != ct_feat.shape[1]:
+                raise ValueError(
+                    "CT/PET channel mismatch at fusion: "
+                    f"ct={tuple(ct_feat.shape)}, pet={tuple(pet_feat.shape)}"
+                )
+            if pet_feat.shape[-2:] != ct_feat.shape[-2:]:
+                pet_feat = F.interpolate(
+                    pet_feat,
+                    size=ct_feat.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+            if return_diagnostics:
+                fused, diagnostics = block(
+                    ct_feat,
+                    pet_feat,
+                    pet_state=state_ids,
+                    return_diagnostics=True,
+                )
+                routing_weights.append(diagnostics["routing_weights"])
+                pet_text_bias.append(diagnostics["pet_text_bias"])
+            else:
+                fused = block(ct_feat, pet_feat, pet_state=state_ids)
+            fused_feats.append(fused)
+
+        if not return_diagnostics:
+            return fused_feats
+
+        return fused_feats, {
+            "routing_weights": routing_weights,
+            "pet_text_bias": pet_text_bias,
+            "pet_state_ids": state_ids,
+        }
+
+
+def _missing_files(path: str, names: Sequence[str]) -> List[str]:
+    return [name for name in names if not os.path.isfile(os.path.join(path, name))]
+
+
+def _has_hf_model_files(path: str) -> bool:
+    return os.path.isfile(os.path.join(path, "config.json")) and (
+        os.path.isfile(os.path.join(path, "pytorch_model.bin"))
+        or os.path.isfile(os.path.join(path, "model.safetensors"))
+    )
+
+
+def _has_hf_tokenizer_files(path: str) -> bool:
+    has_vocab = os.path.isfile(os.path.join(path, "vocab.txt")) or os.path.isfile(
+        os.path.join(path, "tokenizer.json")
+    )
+    has_config = os.path.isfile(os.path.join(path, "tokenizer_config.json"))
+    return has_vocab and has_config
+
+
+def _raise_local_load_error(
+    biomedclip_model_path: str,
+    biomedbert_text_tower_path: str,
+    missing: Mapping[str, Sequence[str]],
+    attempted: Sequence[str],
+) -> None:
+    lines = [
+        "Failed to load local PET text embeddings offline.",
+        f"Checked biomedclip_model_path={biomedclip_model_path}",
+        f"Checked biomedbert_text_tower_path={biomedbert_text_tower_path}",
+    ]
+    for label, files in missing.items():
+        if files:
+            lines.append(f"Missing under {label}: {', '.join(files)}")
+    lines.append("Attempted load methods: " + "; ".join(attempted))
+    lines.append(
+        "No online/Hugging Face hub fallback is allowed. "
+        "Provide complete local tokenizer + text-model files."
+    )
+    raise FileNotFoundError("\n".join(lines))
+
+
+@torch.no_grad()
+def load_local_pet_text_embeddings(
+    biomedclip_model_path: str,
+    biomedbert_text_tower_path: str,
+) -> Tensor:
+    """Encode the two fixed PET prompts once with a local frozen text model.
+
+    Returns a CPU tensor of shape ``[2, text_dim]`` ordered as
+    ``[real/full, proxy/missing]``.  The text encoder is deleted before return.
     """
     try:
         from transformers import AutoModel, AutoTokenizer
@@ -362,22 +530,206 @@ def export_fixed_text_bank(
             "pip install transformers"
         ) from error
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-    text_model = AutoModel.from_pretrained(model_name_or_path).to(device).eval()
+    attempted: List[str] = []
+    missing = {
+        biomedbert_text_tower_path: [],
+        biomedclip_model_path: [],
+    }
+
+    if not os.path.isdir(biomedbert_text_tower_path):
+        missing[biomedbert_text_tower_path] = ["<directory missing>"]
+    if not os.path.isdir(biomedclip_model_path):
+        missing[biomedclip_model_path] = ["<directory missing>"]
+
+    tokenizer_path: Optional[str] = None
+    model_path: Optional[str] = None
+    source = None
+
+    bert_has_model = _has_hf_model_files(biomedbert_text_tower_path)
+    bert_has_tok = _has_hf_tokenizer_files(biomedbert_text_tower_path)
+    clip_has_tok = _has_hf_tokenizer_files(biomedclip_model_path)
+
+    if bert_has_model and bert_has_tok:
+        tokenizer_path = biomedbert_text_tower_path
+        model_path = biomedbert_text_tower_path
+        source = "hf_biomedbert_text_tower"
+        attempted.append(
+            "HF AutoTokenizer+AutoModel from biomedbert_text_tower (preferred)"
+        )
+    elif bert_has_model and clip_has_tok:
+        tokenizer_path = biomedclip_model_path
+        model_path = biomedbert_text_tower_path
+        source = "hf_biomedbert_model_biomedclip_tokenizer"
+        attempted.append(
+            "HF AutoTokenizer from biomedclip_model + AutoModel from biomedbert_text_tower"
+        )
+    else:
+        if not bert_has_model:
+            miss_model = _missing_files(
+                biomedbert_text_tower_path,
+                ["config.json", "pytorch_model.bin"],
+            )
+            if not os.path.isfile(
+                os.path.join(biomedbert_text_tower_path, "model.safetensors")
+            ) and "pytorch_model.bin" in miss_model:
+                miss_model.append("model.safetensors")
+            missing[biomedbert_text_tower_path].extend(miss_model)
+        if not bert_has_tok and not clip_has_tok:
+            for path in (biomedbert_text_tower_path, biomedclip_model_path):
+                miss = []
+                if not os.path.isfile(os.path.join(path, "tokenizer_config.json")):
+                    miss.append("tokenizer_config.json")
+                if not (
+                    os.path.isfile(os.path.join(path, "vocab.txt"))
+                    or os.path.isfile(os.path.join(path, "tokenizer.json"))
+                ):
+                    miss.append("vocab.txt|tokenizer.json")
+                missing[path].extend(miss)
+        attempted.extend(
+            [
+                "HF AutoTokenizer+AutoModel from biomedbert_text_tower",
+                "HF split tokenizer(biomedclip)+model(biomedbert)",
+                "OpenCLIP BioMedCLIP local load (not selected: HF files incomplete)",
+            ]
+        )
+        _raise_local_load_error(
+            biomedclip_model_path,
+            biomedbert_text_tower_path,
+            missing,
+            attempted,
+        )
+
+    assert tokenizer_path is not None and model_path is not None
+
+    tokenizer = None
+    text_model = None
+    embeddings: Optional[Tensor] = None
+    used_cuda = False
+    try:
+        attempted.append(
+            f"AutoTokenizer.from_pretrained({tokenizer_path}, local_files_only=True)"
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            local_files_only=True,
+        )
+        attempted.append(
+            f"AutoModel.from_pretrained({model_path}, local_files_only=True)"
+        )
+        text_model = AutoModel.from_pretrained(
+            model_path,
+            local_files_only=True,
+        )
+        text_model.eval()
+        text_model.requires_grad_(False)
+        # Keep the text encoder on CPU so training GPUs stay free.
+        text_model = text_model.to("cpu")
+
+        tokens = tokenizer(
+            list(PET_PROMPTS),
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+            max_length=512,
+        )
+        tokens = {name: value.to("cpu") for name, value in tokens.items()}
+
+        with torch.no_grad():
+            outputs = text_model(**tokens)
+            if (
+                hasattr(outputs, "text_embeds")
+                and outputs.text_embeds is not None
+            ):
+                embeddings = outputs.text_embeds
+            else:
+                # Prefer verified attention-mask mean pooling over unverified poolers.
+                hidden = outputs.last_hidden_state
+                mask = tokens["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+                embeddings = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(
+                    1.0
+                )
+
+            embeddings = F.normalize(embeddings.float(), dim=-1).cpu()
+
+        assert embeddings.ndim == 2
+        assert embeddings.shape[0] == 2
+        assert torch.isfinite(embeddings).all()
+        assert not torch.allclose(embeddings[0], embeddings[1])
+    except (AssertionError, FileNotFoundError, RuntimeError, ValueError):
+        raise
+    except Exception as error:
+        attempted.append(f"failed with {type(error).__name__}: {error}")
+        _raise_local_load_error(
+            biomedclip_model_path,
+            biomedbert_text_tower_path,
+            missing,
+            attempted,
+        )
+    finally:
+        del tokenizer
+        del text_model
+        gc.collect()
+        if used_cuda and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    assert embeddings is not None
+    print("[TextOAF] offline=True")
+    print(f"[TextOAF] source={source}")
+    print(f"[TextOAF] embedding_shape={tuple(embeddings.shape)}")
+    print("[TextOAF] state_order=['real', 'proxy']")
+    print("[TextOAF] text_encoder_retained=False")
+    return embeddings
+
+
+@torch.no_grad()
+def export_fixed_text_bank(
+    model_name_or_path: str,
+    output_path: Union[str, Path],
+    device: str = "cpu",
+) -> Path:
+    """Encode the two prompts once with a frozen local Hugging Face text model.
+
+    This function is an offline utility.  The resulting ``.pt`` file is loaded
+    by ``TextGuidedOAF.from_text_bank``; the language model is not present in
+    the segmentation training graph.  ``model_name_or_path`` must be a local
+    directory; remote Hugging Face model ids are rejected.
+    """
+    if not os.path.isdir(model_name_or_path):
+        raise ValueError(
+            "export_fixed_text_bank requires a local directory path; "
+            f"got {model_name_or_path!r}. Remote model names are not allowed."
+        )
+
+    try:
+        from transformers import AutoModel, AutoTokenizer
+    except ImportError as error:
+        raise RuntimeError(
+            "Install transformers only for offline prompt encoding: "
+            "pip install transformers"
+        ) from error
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name_or_path, local_files_only=True
+    )
+    text_model = (
+        AutoModel.from_pretrained(model_name_or_path, local_files_only=True)
+        .to(device)
+        .eval()
+    )
+    text_model.requires_grad_(False)
     tokens = tokenizer(
         list(PET_PROMPTS), padding=True, truncation=True, return_tensors="pt"
     )
     tokens = {name: value.to(device) for name, value in tokens.items()}
-    outputs = text_model(**tokens)
+    with torch.no_grad():
+        outputs = text_model(**tokens)
 
-    if hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
-        embeddings = outputs.text_embeds
-    elif hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
-        embeddings = outputs.pooler_output
-    else:
-        hidden = outputs.last_hidden_state
-        mask = tokens["attention_mask"].unsqueeze(-1).to(hidden.dtype)
-        embeddings = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        if hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
+            embeddings = outputs.text_embeds
+        else:
+            hidden = outputs.last_hidden_state
+            mask = tokens["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+            embeddings = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
 
     payload = {
         "embeddings": F.normalize(embeddings.float(), dim=-1).cpu(),
@@ -388,6 +740,12 @@ def export_fixed_text_bank(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, output_path)
+
+    del tokenizer
+    del text_model
+    gc.collect()
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return output_path
 
 
@@ -450,8 +808,8 @@ def main() -> None:
     parser.add_argument(
         "--text-model",
         type=str,
-        default="emilyalsentzer/Bio_ClinicalBERT",
-        help="Hugging Face text model used only with --export-text-bank",
+        default=BIOMEDBERT_TEXT_TOWER_PATH,
+        help="Local text-model directory used only with --export-text-bank",
     )
     parser.add_argument("--device", type=str, default="cpu")
     args = parser.parse_args()

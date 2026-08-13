@@ -351,10 +351,26 @@ class ConvBNAct(nn.Module):
 
 def build_mdt_seg_teacher(config):
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
+    from models.text_guided_oaf_pet_ct import load_local_pet_text_embeddings
+
     cppi_num_clusters = getattr(config, 'cppi_num_clusters', 6)
     cppi_build_stage = getattr(config, 'cppi_build_stage', 3)
     cppi_output_dir = os.path.join(config.checkpoint_dir, 'cppi')
     no_encoder_pretrained = bool(getattr(config, 'no_encoder_pretrained', False))
+    biomedclip_model_path = getattr(
+        config,
+        'biomedclip_model_path',
+        '/root/autodl-tmp/mkd-main/new-train/pretrained/biomedclip_model',
+    )
+    biomedbert_text_tower_path = getattr(
+        config,
+        'biomedbert_text_tower_path',
+        '/root/autodl-tmp/mkd-main/new-train/pretrained/biomedbert_text_tower',
+    )
+    pet_text_embeddings = load_local_pet_text_embeddings(
+        biomedclip_model_path=biomedclip_model_path,
+        biomedbert_text_tower_path=biomedbert_text_tower_path,
+    )
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
@@ -367,11 +383,14 @@ def build_mdt_seg_teacher(config):
         cppi_num_clusters=cppi_num_clusters,
         cppi_build_stage=cppi_build_stage,
         cppi_output_dir=cppi_output_dir,
+        pet_text_embeddings=pet_text_embeddings,
     )
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion=state_aware_weighted_add shared_decoder=UNetStyleDecoder '
+        f'fusion=text_guided_oaf shared_decoder=UNetStyleDecoder '
+        f'text_condition=pet_operation_routing_only '
+        f'text_encoder=offline_local_frozen '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
     print(f'[CPPI] enabled=True')

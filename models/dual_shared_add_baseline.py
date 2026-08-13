@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
 
-from models.baseline_blocks import PrototypeReferencedPETAffineCalibration, StateAwareWeightedAddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
+from models.baseline_blocks import PrototypeReferencedPETAffineCalibration, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.ct_pet_prototype_imputation import CrossScaleCTPETPrototypeMemory
+from models.text_guided_oaf_pet_ct import MultiScaleTextGuidedOAF
 
 
 class StageChannelAlign(nn.Module):
@@ -22,8 +23,12 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
-    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=6, cppi_build_stage=3, cppi_output_dir=None):
+    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=6, cppi_build_stage=3, cppi_output_dir=None, pet_text_embeddings=None):
         super().__init__()
+        if pet_text_embeddings is None:
+            raise ValueError(
+                "pet_text_embeddings is required for Text-Guided OAF"
+            )
         self.use_deep_supervision = bool(use_deep_supervision)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
@@ -33,7 +38,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pet_channels = list(self.enc_pet.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
         self.pet_calibration = PrototypeReferencedPETAffineCalibration(channels=pet_channels)
-        self.fusion = StateAwareWeightedAddFusion(num_scales=len(pet_channels))
+        self.fusion = MultiScaleTextGuidedOAF(
+            channels=pet_channels,
+            text_embeddings=pet_text_embeddings,
+        )
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
         self.prototype_memory = CrossScaleCTPETPrototypeMemory(
             channels=pet_channels,
