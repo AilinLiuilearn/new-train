@@ -494,7 +494,6 @@ def test_shifted_window_mask_blocks_border_wrap():
         _windowed_sdpa,
         build_shifted_window_mask,
         pad_to_window,
-        window_partition,
     )
 
     torch.manual_seed(0)
@@ -527,10 +526,89 @@ def test_shifted_window_mask_blocks_border_wrap():
         ph,
         pw,
         window_size,
-        shift_size,
+        shift_h=shift_size,
+        shift_w=shift_size,
         device=query.device,
         dtype=torch.float32,
     )
     assert mask is not None
     assert bool((mask < 0).any())
 
+
+def test_windowed_sdpa_masks_padding_without_shift():
+    """Padded K/V tokens must be Softmax-masked so valid outputs stay ~1."""
+    from models.evidence_guided_sdnca_pet_ct import _windowed_sdpa
+
+    query = torch.zeros(1, 8, 9, 7)
+    key = torch.zeros_like(query)
+    value = torch.ones_like(query)
+    output = _windowed_sdpa(
+        query,
+        key,
+        value,
+        num_heads=2,
+        window_size=8,
+        shift_size=0,
+    )
+    assert output.shape == query.shape
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(
+        output,
+        torch.ones_like(output),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_windowed_sdpa_masks_padding_with_shift():
+    """Shifted windows must also Softmax-mask padding on non-divisible maps."""
+    from models.evidence_guided_sdnca_pet_ct import _windowed_sdpa
+
+    query = torch.zeros(1, 8, 13, 11)
+    key = torch.zeros_like(query)
+    value = torch.ones_like(query)
+    output = _windowed_sdpa(
+        query,
+        key,
+        value,
+        num_heads=2,
+        window_size=8,
+        shift_size=4,
+    )
+    assert output.shape == query.shape
+    assert torch.isfinite(output).all()
+    assert not torch.isnan(output).any()
+    assert not torch.isinf(output).any()
+    torch.testing.assert_close(
+        output,
+        torch.ones_like(output),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_effective_window_per_axis_shift():
+    """Non-square maps must zero shift on axes that already fit one window."""
+    from models.evidence_guided_sdnca_pet_ct import _effective_window_and_shift
+
+    window, shift_h, shift_w = _effective_window_and_shift(
+        configured_window=8,
+        configured_shift=4,
+        height=8,
+        width=16,
+    )
+    assert (window, shift_h, shift_w) == (8, 0, 4)
+
+    window, shift_h, shift_w = _effective_window_and_shift(
+        configured_window=8,
+        configured_shift=4,
+        height=16,
+        width=8,
+    )
+    assert (window, shift_h, shift_w) == (8, 4, 0)
+
+    # Standard square four-scale context settings remain unchanged.
+    assert _effective_window_and_shift(8, 4, 128, 128) == (8, 4, 4)
+    assert _effective_window_and_shift(8, 4, 64, 64) == (8, 4, 4)
+    assert _effective_window_and_shift(16, 8, 32, 32) == (16, 8, 8)
+    assert _effective_window_and_shift(16, 0, 16, 16) == (16, 0, 0)

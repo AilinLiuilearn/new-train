@@ -276,6 +276,12 @@ def evidential_conflict(ct_belief: Tensor, pet_belief: Tensor) -> Tensor:
 def resolve_attention_backend(attention_backend: Optional[str]) -> str:
     """Map legacy backend names onto the only supported backend: sdpa."""
 
+    if not hasattr(F, "scaled_dot_product_attention"):
+        raise RuntimeError(
+            "EDV shifted-window attention requires "
+            "PyTorch with scaled_dot_product_attention support."
+        )
+
     backend = "sdpa" if attention_backend is None else str(attention_backend).lower()
     if backend in {"sdpa", "auto", "torch"}:
         return "sdpa"
@@ -352,7 +358,8 @@ def build_shifted_window_mask(
     height: int,
     width: int,
     window_size: int,
-    shift_size: int,
+    shift_h: int,
+    shift_w: int,
     device: torch.device,
     dtype: torch.dtype,
 ) -> Optional[Tensor]:
@@ -360,26 +367,37 @@ def build_shifted_window_mask(
 
     Returns ``[nW, N, N]`` with ``0`` for valid pairs and a large negative value
     for pairs that only touch because of ``torch.roll`` wrapping across borders.
+    ``shift_h`` / ``shift_w`` may differ for non-square maps.
     """
 
-    if shift_size <= 0:
+    shift_h = int(shift_h)
+    shift_w = int(shift_w)
+    if shift_h <= 0 and shift_w <= 0:
         return None
-    if shift_size >= window_size:
+    if not (0 <= shift_h < window_size and 0 <= shift_w < window_size):
         raise ValueError(
-            f"shift_size ({shift_size}) must be < window_size ({window_size})."
+            f"shift_h/shift_w must satisfy 0 <= shift < window_size; "
+            f"got shift_h={shift_h}, shift_w={shift_w}, window={window_size}."
         )
 
     img_mask = torch.zeros((1, 1, height, width), device=device, dtype=torch.float32)
-    h_slices = (
-        slice(0, -window_size),
-        slice(-window_size, -shift_size),
-        slice(-shift_size, None),
-    )
-    w_slices = (
-        slice(0, -window_size),
-        slice(-window_size, -shift_size),
-        slice(-shift_size, None),
-    )
+    if shift_h > 0:
+        h_slices = (
+            slice(0, -window_size),
+            slice(-window_size, -shift_h),
+            slice(-shift_h, None),
+        )
+    else:
+        h_slices = (slice(0, None),)
+    if shift_w > 0:
+        w_slices = (
+            slice(0, -window_size),
+            slice(-window_size, -shift_w),
+            slice(-shift_w, None),
+        )
+    else:
+        w_slices = (slice(0, None),)
+
     counter = 0
     for h_slice in h_slices:
         for w_slice in w_slices:
@@ -393,19 +411,69 @@ def build_shifted_window_mask(
     return attn_mask.to(dtype=dtype)
 
 
+def build_window_validity_mask(
+    batch_size: int,
+    original_height: int,
+    original_width: int,
+    padded_height: int,
+    padded_width: int,
+    window_size: int,
+    shift_h: int,
+    shift_w: int,
+    device: torch.device,
+) -> Tuple[Tensor, Tensor]:
+    """Return per-window query/key validity flags after the same pad+shift as QKV.
+
+    Both tensors have shape ``[B * num_windows, window_tokens]`` and are ``bool``.
+    """
+
+    valid_map = torch.ones(
+        (batch_size, 1, original_height, original_width),
+        device=device,
+        dtype=torch.bool,
+    )
+    valid_map = F.pad(
+        valid_map,
+        (
+            0,
+            padded_width - original_width,
+            0,
+            padded_height - original_height,
+        ),
+        value=False,
+    )
+    if shift_h != 0 or shift_w != 0:
+        valid_map = torch.roll(
+            valid_map,
+            shifts=(-int(shift_h), -int(shift_w)),
+            dims=(2, 3),
+        )
+    # window_partition expects a channel axis; cast bool -> float for views.
+    valid_windows = window_partition(valid_map.to(dtype=torch.float32), window_size)
+    valid_windows = valid_windows.squeeze(-1) > 0.5
+    return valid_windows, valid_windows
+
+
 def _effective_window_and_shift(
     configured_window: int,
     configured_shift: int,
     height: int,
     width: int,
-) -> Tuple[int, int]:
+) -> Tuple[int, int, int]:
+    """Return ``(window_size, shift_h, shift_w)`` with per-axis shift gating."""
+
     window_size = max(1, min(int(configured_window), int(height), int(width)))
-    if window_size >= height and window_size >= width:
-        return window_size, 0
-    shift_size = int(configured_shift)
-    if shift_size <= 0 or shift_size >= window_size:
-        shift_size = 0
-    return window_size, shift_size
+    shift = int(configured_shift)
+    if shift < 0 or shift >= window_size:
+        shift = 0
+    shift_h = 0 if window_size >= int(height) else shift
+    shift_w = 0 if window_size >= int(width) else shift
+    if not (0 <= shift_h < window_size and 0 <= shift_w < window_size):
+        raise ValueError(
+            f"Invalid per-axis shifts: shift_h={shift_h}, shift_w={shift_w}, "
+            f"window={window_size}."
+        )
+    return window_size, shift_h, shift_w
 
 
 def _windowed_sdpa(
@@ -419,6 +487,10 @@ def _windowed_sdpa(
     """Run multi-head SDPA inside (optionally shifted) windows.
 
     Inputs/outputs are ``[B,C,H,W]`` with ``C`` divisible by ``num_heads``.
+    Padding tokens are excluded from Softmax via an additive key mask; cyclic
+    wrap pairs are blocked by a Swin-style shift mask.  ``shift_size`` is
+    interpreted per axis and may collapse to zero on an axis that already fits
+    in one window.
     """
 
     if query.shape != key.shape or query.shape != value.shape:
@@ -428,8 +500,13 @@ def _windowed_sdpa(
         raise ValueError(
             f"channels ({channels}) must be divisible by heads ({num_heads})."
         )
+    if not hasattr(F, "scaled_dot_product_attention"):
+        raise RuntimeError(
+            "EDV shifted-window attention requires "
+            "PyTorch with scaled_dot_product_attention support."
+        )
     head_dim = channels // num_heads
-    window_size, shift_size = _effective_window_and_shift(
+    window_size, shift_h, shift_w = _effective_window_and_shift(
         window_size,
         shift_size,
         height,
@@ -440,23 +517,13 @@ def _windowed_sdpa(
     key_pad, _, _ = pad_to_window(key, window_size)
     value_pad, _, _ = pad_to_window(value, window_size)
     _, _, pad_h, pad_w = query_pad.shape
+    has_padding = (pad_h != orig_h) or (pad_w != orig_w)
 
-    if shift_size > 0:
-        shifted_q = torch.roll(
-            query_pad,
-            shifts=(-shift_size, -shift_size),
-            dims=(2, 3),
-        )
-        shifted_k = torch.roll(
-            key_pad,
-            shifts=(-shift_size, -shift_size),
-            dims=(2, 3),
-        )
-        shifted_v = torch.roll(
-            value_pad,
-            shifts=(-shift_size, -shift_size),
-            dims=(2, 3),
-        )
+    if shift_h != 0 or shift_w != 0:
+        roll_shifts = (-shift_h, -shift_w)
+        shifted_q = torch.roll(query_pad, shifts=roll_shifts, dims=(2, 3))
+        shifted_k = torch.roll(key_pad, shifts=roll_shifts, dims=(2, 3))
+        shifted_v = torch.roll(value_pad, shifts=roll_shifts, dims=(2, 3))
     else:
         shifted_q = query_pad
         shifted_k = key_pad
@@ -472,38 +539,78 @@ def _windowed_sdpa(
     k = k_windows.view(num_windows, tokens, num_heads, head_dim).transpose(1, 2)
     v = v_windows.view(num_windows, tokens, num_heads, head_dim).transpose(1, 2)
 
-    attn_mask = build_shifted_window_mask(
+    shift_mask = build_shifted_window_mask(
         height=pad_h,
         width=pad_w,
         window_size=window_size,
-        shift_size=shift_size,
+        shift_h=shift_h,
+        shift_w=shift_w,
         device=query.device,
         dtype=q.dtype,
     )
-    if attn_mask is not None:
-        attn_mask = attn_mask.unsqueeze(1).repeat(batch, 1, 1, 1)
-        if attn_mask.shape[0] != num_windows:
-            raise RuntimeError(
-                f"Attention mask batch mismatch: {attn_mask.shape[0]} vs "
-                f"{num_windows}."
-            )
+    if shift_mask is not None:
+        shift_mask = shift_mask.unsqueeze(1).repeat(batch, 1, 1, 1)
+
+    attention_mask: Optional[Tensor] = None
+    valid_query_windows: Optional[Tensor] = None
+    if has_padding:
+        valid_query_windows, valid_key_windows = build_window_validity_mask(
+            batch_size=batch,
+            original_height=orig_h,
+            original_width=orig_w,
+            padded_height=pad_h,
+            padded_width=pad_w,
+            window_size=window_size,
+            shift_h=shift_h,
+            shift_w=shift_w,
+            device=query.device,
+        )
+        # [BnW, 1, 1, N] — invalidate padded keys for every query in the window.
+        padding_key_mask = torch.zeros(
+            num_windows,
+            1,
+            1,
+            tokens,
+            device=query.device,
+            dtype=q.dtype,
+        )
+        padding_key_mask = padding_key_mask.masked_fill(
+            ~valid_key_windows[:, None, None, :],
+            torch.finfo(q.dtype).min,
+        )
+        attention_mask = padding_key_mask
+        if shift_mask is not None:
+            attention_mask = shift_mask + padding_key_mask
+    elif shift_mask is not None:
+        attention_mask = shift_mask
+
+    if attention_mask is not None and attention_mask.shape[0] != num_windows:
+        raise RuntimeError(
+            f"Attention mask batch mismatch: {attention_mask.shape[0]} vs "
+            f"{num_windows}."
+        )
 
     attended = F.scaled_dot_product_attention(
         q,
         k,
         v,
-        attn_mask=attn_mask,
+        attn_mask=attention_mask,
         dropout_p=0.0,
         is_causal=False,
     )
+    if valid_query_windows is not None:
+        # Zero outputs for padded query tokens to avoid NaNs from fully-masked rows.
+        attended = attended * valid_query_windows[:, None, :, None].to(
+            dtype=attended.dtype
+        )
     attended = (
         attended.transpose(1, 2)
         .contiguous()
         .view(num_windows, tokens, channels)
     )
     merged = window_reverse(attended, window_size, pad_h, pad_w)
-    if shift_size > 0:
-        merged = torch.roll(merged, shifts=(shift_size, shift_size), dims=(2, 3))
+    if shift_h != 0 or shift_w != 0:
+        merged = torch.roll(merged, shifts=(shift_h, shift_w), dims=(2, 3))
     return merged[:, :, :orig_h, :orig_w]
 
 
@@ -1294,10 +1401,31 @@ def run_self_test(args: argparse.Namespace) -> None:
     ]
     availability = torch.arange(args.batch_size, device=device) % 2
 
+    # Warm up kernels / allocator so reported timings exclude cold start.
+    with torch.autocast(
+        device_type=device.type,
+        dtype=torch.float16,
+        enabled=use_amp,
+    ):
+        warm_out, _ = model(
+            ct_features,
+            pet_features,
+            mode="auto",
+            pet_available=availability,
+            return_diagnostics=True,
+        )
+        warm_loss = sum(feature.square().mean() for feature in warm_out)
+    warm_loss.backward()
+    for feature in ct_features + pet_features:
+        if feature.grad is not None:
+            feature.grad = None
     if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
-    start = time.perf_counter()
+        torch.cuda.reset_peak_memory_stats(device)
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    forward_start = time.perf_counter()
     with torch.autocast(
         device_type=device.type,
         dtype=torch.float16,
@@ -1311,29 +1439,71 @@ def run_self_test(args: argparse.Namespace) -> None:
             return_diagnostics=True,
         )
         loss = sum(feature.square().mean() for feature in fused_features)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    forward_elapsed = time.perf_counter() - forward_start
 
     for fused, expected in zip(fused_features, shapes):
         if fused.shape != expected or not torch.isfinite(fused).all():
             raise RuntimeError("Output shape or finite-value check failed.")
+    if not torch.isfinite(loss):
+        raise RuntimeError("Loss is not finite.")
     expected_states = 1 - availability
     torch.testing.assert_close(diagnostics["pet_state_ids"], expected_states)
+
+    for feature in ct_features + pet_features:
+        if feature.grad is not None:
+            feature.grad = None
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device)
+    total_start = time.perf_counter()
+    with torch.autocast(
+        device_type=device.type,
+        dtype=torch.float16,
+        enabled=use_amp,
+    ):
+        fused_features, diagnostics = model(
+            ct_features,
+            pet_features,
+            mode="auto",
+            pet_available=availability,
+            return_diagnostics=True,
+        )
+        loss = sum(feature.square().mean() for feature in fused_features)
     loss.backward()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    total_elapsed = time.perf_counter() - total_start
     if any(feature.grad is None for feature in ct_features + pet_features):
         raise RuntimeError("Backward did not reach every CT/PET scale.")
 
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    elapsed = time.perf_counter() - start
+    effective_shifts = [
+        _effective_window_and_shift(window, shift, height, width)
+        for window, shift, (_, _, height, width) in zip(
+            model.context_window_sizes,
+            model.context_shift_sizes,
+            shapes,
+        )
+    ]
     print("Evidence-guided SDNCA standalone test: PASS")
+    print(f"PyTorch version: {torch.__version__}")
     print(f"device: {device}")
+    if device.type == "cuda":
+        print(f"CUDA device: {torch.cuda.get_device_name(device)}")
+        print(f"CUDA version: {torch.version.cuda}")
     print(f"attention backend: {model.attention_backend}")
     print(f"local_window_size: {model.local_window_size}")
     print(f"context_window_sizes: {model.context_window_sizes}")
     print(f"context_shift_sizes: {model.context_shift_sizes}")
+    print(f"effective context (window, shift_h, shift_w): {effective_shifts}")
+    print(f"four-scale input shapes: {shapes}")
     print(f"AMP enabled: {use_amp}")
     print(f"parameters: {total_parameters:,} total")
     print(f"trainable parameters: {trainable_parameters:,}")
-    print(f"forward + backward: {elapsed:.3f} s")
+    print(f"forward: {forward_elapsed:.3f} s")
+    print(f"forward + backward: {total_elapsed:.3f} s")
+    print(f"NaN/Inf present: False")
     if device.type == "cuda":
         peak_mib = torch.cuda.max_memory_allocated(device) / (1024**2)
         print(f"peak allocated CUDA memory: {peak_mib:.1f} MiB")
@@ -1371,6 +1541,7 @@ __all__ = [
     "window_partition",
     "window_reverse",
     "build_shifted_window_mask",
+    "build_window_validity_mask",
     "resolve_attention_backend",
     "count_parameters",
     "load_local_pet_text_embeddings",
