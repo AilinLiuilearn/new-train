@@ -1,4 +1,4 @@
-"""Evidence-guided full-resolution CT/PET fusion with neighborhood attention.
+"""Evidence-guided full-resolution CT/PET fusion with shifted-window attention.
 
 This file is intentionally standalone.  It implements the complete fusion
 module discussed for paired CT/PET segmentation features:
@@ -7,26 +7,17 @@ module discussed for paired CT/PET segmentation features:
 2. Apply scale-specific residual multiplicative text modulation to PET.
 3. Estimate PET evidential vacuity and CT/PET evidential conflict.
 4. Build one PET trust map from those two quantities.
-5. Correct PET from CT with full-resolution dilated-neighborhood cross-attention.
+5. Correct PET from CT with full-resolution shifted-window cross-attention.
 6. Transfer only trusted PET evidence back to CT with the same attention core.
 7. Produce one reliability-centred fused feature for the shared decoder.
 
 No Q/K/V pooling, token merging, feature interpolation, global HW-by-HW
-attention matrix, ``unfold``, additional loss, or online text encoder is used.
+attention on high-resolution maps, ``unfold``, additional loss, online text
+encoder, or third-party attention packages (NATTEN / flash-attn / xformers)
+are used.
 
-The attention design is based on:
-
-* Neighborhood Attention Transformer (CVPR 2023), which makes spatial
-  attention linear in the number of image tokens by restricting every query
-  to a sliding neighborhood.
-* Dilated Neighborhood Attention Transformer, which expands the receptive
-  field without increasing the number of attended keys.
-
-For production training, install NATTEN and use ``attention_backend="natten"``
-or ``"auto"`` on CUDA.  A chunked pure-PyTorch backend is included for
-correctness tests and environments without NATTEN.  It deliberately avoids
-``unfold`` and bounds temporary memory by processing a few query rows at a
-time, but it is slower than the fused NATTEN kernel.
+Attention uses pure PyTorch ``scaled_dot_product_attention`` over local and
+scale-aware shifted windows.
 
 Expected four-scale project interface:
 
@@ -50,6 +41,7 @@ import gc
 import math
 import os
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -65,16 +57,6 @@ BIOMEDBERT_TEXT_TOWER_PATH = (
     "/root/autodl-tmp/mkd-main/new-train/"
     "pretrained/biomedbert_text_tower"
 )
-
-try:
-    # NATTEN >= 0.21 exposes fused neighborhood attention at package level.
-    from natten import na2d as _natten_na2d
-
-    _NATTEN_AVAILABLE = True
-except (ImportError, OSError):
-    _natten_na2d = None
-    _NATTEN_AVAILABLE = False
-
 
 REAL_PET_PROMPT = (
     "Real PET preserves patient-specific metabolic details "
@@ -98,14 +80,13 @@ class ScaleAttentionConfig:
 
     channels: int
     internal_channels: int
-    context_dilation: int
+    context_window_size: int
+    context_shift_size: int
 
 
-def _check_positive_odd(value: int, name: str) -> int:
-    value = int(value)
-    if value <= 0 or value % 2 == 0:
-        raise ValueError(f"{name} must be a positive odd integer, got {value}.")
-    return value
+DEFAULT_CONTEXT_WINDOW_SIZES = (8, 8, 16, 16)
+DEFAULT_CONTEXT_SHIFT_SIZES = (4, 4, 8, 0)
+DEFAULT_LOCAL_WINDOW_SIZE = 8
 
 
 def _zero_module(module: nn.Module) -> None:
@@ -292,147 +273,246 @@ def evidential_conflict(ct_belief: Tensor, pet_belief: Tensor) -> Tensor:
     return (all_pairs - agreement).clamp(0.0, 1.0)
 
 
-def _feature_to_heads(x: Tensor, num_heads: int) -> Tensor:
-    """Convert [B,D,H,W] to NATTEN's [B,H,W,heads,head_dim]."""
+def resolve_attention_backend(attention_backend: Optional[str]) -> str:
+    """Map legacy backend names onto the only supported backend: sdpa."""
+
+    backend = "sdpa" if attention_backend is None else str(attention_backend).lower()
+    if backend in {"sdpa", "auto", "torch"}:
+        return "sdpa"
+    if backend == "natten":
+        warnings.warn(
+            "NATTEN backend has been removed; using PyTorch SDPA instead.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return "sdpa"
+    raise ValueError(
+        "attention_backend must be one of {'sdpa','auto','torch','natten'} "
+        f"(all map to sdpa); got {attention_backend!r}."
+    )
+
+
+def pad_to_window(x: Tensor, window_size: int) -> Tuple[Tensor, int, int]:
+    """Pad ``[B,C,H,W]`` on the right/bottom so H/W are divisible by window_size."""
+
+    if window_size <= 0:
+        raise ValueError(f"window_size must be positive, got {window_size}.")
+    _, _, height, width = x.shape
+    pad_h = (window_size - height % window_size) % window_size
+    pad_w = (window_size - width % window_size) % window_size
+    if pad_h or pad_w:
+        x = F.pad(x, (0, pad_w, 0, pad_h))
+    return x, height, width
+
+
+def window_partition(x: Tensor, window_size: int) -> Tensor:
+    """Partition ``[B,C,H,W]`` into ``[B*nH*nW, window*window, C]``."""
 
     batch, channels, height, width = x.shape
+    if height % window_size != 0 or width % window_size != 0:
+        raise ValueError(
+            f"H/W must be divisible by window_size={window_size}, "
+            f"got ({height},{width})."
+        )
+    x = x.view(
+        batch,
+        channels,
+        height // window_size,
+        window_size,
+        width // window_size,
+        window_size,
+    )
+    windows = x.permute(0, 2, 4, 3, 5, 1).contiguous()
+    return windows.view(-1, window_size * window_size, channels)
+
+
+def window_reverse(
+    windows: Tensor,
+    window_size: int,
+    height: int,
+    width: int,
+) -> Tensor:
+    """Merge ``[B*nH*nW, window*window, C]`` back to ``[B,C,H,W]``."""
+
+    channels = windows.shape[-1]
+    batch = windows.shape[0] // ((height // window_size) * (width // window_size))
+    x = windows.view(
+        batch,
+        height // window_size,
+        width // window_size,
+        window_size,
+        window_size,
+        channels,
+    )
+    x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
+    return x.view(batch, channels, height, width)
+
+
+def build_shifted_window_mask(
+    height: int,
+    width: int,
+    window_size: int,
+    shift_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Optional[Tensor]:
+    """Build a Swin-style additive attention mask for cyclic-shifted windows.
+
+    Returns ``[nW, N, N]`` with ``0`` for valid pairs and a large negative value
+    for pairs that only touch because of ``torch.roll`` wrapping across borders.
+    """
+
+    if shift_size <= 0:
+        return None
+    if shift_size >= window_size:
+        raise ValueError(
+            f"shift_size ({shift_size}) must be < window_size ({window_size})."
+        )
+
+    img_mask = torch.zeros((1, 1, height, width), device=device, dtype=torch.float32)
+    h_slices = (
+        slice(0, -window_size),
+        slice(-window_size, -shift_size),
+        slice(-shift_size, None),
+    )
+    w_slices = (
+        slice(0, -window_size),
+        slice(-window_size, -shift_size),
+        slice(-shift_size, None),
+    )
+    counter = 0
+    for h_slice in h_slices:
+        for w_slice in w_slices:
+            img_mask[:, :, h_slice, w_slice] = float(counter)
+            counter += 1
+
+    mask_windows = window_partition(img_mask, window_size).squeeze(-1)
+    attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+    attn_mask = attn_mask.masked_fill(attn_mask != 0, torch.finfo(torch.float32).min)
+    attn_mask = attn_mask.masked_fill(attn_mask == 0, 0.0)
+    return attn_mask.to(dtype=dtype)
+
+
+def _effective_window_and_shift(
+    configured_window: int,
+    configured_shift: int,
+    height: int,
+    width: int,
+) -> Tuple[int, int]:
+    window_size = max(1, min(int(configured_window), int(height), int(width)))
+    if window_size >= height and window_size >= width:
+        return window_size, 0
+    shift_size = int(configured_shift)
+    if shift_size <= 0 or shift_size >= window_size:
+        shift_size = 0
+    return window_size, shift_size
+
+
+def _windowed_sdpa(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    num_heads: int,
+    window_size: int,
+    shift_size: int,
+) -> Tensor:
+    """Run multi-head SDPA inside (optionally shifted) windows.
+
+    Inputs/outputs are ``[B,C,H,W]`` with ``C`` divisible by ``num_heads``.
+    """
+
+    if query.shape != key.shape or query.shape != value.shape:
+        raise ValueError("windowed SDPA expects equal Q/K/V shapes.")
+    batch, channels, height, width = query.shape
     if channels % num_heads != 0:
         raise ValueError(
             f"channels ({channels}) must be divisible by heads ({num_heads})."
         )
     head_dim = channels // num_heads
-    return (
-        x.view(batch, num_heads, head_dim, height, width)
-        .permute(0, 3, 4, 1, 2)
-        .contiguous()
+    window_size, shift_size = _effective_window_and_shift(
+        window_size,
+        shift_size,
+        height,
+        width,
     )
 
+    query_pad, orig_h, orig_w = pad_to_window(query, window_size)
+    key_pad, _, _ = pad_to_window(key, window_size)
+    value_pad, _, _ = pad_to_window(value, window_size)
+    _, _, pad_h, pad_w = query_pad.shape
 
-def _heads_to_feature(x: Tensor) -> Tensor:
-    """Convert [B,H,W,heads,head_dim] back to [B,D,H,W]."""
+    if shift_size > 0:
+        shifted_q = torch.roll(
+            query_pad,
+            shifts=(-shift_size, -shift_size),
+            dims=(2, 3),
+        )
+        shifted_k = torch.roll(
+            key_pad,
+            shifts=(-shift_size, -shift_size),
+            dims=(2, 3),
+        )
+        shifted_v = torch.roll(
+            value_pad,
+            shifts=(-shift_size, -shift_size),
+            dims=(2, 3),
+        )
+    else:
+        shifted_q = query_pad
+        shifted_k = key_pad
+        shifted_v = value_pad
 
-    if x.ndim != 5:
-        raise ValueError(f"Head tensor must be 5-D, got {tuple(x.shape)}.")
-    batch, height, width, num_heads, head_dim = x.shape
-    return (
-        x.permute(0, 3, 4, 1, 2)
-        .contiguous()
-        .view(batch, num_heads * head_dim, height, width)
+    q_windows = window_partition(shifted_q, window_size)
+    k_windows = window_partition(shifted_k, window_size)
+    v_windows = window_partition(shifted_v, window_size)
+    tokens = window_size * window_size
+    num_windows = q_windows.shape[0]
+
+    q = q_windows.view(num_windows, tokens, num_heads, head_dim).transpose(1, 2)
+    k = k_windows.view(num_windows, tokens, num_heads, head_dim).transpose(1, 2)
+    v = v_windows.view(num_windows, tokens, num_heads, head_dim).transpose(1, 2)
+
+    attn_mask = build_shifted_window_mask(
+        height=pad_h,
+        width=pad_w,
+        window_size=window_size,
+        shift_size=shift_size,
+        device=query.device,
+        dtype=q.dtype,
     )
-
-
-def _chunked_torch_na2d(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    kernel_size: int,
-    dilation: int,
-    chunk_rows: int,
-) -> Tensor:
-    """Memory-bounded reference implementation of 2-D cross-neighborhood attention.
-
-    Q/K/V use the heads-last layout [B,H,W,heads,head_dim].  The function
-    stores only the K^2 logits for ``chunk_rows`` query rows and never creates
-    an unfolded K/V tensor.  It is intended for tests, not fast training.
-    """
-
-    if query.shape != key.shape or query.shape != value.shape:
-        raise ValueError("Reference NA expects equal Q/K/V shapes.")
-    if query.ndim != 5:
-        raise ValueError("Reference NA expects [B,H,W,heads,head_dim].")
-    if chunk_rows <= 0:
-        raise ValueError("chunk_rows must be positive.")
-
-    batch, height, width, heads, head_dim = query.shape
-    half_kernel = kernel_size // 2
-    radius = half_kernel * dilation
-    if kernel_size * dilation > min(height, width):
-        raise ValueError(
-            "kernel_size * dilation must not exceed either spatial side; "
-            f"got kernel={kernel_size}, dilation={dilation}, "
-            f"shape=({height},{width})."
-        )
-
-    key_cf = key.permute(0, 3, 4, 1, 2).contiguous()
-    value_cf = value.permute(0, 3, 4, 1, 2).contiguous()
-    padding = (radius, radius, radius, radius)
-    key_padded = F.pad(key_cf, padding)
-    value_padded = F.pad(value_cf, padding)
-    scale = head_dim ** -0.5
-    offsets = [
-        (dy * dilation, dx * dilation)
-        for dy in range(-half_kernel, half_kernel + 1)
-        for dx in range(-half_kernel, half_kernel + 1)
-    ]
-    x_coordinates = torch.arange(width, device=query.device)
-    output_chunks: List[Tensor] = []
-
-    for row_start in range(0, height, chunk_rows):
-        row_end = min(row_start + chunk_rows, height)
-        rows = row_end - row_start
-        query_chunk = query[:, row_start:row_end]
-        y_coordinates = torch.arange(
-            row_start,
-            row_end,
-            device=query.device,
-        )
-        logits_per_offset: List[Tensor] = []
-
-        for y_offset, x_offset in offsets:
-            y_start = radius + row_start + y_offset
-            x_start = radius + x_offset
-            key_slice = key_padded[
-                :,
-                :,
-                :,
-                y_start : y_start + rows,
-                x_start : x_start + width,
-            ].permute(0, 3, 4, 1, 2)
-            logits = (query_chunk * key_slice).sum(dim=-1) * scale
-            valid_y = (
-                (y_coordinates + y_offset >= 0)
-                & (y_coordinates + y_offset < height)
+    if attn_mask is not None:
+        attn_mask = attn_mask.unsqueeze(1).repeat(batch, 1, 1, 1)
+        if attn_mask.shape[0] != num_windows:
+            raise RuntimeError(
+                f"Attention mask batch mismatch: {attn_mask.shape[0]} vs "
+                f"{num_windows}."
             )
-            valid_x = (
-                (x_coordinates + x_offset >= 0)
-                & (x_coordinates + x_offset < width)
-            )
-            valid = valid_y[:, None] & valid_x[None, :]
-            logits = logits.masked_fill(
-                ~valid.view(1, rows, width, 1),
-                torch.finfo(logits.dtype).min,
-            )
-            logits_per_offset.append(logits)
 
-        logits = torch.stack(logits_per_offset, dim=-1)
-        weights = torch.softmax(logits.float(), dim=-1).to(query.dtype)
-        output_chunk = torch.zeros_like(query_chunk)
-
-        # Re-read V slices instead of materializing all K^2 value neighborhoods.
-        for offset_index, (y_offset, x_offset) in enumerate(offsets):
-            y_start = radius + row_start + y_offset
-            x_start = radius + x_offset
-            value_slice = value_padded[
-                :,
-                :,
-                :,
-                y_start : y_start + rows,
-                x_start : x_start + width,
-            ].permute(0, 3, 4, 1, 2)
-            output_chunk = output_chunk + (
-                weights[..., offset_index].unsqueeze(-1) * value_slice
-            )
-        output_chunks.append(output_chunk)
-
-    return torch.cat(output_chunks, dim=1)
+    attended = F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        dropout_p=0.0,
+        is_causal=False,
+    )
+    attended = (
+        attended.transpose(1, 2)
+        .contiguous()
+        .view(num_windows, tokens, channels)
+    )
+    merged = window_reverse(attended, window_size, pad_h, pad_w)
+    if shift_size > 0:
+        merged = torch.roll(merged, shifts=(shift_size, shift_size), dims=(2, 3))
+    return merged[:, :, :orig_h, :orig_w]
 
 
-class ScaleAwareDilatedNeighborhoodCrossAttention(nn.Module):
+class ScaleAwareShiftedWindowCrossAttention(nn.Module):
     """Shared bidirectional full-resolution CT/PET attention core.
 
-    Half of the heads use contiguous 7x7 neighborhoods and the other half use
-    the scale's dilated 7x7 neighborhood.  Dilation changes sampling positions
-    but neither parameters nor the number of keys per query.
+    Local heads use non-shifted windows.  Context heads use scale-specific
+    window sizes and (when appropriate) cyclic shifts with Swin-style masks.
+    The same Q/K/V/output projections are reused for CT→PET and PET→CT.
     """
 
     def __init__(
@@ -440,32 +520,27 @@ class ScaleAwareDilatedNeighborhoodCrossAttention(nn.Module):
         channels: int,
         num_heads: int = 4,
         local_heads: int = 2,
-        kernel_size: int = 7,
-        context_dilation: int = 2,
-        attention_backend: str = "auto",
-        natten_backend: Optional[str] = None,
-        torch_chunk_rows: int = 4,
+        local_window_size: int = DEFAULT_LOCAL_WINDOW_SIZE,
+        context_window_size: int = 8,
+        context_shift_size: int = 4,
+        attention_backend: str = "sdpa",
     ) -> None:
         super().__init__()
-        kernel_size = _check_positive_odd(kernel_size, "kernel_size")
         if channels <= 0 or channels % num_heads != 0:
             raise ValueError("channels must be positive and divisible by num_heads.")
         if not 0 < local_heads < num_heads:
             raise ValueError("local_heads must be between 1 and num_heads - 1.")
-        if context_dilation < 1:
-            raise ValueError("context_dilation must be at least 1.")
-        if attention_backend not in {"auto", "natten", "torch"}:
-            raise ValueError("attention_backend must be auto, natten, or torch.")
+        if local_window_size <= 0 or context_window_size <= 0:
+            raise ValueError("window sizes must be positive.")
 
         self.channels = int(channels)
         self.num_heads = int(num_heads)
         self.local_heads = int(local_heads)
         self.context_heads = self.num_heads - self.local_heads
-        self.kernel_size = kernel_size
-        self.context_dilation = int(context_dilation)
-        self.attention_backend = attention_backend
-        self.natten_backend = natten_backend
-        self.torch_chunk_rows = int(torch_chunk_rows)
+        self.local_window_size = int(local_window_size)
+        self.context_window_size = int(context_window_size)
+        self.context_shift_size = int(context_shift_size)
+        self.attention_backend = resolve_attention_backend(attention_backend)
 
         # One projection set is deliberately reused in both directions.
         self.query_projection = nn.Conv2d(
@@ -503,48 +578,21 @@ class ScaleAwareDilatedNeighborhoodCrossAttention(nn.Module):
         ):
             nn.init.xavier_uniform_(module.weight)
 
-    def _use_natten(self, query: Tensor) -> bool:
-        if self.attention_backend == "torch":
-            return False
-        if self.attention_backend == "natten":
-            if not _NATTEN_AVAILABLE:
-                raise RuntimeError(
-                    "attention_backend='natten' was requested, but NATTEN "
-                    "could not be imported. Install a NATTEN build matching "
-                    "the local PyTorch/CUDA versions."
-                )
-            return True
-        return bool(_NATTEN_AVAILABLE and query.is_cuda)
+    def _split_heads(self, feature: Tensor, head_slice: slice) -> Tensor:
+        batch, channels, height, width = feature.shape
+        head_dim = channels // self.num_heads
+        feature = feature.view(batch, self.num_heads, head_dim, height, width)
+        selected = feature[:, head_slice].contiguous()
+        selected_heads = selected.shape[1]
+        return selected.view(batch, selected_heads * head_dim, height, width)
 
-    def _attention_group(
-        self,
-        query: Tensor,
-        key: Tensor,
-        value: Tensor,
-        dilation: int,
-    ) -> Tensor:
-        if self._use_natten(query):
-            kwargs = {}
-            if self.natten_backend is not None:
-                kwargs["backend"] = self.natten_backend
-            return _natten_na2d(
-                query,
-                key,
-                value,
-                kernel_size=self.kernel_size,
-                stride=1,
-                dilation=dilation,
-                is_causal=False,
-                **kwargs,
-            )
-        return _chunked_torch_na2d(
-            query=query,
-            key=key,
-            value=value,
-            kernel_size=self.kernel_size,
-            dilation=dilation,
-            chunk_rows=self.torch_chunk_rows,
-        )
+    def _merge_head_groups(self, local: Tensor, context: Tensor) -> Tensor:
+        batch, _, height, width = local.shape
+        head_dim = self.channels // self.num_heads
+        local = local.view(batch, self.local_heads, head_dim, height, width)
+        context = context.view(batch, self.context_heads, head_dim, height, width)
+        merged = torch.cat((local, context), dim=1)
+        return merged.reshape(batch, self.channels, height, width)
 
     def forward(
         self,
@@ -562,21 +610,9 @@ class ScaleAwareDilatedNeighborhoodCrossAttention(nn.Module):
                 f"got {tuple(query_feature.shape)}."
             )
         height, width = query_feature.shape[-2:]
-        if self.kernel_size * self.context_dilation > min(height, width):
-            raise ValueError(
-                "The configured dilated neighborhood does not fit the feature "
-                f"map: kernel={self.kernel_size}, "
-                f"dilation={self.context_dilation}, shape=({height},{width})."
-            )
 
-        query = _feature_to_heads(
-            self.query_projection(query_feature),
-            self.num_heads,
-        )
-        key = _feature_to_heads(
-            self.key_projection(source_feature),
-            self.num_heads,
-        )
+        query = self.query_projection(query_feature)
+        key = self.key_projection(source_feature)
         value_feature = self.value_projection(source_feature)
         if source_reliability is not None:
             expected_shape = (
@@ -594,24 +630,41 @@ class ScaleAwareDilatedNeighborhoodCrossAttention(nn.Module):
                 device=value_feature.device,
                 dtype=value_feature.dtype,
             )
-        value = _feature_to_heads(value_feature, self.num_heads)
 
-        local_slice = slice(0, self.local_heads)
-        context_slice = slice(self.local_heads, self.num_heads)
-        local_output = self._attention_group(
-            query[..., local_slice, :].contiguous(),
-            key[..., local_slice, :].contiguous(),
-            value[..., local_slice, :].contiguous(),
-            dilation=1,
+        local_query = self._split_heads(query, slice(0, self.local_heads))
+        local_key = self._split_heads(key, slice(0, self.local_heads))
+        local_value = self._split_heads(value_feature, slice(0, self.local_heads))
+        context_query = self._split_heads(
+            query,
+            slice(self.local_heads, self.num_heads),
         )
-        context_output = self._attention_group(
-            query[..., context_slice, :].contiguous(),
-            key[..., context_slice, :].contiguous(),
-            value[..., context_slice, :].contiguous(),
-            dilation=self.context_dilation,
+        context_key = self._split_heads(
+            key,
+            slice(self.local_heads, self.num_heads),
         )
-        output = torch.cat((local_output, context_output), dim=3)
-        return self.output_projection(_heads_to_feature(output))
+        context_value = self._split_heads(
+            value_feature,
+            slice(self.local_heads, self.num_heads),
+        )
+
+        local_output = _windowed_sdpa(
+            local_query,
+            local_key,
+            local_value,
+            num_heads=self.local_heads,
+            window_size=self.local_window_size,
+            shift_size=0,
+        )
+        context_output = _windowed_sdpa(
+            context_query,
+            context_key,
+            context_value,
+            num_heads=self.context_heads,
+            window_size=self.context_window_size,
+            shift_size=self.context_shift_size,
+        )
+        output = self._merge_head_groups(local_output, context_output)
+        return self.output_projection(output)
 
 
 class EvidenceGuidedSDNCAScale(nn.Module):
@@ -622,14 +675,13 @@ class EvidenceGuidedSDNCAScale(nn.Module):
         channels: int,
         internal_channels: int,
         text_dim: int,
-        context_dilation: int,
+        context_window_size: int,
+        context_shift_size: int,
         num_heads: int = 4,
         local_heads: int = 2,
-        kernel_size: int = 7,
+        local_window_size: int = DEFAULT_LOCAL_WINDOW_SIZE,
         num_evidence_classes: int = 2,
-        attention_backend: str = "auto",
-        natten_backend: Optional[str] = None,
-        torch_chunk_rows: int = 4,
+        attention_backend: str = "sdpa",
     ) -> None:
         super().__init__()
         if internal_channels % num_heads != 0:
@@ -639,7 +691,10 @@ class EvidenceGuidedSDNCAScale(nn.Module):
             )
         self.channels = int(channels)
         self.internal_channels = int(internal_channels)
-        self.context_dilation = int(context_dilation)
+        self.local_window_size = int(local_window_size)
+        self.context_window_size = int(context_window_size)
+        self.context_shift_size = int(context_shift_size)
+        self.attention_backend = resolve_attention_backend(attention_backend)
 
         self.text_modulator = TextPETResidualModulation(
             channels=channels,
@@ -652,15 +707,14 @@ class EvidenceGuidedSDNCAScale(nn.Module):
             channels=internal_channels,
             num_classes=num_evidence_classes,
         )
-        self.cross_attention = ScaleAwareDilatedNeighborhoodCrossAttention(
+        self.cross_attention = ScaleAwareShiftedWindowCrossAttention(
             channels=internal_channels,
             num_heads=num_heads,
             local_heads=local_heads,
-            kernel_size=kernel_size,
-            context_dilation=context_dilation,
-            attention_backend=attention_backend,
-            natten_backend=natten_backend,
-            torch_chunk_rows=torch_chunk_rows,
+            local_window_size=local_window_size,
+            context_window_size=context_window_size,
+            context_shift_size=context_shift_size,
+            attention_backend=self.attention_backend,
         )
         self.pet_delta_projection = nn.Conv2d(
             internal_channels,
@@ -679,7 +733,7 @@ class EvidenceGuidedSDNCAScale(nn.Module):
         _zero_module(self.pet_delta_projection)
         _zero_module(self.ct_delta_projection)
 
-    def _validate_inputs(self, ct_feature: Tensor, pet_feature: Tensor) -> None:
+    def _validate_inputs(self, ct_feature: Tensor, pet_feature: Tensor) -> Tensor:
         if ct_feature.shape != pet_feature.shape:
             raise ValueError("CT and PET features must have identical shapes.")
         if ct_feature.ndim != 4 or ct_feature.shape[1] != self.channels:
@@ -689,8 +743,10 @@ class EvidenceGuidedSDNCAScale(nn.Module):
             )
         if ct_feature.device != pet_feature.device:
             raise ValueError("CT and PET must be on the same device.")
-        if ct_feature.dtype != pet_feature.dtype:
-            raise ValueError("CT and PET must have the same dtype.")
+        # Align dtypes for AMP / mixed-precision paths without changing values.
+        if pet_feature.dtype != ct_feature.dtype:
+            pet_feature = pet_feature.to(dtype=ct_feature.dtype)
+        return pet_feature
 
     def forward(
         self,
@@ -699,7 +755,7 @@ class EvidenceGuidedSDNCAScale(nn.Module):
         selected_text: Tensor,
         return_diagnostics: bool = False,
     ) -> Union[Tensor, Tuple[Tensor, Dict[str, Tensor]]]:
-        self._validate_inputs(ct_feature, pet_feature)
+        pet_feature = self._validate_inputs(ct_feature, pet_feature)
 
         # 1) State text acts only on PET and starts from an identity mapping.
         pet_text, text_channel_delta = self.text_modulator(
@@ -757,10 +813,19 @@ class EvidenceGuidedSDNCAScale(nn.Module):
             "pet_after_text_rms": _rms(pet_text),
             "pet_corrected_rms": _rms(pet_corrected),
             "fused_rms": _rms(fused_feature),
-            "context_dilation": torch.tensor(
-                self.context_dilation,
+            "local_window_size": torch.tensor(
+                self.local_window_size,
                 device=ct_feature.device,
             ),
+            "context_window_size": torch.tensor(
+                self.context_window_size,
+                device=ct_feature.device,
+            ),
+            "context_shift_size": torch.tensor(
+                self.context_shift_size,
+                device=ct_feature.device,
+            ),
+            "attention_backend": self.attention_backend,
         }
         return fused_feature, diagnostics
 
@@ -773,7 +838,8 @@ class MultiScaleEvidenceGuidedSDNCA(nn.Module):
             Text must be encoded once outside this module.  The encoder is not
             retained or trained here.
         channels: Encoder feature widths.  Project defaults are MiT-B1 widths.
-        context_dilations: Dilated-head spacing for the four scales.
+        context_window_sizes: Context-head window sizes for the four scales.
+        context_shift_sizes: Context-head cyclic shifts for the four scales.
         internal_ratio: Attention width relative to each scale width.  The
             default 0.5 preserves the agreed half-channel design.
     """
@@ -782,21 +848,26 @@ class MultiScaleEvidenceGuidedSDNCA(nn.Module):
         self,
         text_embeddings: Tensor,
         channels: Sequence[int] = (64, 128, 320, 512),
-        context_dilations: Sequence[int] = (2, 3, 4, 2),
+        context_window_sizes: Sequence[int] = DEFAULT_CONTEXT_WINDOW_SIZES,
+        context_shift_sizes: Sequence[int] = DEFAULT_CONTEXT_SHIFT_SIZES,
         internal_ratio: float = 0.5,
         num_heads: int = 4,
         local_heads: int = 2,
-        kernel_size: int = 7,
+        local_window_size: int = DEFAULT_LOCAL_WINDOW_SIZE,
         num_evidence_classes: int = 2,
-        attention_backend: str = "auto",
-        natten_backend: Optional[str] = None,
-        torch_chunk_rows: int = 4,
+        attention_backend: str = "sdpa",
     ) -> None:
         super().__init__()
         if text_embeddings.ndim != 2 or text_embeddings.shape[0] != 2:
             raise ValueError("text_embeddings must have shape [2,text_dim].")
-        if len(channels) == 0 or len(channels) != len(context_dilations):
-            raise ValueError("channels and context_dilations must have equal length.")
+        if len(channels) == 0 or len(channels) != len(context_window_sizes):
+            raise ValueError(
+                "channels and context_window_sizes must have equal length."
+            )
+        if len(context_window_sizes) != len(context_shift_sizes):
+            raise ValueError(
+                "context_window_sizes and context_shift_sizes must match."
+            )
         if not 0.0 < internal_ratio <= 1.0:
             raise ValueError("internal_ratio must be in (0,1].")
 
@@ -806,20 +877,30 @@ class MultiScaleEvidenceGuidedSDNCA(nn.Module):
         )
         self.register_buffer("text_embeddings", normalized_text)
         self.channels = tuple(int(channel) for channel in channels)
-        self.context_dilations = tuple(
-            int(dilation) for dilation in context_dilations
+        self.context_window_sizes = tuple(
+            int(window) for window in context_window_sizes
         )
+        self.context_shift_sizes = tuple(
+            int(shift) for shift in context_shift_sizes
+        )
+        self.local_window_size = int(local_window_size)
+        self.attention_backend = resolve_attention_backend(attention_backend)
 
         scale_configs: List[ScaleAttentionConfig] = []
         scale_modules: List[nn.Module] = []
-        for channel, dilation in zip(self.channels, self.context_dilations):
+        for channel, window_size, shift_size in zip(
+            self.channels,
+            self.context_window_sizes,
+            self.context_shift_sizes,
+        ):
             internal = int(round(channel * internal_ratio))
             # Round up only as much as needed for equal-sized attention heads.
             internal = int(math.ceil(internal / num_heads) * num_heads)
             config = ScaleAttentionConfig(
                 channels=channel,
                 internal_channels=internal,
-                context_dilation=dilation,
+                context_window_size=window_size,
+                context_shift_size=shift_size,
             )
             scale_configs.append(config)
             scale_modules.append(
@@ -827,14 +908,13 @@ class MultiScaleEvidenceGuidedSDNCA(nn.Module):
                     channels=channel,
                     internal_channels=internal,
                     text_dim=normalized_text.shape[1],
-                    context_dilation=dilation,
+                    context_window_size=window_size,
+                    context_shift_size=shift_size,
                     num_heads=num_heads,
                     local_heads=local_heads,
-                    kernel_size=kernel_size,
+                    local_window_size=local_window_size,
                     num_evidence_classes=num_evidence_classes,
-                    attention_backend=attention_backend,
-                    natten_backend=natten_backend,
-                    torch_chunk_rows=torch_chunk_rows,
+                    attention_backend=self.attention_backend,
                 )
             )
         self.scale_configs = tuple(scale_configs)
@@ -1188,7 +1268,6 @@ def run_self_test(args: argparse.Namespace) -> None:
     model = MultiScaleEvidenceGuidedSDNCA(
         text_embeddings=build_dummy_text_embeddings(args.text_dim),
         attention_backend=args.attention_backend,
-        torch_chunk_rows=args.torch_chunk_rows,
     ).to(device)
     model.train()
 
@@ -1247,8 +1326,10 @@ def run_self_test(args: argparse.Namespace) -> None:
     elapsed = time.perf_counter() - start
     print("Evidence-guided SDNCA standalone test: PASS")
     print(f"device: {device}")
-    print(f"NATTEN import available: {_NATTEN_AVAILABLE}")
-    print(f"attention backend request: {args.attention_backend}")
+    print(f"attention backend: {model.attention_backend}")
+    print(f"local_window_size: {model.local_window_size}")
+    print(f"context_window_sizes: {model.context_window_sizes}")
+    print(f"context_shift_sizes: {model.context_shift_sizes}")
     print(f"AMP enabled: {use_amp}")
     print(f"parameters: {total_parameters:,} total")
     print(f"trainable parameters: {trainable_parameters:,}")
@@ -1266,10 +1347,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-dim", type=int, default=512)
     parser.add_argument(
         "--attention-backend",
-        choices=("auto", "natten", "torch"),
-        default="auto",
+        choices=("sdpa", "auto", "torch", "natten"),
+        default="sdpa",
     )
-    parser.add_argument("--torch-chunk-rows", type=int, default=4)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--seed", type=int, default=7)
@@ -1284,9 +1364,14 @@ __all__ = [
     "BIOMEDBERT_TEXT_TOWER_PATH",
     "TextPETResidualModulation",
     "SharedEvidentialHead",
-    "ScaleAwareDilatedNeighborhoodCrossAttention",
+    "ScaleAwareShiftedWindowCrossAttention",
     "EvidenceGuidedSDNCAScale",
     "MultiScaleEvidenceGuidedSDNCA",
+    "pad_to_window",
+    "window_partition",
+    "window_reverse",
+    "build_shifted_window_mask",
+    "resolve_attention_backend",
     "count_parameters",
     "load_local_pet_text_embeddings",
 ]

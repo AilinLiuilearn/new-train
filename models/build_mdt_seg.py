@@ -354,6 +354,7 @@ def build_mdt_seg_teacher(config):
     from models.evidence_guided_sdnca_pet_ct import (
         count_parameters,
         load_local_pet_text_embeddings,
+        resolve_attention_backend,
     )
 
     cppi_num_clusters = getattr(config, 'cppi_num_clusters', 6)
@@ -378,7 +379,8 @@ def build_mdt_seg_teacher(config):
             biomedclip_model_path=biomedclip_model_path,
             biomedbert_text_tower_path=biomedbert_text_tower_path,
         )
-    edv_attention_backend = getattr(config, 'edv_attention_backend', 'auto')
+    requested_backend = getattr(config, 'edv_attention_backend', 'sdpa')
+    edv_attention_backend = resolve_attention_backend(requested_backend)
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
@@ -406,7 +408,7 @@ def build_mdt_seg_teacher(config):
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
         f'fusion=evidence_guided_multiscale_sdnca '
-        f'attention=full_resolution_dilated_neighborhood_cross_attention '
+        f'attention=full_resolution_scale_aware_shifted_window_cross_attention '
         f'text_condition=real_or_proxy_pet_state '
         f'text_encoder=offline_local_frozen_once '
         f'cppi=unchanged '
@@ -422,8 +424,14 @@ def build_mdt_seg_teacher(config):
         f'[EDV] internal_channels='
         f'{tuple(cfg.internal_channels for cfg in model.fusion.scale_configs)}'
     )
-    print(f'[EDV] context_dilations={tuple(model.fusion.context_dilations)}')
-    print(f'[EDV] requested_attention_backend={edv_attention_backend}')
+    print(f'[EDV] attention_backend=sdpa')
+    print(f'[EDV] local_window_size={model.fusion.local_window_size}')
+    print(f'[EDV] context_window_sizes={tuple(model.fusion.context_window_sizes)}')
+    print(f'[EDV] shift_sizes={tuple(model.fusion.context_shift_sizes)}')
+    print('[EDV] feature_downsampling=False')
+    print('[EDV] kv_pooling=False')
+    print('[EDV] natten_dependency=False')
+    print(f'[EDV] requested_attention_backend={requested_backend}')
     print(f'[CPPI] enabled=True')
     print(f'[CPPI] num_clusters={cppi_num_clusters}')
     print(f'[CPPI] build_stage={cppi_build_stage}')

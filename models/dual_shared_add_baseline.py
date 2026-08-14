@@ -4,7 +4,10 @@ import torch.nn as nn
 from models.baseline_blocks import PrototypeReferencedPETAffineCalibration, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.ct_pet_prototype_imputation import CrossScaleCTPETPrototypeMemory
-from models.evidence_guided_sdnca_pet_ct import MultiScaleEvidenceGuidedSDNCA
+from models.evidence_guided_sdnca_pet_ct import (
+    MultiScaleEvidenceGuidedSDNCA,
+    resolve_attention_backend,
+)
 
 
 class StageChannelAlign(nn.Module):
@@ -37,7 +40,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         cppi_build_stage=3,
         cppi_output_dir=None,
         pet_text_embeddings=None,
-        edv_attention_backend='auto',
+        edv_attention_backend='sdpa',
     ):
         super().__init__()
         if pet_text_embeddings is None:
@@ -74,7 +77,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         self.fusion = MultiScaleEvidenceGuidedSDNCA(
             text_embeddings=pet_text_embeddings,
             channels=pet_channels,
-            attention_backend=edv_attention_backend,
+            attention_backend=resolve_attention_backend(edv_attention_backend),
         )
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
         self.prototype_memory = CrossScaleCTPETPrototypeMemory(

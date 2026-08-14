@@ -21,7 +21,7 @@ def _make_baseline(**kwargs):
     defaults = dict(
         use_deep_supervision=False,
         pet_text_embeddings=_test_text_embeddings(),
-        edv_attention_backend='torch',
+        edv_attention_backend='sdpa',
     )
     defaults.update(kwargs)
     return DualSharedAddPETCTBaseline(**defaults)
@@ -48,9 +48,8 @@ def test_model_imports():
 
 def test_forward_full_missing_shapes():
     model = _make_baseline()
-    # EDV dilated neighborhood needs ~448+ input so stage maps fit kernel*dilation.
-    ct = torch.randn(1, 1, 448, 448)
-    pet = torch.randn(1, 1, 448, 448)
+    ct = torch.randn(1, 1, 64, 64)
+    pet = torch.randn(1, 1, 64, 64)
     out_full = model(ct, pet, forward_mode='full')
     out_missing = model(ct, pet, forward_mode='missing')
     assert out_full['logits'].shape == out_missing['logits'].shape
@@ -68,9 +67,9 @@ def test_bce_dice_loss_unpack():
 def test_task_train_step_unpacks_logits():
     task = MDTSegTeacher({'model': _make_baseline()}, _make_cfg())
     batch = {
-        'ct': torch.randn(1, 1, 448, 448),
-        'pet': torch.randn(1, 1, 448, 448),
-        'mask': torch.zeros(1, 1, 448, 448),
+        'ct': torch.randn(1, 1, 64, 64),
+        'pet': torch.randn(1, 1, 64, 64),
+        'mask': torch.zeros(1, 1, 64, 64),
     }
     loss, logits, outputs, stats = task.train_step(batch, forward_mode='full')
     assert torch.is_tensor(loss)
@@ -90,7 +89,7 @@ def test_build_teacher(tmp_path):
         deep_supervision=False,
         checkpoint_dir=str(tmp_path),
         pet_text_embeddings=_test_text_embeddings(),
-        edv_attention_backend='torch',
+        edv_attention_backend='sdpa',
     )
     out = build_mdt_seg_teacher(cfg)
     assert 'model' in out
@@ -155,8 +154,8 @@ def test_missing_path_encodes_real_pet_but_fuses_calibrated_proxy(monkeypatch):
     monkeypatch.setattr(model.pet_calibration, 'forward', wrapped_calib)
     monkeypatch.setattr(model.fusion, 'forward', wrapped_fusion)
 
-    ct = torch.randn(1, 1, 448, 448)
-    pet = torch.randn(1, 1, 448, 448)
+    ct = torch.randn(1, 1, 64, 64)
+    pet = torch.randn(1, 1, 64, 64)
     with torch.no_grad():
         real_pet_feats = [f.detach().clone() for f in model._encode_pet(pet)]
     pet_encoder_calls['n'] = 0

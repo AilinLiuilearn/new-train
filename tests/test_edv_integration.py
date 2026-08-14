@@ -27,7 +27,7 @@ def _make_baseline(**kwargs):
     defaults = dict(
         use_deep_supervision=False,
         pet_text_embeddings=_test_text_embeddings(),
-        edv_attention_backend='torch',
+        edv_attention_backend='sdpa',
     )
     defaults.update(kwargs)
     return DualSharedAddPETCTBaseline(**defaults)
@@ -44,7 +44,7 @@ def _make_cfg(tmp_path, **kwargs):
         'deep_supervision': False,
         'checkpoint_dir': str(tmp_path),
         'pet_text_embeddings': _test_text_embeddings(),
-        'edv_attention_backend': 'torch',
+        'edv_attention_backend': 'sdpa',
         'cppi_num_clusters': 6,
         'cppi_build_stage': 3,
         'no_encoder_pretrained': True,
@@ -64,11 +64,11 @@ def test_four_scale_shapes_match_no_downsample():
     model = _make_baseline()
     channels = (64, 128, 320, 512)
     assert tuple(model.fusion.channels) == channels
-    # Spatial sizes must satisfy min(H,W) >= kernel_size * context_dilation.
+    # Project 512x512 encoder feature map sizes.
     shapes = [
-        (2, 64, 32, 32),
-        (2, 128, 24, 24),
-        (2, 320, 28, 28),
+        (2, 64, 128, 128),
+        (2, 128, 64, 64),
+        (2, 320, 32, 32),
         (2, 512, 16, 16),
     ]
     ct_feats = [torch.randn(*shape) for shape in shapes]
@@ -84,10 +84,10 @@ def test_four_scale_shapes_match_no_downsample():
 def test_full_missing_state_ids_and_text_modulation_effect():
     model = _make_baseline()
     shapes = [
-        (2, 64, 32, 32),
-        (2, 128, 24, 24),
-        (2, 320, 28, 28),
-        (2, 512, 16, 16),
+        (2, 64, 16, 16),
+        (2, 128, 8, 8),
+        (2, 320, 8, 8),
+        (2, 512, 8, 8),
     ]
     ct_feats = [torch.randn(*shape) for shape in shapes]
     pet_feats = [torch.randn(*shape) for shape in shapes]
@@ -164,10 +164,10 @@ def test_full_missing_state_ids_and_text_modulation_effect():
 def test_auto_batch_state_ids():
     model = _make_baseline()
     shapes = [
-        (4, 64, 32, 32),
-        (4, 128, 24, 24),
-        (4, 320, 28, 28),
-        (4, 512, 16, 16),
+        (4, 64, 16, 16),
+        (4, 128, 8, 8),
+        (4, 320, 8, 8),
+        (4, 512, 8, 8),
     ]
     ct_feats = [torch.randn(*shape) for shape in shapes]
     pet_feats = [torch.randn(*shape) for shape in shapes]
@@ -214,8 +214,8 @@ def test_calibration_before_edv_order(monkeypatch):
     monkeypatch.setattr(model.fusion, 'forward', wrapped_fusion)
     monkeypatch.setattr(model.decoder, 'forward', wrapped_decode)
 
-    ct = torch.randn(1, 1, 448, 448)
-    pet = torch.randn(1, 1, 448, 448)
+    ct = torch.randn(1, 1, 64, 64)
+    pet = torch.randn(1, 1, 64, 64)
     out = model(ct, pet, forward_mode='full')
     assert 'logits' in out
     assert order == ['calibration', 'edv', 'decoder']
@@ -251,8 +251,8 @@ def test_missing_edv_receives_proxy_not_real(monkeypatch):
     monkeypatch.setattr(model.pet_calibration, 'forward', wrapped_calib)
     monkeypatch.setattr(model.fusion, 'forward', wrapped_fusion)
 
-    ct = torch.randn(1, 1, 448, 448)
-    pet = torch.randn(1, 1, 448, 448)
+    ct = torch.randn(1, 1, 64, 64)
+    pet = torch.randn(1, 1, 64, 64)
     model(ct, pet, forward_mode='missing')
     assert real_encoded and calib_pet_in and fusion_pet_in
     for real, proxy_in in zip(real_encoded[0], calib_pet_in[0]):
@@ -316,9 +316,9 @@ def test_two_optimizer_steps_finite_grads(tmp_path):
     assert model.prototype_memory.bank_ready is True
 
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    ct = torch.randn(1, 1, 448, 448, device=device)
-    pet = torch.randn(1, 1, 448, 448, device=device)
-    target = torch.zeros(1, 1, 448, 448, device=device)
+    ct = torch.randn(1, 1, 64, 64, device=device)
+    pet = torch.randn(1, 1, 64, 64, device=device)
+    target = torch.zeros(1, 1, 64, 64, device=device)
 
     modules_to_check = {
         'enc_ct': model.enc_ct,
@@ -404,16 +404,16 @@ def test_two_optimizer_steps_finite_grads(tmp_path):
 
     fused_probe = model.fusion(
         [
-            torch.randn(1, 64, 32, 32, device=device),
-            torch.randn(1, 128, 24, 24, device=device),
-            torch.randn(1, 320, 28, 28, device=device),
-            torch.randn(1, 512, 16, 16, device=device),
+            torch.randn(1, 64, 16, 16, device=device),
+            torch.randn(1, 128, 8, 8, device=device),
+            torch.randn(1, 320, 8, 8, device=device),
+            torch.randn(1, 512, 8, 8, device=device),
         ],
         [
-            torch.randn(1, 64, 32, 32, device=device),
-            torch.randn(1, 128, 24, 24, device=device),
-            torch.randn(1, 320, 28, 28, device=device),
-            torch.randn(1, 512, 16, 16, device=device),
+            torch.randn(1, 64, 16, 16, device=device),
+            torch.randn(1, 128, 8, 8, device=device),
+            torch.randn(1, 320, 8, 8, device=device),
+            torch.randn(1, 512, 8, 8, device=device),
         ],
         mode='full',
     )
@@ -459,3 +459,78 @@ def test_old_checkpoint_strict_false_only_fusion_mismatch(tmp_path):
     assert unexpected_fusion, 'expected old weighted-add fusion keys to be unexpected'
     assert not other_missing, other_missing
     assert not other_unexpected, other_unexpected
+
+
+def test_no_natten_dependency_in_source():
+    from pathlib import Path
+    src = Path('models/evidence_guided_sdnca_pet_ct.py').read_text()
+    assert 'from natten' not in src
+    assert 'import natten' not in src
+    assert '_natten_na2d' not in src
+    assert '_NATTEN_AVAILABLE' not in src
+    assert '_chunked_torch_na2d' not in src
+    assert 'ScaleAwareDilatedNeighborhoodCrossAttention' not in src
+
+
+def test_arbitrary_non_divisible_spatial_sizes():
+    model = _make_baseline()
+    shapes = [
+        (1, 64, 31, 29),
+        (1, 128, 17, 15),
+        (1, 320, 17, 15),
+        (1, 512, 9, 7),
+    ]
+    ct_feats = [torch.randn(*shape) for shape in shapes]
+    pet_feats = [torch.randn(*shape) for shape in shapes]
+    fused = model.fusion(ct_feats, pet_feats, mode='full')
+    for out, expected in zip(fused, shapes):
+        assert out.shape == expected
+        assert torch.isfinite(out).all()
+
+
+def test_shifted_window_mask_blocks_border_wrap():
+    """Left-border pulse must not affect right-border query via cyclic wrap."""
+    from models.evidence_guided_sdnca_pet_ct import (
+        _windowed_sdpa,
+        build_shifted_window_mask,
+        pad_to_window,
+        window_partition,
+    )
+
+    torch.manual_seed(0)
+    batch, channels, height, width = 1, 8, 16, 16
+    window_size, shift_size, num_heads = 8, 4, 2
+    query = torch.zeros(batch, channels, height, width)
+    key = torch.zeros(batch, channels, height, width)
+    value = torch.zeros(batch, channels, height, width)
+    # Strong pulse only on the left border.
+    key[:, :, :, 0] = 10.0
+    value[:, :, :, 0] = 1.0
+    query[:, :, :, -1] = 1.0
+
+    with_mask = _windowed_sdpa(
+        query,
+        key,
+        value,
+        num_heads=num_heads,
+        window_size=window_size,
+        shift_size=shift_size,
+    )
+    # Right-border output should stay near zero when the mask is correct.
+    right = with_mask[:, :, :, -1].abs().mean().item()
+    assert right < 1e-3, f'right-border leak with mask: {right}'
+
+    # Sanity: mask itself marks wrapped regions as blocked.
+    padded, _, _ = pad_to_window(query, window_size)
+    _, _, ph, pw = padded.shape
+    mask = build_shifted_window_mask(
+        ph,
+        pw,
+        window_size,
+        shift_size,
+        device=query.device,
+        dtype=torch.float32,
+    )
+    assert mask is not None
+    assert bool((mask < 0).any())
+
