@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
 
-from models.baseline_blocks import PrototypeReferencedPETAffineCalibration, StateAwareWeightedAddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
+from models.baseline_blocks import PrototypeReferencedPETAffineCalibration, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.ct_pet_prototype_imputation import CrossScaleCTPETPrototypeMemory
+from models.evidence_guided_sdnca_pet_ct import MultiScaleEvidenceGuidedSDNCA
 
 
 class StageChannelAlign(nn.Module):
@@ -22,8 +23,45 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
-    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=6, cppi_build_stage=3, cppi_output_dir=None):
+    def __init__(
+        self,
+        ct_backbone='convnextv2_nano',
+        pet_backbone='mit_b1',
+        ct_pretrained_path=None,
+        pet_pretrained_path=None,
+        in_channels=3,
+        out_channels=1,
+        decoder_channels=(512, 256, 128, 64),
+        use_deep_supervision=False,
+        cppi_num_clusters=6,
+        cppi_build_stage=3,
+        cppi_output_dir=None,
+        pet_text_embeddings=None,
+        edv_attention_backend='auto',
+    ):
         super().__init__()
+        if pet_text_embeddings is None:
+            raise ValueError(
+                'pet_text_embeddings is required for '
+                'MultiScaleEvidenceGuidedSDNCA'
+            )
+        if not torch.is_tensor(pet_text_embeddings):
+            raise TypeError('pet_text_embeddings must be a torch.Tensor')
+        if pet_text_embeddings.ndim != 2 or pet_text_embeddings.shape[0] != 2:
+            raise ValueError(
+                'pet_text_embeddings must have shape [2, text_dim], '
+                f'got {tuple(pet_text_embeddings.shape)}'
+            )
+        if not pet_text_embeddings.is_floating_point():
+            raise TypeError('pet_text_embeddings must be floating point')
+        if not torch.isfinite(pet_text_embeddings).all():
+            raise ValueError('pet_text_embeddings must contain only finite values')
+        if torch.allclose(pet_text_embeddings[0], pet_text_embeddings[1]):
+            raise ValueError(
+                'pet_text_embeddings rows must differ '
+                '(real vs proxy PET text)'
+            )
+
         self.use_deep_supervision = bool(use_deep_supervision)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
@@ -33,7 +71,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pet_channels = list(self.enc_pet.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
         self.pet_calibration = PrototypeReferencedPETAffineCalibration(channels=pet_channels)
-        self.fusion = StateAwareWeightedAddFusion(num_scales=len(pet_channels))
+        self.fusion = MultiScaleEvidenceGuidedSDNCA(
+            text_embeddings=pet_text_embeddings,
+            channels=pet_channels,
+            attention_backend=edv_attention_backend,
+        )
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
         self.prototype_memory = CrossScaleCTPETPrototypeMemory(
             channels=pet_channels,

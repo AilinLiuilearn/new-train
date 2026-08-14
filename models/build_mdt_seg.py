@@ -351,10 +351,34 @@ class ConvBNAct(nn.Module):
 
 def build_mdt_seg_teacher(config):
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
+    from models.evidence_guided_sdnca_pet_ct import (
+        count_parameters,
+        load_local_pet_text_embeddings,
+    )
+
     cppi_num_clusters = getattr(config, 'cppi_num_clusters', 6)
     cppi_build_stage = getattr(config, 'cppi_build_stage', 3)
     cppi_output_dir = os.path.join(config.checkpoint_dir, 'cppi')
     no_encoder_pretrained = bool(getattr(config, 'no_encoder_pretrained', False))
+    biomedclip_model_path = getattr(
+        config,
+        'biomedclip_model_path',
+        '/root/autodl-tmp/mkd-main/new-train/'
+        'pretrained/biomedclip_model',
+    )
+    biomedbert_text_tower_path = getattr(
+        config,
+        'biomedbert_text_tower_path',
+        '/root/autodl-tmp/mkd-main/new-train/'
+        'pretrained/biomedbert_text_tower',
+    )
+    pet_text_embeddings = getattr(config, 'pet_text_embeddings', None)
+    if pet_text_embeddings is None:
+        pet_text_embeddings = load_local_pet_text_embeddings(
+            biomedclip_model_path=biomedclip_model_path,
+            biomedbert_text_tower_path=biomedbert_text_tower_path,
+        )
+    edv_attention_backend = getattr(config, 'edv_attention_backend', 'auto')
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
@@ -367,13 +391,39 @@ def build_mdt_seg_teacher(config):
         cppi_num_clusters=cppi_num_clusters,
         cppi_build_stage=cppi_build_stage,
         cppi_output_dir=cppi_output_dir,
+        pet_text_embeddings=pet_text_embeddings,
+        edv_attention_backend=edv_attention_backend,
+    )
+    edv_total, edv_trainable = count_parameters(model.fusion)
+    if edv_total >= 5_000_000:
+        raise RuntimeError(
+            f'EDV fusion parameters must be < 5,000,000, got {edv_total:,}'
+        )
+    edv_buffer_elements = sum(
+        buffer.numel() for buffer in model.fusion.buffers()
     )
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion=state_aware_weighted_add shared_decoder=UNetStyleDecoder '
+        f'fusion=evidence_guided_multiscale_sdnca '
+        f'attention=full_resolution_dilated_neighborhood_cross_attention '
+        f'text_condition=real_or_proxy_pet_state '
+        f'text_encoder=offline_local_frozen_once '
+        f'cppi=unchanged '
+        f'pet_calibration=before_edv '
+        f'shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
+    print(f'[EDV] trainable_parameters={edv_trainable:,}')
+    print(f'[EDV] total_parameters={edv_total:,}')
+    print(f'[EDV] buffer_elements={edv_buffer_elements:,}')
+    print(f'[EDV] channels={tuple(model.fusion.channels)}')
+    print(
+        f'[EDV] internal_channels='
+        f'{tuple(cfg.internal_channels for cfg in model.fusion.scale_configs)}'
+    )
+    print(f'[EDV] context_dilations={tuple(model.fusion.context_dilations)}')
+    print(f'[EDV] requested_attention_backend={edv_attention_backend}')
     print(f'[CPPI] enabled=True')
     print(f'[CPPI] num_clusters={cppi_num_clusters}')
     print(f'[CPPI] build_stage={cppi_build_stage}')
