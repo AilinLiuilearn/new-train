@@ -388,8 +388,8 @@ def build_mdt_seg_teacher(config):
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion=text_guided_oaf shared_decoder=UNetStyleDecoder '
-        f'text_condition=pet_operation_routing_only '
+        f'fusion=identity_centered_text_modulated_oaf shared_decoder=UNetStyleDecoder '
+        f'text_condition=pet_channel_residual_multiplication '
         f'text_encoder=offline_local_frozen '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
