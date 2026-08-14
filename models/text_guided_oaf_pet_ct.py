@@ -7,9 +7,10 @@ Adaptive Fusion (OAF) idea from TITA (ICCV 2025):
 
 The original OAF creates HPF, ADD and MUL candidates for each source and uses
 six sample-wise weights to aggregate them.  This version keeps that core and
-adds a *non-affine* fixed-text condition: a frozen Real/Proxy PET text embedding
-adds a learned bias only to the three PET routing logits.  It never scales or
-shifts the PET feature itself.
+adds a *non-affine* fixed-text condition: frozen Real/Proxy PET text embeddings
+score compatibility against PET HPF/ADD/MUL candidates and only modulate PET
+operation routing.  The fused output uses an outer dual residual:
+``F_out = F_CT + F_PET + F_OAF``.
 
 Input:
     ct_feature:  [B, C, H, W]
@@ -176,28 +177,56 @@ class OAFSourceBranch(nn.Module):
         return highpass, addition, multiplication
 
 
-class TextPETRouteBias(nn.Module):
-    """Map a frozen text vector to biases for PET's HPF/ADD/MUL logits.
+class PETOperationTextCompatibility(nn.Module):
+    """Score PET HPF/ADD/MUL candidates against the selected PET text token.
 
-    The final layer is zero-initialized.  Therefore, before learning, this
-    module is exactly neutral and TextGuidedOAF reduces to image-only OAF.
+    A shared projector maps each PET operation candidate to a route token; the
+    frozen text embedding is projected into the same space.  Cosine similarity
+    yields a three-way compatibility vector that is gated by a zero-initialized
+    scalar, so training starts as pure image-driven OAF.
     """
 
-    def __init__(self, text_dim: int, hidden_dim: int) -> None:
+    def __init__(self, channels: int, text_dim: int) -> None:
         super().__init__()
-        if text_dim <= 0 or hidden_dim <= 0:
-            raise ValueError("text_dim and hidden_dim must be positive")
-        self.net = nn.Sequential(
-            nn.LayerNorm(text_dim),
-            nn.Linear(text_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 3),
-        )
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
+        if channels <= 0 or text_dim <= 0:
+            raise ValueError("channels and text_dim must be positive")
 
-    def forward(self, text_embedding: Tensor) -> Tensor:
-        return self.net(text_embedding)
+        route_dim = min(int(channels), 32)
+        self.route_dim = route_dim
+        self.operation_projector = nn.Sequential(
+            nn.Conv2d(channels, route_dim, kernel_size=1, bias=False),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.text_projector = nn.Sequential(
+            nn.LayerNorm(text_dim),
+            nn.Linear(text_dim, route_dim, bias=False),
+        )
+        self.text_route_gate = nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self,
+        pet_candidates: Tuple[Tensor, Tensor, Tensor],
+        selected_text: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        operation_tokens = []
+        for candidate in pet_candidates:
+            token = self.operation_projector(candidate)
+            operation_tokens.append(token.flatten(1))
+        operation_tokens = torch.stack(operation_tokens, dim=1)
+
+        text_token = self.text_projector(selected_text)
+        operation_tokens = F.normalize(
+            operation_tokens.float(), dim=-1, eps=1e-6
+        )
+        text_token = F.normalize(text_token.float(), dim=-1, eps=1e-6)
+
+        text_compatibility = torch.sum(
+            operation_tokens * text_token.unsqueeze(1),
+            dim=-1,
+        )
+        text_delta = torch.tanh(self.text_route_gate) * text_compatibility
+        return text_delta, text_compatibility
 
 
 PetState = Union[str, Sequence[str], Tensor]
@@ -209,6 +238,9 @@ class TextGuidedOAF(nn.Module):
     Branch order in diagnostics:
         modality dimension: 0=CT, 1=PET
         operation dimension: 0=HPF, 1=ADD, 2=MUL
+
+    Final output uses the outer dual residual:
+        fused = ct_feature + pet_feature + oaf_feature
     """
 
     def __init__(
@@ -246,8 +278,9 @@ class TextGuidedOAF(nn.Module):
 
         normalized_text = F.normalize(text_embeddings.detach().float(), dim=-1)
         self.register_buffer("text_embeddings", normalized_text)
-        self.text_router = TextPETRouteBias(
-            text_dim=normalized_text.shape[1], hidden_dim=channels
+        self.text_router = PETOperationTextCompatibility(
+            channels=channels,
+            text_dim=normalized_text.shape[1],
         )
 
     @classmethod
@@ -326,32 +359,73 @@ class TextGuidedOAF(nn.Module):
 
         image_logits = self.image_router(torch.cat((ct_feature, pet_feature), dim=1))
         selected_text = self.text_embeddings.index_select(0, state_ids)
-        text_bias = self.text_router(selected_text).to(dtype=image_logits.dtype)
-
-        # Text changes only PET operation selection; CT logits remain image-driven.
-        routing_logits = torch.cat(
-            (image_logits[:, :3], image_logits[:, 3:] + text_bias), dim=1
+        text_delta, text_compatibility = self.text_router(
+            pet_candidates=pet_candidates,
+            selected_text=selected_text,
         )
-        routing_weights = F.softmax(routing_logits, dim=1)
+        text_delta = text_delta.to(dtype=image_logits.dtype)
 
-        fused = torch.zeros_like(ct_feature)
+        # Hierarchical routing: modality mix stays image-only; text only
+        # reshapes PET-internal HPF/ADD/MUL shares.  With text_delta=0 this is
+        # exactly equivalent to a joint Softmax over the six image logits.
+        ct_logits = image_logits[:, :3]
+        pet_logits = image_logits[:, 3:]
+        modality_logits = torch.stack(
+            (
+                torch.logsumexp(ct_logits, dim=1),
+                torch.logsumexp(pet_logits, dim=1),
+            ),
+            dim=1,
+        )
+        modality_weights = F.softmax(modality_logits, dim=1)
+        ct_modality_weight = modality_weights[:, 0:1]
+        pet_modality_weight = modality_weights[:, 1:2]
+
+        ct_operation_weights = F.softmax(ct_logits, dim=1)
+        pet_operation_weights = F.softmax(pet_logits + text_delta, dim=1)
+
+        ct_weights = ct_modality_weight * ct_operation_weights
+        pet_weights = pet_modality_weight * pet_operation_weights
+        routing_weights = torch.cat((ct_weights, pet_weights), dim=1)
+
+        oaf_feature = torch.zeros_like(ct_feature)
         for operation_index, (ct_candidate, pet_candidate) in enumerate(
             zip(ct_candidates, pet_candidates)
         ):
             ct_weight = routing_weights[:, operation_index].view(-1, 1, 1, 1)
             pet_weight = routing_weights[:, operation_index + 3].view(-1, 1, 1, 1)
-            fused = fused + ct_weight * ct_candidate + pet_weight * pet_candidate
+            oaf_feature = (
+                oaf_feature + ct_weight * ct_candidate + pet_weight * pet_candidate
+            )
+
+        fused_feature = ct_feature + pet_feature + oaf_feature
 
         if not return_diagnostics:
-            return fused
+            return fused_feature
 
         diagnostics = {
             "routing_weights": routing_weights.reshape(batch_size, 2, 3),
-            "image_logits": image_logits,
-            "pet_text_bias": text_bias,
+            "modality_weights": modality_weights,
+            "ct_operation_weights": ct_operation_weights,
+            "pet_operation_weights": pet_operation_weights,
+            "text_compatibility": text_compatibility,
+            "text_delta": text_delta,
+            "text_route_gate": torch.tanh(
+                self.text_router.text_route_gate
+            ).detach(),
             "pet_state_ids": state_ids,
+            "ct_rms": ct_feature.detach().float().square().mean().sqrt(),
+            "pet_rms": pet_feature.detach().float().square().mean().sqrt(),
+            "oaf_rms": oaf_feature.detach().float().square().mean().sqrt(),
+            "fused_rms": fused_feature.detach().float().square().mean().sqrt(),
+            # Backward-compatible diagnostic alias.
+            # This is now a compatibility delta,
+            # not a text-generated fixed bias.
+            "pet_text_bias": text_delta,
+            "image_logits": image_logits,
+            "oaf_feature": oaf_feature,
         }
-        return fused, diagnostics
+        return fused_feature, diagnostics
 
 
 class MultiScaleTextGuidedOAF(nn.Module):
@@ -439,7 +513,12 @@ class MultiScaleTextGuidedOAF(nn.Module):
 
         fused_feats: List[Tensor] = []
         routing_weights: List[Tensor] = []
-        pet_text_bias: List[Tensor] = []
+        text_compatibility: List[Tensor] = []
+        text_delta: List[Tensor] = []
+        modality_weights: List[Tensor] = []
+        ct_operation_weights: List[Tensor] = []
+        pet_operation_weights: List[Tensor] = []
+        residual_rms: List[Dict[str, Tensor]] = []
 
         for block, ct_feat, pet_feat in zip(self.blocks, ct_feats, pet_feats):
             if pet_feat.shape[1] != ct_feat.shape[1]:
@@ -463,7 +542,19 @@ class MultiScaleTextGuidedOAF(nn.Module):
                     return_diagnostics=True,
                 )
                 routing_weights.append(diagnostics["routing_weights"])
-                pet_text_bias.append(diagnostics["pet_text_bias"])
+                text_compatibility.append(diagnostics["text_compatibility"])
+                text_delta.append(diagnostics["text_delta"])
+                modality_weights.append(diagnostics["modality_weights"])
+                ct_operation_weights.append(diagnostics["ct_operation_weights"])
+                pet_operation_weights.append(diagnostics["pet_operation_weights"])
+                residual_rms.append(
+                    {
+                        "ct_rms": diagnostics["ct_rms"],
+                        "pet_rms": diagnostics["pet_rms"],
+                        "oaf_rms": diagnostics["oaf_rms"],
+                        "fused_rms": diagnostics["fused_rms"],
+                    }
+                )
             else:
                 fused = block(ct_feat, pet_feat, pet_state=state_ids)
             fused_feats.append(fused)
@@ -473,7 +564,14 @@ class MultiScaleTextGuidedOAF(nn.Module):
 
         return fused_feats, {
             "routing_weights": routing_weights,
-            "pet_text_bias": pet_text_bias,
+            "text_compatibility": text_compatibility,
+            "text_delta": text_delta,
+            "modality_weights": modality_weights,
+            "ct_operation_weights": ct_operation_weights,
+            "pet_operation_weights": pet_operation_weights,
+            "residual_rms": residual_rms,
+            # Backward-compatible diagnostic alias.
+            "pet_text_bias": text_delta,
             "pet_state_ids": state_ids,
         }
 
@@ -788,11 +886,26 @@ def smoke_test() -> None:
         torch.ones(batch),
         atol=1e-6,
     )
+    torch.testing.assert_close(
+        fused,
+        ct + pet + diagnostics["oaf_feature"],
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    # Init gate is zero => hierarchical weights match joint Softmax.
+    assert float(module.text_router.text_route_gate.detach()) == 0.0
+    legacy_weights = F.softmax(diagnostics["image_logits"], dim=1)
+    torch.testing.assert_close(
+        weights.reshape(batch, 6),
+        legacy_weights,
+        rtol=1e-5,
+        atol=1e-6,
+    )
 
     fused.square().mean().backward()
     assert ct.grad is not None and torch.isfinite(ct.grad).all()
     assert pet.grad is not None and torch.isfinite(pet.grad).all()
-    assert module.text_router.net[-1].weight.grad is not None
+    assert module.text_router.text_route_gate.grad is not None
 
     print("Smoke test passed")
     print("fused shape:", tuple(fused.shape))
