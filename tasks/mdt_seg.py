@@ -39,12 +39,51 @@ class MDTSegTeacher:
         ct = batch['ct'].to(self.device, non_blocking=True)
         pet = batch['pet'].to(self.device, non_blocking=True)
         mask = batch['mask'].to(self.device, non_blocking=True).float()
-        outputs = self.model(ct, pet=pet, mask=mask, forward_mode=forward_mode)
+        global_step = int(self.global_batch_step)
+        outputs = self.model(
+            ct,
+            pet=pet,
+            mask=mask,
+            forward_mode=forward_mode,
+            global_step=global_step,
+        )
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-        loss, loss_stats = self.criterion(logits, mask)
+        loss_seg, loss_stats = self.criterion(logits, mask)
+        loss_turr = torch.zeros((), device=loss_seg.device, dtype=loss_seg.dtype)
+        aux = outputs.get('aux', {}) if isinstance(outputs, dict) else {}
+
+        use_tgtu = bool(getattr(self.model, 'use_tgtu_fusion', False))
+        use_turr = bool(getattr(self.model, 'tgtu_use_turr_loss', False))
+        if use_tgtu and use_turr:
+            fusion = self.model.fusion
+            turr_context = aux.pop('turr_context', None)
+            reliability_logits = aux.get('reliability_logits')
+            if reliability_logits is None and turr_context is not None:
+                reliability_logits = turr_context['reliability_logits']
+            if reliability_logits is not None:
+                if turr_context is not None:
+                    target_size = turr_context.get('target_size', ct.shape[-2:])
+                    loss_turr, _turr_info = fusion.compute_turr_loss(
+                        global_step=global_step,
+                        decoder=self.model.decoder,
+                        decoder_args=(target_size,),
+                        main_prediction=outputs,
+                        target=mask,
+                        segmentation_loss_per_sample=self.criterion.forward_per_sample,
+                        ct_features=turr_context['ct_feats'],
+                        main_fused_features=turr_context['fused_feats'],
+                        reliability_logits=reliability_logits,
+                    )
+                    del turr_context
+                else:
+                    # Interval not reached: graph-connected zero, no extra decode.
+                    loss_turr = reliability_logits.sum() * 0.0
+
+        loss = loss_seg + loss_turr
         stats = {
             'loss_total': loss.detach(),
-            'loss_seg': loss_stats.get('loss_dice', loss.detach()),
+            'loss_seg': loss_stats.get('loss_dice', loss_seg.detach()),
+            'loss_turr': loss_turr.detach(),
             'loss_boundary': torch.tensor(0.0, device=loss.device),
         }
         return loss, logits, outputs, stats
@@ -65,7 +104,7 @@ class MDTSegTeacher:
                 forward_mode = 'full'
                 pet_available = None
             elif eval_mode == 'fixed_missing':
-                pet = batch['pet'].to(self.device, non_blocking=True)
+                pet = None
                 forward_mode = 'missing'
                 pet_available = None
             else:

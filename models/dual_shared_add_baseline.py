@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from models.baseline_blocks import PrototypeReferencedPETAffineCalibration, StateAwareWeightedAddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
+from models.baseline_blocks import PrototypeReferencedPETAffineCalibration, StateAwareWeightedAddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.ct_pet_prototype_imputation import CrossScaleCTPETPrototypeMemory
 
@@ -22,9 +22,30 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
-    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=6, cppi_build_stage=3, cppi_output_dir=None):
+    def __init__(
+        self,
+        ct_backbone='convnextv2_nano',
+        pet_backbone='mit_b1',
+        ct_pretrained_path=None,
+        pet_pretrained_path=None,
+        in_channels=3,
+        out_channels=1,
+        decoder_channels=(512, 256, 128, 64),
+        use_deep_supervision=False,
+        cppi_num_clusters=6,
+        cppi_build_stage=3,
+        cppi_output_dir=None,
+        use_tgtu_fusion=False,
+        tgtu_use_text=True,
+        tgtu_use_turr_loss=True,
+        tgtu_turr_interval=5,
+    ):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
+        self.use_tgtu_fusion = bool(use_tgtu_fusion)
+        self.tgtu_use_text = bool(tgtu_use_text)
+        self.tgtu_use_turr_loss = bool(tgtu_use_turr_loss)
+        self.tgtu_turr_interval = int(tgtu_turr_interval)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
         load_local_weights_safe(self.enc_ct, ct_pretrained_path, name='CT_Encoder')
@@ -33,7 +54,18 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pet_channels = list(self.enc_pet.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
         self.pet_calibration = PrototypeReferencedPETAffineCalibration(channels=pet_channels)
-        self.fusion = StateAwareWeightedAddFusion(num_scales=len(pet_channels))
+        if self.use_tgtu_fusion:
+            from models.text_guided_task_utility_reliability_fusion import (
+                TextGuidedTaskUtilityReliabilityFusion,
+            )
+            self.fusion = TextGuidedTaskUtilityReliabilityFusion(
+                channels=pet_channels,
+                use_text=self.tgtu_use_text,
+                use_turr_loss=self.tgtu_use_turr_loss,
+                turr_interval=self.tgtu_turr_interval,
+            )
+        else:
+            self.fusion = StateAwareWeightedAddFusion(num_scales=len(pet_channels))
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
         self.prototype_memory = CrossScaleCTPETPrototypeMemory(
             channels=pet_channels,
@@ -53,20 +85,60 @@ class DualSharedAddPETCTBaseline(nn.Module):
 
     def _encode_pet(self, pet):
         if pet is None:
-            raise ValueError('API-style baseline requires PET input before fusion-time masking')
+            raise ValueError('PET encoder requires a non-None PET input')
         pet_feats = self.enc_pet(self._to_3ch(pet))
         _check_tensor_list('pet_feats', pet_feats)
         return pet_feats
 
-    def _decode(self, fused_feats, target_size):
+    def _decode(self, fused_feats, target_size, aux=None):
         out = self.decoder(fused_feats, target_size)
         _check_tensor('logits', out['logits'])
         out['pred'] = out['logits']
-        out['aux'] = {}
+        out['aux'] = {} if aux is None else aux
         return out
 
+    def _fuse(self, ct_feats, pet_feats, mode, pet_available=None, global_step=None):
+        if not self.use_tgtu_fusion:
+            fused_feats = self.fusion(
+                ct_feats,
+                pet_feats,
+                mode=mode,
+                pet_available=pet_available,
+            )
+            return fused_feats, {}
+
+        need_turr = bool(self.tgtu_use_turr_loss and self.training)
+        compute_full_turr = bool(
+            need_turr
+            and global_step is not None
+            and self.fusion.should_compute_turr(int(global_step))
+        )
+        return_diagnostics = bool(need_turr)
+        fused = self.fusion(
+            ct_feats,
+            pet_feats,
+            mode=mode,
+            pet_available=pet_available,
+            return_diagnostics=return_diagnostics,
+        )
+        aux = {}
+        if return_diagnostics:
+            fused_feats, diagnostics = fused
+            reliability_logits = diagnostics['reliability_logits']
+            aux['reliability_logits'] = reliability_logits
+            aux['pet_state_ids'] = diagnostics['pet_state_ids']
+            if compute_full_turr:
+                aux['turr_context'] = {
+                    'ct_feats': ct_feats,
+                    'fused_feats': fused_feats,
+                    'reliability_logits': reliability_logits,
+                    'target_size': None,
+                }
+            return fused_feats, aux
+        return fused, aux
+
     def _collect_cppi(self, ct_feats, pet_feats_real, mask):
-        if self.training and mask is not None:
+        if self.training and mask is not None and pet_feats_real is not None:
             return self.prototype_memory.collect(
                 ct_feats=ct_feats,
                 pet_feats=pet_feats_real,
@@ -85,7 +157,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
             return_ct_reference=return_ct_reference,
         )
 
-    def _forward_full(self, ct, pet, target_size, mask=None):
+    def _forward_full(self, ct, pet, target_size, mask=None, global_step=None):
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
         self._collect_cppi(ct_feats, pet_feats_real, mask)
@@ -111,13 +183,22 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 None,
                 reference_valid=False,
             )
-        fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='full')
-        return self._decode(fused_feats, target_size)
+        fused_feats, aux = self._fuse(
+            ct_feats,
+            pet_feats_cal,
+            mode='full',
+            global_step=global_step,
+        )
+        if 'turr_context' in aux:
+            aux['turr_context']['target_size'] = target_size
+        return self._decode(fused_feats, target_size, aux=aux)
 
-    def _forward_missing(self, ct, pet, target_size, mask=None):
+    def _forward_missing(self, ct, pet, target_size, mask=None, global_step=None):
         ct_feats = self._encode_ct(ct)
-        pet_feats_real = self._encode_pet(pet)
-        self._collect_cppi(ct_feats, pet_feats_real, mask)
+        pet_feats_real = None
+        if pet is not None:
+            pet_feats_real = self._encode_pet(pet)
+            self._collect_cppi(ct_feats, pet_feats_real, mask)
         pet_feats_proxy, ct_reference_feats, _ = self._retrieve_cppi(
             ct_feats,
             compute_report=False,
@@ -132,13 +213,24 @@ class DualSharedAddPETCTBaseline(nn.Module):
             ct_reference_feats,
             reference_valid=self.prototype_memory.bank_ready,
         )
-        fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='missing')
-        return self._decode(fused_feats, target_size)
+        fused_feats, aux = self._fuse(
+            ct_feats,
+            pet_feats_cal,
+            mode='missing',
+            global_step=global_step,
+        )
+        if 'turr_context' in aux:
+            aux['turr_context']['target_size'] = target_size
+        return self._decode(fused_feats, target_size, aux=aux)
 
-    def _forward_auto(self, ct, pet, pet_available, target_size, mask=None):
+    def _forward_auto(self, ct, pet, pet_available, target_size, mask=None, global_step=None):
         ct_feats = self._encode_ct(ct)
-        pet_feats_real = self._encode_pet(pet)
-        self._collect_cppi(ct_feats, pet_feats_real, mask)
+        availability = pet_available.to(device=ct.device).long().view(-1)
+        if availability.numel() != ct.shape[0]:
+            raise ValueError('pet_available must contain one state per sample')
+        if not torch.all((availability == 0) | (availability == 1)):
+            raise ValueError('pet_available values must be 0 or 1')
+
         pet_feats_proxy, ct_reference_feats, _ = self._retrieve_cppi(
             ct_feats,
             compute_report=False,
@@ -147,29 +239,36 @@ class DualSharedAddPETCTBaseline(nn.Module):
             return_ct_reference=True,
         )
         ct_reference_feats = [x.detach() for x in ct_reference_feats]
-        pet_selected = []
-        availability = pet_available.to(device=ct.device).long().view(-1)
-        if availability.numel() != ct.shape[0]:
-            raise ValueError('pet_available must contain one state per sample')
-        if not torch.all((availability == 0) | (availability == 1)):
-            raise ValueError('pet_available values must be 0 or 1')
-        availability = availability.view(-1, 1, 1, 1)
-        for feat_real, feat_proxy in zip(pet_feats_real, pet_feats_proxy):
-            availability_mask = availability.to(device=feat_real.device, dtype=feat_real.dtype)
-            pet_selected.append(feat_real * availability_mask + feat_proxy * (1.0 - availability_mask))
+
+        if pet is not None:
+            pet_feats_real = self._encode_pet(pet)
+            self._collect_cppi(ct_feats, pet_feats_real, mask)
+            pet_selected = []
+            availability_spatial = availability.view(-1, 1, 1, 1)
+            for feat_real, feat_proxy in zip(pet_feats_real, pet_feats_proxy):
+                availability_mask = availability_spatial.to(device=feat_real.device, dtype=feat_real.dtype)
+                pet_selected.append(feat_real * availability_mask + feat_proxy * (1.0 - availability_mask))
+        else:
+            if torch.any(availability != 0):
+                raise ValueError('Auto mode with pet=None requires pet_available all zeros')
+            pet_selected = pet_feats_proxy
+
         pet_selected = self.pet_calibration(
             ct_feats,
             pet_selected,
             ct_reference_feats,
             reference_valid=self.prototype_memory.bank_ready,
         )
-        fused_feats = self.fusion(
+        fused_feats, aux = self._fuse(
             ct_feats,
             pet_selected,
             mode='auto',
             pet_available=pet_available,
+            global_step=global_step,
         )
-        return self._decode(fused_feats, target_size)
+        if 'turr_context' in aux:
+            aux['turr_context']['target_size'] = target_size
+        return self._decode(fused_feats, target_size, aux=aux)
 
     @torch.no_grad()
     def finalize_cppi_epoch(self, epoch, save_json=True, save_visualizations=False, print_info=True):
@@ -180,15 +279,15 @@ class DualSharedAddPETCTBaseline(nn.Module):
             print_info=print_info,
         )
 
-    def forward(self, ct, pet, pet_available=None, target_size=None, forward_mode='auto', mask=None):
+    def forward(self, ct, pet, pet_available=None, target_size=None, forward_mode='auto', mask=None, global_step=None):
         if target_size is None:
             target_size = ct.shape[-2:]
         if forward_mode == 'full':
-            return self._forward_full(ct, pet, target_size, mask=mask)
+            return self._forward_full(ct, pet, target_size, mask=mask, global_step=global_step)
         if forward_mode == 'missing':
-            return self._forward_missing(ct, pet, target_size, mask=mask)
+            return self._forward_missing(ct, pet, target_size, mask=mask, global_step=global_step)
         if forward_mode == 'auto':
             if pet_available is None:
                 pet_available = torch.ones(ct.shape[0], device=ct.device, dtype=torch.long)
-            return self._forward_auto(ct, pet, pet_available, target_size, mask=mask)
+            return self._forward_auto(ct, pet, pet_available, target_size, mask=mask, global_step=global_step)
         raise ValueError(f'Unsupported forward_mode={forward_mode!r}')

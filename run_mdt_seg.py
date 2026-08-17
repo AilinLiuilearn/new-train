@@ -125,6 +125,7 @@ def main():
         'grad_full_enc_ct', 'grad_missing_enc_ct', 'grad_full_ct_align', 'grad_missing_ct_align', 'grad_full_decoder', 'grad_missing_decoder',
         'epoch_time',
         'cppi_bank_version', 'cppi_ready_slots', 'cppi_bg_candidates', 'cppi_fg_candidates',
+        'train_turr_loss',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
 
@@ -142,6 +143,8 @@ def main():
         task.model.train()
         full_n = missing_n = 0
         full_loss = missing_loss = 0.0
+        turr_loss_accum = 0.0
+        turr_loss_steps = 0
         grad_norm_accum = 0.0
         grad_norm_steps = 0
         grads = {
@@ -156,7 +159,7 @@ def main():
             route = 'full' if global_batch_step % 2 == 0 else 'missing'
             task.optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
-                loss, _, _, _ = task.train_step(batch, forward_mode=route)
+                loss, _, _, step_stats = task.train_step(batch, forward_mode=route)
             if not torch.isfinite(loss):
                 raise RuntimeError('loss became non-finite')
 
@@ -182,7 +185,14 @@ def main():
             task.scheduler.step()
 
             if (batch_idx + 1) % 100 == 0:
-                print(f'[BATCH {batch_idx + 1}] route={route} loss={float(loss.detach()):.6f}', flush=True)
+                print(
+                    f'[BATCH {batch_idx + 1}] route={route} loss={float(loss.detach()):.6f} '
+                    f'turr={float(step_stats.get("loss_turr", 0.0)):.6f}',
+                    flush=True,
+                )
+
+            turr_loss_accum += float(step_stats.get('loss_turr', 0.0))
+            turr_loss_steps += 1
 
             if route == 'full':
                 full_n += 1
@@ -287,6 +297,7 @@ def main():
             'cppi_ready_slots': int(cppi_report.get('ready_count', cppi_report.get('ready_slots', 0))),
             'cppi_bg_candidates': int(cppi_report.get('classes', {}).get('background', {}).get('num_candidates', 0)),
             'cppi_fg_candidates': int(cppi_report.get('classes', {}).get('foreground', {}).get('num_candidates', 0)),
+            'train_turr_loss': turr_loss_accum / max(1, turr_loss_steps),
             **{f'diag_{k}': v for k, v in diag_stats.items()},
         }
         append_epoch_log(
