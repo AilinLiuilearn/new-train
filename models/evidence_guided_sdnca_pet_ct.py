@@ -1416,15 +1416,15 @@ def run_self_test(args: argparse.Namespace) -> None:
         )
         warm_loss = sum(feature.square().mean() for feature in warm_out)
     warm_loss.backward()
+    model.zero_grad(set_to_none=True)
     for feature in ct_features + pet_features:
-        if feature.grad is not None:
-            feature.grad = None
+        feature.grad = None
+    del warm_out, warm_loss
+    gc.collect()
     if device.type == "cuda":
-        torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
-
-    if device.type == "cuda":
         torch.cuda.synchronize(device)
+
     forward_start = time.perf_counter()
     with torch.autocast(
         device_type=device.type,
@@ -1451,9 +1451,12 @@ def run_self_test(args: argparse.Namespace) -> None:
     expected_states = 1 - availability
     torch.testing.assert_close(diagnostics["pet_state_ids"], expected_states)
 
+    # Drop the forward-only graph before measuring forward+backward peak memory.
+    del fused_features, diagnostics, loss
+    model.zero_grad(set_to_none=True)
     for feature in ct_features + pet_features:
-        if feature.grad is not None:
-            feature.grad = None
+        feature.grad = None
+    gc.collect()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
