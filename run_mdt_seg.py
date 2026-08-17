@@ -81,6 +81,11 @@ def _load_state_dict_with_report(model, checkpoint_path):
     print(f'[RESUME] checkpoint={checkpoint_path}', flush=True)
     print(f'[RESUME] missing_keys={missing_keys}', flush=True)
     print(f'[RESUME] unexpected_keys={unexpected_keys}', flush=True)
+    old_fusion_ignored = any(k.startswith('fusion.raw_alpha_') for k in unexpected_keys)
+    trdf_from_scratch = any(k.startswith('fusion.scales.') for k in missing_keys)
+    if old_fusion_ignored or trdf_from_scratch:
+        print('old fusion weights ignored', flush=True)
+        print('TRDF initialized from scratch', flush=True)
     return checkpoint
 
 

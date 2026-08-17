@@ -355,6 +355,11 @@ def build_mdt_seg_teacher(config):
     cppi_build_stage = getattr(config, 'cppi_build_stage', 3)
     cppi_output_dir = os.path.join(config.checkpoint_dir, 'cppi')
     no_encoder_pretrained = bool(getattr(config, 'no_encoder_pretrained', False))
+    trdf_use_text_prior = bool(getattr(config, 'trdf_use_text_prior', False))
+    trdf_text_backend = getattr(config, 'trdf_text_backend', 'precomputed')
+    trdf_text_embedding_path = getattr(config, 'trdf_text_embedding_path', None)
+    trdf_text_model_path = getattr(config, 'trdf_text_model_path', None)
+    trdf_text_hidden_dim = getattr(config, 'trdf_text_hidden_dim', 128)
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
@@ -367,15 +372,25 @@ def build_mdt_seg_teacher(config):
         cppi_num_clusters=cppi_num_clusters,
         cppi_build_stage=cppi_build_stage,
         cppi_output_dir=cppi_output_dir,
+        trdf_use_text_prior=trdf_use_text_prior,
+        trdf_text_backend=trdf_text_backend,
+        trdf_text_embedding_path=trdf_text_embedding_path,
+        trdf_text_model_path=trdf_text_model_path,
+        trdf_text_hidden_dim=trdf_text_hidden_dim,
     )
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion=state_aware_weighted_add shared_decoder=UNetStyleDecoder '
+        f'fusion=TRDF shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
     print(f'[CPPI] enabled=True')
     print(f'[CPPI] num_clusters={cppi_num_clusters}')
     print(f'[CPPI] build_stage={cppi_build_stage}')
     print(f'[CPPI] output_dir={cppi_output_dir}')
+    print(f'[TRDF] enabled=True')
+    print(f'[TRDF] use_text_prior={trdf_use_text_prior}')
+    print(f'[TRDF] text_backend={trdf_text_backend}')
+    print(f'[TRDF] text_embedding_path={trdf_text_embedding_path}')
+    print(f'[TRDF] text_model_path={trdf_text_model_path}')
     return {'model': model}
