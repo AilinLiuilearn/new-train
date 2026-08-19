@@ -195,7 +195,7 @@ def test_builder_and_resume():
     cfg = SimpleNamespace(
         checkpoint_dir=tempfile.mkdtemp(),
         cppi_num_clusters=6,
-        cppi_build_stage=3,
+        cppi_build_stage=4,
         no_encoder_pretrained=True,
         ct_backbone='convnextv2_nano',
         pet_backbone='mit_b1',

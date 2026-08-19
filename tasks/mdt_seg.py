@@ -25,12 +25,39 @@ class MDTSegTeacher:
         self.model = networks['model']
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+        self.optimizer = self._build_optimizer(config)
         self.scheduler = None
         self.scaler = torch.cuda.amp.GradScaler(enabled=bool(config.mixed_precision))
         self.global_batch_step = 0
         self.criterion = BCEDiceLoss(smooth=config.loss_smooth, bce_weight=config.bce_weight, dice_weight=config.dice_weight)
         self.metrics = SegmentationMetricsCIPA()
+
+    def _build_optimizer(self, config):
+        """
+        Two LR groups only:
+          - Stage-1 modules (encoders / align / CPPI trainable / calibration / decoder)
+          - TRDF fusion
+        """
+        old_lr = float(getattr(config, 'old_module_lr', 2e-5))
+        trdf_lr = float(getattr(config, 'learning_rate', 8e-5))
+        weight_decay = float(getattr(config, 'weight_decay', 1e-4))
+
+        trdf_params = [p for p in self.model.fusion.parameters() if p.requires_grad]
+        trdf_ids = {id(p) for p in trdf_params}
+        old_params = [
+            p for p in self.model.parameters()
+            if p.requires_grad and id(p) not in trdf_ids
+        ]
+        if not trdf_params:
+            raise RuntimeError('TRDF param group is empty; fusion module missing trainable params')
+        if not old_params:
+            raise RuntimeError('Stage-1 param group is empty')
+
+        param_groups = [
+            {'params': old_params, 'lr': old_lr, 'name': 'stage1_modules'},
+            {'params': trdf_params, 'lr': trdf_lr, 'name': 'trdf'},
+        ]
+        return torch.optim.AdamW(param_groups, lr=trdf_lr, weight_decay=weight_decay)
 
     def trainable_parameters(self):
         return [p for p in self.model.parameters() if p.requires_grad]

@@ -352,7 +352,7 @@ class ConvBNAct(nn.Module):
 def build_mdt_seg_teacher(config):
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
     cppi_num_clusters = getattr(config, 'cppi_num_clusters', 6)
-    cppi_build_stage = getattr(config, 'cppi_build_stage', 3)
+    cppi_build_stage = getattr(config, 'cppi_build_stage', 4)
     cppi_output_dir = os.path.join(config.checkpoint_dir, 'cppi')
     no_encoder_pretrained = bool(getattr(config, 'no_encoder_pretrained', False))
     trdf_use_text_prior = bool(getattr(config, 'trdf_use_text_prior', False))

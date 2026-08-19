@@ -34,7 +34,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--joint_full_weight', type=float, default=0.5)
         p.add_argument('--joint_missing_weight', type=float, default=0.5)
         p.add_argument('--cppi_num_clusters', type=int, default=6)
-        p.add_argument('--cppi_build_stage', type=int, default=3)
+        p.add_argument('--cppi_build_stage', type=int, default=4)
         p.add_argument('--trdf_use_text_prior', type=str2bool, default=False)
         p.add_argument('--trdf_text_backend', type=str, default='precomputed', choices=('precomputed', 'hf_local'))
         p.add_argument('--trdf_text_embedding_path', type=str, default=None)
@@ -43,7 +43,19 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--enable_gradient_diagnostics', type=str2bool, default=False)
         p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
-        p.add_argument('--resume_checkpoint', type=str, default=None)
+        p.add_argument(
+            '--stage1_checkpoint',
+            type=str,
+            default=None,
+            help='Stage-1 CPPI+Calibration best checkpoint for TRDF warm-start. '
+                 'Loads encoders/align/CPPI bank/calibration/decoder; skips old fusion.',
+        )
+        p.add_argument(
+            '--resume_checkpoint',
+            type=str,
+            default=None,
+            help='Resume a Stage-2 TRDF run (full model). Do not use NaN-polluted TRDF runs.',
+        )
         return p
 
     @staticmethod
@@ -53,10 +65,21 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--batch_size', type=int, default=16)
         p.add_argument('--accumulation_steps', type=int, default=1)
         p.add_argument('--optimizer', type=str, default='adamw', choices=('adamw', 'sgd'))
-        p.add_argument('--learning_rate', type=float, default=8e-5)
+        p.add_argument(
+            '--learning_rate',
+            type=float,
+            default=8e-5,
+            help='TRDF learning rate (new fusion module).',
+        )
+        p.add_argument(
+            '--old_module_lr',
+            type=float,
+            default=2e-5,
+            help='Warm-start LR for Stage-1 modules (encoders/align/CPPI/calibration/decoder).',
+        )
         p.add_argument('--decoder_lr', type=float, default=8e-5)
         p.add_argument('--weight_decay', type=float, default=1e-4)
-        p.add_argument('--cosine_warmup', type=int, default=3)
+        p.add_argument('--cosine_warmup', type=int, default=1)
         p.add_argument('--cosine_min_lr', type=float, default=1e-6)
         p.add_argument('--lr_flat_ratio', type=float, default=0.3)
         p.add_argument('--mixed_precision', type=str2bool, default=True)

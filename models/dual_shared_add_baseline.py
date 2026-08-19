@@ -34,7 +34,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         decoder_channels=(512, 256, 128, 64),
         use_deep_supervision=False,
         cppi_num_clusters=6,
-        cppi_build_stage=3,
+        cppi_build_stage=4,
         cppi_output_dir=None,
         trdf_use_text_prior=False,
         trdf_text_backend='precomputed',

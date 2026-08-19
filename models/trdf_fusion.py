@@ -110,8 +110,16 @@ PROXY_PET_PROMPT = (
 )
 
 
-def _sanitize(x: torch.Tensor) -> torch.Tensor:
-    return torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+def _assert_finite(name: str, x: torch.Tensor) -> None:
+    if not torch.isfinite(x).all():
+        raise RuntimeError(f"[TRDF] {name} contains NaN/Inf")
+
+
+def _make_group_norm(channels: int, max_groups: int = 32) -> nn.GroupNorm:
+    groups = min(int(max_groups), int(channels))
+    while groups > 1 and channels % groups != 0:
+        groups -= 1
+    return nn.GroupNorm(groups, channels)
 
 
 def _check_4d(name: str, x: torch.Tensor) -> None:
@@ -157,7 +165,7 @@ class PETSelfGaussianHead(nn.Module):
         self.logvar_clamp = tuple(float(v) for v in logvar_clamp)
 
         self.local = nn.Sequential(
-            nn.BatchNorm2d(channels),
+            _make_group_norm(channels),
             nn.Conv2d(
                 channels,
                 channels,
@@ -168,8 +176,8 @@ class PETSelfGaussianHead(nn.Module):
             ),
             nn.GELU(),
         )
-        self.mu_norm = nn.BatchNorm2d(channels)
-        self.lv_norm = nn.BatchNorm2d(channels)
+        self.mu_norm = _make_group_norm(channels)
+        self.lv_norm = _make_group_norm(channels)
         self.mu_head = BottleneckConvMlp(channels)
         self.lv_head = BottleneckConvMlp(channels)
 
@@ -207,7 +215,7 @@ class CTConditionedPETGaussianHead(nn.Module):
 
         self.ct_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
         self.pet_proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.pre_norm = nn.BatchNorm2d(channels)
+        self.pre_norm = _make_group_norm(channels)
 
         self.local = nn.Sequential(
             nn.GELU(),
@@ -222,8 +230,8 @@ class CTConditionedPETGaussianHead(nn.Module):
             nn.GELU(),
         )
 
-        self.mu_norm = nn.BatchNorm2d(channels)
-        self.lv_norm = nn.BatchNorm2d(channels)
+        self.mu_norm = _make_group_norm(channels)
+        self.lv_norm = _make_group_norm(channels)
         self.mu_head = BottleneckConvMlp(channels)
         self.lv_head = BottleneckConvMlp(channels)
 
@@ -253,22 +261,30 @@ class PETConfidenceGenerator(nn.Module):
     Both uncertainty maps have shape [B,1,H,W].
     Output:
         r_vis in (0,1), shape [B,1,H,W]
+
+    The final 1x1 layer is initialized so that sigmoid(bias) ≈ 0.90, which makes
+    the early-training fusion closer to the previous CT + PET baseline while
+    still leaving room for reliability learning.
     """
 
     def __init__(self, hidden: int = 8):
         super().__init__()
-        self.head = nn.Sequential(
-            nn.Conv2d(2, hidden, kernel_size=3, padding=1, bias=True),
-            nn.GELU(),
-            nn.Conv2d(hidden, 1, kernel_size=1, bias=True),
-        )
+        self.conv1 = nn.Conv2d(2, hidden, kernel_size=3, padding=1, bias=True)
+        self.act = nn.GELU()
+        self.conv_out = nn.Conv2d(hidden, 1, kernel_size=1, bias=True)
+        nn.init.zeros_(self.conv_out.weight)
+        # sigmoid(2.1972246) ≈ 0.90
+        nn.init.constant_(self.conv_out.bias, 2.1972246)
 
     @staticmethod
     def confidence_from_logvar(logvar: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Stable positive uncertainty.  We intentionally avoid exp(exp(.)).
-        uncertainty = F.softplus(logvar).mean(dim=1, keepdim=True)
-        confidence = torch.exp(-uncertainty)
-        return confidence, uncertainty
+        # softplus/exp are safer in FP32 under AMP.
+        original_dtype = logvar.dtype
+        with torch.cuda.amp.autocast(enabled=False):
+            lv32 = logvar.float()
+            uncertainty = F.softplus(lv32).mean(dim=1, keepdim=True)
+            confidence = torch.exp(-uncertainty)
+        return confidence.to(dtype=original_dtype), uncertainty.to(dtype=original_dtype)
 
     def forward(
         self,
@@ -279,7 +295,10 @@ class PETConfidenceGenerator(nn.Module):
         conf_ctx, u_ctx = self.confidence_from_logvar(ctx_logvar)
 
         x = torch.cat([conf_self, conf_ctx], dim=1)
-        r_vis = torch.sigmoid(self.head(x))
+        original_dtype = x.dtype
+        with torch.cuda.amp.autocast(enabled=False):
+            r_vis = torch.sigmoid(self.conv_out(self.act(self.conv1(x.float()))))
+        r_vis = r_vis.to(dtype=original_dtype)
 
         aux = {
             "self_uncertainty": u_self,
@@ -551,18 +570,25 @@ class TextReliabilityCalibrator(nn.Module):
         if not (0 <= scale_idx < self.num_scales):
             raise IndexError(f"scale_idx={scale_idx} out of range")
 
-        params = self.mlp(text_embedding)
-        params = params.view(text_embedding.shape[0], self.num_scales, 2)
-        a = params[:, scale_idx, 0].view(-1, 1, 1, 1)
-        b = params[:, scale_idx, 1].view(-1, 1, 1, 1)
+        original_dtype = r_vis.dtype
+        # logit(R) is numerically fragile in FP16 near 0/1; keep calibration in FP32.
+        with torch.cuda.amp.autocast(enabled=False):
+            text32 = text_embedding.float()
+            r32 = r_vis.float().clamp(max(self.eps, 1e-4), 1.0 - max(self.eps, 1e-4))
 
-        gamma = 1.0 + torch.tanh(a)  # (0,2)
-        beta = torch.tanh(b)         # (-1,1)
+            params = self.mlp(text32)
+            params = params.view(text32.shape[0], self.num_scales, 2)
+            a = params[:, scale_idx, 0].view(-1, 1, 1, 1)
+            b = params[:, scale_idx, 1].view(-1, 1, 1, 1)
 
-        r = r_vis.clamp(self.eps, 1.0 - self.eps)
-        logits = torch.log(r) - torch.log1p(-r)
-        calibrated = torch.sigmoid(gamma * logits + beta)
-        return calibrated
+            gamma = 1.0 + torch.tanh(a)  # (0,2)
+            beta = torch.tanh(b)         # (-1,1)
+
+            logits = torch.log(r32) - torch.log1p(-r32)
+            calibrated = torch.sigmoid(gamma * logits + beta)
+            _assert_finite("text_calibrated_reliability", calibrated)
+
+        return calibrated.to(dtype=original_dtype)
 
 
 class LinearCrossAttention2d(nn.Module):
@@ -578,6 +604,10 @@ class LinearCrossAttention2d(nn.Module):
     - all Q/K/V/output projections use bias=False
     - V local depthwise conv uses bias=False
     Therefore, when reliable PET is exactly zero, the synergy output is zero.
+
+    Numerical safety:
+    - Q/K/V projections, linear-attention accumulator, and out_proj all run in FP32
+    - uses mean-normalized formulation so the N-scale does not overflow FP16
     """
 
     def __init__(
@@ -622,30 +652,37 @@ class LinearCrossAttention2d(nn.Module):
 
         b, _, h, w = ct.shape
         n = h * w
+        original_dtype = ct.dtype
 
-        q = self.q_proj(ct)
-        k = self.k_proj(pet_reliable)
-        v = self.v_local(self.v_proj(pet_reliable))
+        # Entire synergy path in FP32: projections under AMP/FP16 can already Inf.
+        with torch.cuda.amp.autocast(enabled=False):
+            ct32 = ct.float()
+            pet32 = pet_reliable.float()
 
-        # [B,d,H,W] -> [B,N,d]
-        q = q.flatten(2).transpose(1, 2)
-        k = k.flatten(2).transpose(1, 2)
-        v = v.flatten(2).transpose(1, 2)
+            q = self.q_proj(ct32)
+            k = self.k_proj(pet32)
+            v = self.v_local(self.v_proj(pet32))
 
-        q_phi = self._phi(q)
-        k_phi = self._phi(k)
+            # [B,d,H,W] -> [B,N,d]
+            q = q.flatten(2).transpose(1, 2)
+            k = k.flatten(2).transpose(1, 2)
+            v = v.flatten(2).transpose(1, 2)
 
-        # Core relation: [B,d,N] @ [B,N,d] -> [B,d,d]
-        kv = torch.bmm(k_phi.transpose(1, 2), v)
+            q32 = self._phi(q)
+            k32 = self._phi(k)
 
-        # Linear-attention normalizer.
-        k_sum = k_phi.sum(dim=1)  # [B,d]
-        denom = torch.bmm(q_phi, k_sum.unsqueeze(-1)).clamp_min(self.eps)
+            # Mean-normalized formulation: numerator/denominator cancel N.
+            kv = torch.bmm(k32.transpose(1, 2), v) / float(max(n, 1))
+            k_mean = k32.mean(dim=1)
+            denom = torch.bmm(q32, k_mean.unsqueeze(-1)).clamp_min(max(self.eps, 1e-4))
+            out32 = torch.bmm(q32, kv) / denom
+            _assert_finite("LinearCrossAttention FP32 core", out32)
 
-        out = torch.bmm(q_phi, kv) / denom
-        out = out.transpose(1, 2).reshape(b, self.attn_dim, h, w)
-        out = self.out_proj(out)
-        return _sanitize(out)
+            out32 = out32.transpose(1, 2).reshape(b, self.attn_dim, h, w)
+            out32 = self.out_proj(out32)
+            _assert_finite("LinearCrossAttention output", out32)
+
+        return out32.to(dtype=original_dtype)
 
 
 class TRDFScale(nn.Module):
@@ -703,7 +740,8 @@ class TRDFScale(nn.Module):
         synergy = self.synergy(ct, pet_reliable)
 
         # No second reliability multiplication and no extra gate.
-        out = _sanitize(direct + synergy)
+        out = direct + synergy
+        _assert_finite("fused feature", out)
 
         if not return_aux:
             return out
@@ -714,6 +752,7 @@ class TRDFScale(nn.Module):
                 "reliability": r,
                 "reliable_pet": pet_reliable,
                 "synergy": synergy,
+                "visual_reliability": r_vis,
             }
         )
         return out, aux
@@ -939,6 +978,7 @@ def demo(
     text_embedding_path: Optional[str] = None,
     text_model_path: Optional[str] = None,
     run_backward: bool = True,
+    amp_steps: int = 20,
 ) -> None:
     """
     Standalone smoke test using the actual expected MiT-B1-aligned four scales.
@@ -946,6 +986,8 @@ def demo(
     Default text is OFF so:
         python trdf_fusion.py
     works with PyTorch only.
+
+    When CUDA is available, also runs an AMP multi-step trainability check.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     channels = (64, 128, 320, 512)
@@ -990,13 +1032,25 @@ def demo(
     ):
         r = a["reliability"]
         syn = a["synergy"]
+        r_min = float(r.detach().min())
+        r_mean = float(r.detach().mean())
+        r_max = float(r.detach().max())
         print(
             f"S{i}: CT={tuple(ct.shape)} PET={tuple(pet.shape)} "
             f"R={tuple(r.shape)} synergy={tuple(syn.shape)} OUT={tuple(out.shape)} "
-            f"R_mean={float(r.detach().mean()):.4f}"
+            f"R_min={r_min:.4f} R_mean={r_mean:.4f} R_max={r_max:.4f}"
         )
         assert out.shape == ct.shape == pet.shape
         assert r.shape == (batch_size, 1, ct.shape[-2], ct.shape[-1])
+        assert 0.85 <= r_mean <= 0.95, f"Expected R_mean≈0.90 at init, got {r_mean}"
+        _assert_finite(f"S{i}.ct", ct)
+        _assert_finite(f"S{i}.pet", pet)
+        _assert_finite(f"S{i}.self_logvar_proxy", a["self_uncertainty"])
+        _assert_finite(f"S{i}.ctx_logvar_proxy", a["context_uncertainty"])
+        _assert_finite(f"S{i}.R", r)
+        _assert_finite(f"S{i}.P_rel", a["reliable_pet"])
+        _assert_finite(f"S{i}.synergy", syn)
+        _assert_finite(f"S{i}.F_out", out)
 
     if run_backward:
         loss = sum(x.float().square().mean() for x in fused)
@@ -1014,6 +1068,63 @@ def demo(
         max_abs = float(zero_synergy.abs().max())
         print(f"zero_reliable_pet_synergy_max_abs={max_abs:.8f}")
 
+    # Multi-step AMP trainability check (required on CUDA).
+    if device.type == "cuda" and amp_steps > 0:
+        print("=" * 80)
+        print(f"AMP {amp_steps}-step trainability check")
+        model.train()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        scaler = torch.cuda.amp.GradScaler(enabled=True)
+        torch.cuda.reset_peak_memory_stats(device)
+
+        for step in range(1, amp_steps + 1):
+            optimizer.zero_grad(set_to_none=True)
+            ct_step = [
+                torch.randn(batch_size, c, h, w, device=device, requires_grad=True)
+                for c, (h, w) in zip(channels, spatial)
+            ]
+            pet_step = [
+                torch.randn(batch_size, c, h, w, device=device, requires_grad=True)
+                for c, (h, w) in zip(channels, spatial)
+            ]
+            with torch.cuda.amp.autocast(enabled=True):
+                fused_step = model(ct_step, pet_step, mode="full", return_aux=False)
+                loss = sum(x.float().square().mean() for x in fused_step)
+
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"[TRDF] AMP step {step}: non-finite loss")
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+
+            for name, param in model.named_parameters():
+                if param.grad is not None and not torch.isfinite(param.grad).all():
+                    raise RuntimeError(f"[TRDF] AMP step {step}: non-finite grad at {name}")
+            for i, (ct, pet) in enumerate(zip(ct_step, pet_step), start=1):
+                if ct.grad is not None and not torch.isfinite(ct.grad).all():
+                    raise RuntimeError(f"[TRDF] AMP step {step}: non-finite CT grad S{i}")
+                if pet.grad is not None and not torch.isfinite(pet.grad).all():
+                    raise RuntimeError(f"[TRDF] AMP step {step}: non-finite PET grad S{i}")
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0, error_if_nonfinite=True)
+            scaler.step(optimizer)
+            scaler.update()
+
+            for name, param in model.named_parameters():
+                if not torch.isfinite(param).all():
+                    raise RuntimeError(f"[TRDF] AMP step {step}: non-finite param at {name}")
+
+            if step == 1 or step == amp_steps:
+                print(f"  step={step}/{amp_steps} loss={float(loss.detach()):.6f} finite=True")
+
+        peak_alloc = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        peak_reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+        print(f"AMP_peak_allocated_MB={peak_alloc:.1f}")
+        print(f"AMP_peak_reserved_MB={peak_reserved:.1f}")
+        print("AMP 20-step check PASSED")
+    else:
+        print("AMP multi-step check skipped (CUDA unavailable)")
+
     print("TRDF demo completed successfully.")
 
 
@@ -1021,6 +1132,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Standalone TRDF fusion smoke test")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--no-backward", action="store_true")
+    parser.add_argument("--amp-steps", type=int, default=20)
 
     parser.add_argument("--use-text-prior", action="store_true")
     parser.add_argument(
@@ -1043,4 +1155,5 @@ if __name__ == "__main__":
         text_embedding_path=args.text_embedding_path,
         text_model_path=args.text_model_path,
         run_backward=not args.no_backward,
+        amp_steps=args.amp_steps,
     )

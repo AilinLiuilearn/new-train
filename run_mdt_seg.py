@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import json
+import math
 import os
 import random
 import time
@@ -63,13 +64,114 @@ def module_grad_norm(module):
     return float(total.sqrt().item()) if total is not None else 0.0
 
 
-def _checkpoint_paths(checkpoint_dir):
-    return {
-        'best_joint': os.path.join(checkpoint_dir, 'ckpt.best_joint.pth.tar'),
-        'best_full': os.path.join(checkpoint_dir, 'ckpt.best_full.pth.tar'),
-        'best_missing': os.path.join(checkpoint_dir, 'ckpt.best_missing.pth.tar'),
-        'last': os.path.join(checkpoint_dir, 'ckpt.last.pth.tar'),
-    }
+def _nonfinite_grad_report(model, max_names=12):
+    bad = []
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        if not torch.isfinite(param.grad).all():
+            bad.append(name)
+            if len(bad) >= max_names:
+                break
+    return bad
+
+
+_STAGE1_MODULE_PREFIXES = (
+    'enc_ct.',
+    'enc_pet.',
+    'ct_align.',
+    'pet_calibration.',
+    'decoder.',
+    'prototype_memory.',
+)
+
+
+def _count_prefix_matches(keys, prefix):
+    return sum(1 for k in keys if k.startswith(prefix))
+
+
+def _load_stage1_warmstart(model, checkpoint_path):
+    """
+    Warm-start Stage-2 TRDF training from a Stage-1 CPPI+Calibration checkpoint.
+
+    Loads: encoders, align, CPPI bank, PET calibration, decoder.
+    Skips: old StateAwareWeightedAddFusion (and any fusion.* keys).
+    TRDF remains randomly initialized.
+    """
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    state_dict = checkpoint.get('model', checkpoint)
+    if not isinstance(state_dict, dict):
+        raise ValueError(f'Invalid Stage-1 checkpoint model state: {checkpoint_path}')
+
+    filtered = {}
+    skipped_fusion = []
+    skipped_other = []
+    for key, value in state_dict.items():
+        if key.startswith('fusion.'):
+            skipped_fusion.append(key)
+            continue
+        if any(key.startswith(prefix) for prefix in _STAGE1_MODULE_PREFIXES):
+            filtered[key] = value
+        else:
+            skipped_other.append(key)
+
+    result = model.load_state_dict(filtered, strict=False)
+    missing_keys = list(result.missing_keys)
+    unexpected_keys = list(result.unexpected_keys)
+
+    loaded_keys = sorted(filtered.keys())
+    print(f'[WARMSTART] stage1_checkpoint={checkpoint_path}', flush=True)
+    print(
+        f'[WARMSTART] loaded_tensors={len(loaded_keys)} '
+        f'skipped_fusion={len(skipped_fusion)} skipped_other={len(skipped_other)}',
+        flush=True,
+    )
+    for prefix, label in [
+        ('enc_ct.', 'CT encoder'),
+        ('enc_pet.', 'PET encoder'),
+        ('ct_align.', 'CT align'),
+        ('prototype_memory.', 'CPPI prototype bank'),
+        ('pet_calibration.', 'PET affine calibration'),
+        ('decoder.', 'shared decoder'),
+    ]:
+        n = _count_prefix_matches(loaded_keys, prefix)
+        print(f'[WARMSTART] loaded {label}: tensors={n}', flush=True)
+
+    if skipped_fusion:
+        print(
+            f'[WARMSTART] ignored old fusion weights ({len(skipped_fusion)}): '
+            f'{skipped_fusion[:8]}{"..." if len(skipped_fusion) > 8 else ""}',
+            flush=True,
+        )
+    else:
+        print('[WARMSTART] no fusion.* keys found in Stage-1 checkpoint', flush=True)
+
+    trdf_missing = [k for k in missing_keys if k.startswith('fusion.')]
+    other_missing = [k for k in missing_keys if not k.startswith('fusion.')]
+    print(f'[WARMSTART] TRDF initialized from scratch (missing_fusion_keys={len(trdf_missing)})', flush=True)
+    if other_missing:
+        print(f'[WARMSTART] other_missing_keys={other_missing[:20]}', flush=True)
+    if unexpected_keys:
+        print(f'[WARMSTART] unexpected_keys={unexpected_keys[:20]}', flush=True)
+
+    pm = model.prototype_memory
+    ready_slots = int(pm.prototype_ready.sum().item())
+    total_slots = int(pm.prototype_ready.numel())
+    bank_version = int(pm.bank_version.item())
+    bank_ready = bool(pm.bank_ready)
+    print(
+        f'[WARMSTART] Stage1 prototype bank restored: '
+        f'ready={bank_ready} version={bank_version} '
+        f'ready_slots={ready_slots}/{total_slots}',
+        flush=True,
+    )
+    if not bank_ready:
+        print(
+            '[WARMSTART][WARN] prototype bank is NOT ready after Stage-1 load; '
+            'Missing path will be weak until first finalize.',
+            flush=True,
+        )
+    return checkpoint
 
 
 def _load_state_dict_with_report(model, checkpoint_path):
@@ -89,10 +191,36 @@ def _load_state_dict_with_report(model, checkpoint_path):
     return checkpoint
 
 
+def _print_optimizer_groups(optimizer, warmup_epochs):
+    print('[OPT] two learning-rate groups:', flush=True)
+    for group in optimizer.param_groups:
+        name = group.get('name', 'unnamed')
+        n_params = sum(p.numel() for p in group['params'])
+        print(f"[OPT] group={name} lr={group['lr']:.8f} n_params={n_params}", flush=True)
+    print(f'[OPT] cosine_warmup_epochs={warmup_epochs}', flush=True)
+
+
+def _optimizer_lrs(optimizer):
+    lrs = {}
+    for group in optimizer.param_groups:
+        name = group.get('name', f"group{len(lrs)}")
+        lrs[name] = float(group['lr'])
+    return lrs
+
+
 def _count_parameters(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
+
+
+def _checkpoint_paths(checkpoint_dir):
+    return {
+        'best_joint': os.path.join(checkpoint_dir, 'ckpt.best_joint.pth.tar'),
+        'best_full': os.path.join(checkpoint_dir, 'ckpt.best_full.pth.tar'),
+        'best_missing': os.path.join(checkpoint_dir, 'ckpt.best_missing.pth.tar'),
+        'last': os.path.join(checkpoint_dir, 'ckpt.last.pth.tar'),
+    }
 
 
 def main():
@@ -107,11 +235,29 @@ def main():
     train_loader, val_loader, _ = _loaders(cfg)
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)}', flush=True)
 
+    stage1_ckpt = getattr(cfg, 'stage1_checkpoint', None)
+    resume_ckpt = getattr(cfg, 'resume_checkpoint', None)
+    if stage1_ckpt and resume_ckpt:
+        raise ValueError(
+            'Use either --stage1_checkpoint (TRDF warm-start) or --resume_checkpoint '
+            '(continue a Stage-2 TRDF run), not both.'
+        )
+
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
-    if getattr(cfg, 'resume_checkpoint', None):
-        _load_state_dict_with_report(task.model, cfg.resume_checkpoint)
+    if stage1_ckpt:
+        _load_stage1_warmstart(task.model, stage1_ckpt)
+    elif resume_ckpt:
+        print(
+            '[RESUME][WARN] Resuming a Stage-2 checkpoint. '
+            'Do not resume NaN-polluted TRDF runs.',
+            flush=True,
+        )
+        _load_state_dict_with_report(task.model, resume_ckpt)
+
     total_params, trainable_params = _count_parameters(task.model)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
+    _print_optimizer_groups(task.optimizer, warmup_epochs=int(cfg.cosine_warmup))
+
     task.scheduler = get_cosine_scheduler(
         task.optimizer,
         epochs=cfg.epochs,
@@ -174,8 +320,31 @@ def main():
             grads[route]['enc_ct'].append(module_grad_norm(task.model.enc_ct))
             grads[route]['ct_align'].append(module_grad_norm(task.model.ct_align))
             grads[route]['decoder'].append(module_grad_norm(task.model.decoder))
-            total_grad_norm = torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip)) if float(cfg.grad_clip) > 0 else 0.0
-            grad_norm_accum += float(total_grad_norm)
+            # AMP may produce rare Inf grads; GradScaler should skip the step and
+            # lower the loss scale. Never optimizer.step() with non-finite grads.
+            total_grad_norm = torch.nn.utils.clip_grad_norm_(
+                task.trainable_parameters(),
+                float(cfg.grad_clip),
+                error_if_nonfinite=False,
+            ) if float(cfg.grad_clip) > 0 else torch.tensor(0.0)
+            total_grad_norm = float(total_grad_norm)
+
+            if not math.isfinite(total_grad_norm):
+                bad = _nonfinite_grad_report(task.model)
+                print(
+                    f'[WARN] non-finite grads at epoch={epoch} batch={batch_idx + 1} '
+                    f'route={route} loss={float(loss.detach()):.6f}; '
+                    f'skip optimizer.step; bad_params={bad}',
+                    flush=True,
+                )
+                if task.scaler.is_enabled():
+                    task.scaler.update()
+                task.optimizer.zero_grad(set_to_none=True)
+                global_batch_step += 1
+                task.global_batch_step = global_batch_step
+                continue
+
+            grad_norm_accum += total_grad_norm
             grad_norm_steps += 1
 
             if task.scaler.is_enabled():
@@ -217,10 +386,13 @@ def main():
         )
         print(
             f"[CPPI EPOCH {epoch}]\n"
-            f"bank_version={cppi_report.get('bank_version_after', cppi_report.get('bank_version_before', 0))}\n"
+            f"status={cppi_report.get('status', 'unknown')}\n"
+            f"bank_version_before={cppi_report.get('bank_version_before', 0)}\n"
+            f"bank_version_after={cppi_report.get('bank_version_after', cppi_report.get('bank_version_before', 0))}\n"
             f"ready_slots={cppi_report.get('ready_count', cppi_report.get('ready_slots', 0))}\n"
             f"bg_candidates={cppi_report.get('classes', {}).get('background', {}).get('num_candidates', 0)}\n"
-            f"fg_candidates={cppi_report.get('classes', {}).get('foreground', {}).get('num_candidates', 0)}",
+            f"fg_candidates={cppi_report.get('classes', {}).get('foreground', {}).get('num_candidates', 0)}\n"
+            f"bank_updated={cppi_report.get('status') == 'bank_updated'}",
             flush=True,
         )
         if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is not None and epoch % int(cfg.gradient_diagnostics_interval) == 0:
@@ -294,17 +466,23 @@ def main():
             'cppi_fg_candidates': int(cppi_report.get('classes', {}).get('foreground', {}).get('num_candidates', 0)),
             **{f'diag_{k}': v for k, v in diag_stats.items()},
         }
+        lrs = _optimizer_lrs(task.optimizer)
         append_epoch_log(
             os.path.join(cfg.checkpoint_dir, 'train_log.csv'),
             epoch,
             train_loss,
             {'total_loss': val_loss, 'dice': val_dice, 'iou': val_iou, 'acc': val_acc, 'acc_pixel': val_acc_pixel, 'hd95': val_hd95},
-            lr=task.optimizer.param_groups[0]['lr'],
+            lr=lrs.get('trdf', task.optimizer.param_groups[-1]['lr']),
             grad_norm=avg_grad_norm,
             extra_metrics=extra_metrics,
         )
 
-        print(f'[EPOCH {epoch}] joint_dice={joint_dice:.4f} best_joint={best_joint:.4f} lr={task.optimizer.param_groups[0]["lr"]:.8f}', flush=True)
+        print(
+            f'[EPOCH {epoch}] joint_dice={joint_dice:.4f} best_joint={best_joint:.4f} '
+            f'lr_old={lrs.get("stage1_modules", float("nan")):.8f} '
+            f'lr_trdf={lrs.get("trdf", float("nan")):.8f}',
+            flush=True,
+        )
         if no_improve >= patience:
             print(f'[EARLY STOP] no improvement for {patience} epochs', flush=True)
             break
