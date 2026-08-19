@@ -46,7 +46,8 @@ class SegMDTConfig(ConfigBase):
             type=str,
             default=None,
             help='Stage-1 CPPI+Calibration best checkpoint for DRBF warm-start. '
-                 'Loads encoders/align/CPPI bank/calibration/decoder; skips old fusion.',
+                 'Loads encoders/align/CPPI bank/calibration/decoder and maps '
+                 'fusion.raw_alpha_* -> pet_evidence_scaler.raw_alpha_*; DRBF from scratch.',
         )
         p.add_argument(
             '--resume_checkpoint',
@@ -73,7 +74,8 @@ class SegMDTConfig(ConfigBase):
             '--old_module_lr',
             type=float,
             default=2e-5,
-            help='Warm-start LR for Stage-1 modules (encoders/align/CPPI/calibration/decoder).',
+            help='Warm-start LR for Stage-1 modules '
+                 '(encoders/align/CPPI/calibration/evidence-scaler/decoder).',
         )
         p.add_argument('--decoder_lr', type=float, default=8e-5)
         p.add_argument('--weight_decay', type=float, default=1e-4)

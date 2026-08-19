@@ -35,7 +35,8 @@ class MDTSegTeacher:
     def _build_optimizer(self, config):
         """
         Two LR groups only:
-          - Stage-1 modules (encoders / align / CPPI trainable / calibration / decoder)
+          - Stage-1 modules (encoders / align / CPPI trainable / calibration /
+            pet_evidence_scaler / decoder)
           - DRBF fusion
         """
         old_lr = float(getattr(config, 'old_module_lr', 2e-5))
@@ -52,6 +53,15 @@ class MDTSegTeacher:
             raise RuntimeError('DRBF param group is empty; fusion module missing trainable params')
         if not old_params:
             raise RuntimeError('Stage-1 param group is empty')
+
+        # Ensure pet_evidence_scaler is in the Stage-1 LR group.
+        scaler_ids = {
+            id(p) for p in self.model.pet_evidence_scaler.parameters() if p.requires_grad
+        }
+        if not scaler_ids.issubset({id(p) for p in old_params}):
+            raise RuntimeError('pet_evidence_scaler must belong to Stage-1 optimizer group')
+        if scaler_ids & drbf_ids:
+            raise RuntimeError('pet_evidence_scaler must not belong to DRBF optimizer group')
 
         param_groups = [
             {'params': old_params, 'lr': old_lr, 'name': 'stage1_modules'},

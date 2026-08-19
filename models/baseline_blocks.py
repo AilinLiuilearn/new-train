@@ -119,6 +119,64 @@ class StateAwareWeightedAddFusion(nn.Module):
         return fused
 
 
+class StateAwarePETEvidenceScaler(nn.Module):
+    """Stage-1 route-level PET participation: E = alpha_route * P_cal.
+
+    Same alpha parameterization as StateAwareWeightedAddFusion, but does NOT
+    perform CT + PET fusion. Final fusion is left to Stage-2 DRBF.
+    """
+
+    def __init__(self, num_scales=4):
+        super().__init__()
+        self.num_scales = int(num_scales)
+        self.raw_alpha_full = nn.Parameter(torch.zeros(self.num_scales))
+        self.raw_alpha_missing = nn.Parameter(
+            torch.full((self.num_scales,), -2.944)
+        )
+
+    @property
+    def alpha_full(self):
+        return 2.0 * torch.sigmoid(self.raw_alpha_full)
+
+    @property
+    def alpha_missing(self):
+        return 2.0 * torch.sigmoid(self.raw_alpha_missing)
+
+    def forward(self, pet_feats, mode, pet_available=None):
+        if len(pet_feats) != self.num_scales:
+            raise ValueError(
+                f'Expected {self.num_scales} PET scales, got {len(pet_feats)}'
+            )
+        mode = str(mode).lower().strip()
+        if mode == 'full':
+            alpha = self.alpha_full
+        elif mode == 'missing':
+            alpha = self.alpha_missing
+        elif mode == 'auto':
+            if pet_available is None:
+                raise ValueError('pet_available is required for auto evidence scaling')
+            pet_available = pet_available.view(-1, 1, 1, 1)
+            alpha = None
+        else:
+            raise ValueError(f'Unsupported evidence mode: {mode}')
+
+        evidence = []
+        for scale_idx, pet_feat in enumerate(pet_feats):
+            if mode == 'auto':
+                availability = pet_available.to(device=pet_feat.device, dtype=pet_feat.dtype)
+                full_weight = self.alpha_full[scale_idx].to(
+                    device=pet_feat.device, dtype=pet_feat.dtype
+                )
+                missing_weight = self.alpha_missing[scale_idx].to(
+                    device=pet_feat.device, dtype=pet_feat.dtype
+                )
+                weight = availability * full_weight + (1.0 - availability) * missing_weight
+            else:
+                weight = alpha[scale_idx].to(device=pet_feat.device, dtype=pet_feat.dtype)
+            evidence.append(_sanitize(weight * pet_feat))
+        return evidence
+
+
 class PrototypeReferencedPETAffineCalibration(nn.Module):
     """PET representation calibration layer, not the final PET-CT fusion module.
 

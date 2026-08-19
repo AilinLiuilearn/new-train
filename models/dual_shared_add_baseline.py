@@ -1,7 +1,13 @@
 import torch
 import torch.nn as nn
 
-from models.baseline_blocks import PrototypeReferencedPETAffineCalibration, UNetStyleDecoder, _check_tensor, _check_tensor_list
+from models.baseline_blocks import (
+    PrototypeReferencedPETAffineCalibration,
+    StateAwarePETEvidenceScaler,
+    UNetStyleDecoder,
+    _check_tensor,
+    _check_tensor_list,
+)
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.ct_pet_prototype_imputation import CrossScaleCTPETPrototypeMemory
 from models.drbf_fusion import DRBFFusion
@@ -50,6 +56,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pet_channels = list(self.enc_pet.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
         self.pet_calibration = PrototypeReferencedPETAffineCalibration(channels=pet_channels)
+        # Stage-1 route-level PET participation is preserved:
+        # E_s = alpha_route,s * calibrated_pet_s.
+        # DRBF learns only local relative-dominance-guided residual interaction.
+        self.pet_evidence_scaler = StateAwarePETEvidenceScaler(num_scales=len(pet_channels))
         self.fusion = DRBFFusion(
             channels=pet_channels,
             use_text_prior=drbf_use_text_prior,
@@ -135,8 +145,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 None,
                 reference_valid=False,
             )
-        # Calibrated PET is used as Stage-2 evidence (alpha=1; dominance is learned inside DRBF).
-        fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='full')
+        pet_evidence_feats = self.pet_evidence_scaler(pet_feats_cal, mode='full')
+        fused_feats = self.fusion(ct_feats, pet_evidence_feats, mode='full')
         return self._decode(fused_feats, target_size)
 
     def _forward_missing(self, ct, pet, target_size, mask=None):
@@ -157,7 +167,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
             ct_reference_feats,
             reference_valid=self.prototype_memory.bank_ready,
         )
-        fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='missing')
+        pet_evidence_feats = self.pet_evidence_scaler(pet_feats_cal, mode='missing')
+        fused_feats = self.fusion(ct_feats, pet_evidence_feats, mode='missing')
         return self._decode(fused_feats, target_size)
 
     def _forward_auto(self, ct, pet, pet_available, target_size, mask=None):
@@ -188,9 +199,15 @@ class DualSharedAddPETCTBaseline(nn.Module):
             ct_reference_feats,
             reference_valid=self.prototype_memory.bank_ready,
         )
+        # Route-consistent Auto: PET source / alpha / text all follow pet_available.
+        pet_evidence_feats = self.pet_evidence_scaler(
+            pet_selected,
+            mode='auto',
+            pet_available=pet_available,
+        )
         fused_feats = self.fusion(
             ct_feats,
-            pet_selected,
+            pet_evidence_feats,
             mode='auto',
             pet_available=pet_available,
         )

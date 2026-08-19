@@ -380,6 +380,18 @@ def build_mdt_seg_teacher(config):
         f'fusion=DRBF shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
+    print('[PIPELINE]', flush=True)
+    print('  CT encoder', flush=True)
+    print('  PET encoder / CPPI', flush=True)
+    print('  PET affine calibration', flush=True)
+    print('  StateAware PET evidence scaling', flush=True)
+    print('  DRBF', flush=True)
+    print('  Shared decoder', flush=True)
+    print('[PET EVIDENCE]', flush=True)
+    print('  Full:    E = alpha_full * calibrated_real_PET', flush=True)
+    print('  Missing: E = alpha_missing * calibrated_proxy_PET', flush=True)
+    print('[DRBF]', flush=True)
+    print('  output = C + E + D_PET * Delta_CT + D_CT * Delta_PET', flush=True)
     print(f'[CPPI] enabled=True')
     print(f'[CPPI] num_clusters={cppi_num_clusters}')
     print(f'[CPPI] build_stage={cppi_build_stage}')
@@ -388,4 +400,16 @@ def build_mdt_seg_teacher(config):
     print(f'[DRBF] use_text_prior={drbf_use_text_prior}')
     print(f'[DRBF] text_embedding_path={drbf_text_embedding_path}')
     print(f'[DRBF] text_dim={drbf_text_dim}')
+    real_loaded = bool(
+        drbf_use_text_prior
+        and model.fusion.real_text_embedding.numel() > 0
+    )
+    proxy_loaded = bool(
+        drbf_use_text_prior
+        and model.fusion.proxy_text_embedding.numel() > 0
+    )
+    print('[TEXT]', flush=True)
+    print(f'  enabled = {drbf_use_text_prior}', flush=True)
+    print(f'  real embedding loaded = {real_loaded}', flush=True)
+    print(f'  proxy embedding loaded = {proxy_loaded}', flush=True)
     return {'model': model}

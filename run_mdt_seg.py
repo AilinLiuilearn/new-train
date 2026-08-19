@@ -81,22 +81,54 @@ _STAGE1_MODULE_PREFIXES = (
     'enc_pet.',
     'ct_align.',
     'pet_calibration.',
+    'pet_evidence_scaler.',
     'decoder.',
     'prototype_memory.',
 )
+
+_STAGE1_ALPHA_KEY_MAP = {
+    'fusion.raw_alpha_full': 'pet_evidence_scaler.raw_alpha_full',
+    'fusion.raw_alpha_missing': 'pet_evidence_scaler.raw_alpha_missing',
+}
 
 
 def _count_prefix_matches(keys, prefix):
     return sum(1 for k in keys if k.startswith(prefix))
 
 
+def _sync_cppi_config_from_stage1(cfg, checkpoint_path):
+    """Inherit CPPI settings from Stage-1 config_args.json when available."""
+    import json
+
+    cfg_path = os.path.join(os.path.dirname(checkpoint_path), 'config_args.json')
+    if not os.path.isfile(cfg_path):
+        print(f'[WARMSTART][WARN] Stage-1 config not found: {cfg_path}', flush=True)
+        return
+    with open(cfg_path, 'r') as f:
+        stage1_cfg = json.load(f)
+    for key in ('cppi_build_stage', 'cppi_num_clusters'):
+        if key not in stage1_cfg:
+            continue
+        stage1_val = stage1_cfg[key]
+        cur_val = getattr(cfg, key, None)
+        if cur_val != stage1_val:
+            print(
+                f'[WARMSTART] sync {key}: {cur_val} -> {stage1_val} (from Stage-1 config)',
+                flush=True,
+            )
+            setattr(cfg, key, stage1_val)
+        else:
+            print(f'[WARMSTART] {key}={cur_val} matches Stage-1', flush=True)
+
+
 def _load_stage1_warmstart(model, checkpoint_path):
     """
     Warm-start Stage-2 DRBF training from a Stage-1 CPPI+Calibration checkpoint.
 
-    Loads: encoders, align, CPPI bank, PET calibration, decoder.
-    Skips: old StateAwareWeightedAddFusion (and any fusion.* keys).
-    DRBF remains randomly initialized.
+    Loads: encoders, align, CPPI bank, PET calibration, decoder,
+           and Stage-1 route alphas into pet_evidence_scaler.
+    Skips: old StateAwareWeightedAddFusion final-add weights except raw alphas.
+    DRBF remains randomly / zero-init residual initialized.
     """
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     state_dict = checkpoint.get('model', checkpoint)
@@ -106,7 +138,13 @@ def _load_stage1_warmstart(model, checkpoint_path):
     filtered = {}
     skipped_fusion = []
     skipped_other = []
+    restored_alpha_keys = []
     for key, value in state_dict.items():
+        if key in _STAGE1_ALPHA_KEY_MAP:
+            mapped = _STAGE1_ALPHA_KEY_MAP[key]
+            filtered[mapped] = value
+            restored_alpha_keys.append((key, mapped))
+            continue
         if key.startswith('fusion.'):
             skipped_fusion.append(key)
             continue
@@ -132,22 +170,36 @@ def _load_stage1_warmstart(model, checkpoint_path):
         ('ct_align.', 'CT align'),
         ('prototype_memory.', 'CPPI prototype bank'),
         ('pet_calibration.', 'PET affine calibration'),
+        ('pet_evidence_scaler.', 'PET evidence scaler (alphas)'),
         ('decoder.', 'shared decoder'),
     ]:
         n = _count_prefix_matches(loaded_keys, prefix)
         print(f'[WARMSTART] loaded {label}: tensors={n}', flush=True)
 
+    if restored_alpha_keys:
+        for src, dst in restored_alpha_keys:
+            print(f'[WARMSTART] mapped {src} -> {dst}', flush=True)
+        alpha_full = model.pet_evidence_scaler.alpha_full.detach().cpu().tolist()
+        alpha_missing = model.pet_evidence_scaler.alpha_missing.detach().cpu().tolist()
+        print(f'[WARMSTART] alpha_full restored = {[round(x, 6) for x in alpha_full]}', flush=True)
+        print(f'[WARMSTART] alpha_missing restored = {[round(x, 6) for x in alpha_missing]}', flush=True)
+    else:
+        print('[WARMSTART][WARN] Stage-1 raw_alpha_* not found; scaler keeps init values', flush=True)
+
     if skipped_fusion:
         print(
-            f'[WARMSTART] ignored old fusion weights ({len(skipped_fusion)}): '
+            f'[WARMSTART] ignored other old fusion weights ({len(skipped_fusion)}): '
             f'{skipped_fusion[:8]}{"..." if len(skipped_fusion) > 8 else ""}',
             flush=True,
         )
     else:
-        print('[WARMSTART] no fusion.* keys found in Stage-1 checkpoint', flush=True)
+        print('[WARMSTART] no other fusion.* keys found in Stage-1 checkpoint', flush=True)
 
     drbf_missing = [k for k in missing_keys if k.startswith('fusion.')]
-    other_missing = [k for k in missing_keys if not k.startswith('fusion.')]
+    other_missing = [
+        k for k in missing_keys
+        if not k.startswith('fusion.') and not k.startswith('pet_evidence_scaler.')
+    ]
     print(f'[WARMSTART] DRBF initialized from scratch (missing_fusion_keys={len(drbf_missing)})', flush=True)
     if other_missing:
         print(f'[WARMSTART] other_missing_keys={other_missing[:20]}', flush=True)
@@ -242,6 +294,9 @@ def main():
             'Use either --stage1_checkpoint (DRBF warm-start) or --resume_checkpoint '
             '(continue a Stage-2 DRBF run), not both.'
         )
+
+    if stage1_ckpt:
+        _sync_cppi_config_from_stage1(cfg, stage1_ckpt)
 
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
     if stage1_ckpt:
