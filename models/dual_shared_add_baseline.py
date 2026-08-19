@@ -11,6 +11,7 @@ from models.baseline_blocks import (
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.ct_pet_prototype_imputation import CrossScaleCTPETPrototypeMemory
 from models.drbf_fusion import DRBFFusion
+from models.fixed_pet_source_text_encoder import FixedPETSourceTextEncoder
 
 
 class StageChannelAlign(nn.Module):
@@ -43,11 +44,13 @@ class DualSharedAddPETCTBaseline(nn.Module):
         cppi_build_stage=4,
         cppi_output_dir=None,
         drbf_use_text_prior=False,
-        drbf_text_embedding_path=None,
-        drbf_text_dim=128,
+        drbf_text_encoder_path=None,
+        drbf_text_tower_path=None,
+        drbf_text_encoder_trainable=False,
     ):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
+        self.drbf_use_text_prior = bool(drbf_use_text_prior)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
         load_local_weights_safe(self.enc_ct, ct_pretrained_path, name='CT_Encoder')
@@ -60,15 +63,31 @@ class DualSharedAddPETCTBaseline(nn.Module):
         # E_s = alpha_route,s * calibrated_pet_s.
         # DRBF learns only local relative-dominance-guided residual interaction.
         self.pet_evidence_scaler = StateAwarePETEvidenceScaler(num_scales=len(pet_channels))
+
+        text_encoder = None
+        if self.drbf_use_text_prior:
+            if not drbf_text_encoder_path:
+                raise ValueError(
+                    'drbf_text_encoder_path is required when drbf_use_text_prior=True'
+                )
+            text_encoder = FixedPETSourceTextEncoder(
+                model_path=drbf_text_encoder_path,
+                text_tower_path=drbf_text_tower_path,
+                trainable=bool(drbf_text_encoder_trainable),
+            )
+
+        self.text_encoder = text_encoder
         self.fusion = DRBFFusion(
             channels=pet_channels,
-            use_text_prior=drbf_use_text_prior,
-            text_dim=None if drbf_text_embedding_path else (
-                int(drbf_text_dim) if drbf_use_text_prior else None
-            ),
-            text_embedding_path=drbf_text_embedding_path,
+            use_text_prior=self.drbf_use_text_prior,
+            text_encoder=text_encoder,
         )
-        self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
+        self.decoder = UNetStyleDecoder(
+            pet_channels,
+            decoder_channels=decoder_channels,
+            out_channels=out_channels,
+            use_deep_supervision=self.use_deep_supervision,
+        )
         self.prototype_memory = CrossScaleCTPETPrototypeMemory(
             channels=pet_channels,
             num_clusters=cppi_num_clusters,
@@ -151,6 +170,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
 
     def _forward_missing(self, ct, pet, target_size, mask=None):
         ct_feats = self._encode_ct(ct)
+        # Missing simulates fusion-time PET unavailability, not absent training PET.
+        # Real PET encoder still runs here only for CPPI collect/update.
         pet_feats_real = self._encode_pet(pet)
         self._collect_cppi(ct_feats, pet_feats_real, mask)
         pet_feats_proxy, ct_reference_feats, _ = self._retrieve_cppi(

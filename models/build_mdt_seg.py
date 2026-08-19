@@ -356,8 +356,10 @@ def build_mdt_seg_teacher(config):
     cppi_output_dir = os.path.join(config.checkpoint_dir, 'cppi')
     no_encoder_pretrained = bool(getattr(config, 'no_encoder_pretrained', False))
     drbf_use_text_prior = bool(getattr(config, 'drbf_use_text_prior', False))
-    drbf_text_embedding_path = getattr(config, 'drbf_text_embedding_path', None)
-    drbf_text_dim = getattr(config, 'drbf_text_dim', 128)
+    drbf_text_encoder_path = getattr(config, 'drbf_text_encoder_path', None)
+    drbf_text_tower_path = getattr(config, 'drbf_text_tower_path', None)
+    drbf_text_encoder_trainable = bool(getattr(config, 'drbf_text_encoder_trainable', False))
+    train_mode = getattr(config, 'train_mode', 'stage1_warmstart')
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
@@ -371,8 +373,9 @@ def build_mdt_seg_teacher(config):
         cppi_build_stage=cppi_build_stage,
         cppi_output_dir=cppi_output_dir,
         drbf_use_text_prior=drbf_use_text_prior,
-        drbf_text_embedding_path=drbf_text_embedding_path,
-        drbf_text_dim=drbf_text_dim,
+        drbf_text_encoder_path=drbf_text_encoder_path if drbf_use_text_prior else None,
+        drbf_text_tower_path=drbf_text_tower_path if drbf_use_text_prior else None,
+        drbf_text_encoder_trainable=drbf_text_encoder_trainable,
     )
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
@@ -380,36 +383,46 @@ def build_mdt_seg_teacher(config):
         f'fusion=DRBF shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
+    print('[TRAIN MODE]', flush=True)
+    print(f'  mode = {train_mode}', flush=True)
     print('[PIPELINE]', flush=True)
     print('  CT encoder', flush=True)
-    print('  PET encoder / CPPI', flush=True)
+    print('  PET encoder', flush=True)
+    print('  CPPI collect/retrieve', flush=True)
     print('  PET affine calibration', flush=True)
     print('  StateAware PET evidence scaling', flush=True)
     print('  DRBF', flush=True)
     print('  Shared decoder', flush=True)
+    print('[ROUTE]', flush=True)
+    print('  Full:    real PET -> collect -> calibration -> alpha_full -> DRBF', flush=True)
+    print('  Missing: real PET -> collect only; CT -> CPPI proxy -> calibration -> alpha_missing -> DRBF', flush=True)
     print('[PET EVIDENCE]', flush=True)
     print('  Full:    E = alpha_full * calibrated_real_PET', flush=True)
     print('  Missing: E = alpha_missing * calibrated_proxy_PET', flush=True)
     print('[DRBF]', flush=True)
-    print('  output = C + E + D_PET * Delta_CT + D_CT * Delta_PET', flush=True)
+    print('  F = C + E + D_PET * Delta_CT + D_CT * Delta_PET', flush=True)
+    alpha_full = model.pet_evidence_scaler.alpha_full.detach().cpu().tolist()
+    alpha_missing = model.pet_evidence_scaler.alpha_missing.detach().cpu().tolist()
+    print('[ALPHA]', flush=True)
+    print(f'  alpha_full = {[round(x, 6) for x in alpha_full]}', flush=True)
+    print(f'  alpha_missing = {[round(x, 6) for x in alpha_missing]}', flush=True)
     print(f'[CPPI] enabled=True')
     print(f'[CPPI] num_clusters={cppi_num_clusters}')
     print(f'[CPPI] build_stage={cppi_build_stage}')
     print(f'[CPPI] output_dir={cppi_output_dir}')
     print(f'[DRBF] enabled=True')
     print(f'[DRBF] use_text_prior={drbf_use_text_prior}')
-    print(f'[DRBF] text_embedding_path={drbf_text_embedding_path}')
-    print(f'[DRBF] text_dim={drbf_text_dim}')
-    real_loaded = bool(
-        drbf_use_text_prior
-        and model.fusion.real_text_embedding.numel() > 0
-    )
-    proxy_loaded = bool(
-        drbf_use_text_prior
-        and model.fusion.proxy_text_embedding.numel() > 0
-    )
+    text_encoder = getattr(model, 'text_encoder', None)
     print('[TEXT]', flush=True)
     print(f'  enabled = {drbf_use_text_prior}', flush=True)
-    print(f'  real embedding loaded = {real_loaded}', flush=True)
-    print(f'  proxy embedding loaded = {proxy_loaded}', flush=True)
+    print('  encoder = BioMedCLIP', flush=True)
+    print(f'  source = {drbf_text_encoder_path if drbf_use_text_prior else "N/A"}', flush=True)
+    print(f'  trainable = {drbf_text_encoder_trainable}', flush=True)
+    if drbf_use_text_prior and text_encoder is not None:
+        print(f'  real prompt ready = {text_encoder.real_prompt_ready}', flush=True)
+        print(f'  proxy prompt ready = {text_encoder.proxy_prompt_ready}', flush=True)
+        print(f'  text_dim = {text_encoder.text_dim}', flush=True)
+    else:
+        print('  real prompt ready = False', flush=True)
+        print('  proxy prompt ready = False', flush=True)
     return {'model': model}

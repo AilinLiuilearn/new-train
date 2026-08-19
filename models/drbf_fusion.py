@@ -309,7 +309,7 @@ class DRBFFusion(nn.Module):
         interaction_dims: Optional[Sequence[int]] = None,
         use_text_prior: bool = False,
         text_dim: Optional[int] = None,
-        text_embedding_path: Optional[str] = None,
+        text_encoder=None,
         max_heads: int = 4,
         real_text_embedding: Optional[Tensor] = None,
         proxy_text_embedding: Optional[Tensor] = None,
@@ -318,6 +318,7 @@ class DRBFFusion(nn.Module):
         self.channels = tuple(int(c) for c in channels)
         self.use_text_prior = use_text_prior
         self.text_dim = text_dim
+        self.text_encoder = text_encoder
 
         if interaction_dims is None:
             interaction_dims = tuple(max(c // 2, 1) for c in self.channels)
@@ -327,27 +328,24 @@ class DRBFFusion(nn.Module):
         if len(interaction_dims) != len(self.channels):
             raise ValueError("interaction_dims/channels length mismatch")
 
-        if use_text_prior and text_dim is None and text_embedding_path is None:
-            # Allow inferring text_dim from a precomputed embedding file.
-            if real_text_embedding is not None:
-                text_dim = int(real_text_embedding.numel())
-                self.text_dim = text_dim
-            else:
-                raise ValueError(
-                    "text_dim or text_embedding_path is required when use_text_prior=True"
-                )
-
-        # Fixed external semantic embeddings: buffers, not trainable params.
         self.register_buffer("real_text_embedding", torch.empty(0), persistent=True)
         self.register_buffer("proxy_text_embedding", torch.empty(0), persistent=True)
 
-        if use_text_prior and text_embedding_path is not None:
-            real_loaded, proxy_loaded = self._load_precomputed(text_embedding_path)
-            if text_dim is None:
-                text_dim = int(real_loaded.numel())
+        if use_text_prior:
+            if text_encoder is not None:
+                text_encoder.ensure_ready()
+                text_dim = int(text_encoder.text_dim)
                 self.text_dim = text_dim
-            real_text_embedding = real_loaded
-            proxy_text_embedding = proxy_loaded
+                real_text_embedding = text_encoder.real_embedding
+                proxy_text_embedding = text_encoder.proxy_embedding
+            elif real_text_embedding is not None:
+                if text_dim is None:
+                    text_dim = int(real_text_embedding.reshape(-1).numel())
+                    self.text_dim = text_dim
+            else:
+                raise ValueError(
+                    "text_encoder is required when use_text_prior=True"
+                )
 
         if use_text_prior and text_dim is None:
             raise ValueError("text_dim is required when use_text_prior=True")
@@ -369,22 +367,6 @@ class DRBFFusion(nn.Module):
             if real_text_embedding is None or proxy_text_embedding is None:
                 raise ValueError("Provide both real and proxy text embeddings")
             self.set_text_embeddings(real_text_embedding, proxy_text_embedding)
-
-    @staticmethod
-    def _load_precomputed(embedding_path: str) -> Tuple[Tensor, Tensor]:
-        data = torch.load(embedding_path, map_location="cpu")
-        if not isinstance(data, dict):
-            raise ValueError(
-                "Precomputed embedding file must be a dict containing real/proxy embeddings."
-            )
-        real = data.get("real", data.get("real_text_embedding"))
-        proxy = data.get("proxy", data.get("proxy_text_embedding"))
-        if real is None or proxy is None:
-            raise ValueError(
-                "Expected keys {'real','proxy'} or "
-                "{'real_text_embedding','proxy_text_embedding'} in the .pt file."
-            )
-        return torch.as_tensor(real).float().reshape(-1), torch.as_tensor(proxy).float().reshape(-1)
 
     @torch.no_grad()
     def set_text_embeddings(
@@ -440,7 +422,7 @@ class DRBFFusion(nn.Module):
         if self.real_text_embedding.numel() == 0:
             raise RuntimeError(
                 "Text prior enabled but embeddings are not set. "
-                "Call set_text_embeddings(...) or pass text_embedding."
+                "Initialize FixedPETSourceTextEncoder before building DRBF."
             )
 
         mode = str(mode).lower().strip()

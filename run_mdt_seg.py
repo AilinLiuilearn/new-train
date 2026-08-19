@@ -97,15 +97,28 @@ def _count_prefix_matches(keys, prefix):
 
 
 def _sync_cppi_config_from_stage1(cfg, checkpoint_path):
-    """Inherit CPPI settings from Stage-1 config_args.json when available."""
-    import json
+    """
+    Inherit CPPI settings from Stage-1 checkpoint.
 
-    cfg_path = os.path.join(os.path.dirname(checkpoint_path), 'config_args.json')
-    if not os.path.isfile(cfg_path):
-        print(f'[WARMSTART][WARN] Stage-1 config not found: {cfg_path}', flush=True)
-        return
-    with open(cfg_path, 'r') as f:
-        stage1_cfg = json.load(f)
+    Priority:
+      1) checkpoint['config']
+      2) sibling config_args.json
+    """
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    stage1_cfg = checkpoint.get('config')
+    source = 'checkpoint.config'
+    if not isinstance(stage1_cfg, dict):
+        cfg_path = os.path.join(os.path.dirname(checkpoint_path), 'config_args.json')
+        if not os.path.isfile(cfg_path):
+            print(
+                f'[WARMSTART][WARN] Stage-1 config not found in checkpoint or {cfg_path}',
+                flush=True,
+            )
+            return checkpoint
+        with open(cfg_path, 'r') as f:
+            stage1_cfg = json.load(f)
+        source = 'config_args.json'
+
     for key in ('cppi_build_stage', 'cppi_num_clusters'):
         if key not in stage1_cfg:
             continue
@@ -113,12 +126,13 @@ def _sync_cppi_config_from_stage1(cfg, checkpoint_path):
         cur_val = getattr(cfg, key, None)
         if cur_val != stage1_val:
             print(
-                f'[WARMSTART] sync {key}: {cur_val} -> {stage1_val} (from Stage-1 config)',
+                f'[WARMSTART] sync {key}: {cur_val} -> {stage1_val} (from {source})',
                 flush=True,
             )
             setattr(cfg, key, stage1_val)
         else:
-            print(f'[WARMSTART] {key}={cur_val} matches Stage-1', flush=True)
+            print(f'[WARMSTART] {key}={cur_val} matches Stage-1 ({source})', flush=True)
+    return checkpoint
 
 
 def _load_stage1_warmstart(model, checkpoint_path):
@@ -226,6 +240,108 @@ def _load_stage1_warmstart(model, checkpoint_path):
     return checkpoint
 
 
+def _resolve_train_mode(cfg):
+    train_mode = str(getattr(cfg, 'train_mode', 'stage1_warmstart')).lower().strip()
+    stage1_ckpt = getattr(cfg, 'stage1_checkpoint', None)
+    resume_ckpt = getattr(cfg, 'resume_checkpoint', None)
+
+    if train_mode == 'scratch':
+        if stage1_ckpt or resume_ckpt:
+            raise ValueError(
+                'train_mode=scratch must not use --stage1_checkpoint or --resume_checkpoint'
+            )
+    elif train_mode == 'stage1_warmstart':
+        if not stage1_ckpt:
+            raise ValueError('train_mode=stage1_warmstart requires --stage1_checkpoint')
+        if resume_ckpt:
+            raise ValueError(
+                'train_mode=stage1_warmstart must not use --resume_checkpoint'
+            )
+        if not os.path.isfile(stage1_ckpt):
+            raise FileNotFoundError(f'Stage-1 checkpoint not found: {stage1_ckpt}')
+    elif train_mode == 'resume':
+        if not resume_ckpt:
+            raise ValueError('train_mode=resume requires --resume_checkpoint')
+        if stage1_ckpt:
+            raise ValueError(
+                'train_mode=resume must not use --stage1_checkpoint'
+            )
+        if not os.path.isfile(resume_ckpt):
+            raise FileNotFoundError(f'Resume checkpoint not found: {resume_ckpt}')
+    else:
+        raise ValueError(f'Unsupported train_mode={train_mode!r}')
+
+    return train_mode, stage1_ckpt, resume_ckpt
+
+
+def _prepare_calibrated(model, ct, pet, mode='full'):
+    ct_feats = model._encode_ct(ct)
+    pet_feats_real = model._encode_pet(pet)
+    if mode == 'full':
+        if model.prototype_memory.bank_ready:
+            _, ct_ref, _ = model._retrieve_cppi(ct_feats, return_ct_reference=True)
+            ct_ref = [x.detach() for x in ct_ref]
+            pet_cal = model.pet_calibration(
+                ct_feats, pet_feats_real, ct_ref, reference_valid=True
+            )
+        else:
+            pet_cal = model.pet_calibration(
+                ct_feats, pet_feats_real, None, reference_valid=False
+            )
+    elif mode == 'missing':
+        pet_proxy, ct_ref, _ = model._retrieve_cppi(
+            ct_feats, return_ct_reference=True
+        )
+        ct_ref = [x.detach() for x in ct_ref]
+        pet_cal = model.pet_calibration(
+            ct_feats,
+            pet_proxy,
+            ct_ref,
+            reference_valid=model.prototype_memory.bank_ready,
+        )
+    else:
+        raise ValueError(mode)
+    return ct_feats, pet_cal
+
+
+def _verify_zero_step_equivalence(model, device, size=64):
+    from models.baseline_blocks import StateAwareWeightedAddFusion
+
+    ckpt_raw_full = model.pet_evidence_scaler.raw_alpha_full.detach().clone()
+    ckpt_raw_miss = model.pet_evidence_scaler.raw_alpha_missing.detach().clone()
+
+    stage1_fusion = StateAwareWeightedAddFusion(
+        num_scales=len(model.fusion.channels)
+    ).to(device)
+    stage1_fusion.raw_alpha_full.data.copy_(ckpt_raw_full)
+    stage1_fusion.raw_alpha_missing.data.copy_(ckpt_raw_miss)
+
+    ct = torch.randn(1, 1, size, size, device=device)
+    pet = torch.randn(1, 1, size, size, device=device)
+    report = {}
+    model.eval()
+    with torch.no_grad():
+        for mode in ('full', 'missing'):
+            ct_feats, pet_cal = _prepare_calibrated(model, ct, pet, mode=mode)
+            f_old = stage1_fusion(ct_feats, pet_cal, mode=mode)
+            evidence = model.pet_evidence_scaler(pet_cal, mode=mode)
+            f_new = model.fusion(ct_feats, evidence, mode=mode)
+            feat_err = max((a - b).abs().max().item() for a, b in zip(f_old, f_new))
+            logits_old = model.decoder(f_old, (size, size))['logits']
+            logits_new = model.decoder(f_new, (size, size))['logits']
+            logit_err = (logits_old - logits_new).abs().max().item()
+            report[f'{mode}_feat_max_err'] = feat_err
+            report[f'{mode}_logit_max_err'] = logit_err
+            print(f'[ZERO STEP] {mode} feature max error = {feat_err:.3e}', flush=True)
+            print(f'[ZERO STEP] {mode} logits max error = {logit_err:.3e}', flush=True)
+            if feat_err > 1e-6 or logit_err > 1e-6:
+                raise RuntimeError(
+                    f'Stage-1 zero-step equivalence failed for {mode}: '
+                    f'feat_err={feat_err:.3e}, logit_err={logit_err:.3e}'
+                )
+    return report
+
+
 def _load_state_dict_with_report(model, checkpoint_path):
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     state_dict = checkpoint.get('model', checkpoint)
@@ -279,6 +395,11 @@ def main():
     print('[INFO] starting baseline training', flush=True)
     cfg = SegMDTConfig.parse_arguments()
     _assert_baseline(cfg)
+    train_mode, stage1_ckpt, resume_ckpt = _resolve_train_mode(cfg)
+
+    if train_mode == 'stage1_warmstart':
+        _sync_cppi_config_from_stage1(cfg, stage1_ckpt)
+
     _seed(cfg)
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
@@ -287,40 +408,54 @@ def main():
     train_loader, val_loader, _ = _loaders(cfg)
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)}', flush=True)
 
-    stage1_ckpt = getattr(cfg, 'stage1_checkpoint', None)
-    resume_ckpt = getattr(cfg, 'resume_checkpoint', None)
-    if stage1_ckpt and resume_ckpt:
-        raise ValueError(
-            'Use either --stage1_checkpoint (DRBF warm-start) or --resume_checkpoint '
-            '(continue a Stage-2 DRBF run), not both.'
-        )
-
-    if stage1_ckpt:
-        _sync_cppi_config_from_stage1(cfg, stage1_ckpt)
-
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
-    if stage1_ckpt:
+
+    resume_state = None
+    if train_mode == 'stage1_warmstart':
         _load_stage1_warmstart(task.model, stage1_ckpt)
-    elif resume_ckpt:
+        device = task.device
+        _verify_zero_step_equivalence(task.model, device, size=min(64, int(cfg.image_size_2d)))
+    elif train_mode == 'resume':
         print(
-            '[RESUME][WARN] Resuming a Stage-2 checkpoint. '
-            'Do not resume NaN-polluted Stage-2 runs.',
+            '[RESUME] Restoring full training state from checkpoint.',
             flush=True,
         )
-        _load_state_dict_with_report(task.model, resume_ckpt)
+        task.scheduler = get_cosine_scheduler(
+            task.optimizer,
+            epochs=cfg.epochs,
+            warmup_steps=cfg.cosine_warmup * len(train_loader),
+            min_lr=cfg.cosine_min_lr,
+            steps_per_epoch=len(train_loader),
+            flat_ratio=cfg.lr_flat_ratio,
+        )
+        resume_state = task.load_training_checkpoint(resume_ckpt)
+        print(f'[RESUME] checkpoint={resume_ckpt}', flush=True)
+        print(f'[RESUME] epoch={resume_state["epoch"]} global_batch_step={resume_state["global_batch_step"]}', flush=True)
+        print(
+            f'[RESUME] best_joint={resume_state["best_joint"]:.6f} '
+            f'best_full={resume_state["best_full"]:.6f} '
+            f'best_missing={resume_state["best_missing"]:.6f} '
+            f'best_joint_epoch={resume_state["best_joint_epoch"]}',
+            flush=True,
+        )
+        if resume_state['missing_keys']:
+            print(f'[RESUME] missing_keys={resume_state["missing_keys"][:20]}', flush=True)
+        if resume_state['unexpected_keys']:
+            print(f'[RESUME] unexpected_keys={resume_state["unexpected_keys"][:20]}', flush=True)
 
     total_params, trainable_params = _count_parameters(task.model)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
     _print_optimizer_groups(task.optimizer, warmup_epochs=int(cfg.cosine_warmup))
 
-    task.scheduler = get_cosine_scheduler(
-        task.optimizer,
-        epochs=cfg.epochs,
-        warmup_steps=cfg.cosine_warmup * len(train_loader),
-        min_lr=cfg.cosine_min_lr,
-        steps_per_epoch=len(train_loader),
-        flat_ratio=cfg.lr_flat_ratio,
-    )
+    if task.scheduler is None:
+        task.scheduler = get_cosine_scheduler(
+            task.optimizer,
+            epochs=cfg.epochs,
+            warmup_steps=cfg.cosine_warmup * len(train_loader),
+            min_lr=cfg.cosine_min_lr,
+            steps_per_epoch=len(train_loader),
+            flat_ratio=cfg.lr_flat_ratio,
+        )
 
     extra_headers = [
         'train_full_loss', 'train_missing_loss', 'train_overall_loss',
@@ -334,17 +469,28 @@ def main():
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
 
-    best_joint = -1.0
-    best_full = -1.0
-    best_missing = -1.0
-    best_joint_epoch = 0
-    global_batch_step = 0
+    if resume_state is not None:
+        best_joint = resume_state['best_joint']
+        best_full = resume_state['best_full']
+        best_missing = resume_state['best_missing']
+        best_joint_epoch = resume_state['best_joint_epoch']
+        global_batch_step = resume_state['global_batch_step']
+        start_epoch = resume_state['epoch'] + 1
+    else:
+        best_joint = -1.0
+        best_full = -1.0
+        best_missing = -1.0
+        best_joint_epoch = 0
+        global_batch_step = 0
+        start_epoch = 1
+
+    task.global_batch_step = global_batch_step
     amp_enabled = bool(cfg.mixed_precision)
     patience = int(getattr(cfg, 'early_stop_patience', 10))
     no_improve = 0
     paths = _checkpoint_paths(cfg.checkpoint_dir)
 
-    for epoch in range(1, cfg.epochs + 1):
+    for epoch in range(start_epoch, cfg.epochs + 1):
         task.model.train()
         full_n = missing_n = 0
         full_loss = missing_loss = 0.0

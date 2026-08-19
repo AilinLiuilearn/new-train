@@ -2,6 +2,7 @@
 """AMP Full/Missing smoke test for DualSharedAddPETCTBaseline + DRBF."""
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 
@@ -35,9 +36,14 @@ def _module_grad_norm(module):
 def main():
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--size', type=int, default=512)
+    args = parser.parse_args()
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     use_amp = device.type == 'cuda'
-    print(f'device={device} amp={use_amp}', flush=True)
+    print(f'device={device} amp={use_amp} batch={args.batch_size} size={args.size}', flush=True)
 
     model = DualSharedAddPETCTBaseline(
         ct_backbone='convnextv2_nano',
@@ -56,8 +62,8 @@ def main():
             getattr(model.prototype_memory, f'pet_values_s{s + 1}').normal_()
         model.prototype_memory.bank_version.fill_(1)
 
-    size = 128
-    batch = 1
+    batch = args.batch_size
+    size = args.size
     ct = torch.randn(batch, 1, size, size, device=device)
     pet = torch.randn(batch, 1, size, size, device=device)
     mask = (torch.rand(batch, 1, size, size, device=device) > 0.8).float()
@@ -86,12 +92,13 @@ def main():
             loss.backward()
 
         enc_ct_g = _module_grad_norm(model.enc_ct)
+        enc_pet_g = _module_grad_norm(model.enc_pet)
         ct_align_g = _module_grad_norm(model.ct_align)
         fusion_g = _module_grad_norm(model.fusion)
         decoder_g = _module_grad_norm(model.decoder)
         print(
-            f'  enc_ct_grad={enc_ct_g:.6f} ct_align_grad={ct_align_g:.6f} '
-            f'fusion_grad={fusion_g:.6f} decoder_grad={decoder_g:.6f}',
+            f'  enc_ct_grad={enc_ct_g:.6f} enc_pet_grad={enc_pet_g:.6f} '
+            f'ct_align_grad={ct_align_g:.6f} fusion_grad={fusion_g:.6f} decoder_grad={decoder_g:.6f}',
             flush=True,
         )
         for name, g in [
@@ -102,6 +109,12 @@ def main():
         ]:
             assert g == g and g != float('inf'), f'{mode} {name} grad non-finite'
             assert g > 0, f'{mode} {name} grad is zero'
+        if mode == 'full':
+            assert enc_pet_g > 0, f'{mode} enc_pet grad is zero'
+        else:
+            # Missing fusion path uses proxy PET; real PET encoder may have zero grad
+            # from the segmentation loss even though forward still runs enc_pet.
+            print(f'  missing enc_pet_grad={enc_pet_g:.6f} (zero expected for fusion loss)', flush=True)
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0, error_if_nonfinite=True)
         if use_amp:
@@ -111,6 +124,7 @@ def main():
             opt.step()
         results[mode] = {
             'enc_ct': enc_ct_g,
+            'enc_pet': enc_pet_g,
             'ct_align': ct_align_g,
             'fusion': fusion_g,
             'decoder': decoder_g,

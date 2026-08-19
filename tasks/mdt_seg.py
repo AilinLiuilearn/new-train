@@ -34,13 +34,20 @@ class MDTSegTeacher:
 
     def _build_optimizer(self, config):
         """
-        Two LR groups only:
+        Two LR groups:
           - Stage-1 modules (encoders / align / CPPI trainable / calibration /
             pet_evidence_scaler / decoder)
           - DRBF fusion
+
+        scratch: both groups use learning_rate.
+        stage1_warmstart/resume: stage1_modules=old_module_lr, drbf=learning_rate.
         """
-        old_lr = float(getattr(config, 'old_module_lr', 2e-5))
+        train_mode = str(getattr(config, 'train_mode', 'stage1_warmstart'))
         drbf_lr = float(getattr(config, 'learning_rate', 8e-5))
+        if train_mode == 'scratch':
+            old_lr = drbf_lr
+        else:
+            old_lr = float(getattr(config, 'old_module_lr', 2e-5))
         weight_decay = float(getattr(config, 'weight_decay', 1e-4))
 
         drbf_params = [p for p in self.model.fusion.parameters() if p.requires_grad]
@@ -54,7 +61,6 @@ class MDTSegTeacher:
         if not old_params:
             raise RuntimeError('Stage-1 param group is empty')
 
-        # Ensure pet_evidence_scaler is in the Stage-1 LR group.
         scaler_ids = {
             id(p) for p in self.model.pet_evidence_scaler.parameters() if p.requires_grad
         }
@@ -206,3 +212,42 @@ class MDTSegTeacher:
         if torch.cuda.is_available():
             payload['random_state_cuda'] = torch.cuda.get_rng_state_all()
         torch.save(payload, path)
+
+    def load_training_checkpoint(self, path):
+        checkpoint = torch.load(path, map_location=self.device)
+        model_state = checkpoint.get('model', checkpoint)
+        result = self.model.load_state_dict(model_state, strict=False)
+        if checkpoint.get('optimizer') is not None:
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
+        if self.scheduler is not None and checkpoint.get('scheduler') is not None:
+            self.scheduler.load_state_dict(checkpoint['scheduler'])
+        if checkpoint.get('scaler') is not None:
+            self.scaler.load_state_dict(checkpoint['scaler'])
+        self.global_batch_step = int(checkpoint.get('global_batch_step', 0))
+
+        if checkpoint.get('random_state_python') is not None:
+            random.setstate(checkpoint['random_state_python'])
+        if checkpoint.get('random_state_numpy') is not None:
+            np.random.set_state(checkpoint['random_state_numpy'])
+        if checkpoint.get('random_state_torch') is not None:
+            torch.set_rng_state(checkpoint['random_state_torch'].cpu())
+        if torch.cuda.is_available() and checkpoint.get('random_state_cuda') is not None:
+            cuda_states = []
+            for state in checkpoint['random_state_cuda']:
+                if isinstance(state, torch.Tensor):
+                    cuda_states.append(state.byte().cpu())
+                else:
+                    cuda_states.append(state)
+            torch.cuda.set_rng_state_all(cuda_states)
+
+        resume_state = {
+            'epoch': int(checkpoint.get('epoch', 0)),
+            'global_batch_step': self.global_batch_step,
+            'best_joint': float(checkpoint.get('best_joint', -1.0)),
+            'best_full': float(checkpoint.get('best_full', -1.0)),
+            'best_missing': float(checkpoint.get('best_missing', -1.0)),
+            'best_joint_epoch': int(checkpoint.get('best_joint_epoch', 0)),
+            'missing_keys': list(result.missing_keys),
+            'unexpected_keys': list(result.unexpected_keys),
+        }
+        return resume_state

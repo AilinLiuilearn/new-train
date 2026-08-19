@@ -36,24 +36,40 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--cppi_num_clusters', type=int, default=6)
         p.add_argument('--cppi_build_stage', type=int, default=4)
         p.add_argument('--drbf_use_text_prior', type=str2bool, default=False)
-        p.add_argument('--drbf_text_embedding_path', type=str, default=None)
-        p.add_argument('--drbf_text_dim', type=int, default=128)
+        p.add_argument(
+            '--drbf_text_encoder_path',
+            type=str,
+            default='/root/autodl-tmp/mkd-main/new-train/pretrained/biomedclip_model',
+            help='Local BioMedCLIP directory containing open_clip_config.json and open_clip_pytorch_model.bin.',
+        )
+        p.add_argument(
+            '--drbf_text_tower_path',
+            type=str,
+            default='/root/autodl-tmp/mkd-main/new-train/pretrained/biomedbert_text_tower',
+            help='Local BioMedBERT text tower used by BioMedCLIP text encoder.',
+        )
+        p.add_argument('--drbf_text_encoder_trainable', type=str2bool, default=False)
         p.add_argument('--enable_gradient_diagnostics', type=str2bool, default=False)
         p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
         p.add_argument(
+            '--train_mode',
+            type=str,
+            default='stage1_warmstart',
+            choices=('scratch', 'stage1_warmstart', 'resume'),
+            help='scratch: full joint training; stage1_warmstart: load Stage-1 checkpoint; resume: continue Stage-2 run.',
+        )
+        p.add_argument(
             '--stage1_checkpoint',
             type=str,
             default=None,
-            help='Stage-1 CPPI+Calibration best checkpoint for DRBF warm-start. '
-                 'Loads encoders/align/CPPI bank/calibration/decoder and maps '
-                 'fusion.raw_alpha_* -> pet_evidence_scaler.raw_alpha_*; DRBF from scratch.',
+            help='Required for train_mode=stage1_warmstart. Loads Stage-1 modules and maps fusion.raw_alpha_* to pet_evidence_scaler.',
         )
         p.add_argument(
             '--resume_checkpoint',
             type=str,
             default=None,
-            help='Resume a Stage-2 DRBF run (full model).',
+            help='Required for train_mode=resume. Restores model/optimizer/scheduler/scaler/training counters.',
         )
         return p
 
@@ -68,14 +84,13 @@ class SegMDTConfig(ConfigBase):
             '--learning_rate',
             type=float,
             default=8e-5,
-            help='DRBF learning rate (new fusion module).',
+            help='DRBF LR in stage1_warmstart/resume; joint LR for scratch mode.',
         )
         p.add_argument(
             '--old_module_lr',
             type=float,
             default=2e-5,
-            help='Warm-start LR for Stage-1 modules '
-                 '(encoders/align/CPPI/calibration/evidence-scaler/decoder).',
+            help='Stage-1 module LR for stage1_warmstart/resume.',
         )
         p.add_argument('--decoder_lr', type=float, default=8e-5)
         p.add_argument('--weight_decay', type=float, default=1e-4)
