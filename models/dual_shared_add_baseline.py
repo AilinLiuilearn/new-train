@@ -4,7 +4,7 @@ import torch.nn as nn
 from models.baseline_blocks import PrototypeReferencedPETAffineCalibration, UNetStyleDecoder, _check_tensor, _check_tensor_list
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.ct_pet_prototype_imputation import CrossScaleCTPETPrototypeMemory
-from models.trdf_fusion import TRDFFusion
+from models.drbf_fusion import DRBFFusion
 
 
 class StageChannelAlign(nn.Module):
@@ -36,11 +36,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
         cppi_num_clusters=6,
         cppi_build_stage=4,
         cppi_output_dir=None,
-        trdf_use_text_prior=False,
-        trdf_text_backend='precomputed',
-        trdf_text_embedding_path=None,
-        trdf_text_model_path=None,
-        trdf_text_hidden_dim=128,
+        drbf_use_text_prior=False,
+        drbf_text_embedding_path=None,
+        drbf_text_dim=128,
     ):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
@@ -52,13 +50,13 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pet_channels = list(self.enc_pet.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
         self.pet_calibration = PrototypeReferencedPETAffineCalibration(channels=pet_channels)
-        self.fusion = TRDFFusion(
+        self.fusion = DRBFFusion(
             channels=pet_channels,
-            use_text_prior=trdf_use_text_prior,
-            text_backend=trdf_text_backend,
-            text_embedding_path=trdf_text_embedding_path,
-            text_model_path=trdf_text_model_path,
-            text_hidden_dim=trdf_text_hidden_dim,
+            use_text_prior=drbf_use_text_prior,
+            text_dim=None if drbf_text_embedding_path else (
+                int(drbf_text_dim) if drbf_use_text_prior else None
+            ),
+            text_embedding_path=drbf_text_embedding_path,
         )
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
         self.prototype_memory = CrossScaleCTPETPrototypeMemory(
@@ -137,6 +135,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 None,
                 reference_valid=False,
             )
+        # Calibrated PET is used as Stage-2 evidence (alpha=1; dominance is learned inside DRBF).
         fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='full')
         return self._decode(fused_feats, target_size)
 

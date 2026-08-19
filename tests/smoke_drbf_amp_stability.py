@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""AMP Full/Missing smoke test for DualSharedAddPETCTBaseline + TRDF."""
+"""AMP Full/Missing smoke test for DualSharedAddPETCTBaseline + DRBF."""
 from __future__ import annotations
 
 import os
@@ -44,12 +44,11 @@ def main():
         pet_backbone='mit_b1',
         ct_pretrained_path=None,
         pet_pretrained_path=None,
-        trdf_use_text_prior=False,
+        drbf_use_text_prior=False,
         cppi_build_stage=4,
     ).to(device)
     model.train()
 
-    # Seed CPPI bank so missing path is realistic.
     with torch.no_grad():
         model.prototype_memory.prototype_ready.fill_(True)
         for s in range(len(model.fusion.channels)):
@@ -118,7 +117,6 @@ def main():
             'loss': float(loss.detach()),
         }
 
-    peak_alloc = peak_reserved = None
     if device.type == 'cuda':
         peak_alloc = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
         peak_reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 2)

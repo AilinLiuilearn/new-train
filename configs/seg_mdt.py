@@ -35,11 +35,9 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--joint_missing_weight', type=float, default=0.5)
         p.add_argument('--cppi_num_clusters', type=int, default=6)
         p.add_argument('--cppi_build_stage', type=int, default=4)
-        p.add_argument('--trdf_use_text_prior', type=str2bool, default=False)
-        p.add_argument('--trdf_text_backend', type=str, default='precomputed', choices=('precomputed', 'hf_local'))
-        p.add_argument('--trdf_text_embedding_path', type=str, default=None)
-        p.add_argument('--trdf_text_model_path', type=str, default=None)
-        p.add_argument('--trdf_text_hidden_dim', type=int, default=128)
+        p.add_argument('--drbf_use_text_prior', type=str2bool, default=False)
+        p.add_argument('--drbf_text_embedding_path', type=str, default=None)
+        p.add_argument('--drbf_text_dim', type=int, default=128)
         p.add_argument('--enable_gradient_diagnostics', type=str2bool, default=False)
         p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
@@ -47,14 +45,14 @@ class SegMDTConfig(ConfigBase):
             '--stage1_checkpoint',
             type=str,
             default=None,
-            help='Stage-1 CPPI+Calibration best checkpoint for TRDF warm-start. '
+            help='Stage-1 CPPI+Calibration best checkpoint for DRBF warm-start. '
                  'Loads encoders/align/CPPI bank/calibration/decoder; skips old fusion.',
         )
         p.add_argument(
             '--resume_checkpoint',
             type=str,
             default=None,
-            help='Resume a Stage-2 TRDF run (full model). Do not use NaN-polluted TRDF runs.',
+            help='Resume a Stage-2 DRBF run (full model).',
         )
         return p
 
@@ -69,7 +67,7 @@ class SegMDTConfig(ConfigBase):
             '--learning_rate',
             type=float,
             default=8e-5,
-            help='TRDF learning rate (new fusion module).',
+            help='DRBF learning rate (new fusion module).',
         )
         p.add_argument(
             '--old_module_lr',

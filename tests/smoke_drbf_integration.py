@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Minimal smoke tests for TRDF integration into DualSharedAddPETCTBaseline."""
+"""Minimal smoke tests for DRBF integration into DualSharedAddPETCTBaseline."""
 from __future__ import annotations
 
 import argparse
@@ -45,7 +45,7 @@ def build_model(**kwargs):
         pet_backbone='mit_b1',
         ct_pretrained_path=None,
         pet_pretrained_path=None,
-        trdf_use_text_prior=False,
+        drbf_use_text_prior=False,
     )
     defaults.update(kwargs)
     return DualSharedAddPETCTBaseline(**defaults)
@@ -53,16 +53,16 @@ def build_model(**kwargs):
 
 def test_replace_and_text_off(device, batch_size=1, size=64):
     from models.baseline_blocks import StateAwareWeightedAddFusion
-    from models.trdf_fusion import TRDFFusion
+    from models.drbf_fusion import DRBFFusion
 
     print('=' * 72, flush=True)
     print('[Test2] build model Text OFF', flush=True)
-    model = build_model(trdf_use_text_prior=False).to(device)
+    model = build_model(drbf_use_text_prior=False).to(device)
     model.train()
     _seed_cppi(model)
 
     print('fusion_type=', type(model.fusion).__name__, flush=True)
-    assert isinstance(model.fusion, TRDFFusion)
+    assert isinstance(model.fusion, DRBFFusion)
     assert not isinstance(model.fusion, StateAwareWeightedAddFusion)
     names = [n for n, _ in model.named_parameters()]
     assert not any(n.startswith('fusion.raw_alpha_') for n in names)
@@ -70,8 +70,7 @@ def test_replace_and_text_off(device, batch_size=1, size=64):
     print('pet_channels=', model.fusion.channels, flush=True)
 
     ct = torch.randn(batch_size, 1, size, size, device=device)
-    pet = torch.randn(B := batch_size, 1, size, size, device=device)
-    del B
+    pet = torch.randn(batch_size, 1, size, size, device=device)
     mask = (torch.rand(batch_size, 1, size, size, device=device) > 0.8).float()
 
     print('--- Full ---', flush=True)
@@ -94,31 +93,30 @@ def test_replace_and_text_off(device, batch_size=1, size=64):
     assert g > 0
     model.zero_grad(set_to_none=True)
 
-    print('--- Four-scale shapes ---', flush=True)
+    print('--- Zero-step equivalence ---', flush=True)
     ct_feats = model._encode_ct(ct)
     pet_feats = model._encode_pet(pet)
     pet_cal = model.pet_calibration(ct_feats, pet_feats, None, reference_valid=False)
+    # Fresh fusion with zero-init residual projections must equal CT + E.
+    fresh = DRBFFusion(channels=model.fusion.channels, use_text_prior=False).to(device)
+    fused0 = fresh(ct_feats, pet_cal, mode='full')
+    for i, (c, p, f) in enumerate(zip(ct_feats, pet_cal, fused0), 1):
+        err = (f - (c + p)).abs().max().item()
+        print(f'  S{i}: max|out-(ct+E)|={err:.8e}', flush=True)
+        assert err == 0.0
+
+    print('--- Four-scale shapes ---', flush=True)
     fused = model.fusion(ct_feats, pet_cal, mode='full')
     for i, (c, p, f) in enumerate(zip(ct_feats, pet_cal, fused), 1):
         print(f'  S{i}: CT={tuple(c.shape)} PET_cal={tuple(p.shape)} FUSED={tuple(f.shape)}', flush=True)
         assert c.shape == p.shape == f.shape
 
     print('--- Auto ---', flush=True)
-    pet_available = torch.zeros(batch_size, device=device, dtype=torch.long)
-    if batch_size >= 2:
-        pet_available[0] = 1
-    elif batch_size == 1:
-        # still exercise auto path; alternate via a second sample when possible
-        pass
-    if batch_size == 1:
-        # expand to 2 for mixed auto check if memory allows
-        ct2 = torch.cat([ct, ct], dim=0)
-        pet2 = torch.cat([pet, pet], dim=0)
-        mask2 = torch.cat([mask, mask], dim=0)
-        pet_available = torch.tensor([1, 0], device=device, dtype=torch.long)
-        out = model(ct2, pet2, pet_available=pet_available, forward_mode='auto', mask=mask2, target_size=(size, size))
-    else:
-        out = model(ct, pet, pet_available=pet_available, forward_mode='auto', mask=mask, target_size=(size, size))
+    ct2 = torch.cat([ct, ct], dim=0)
+    pet2 = torch.cat([pet, pet], dim=0)
+    mask2 = torch.cat([mask, mask], dim=0)
+    pet_available = torch.tensor([1, 0], device=device, dtype=torch.long)
+    out = model(ct2, pet2, pet_available=pet_available, forward_mode='auto', mask=mask2, target_size=(size, size))
     _check_finite('logits_auto', out['logits'])
     loss = out['logits'].float().square().mean()
     loss.backward()
@@ -137,23 +135,23 @@ def test_replace_and_text_off(device, batch_size=1, size=64):
 def test_text_on(device, size=64):
     print('=' * 72, flush=True)
     print('[Test3] Text ON precomputed', flush=True)
-    emb_path = os.path.join(tempfile.gettempdir(), 'trdf_smoke_embeddings.pt')
-    torch.save({'real': torch.randn(768), 'proxy': torch.randn(768) + 1.0}, emb_path)
+    emb_path = os.path.join(tempfile.gettempdir(), 'drbf_smoke_embeddings.pt')
+    torch.save({'real': torch.randn(128), 'proxy': torch.randn(128) + 1.0}, emb_path)
 
     model = build_model(
-        trdf_use_text_prior=True,
-        trdf_text_backend='precomputed',
-        trdf_text_embedding_path=emb_path,
+        drbf_use_text_prior=True,
+        drbf_text_embedding_path=emb_path,
     ).to(device)
     model.train()
     _seed_cppi(model)
 
-    prior = model.fusion.text_prior
-    real = prior.real_embedding.to(device=device, dtype=torch.float32)
-    proxy = prior.proxy_embedding.to(device=device, dtype=torch.float32)
-    emb_full = prior.get(2, 'full', device, torch.float32)
-    emb_miss = prior.get(2, 'missing', device, torch.float32)
-    emb_auto = prior.get(4, 'auto', device, torch.float32, pet_available=torch.tensor([1, 0, 1, 0], device=device))
+    real = model.fusion.real_text_embedding.to(device=device, dtype=torch.float32)
+    proxy = model.fusion.proxy_text_embedding.to(device=device, dtype=torch.float32)
+    emb_full = model.fusion._resolve_text(2, device, torch.float32, 'full', None, None)
+    emb_miss = model.fusion._resolve_text(2, device, torch.float32, 'missing', None, None)
+    emb_auto = model.fusion._resolve_text(
+        4, device, torch.float32, 'auto', None, torch.tensor([1, 0, 1, 0], device=device)
+    )
     assert torch.allclose(emb_full[0], real)
     assert torch.allclose(emb_miss[0], proxy)
     assert torch.allclose(emb_auto[0], real) and torch.allclose(emb_auto[1], proxy)
@@ -204,11 +202,9 @@ def test_builder_and_resume():
         decoder_channels=(512, 256, 128, 64),
         use_deep_supervision=False,
         deep_supervision=False,
-        trdf_use_text_prior=False,
-        trdf_text_backend='precomputed',
-        trdf_text_embedding_path=None,
-        trdf_text_model_path=None,
-        trdf_text_hidden_dim=128,
+        drbf_use_text_prior=False,
+        drbf_text_embedding_path=None,
+        drbf_text_dim=128,
     )
     built = build_mdt_seg_teacher(cfg)
     print('built fusion=', type(built['model'].fusion).__name__, flush=True)

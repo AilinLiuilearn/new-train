@@ -92,11 +92,11 @@ def _count_prefix_matches(keys, prefix):
 
 def _load_stage1_warmstart(model, checkpoint_path):
     """
-    Warm-start Stage-2 TRDF training from a Stage-1 CPPI+Calibration checkpoint.
+    Warm-start Stage-2 DRBF training from a Stage-1 CPPI+Calibration checkpoint.
 
     Loads: encoders, align, CPPI bank, PET calibration, decoder.
     Skips: old StateAwareWeightedAddFusion (and any fusion.* keys).
-    TRDF remains randomly initialized.
+    DRBF remains randomly initialized.
     """
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     state_dict = checkpoint.get('model', checkpoint)
@@ -146,9 +146,9 @@ def _load_stage1_warmstart(model, checkpoint_path):
     else:
         print('[WARMSTART] no fusion.* keys found in Stage-1 checkpoint', flush=True)
 
-    trdf_missing = [k for k in missing_keys if k.startswith('fusion.')]
+    drbf_missing = [k for k in missing_keys if k.startswith('fusion.')]
     other_missing = [k for k in missing_keys if not k.startswith('fusion.')]
-    print(f'[WARMSTART] TRDF initialized from scratch (missing_fusion_keys={len(trdf_missing)})', flush=True)
+    print(f'[WARMSTART] DRBF initialized from scratch (missing_fusion_keys={len(drbf_missing)})', flush=True)
     if other_missing:
         print(f'[WARMSTART] other_missing_keys={other_missing[:20]}', flush=True)
     if unexpected_keys:
@@ -184,10 +184,10 @@ def _load_state_dict_with_report(model, checkpoint_path):
     print(f'[RESUME] missing_keys={missing_keys}', flush=True)
     print(f'[RESUME] unexpected_keys={unexpected_keys}', flush=True)
     old_fusion_ignored = any(k.startswith('fusion.raw_alpha_') for k in unexpected_keys)
-    trdf_from_scratch = any(k.startswith('fusion.scales.') for k in missing_keys)
-    if old_fusion_ignored or trdf_from_scratch:
+    drbf_from_scratch = any(k.startswith('fusion.scales.') for k in missing_keys)
+    if old_fusion_ignored or drbf_from_scratch:
         print('old fusion weights ignored', flush=True)
-        print('TRDF initialized from scratch', flush=True)
+        print('DRBF initialized from scratch', flush=True)
     return checkpoint
 
 
@@ -239,8 +239,8 @@ def main():
     resume_ckpt = getattr(cfg, 'resume_checkpoint', None)
     if stage1_ckpt and resume_ckpt:
         raise ValueError(
-            'Use either --stage1_checkpoint (TRDF warm-start) or --resume_checkpoint '
-            '(continue a Stage-2 TRDF run), not both.'
+            'Use either --stage1_checkpoint (DRBF warm-start) or --resume_checkpoint '
+            '(continue a Stage-2 DRBF run), not both.'
         )
 
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
@@ -249,7 +249,7 @@ def main():
     elif resume_ckpt:
         print(
             '[RESUME][WARN] Resuming a Stage-2 checkpoint. '
-            'Do not resume NaN-polluted TRDF runs.',
+            'Do not resume NaN-polluted Stage-2 runs.',
             flush=True,
         )
         _load_state_dict_with_report(task.model, resume_ckpt)
@@ -472,7 +472,7 @@ def main():
             epoch,
             train_loss,
             {'total_loss': val_loss, 'dice': val_dice, 'iou': val_iou, 'acc': val_acc, 'acc_pixel': val_acc_pixel, 'hd95': val_hd95},
-            lr=lrs.get('trdf', task.optimizer.param_groups[-1]['lr']),
+            lr=lrs.get('drbf', task.optimizer.param_groups[-1]['lr']),
             grad_norm=avg_grad_norm,
             extra_metrics=extra_metrics,
         )
@@ -480,7 +480,7 @@ def main():
         print(
             f'[EPOCH {epoch}] joint_dice={joint_dice:.4f} best_joint={best_joint:.4f} '
             f'lr_old={lrs.get("stage1_modules", float("nan")):.8f} '
-            f'lr_trdf={lrs.get("trdf", float("nan")):.8f}',
+            f'lr_drbf={lrs.get("drbf", float("nan")):.8f}',
             flush=True,
         )
         if no_improve >= patience:
