@@ -50,7 +50,9 @@ def _cv_squared(x: Tensor, eps: float = 1e-10) -> Tensor:
     if x.numel() <= 1:
         return x.new_zeros(())
     xf = x.float()
-    return xf.var(unbiased=False) / (xf.mean().square() + eps)
+    mean = xf.mean()
+    var = xf.var(unbiased=False)
+    return var / (mean.square() + eps)
 
 
 @dataclass
@@ -165,9 +167,13 @@ class NoisyTopKGate(nn.Module):
         th_out = flat.gather(0, pos_out).unsqueeze(1)
 
         is_in = noisy_logits > th_in
-        std = noise_std.clamp_min(1e-6)
-        p_in = self._normal_cdf((clean_logits - th_in) / std)
-        p_out = self._normal_cdf((clean_logits - th_out) / std)
+        safe_std = noise_std.clamp(min=1e-3, max=10.0)
+        z_in = (clean_logits - th_in) / safe_std
+        z_out = (clean_logits - th_out) / safe_std
+        z_in = torch.nan_to_num(z_in, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+        z_out = torch.nan_to_num(z_out, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+        p_in = self._normal_cdf(z_in)
+        p_out = self._normal_cdf(z_out)
         return torch.where(is_in, p_in, p_out)
 
     def forward(
@@ -179,12 +185,25 @@ class NoisyTopKGate(nn.Module):
             raise ValueError("token_features/token_prompts shape mismatch")
 
         router_in = torch.cat([token_features, token_prompts], dim=-1)
+        router_in = torch.nan_to_num(router_in, nan=0.0, posinf=1e4, neginf=-1e4)
+
         clean_logits = router_in @ self.w_gate
+        clean_logits = torch.nan_to_num(
+            clean_logits, nan=0.0, posinf=20.0, neginf=-20.0
+        ).clamp(-20.0, 20.0)
 
         noise_std: Optional[Tensor] = None
         if self.noisy_gating and self.training:
-            noise_std = self.softplus(router_in @ self.w_noise) + self.noise_epsilon
+            raw_noise = router_in @ self.w_noise
+            raw_noise = torch.nan_to_num(
+                raw_noise, nan=0.0, posinf=20.0, neginf=-20.0
+            ).clamp(-20.0, 20.0)
+            noise_std = self.softplus(raw_noise) + self.noise_epsilon
+            noise_std = noise_std.clamp(min=1e-3, max=10.0)
             noisy_logits = clean_logits + torch.randn_like(clean_logits) * noise_std
+            noisy_logits = torch.nan_to_num(
+                noisy_logits, nan=0.0, posinf=20.0, neginf=-20.0
+            ).clamp(-20.0, 20.0)
             logits = noisy_logits
         else:
             noisy_logits = clean_logits
@@ -257,9 +276,20 @@ class SparseExpertCollaboration(nn.Module):
             expert_in = tokens.index_select(0, token_ids)
             expert_out = expert(expert_in)
             weight = gates.index_select(0, token_ids)[:, eid].unsqueeze(-1)
-            delta.index_add_(0, token_ids, expert_out * weight)
+            delta.index_add_(0, token_ids, (expert_out * weight).to(dtype=delta.dtype))
 
+        importance = torch.nan_to_num(
+            importance.float(), nan=0.0, posinf=1e4, neginf=0.0
+        )
+        load = torch.nan_to_num(
+            load.float(), nan=0.0, posinf=1e4, neginf=0.0
+        )
         balance_loss = _cv_squared(importance) + _cv_squared(load)
+        if not torch.isfinite(balance_loss):
+            print('[TASKMOE WARNING] non-finite balance loss detected', flush=True)
+        balance_loss = torch.nan_to_num(
+            balance_loss, nan=0.0, posinf=10.0, neginf=0.0
+        )
         routing = {
             "importance": importance,
             "load": load,

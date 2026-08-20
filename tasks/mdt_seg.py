@@ -62,12 +62,16 @@ class MDTSegTeacher:
         seg_loss, loss_stats = self.criterion(logits, mask)
         moe_loss = outputs.get('aux', {}).get(
             'taskmoe_balance_loss',
-            seg_loss.new_zeros(()),
+            None,
         )
-        total_loss = seg_loss + moe_loss
+        if moe_loss is None:
+            moe_loss = torch.zeros((), device=seg_loss.device, dtype=torch.float32)
+        else:
+            moe_loss = moe_loss.float()
+        total_loss = seg_loss.float() + moe_loss
         stats = {
-            'loss_seg_total': seg_loss.detach(),
-            'loss_moe_balance': moe_loss.detach() if torch.is_tensor(moe_loss) else torch.tensor(float(moe_loss), device=seg_loss.device),
+            'loss_seg_total': seg_loss.detach().float(),
+            'loss_moe_balance': moe_loss.detach(),
             'loss_total': total_loss.detach(),
             'loss_seg': loss_stats.get('loss_dice', seg_loss.detach()),
             'loss_boundary': torch.tensor(0.0, device=seg_loss.device),

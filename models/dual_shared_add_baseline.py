@@ -82,12 +82,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
             zero = fused_feats[-1].new_zeros(())
             return fused_feats, zero
         # Sparse index_add_ is not AMP-safe (Half buffer vs Float source).
-        # Run TaskMoE in fp32, then cast back to the fused feature dtype.
+        # Run TaskMoE in fp32; keep moe_aux_loss in float32 (do not cast to FP16).
         f4 = fused_feats[3]
         with torch.cuda.amp.autocast(enabled=False):
             f4_out, moe_aux_loss = self.taskmoe_s4(f4.float())
         fused_feats[3] = f4_out.to(dtype=f4.dtype)
-        return fused_feats, moe_aux_loss.to(dtype=f4.dtype)
+        return fused_feats, moe_aux_loss.float()
 
     def _decode(self, fused_feats, target_size, aux=None):
         out = self.decoder(fused_feats, target_size)

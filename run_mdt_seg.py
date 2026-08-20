@@ -221,16 +221,17 @@ def main():
     _assert_baseline(cfg)
     _seed(cfg)
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+
+    if not getattr(cfg, 'stage1_checkpoint', None):
+        raise ValueError('Stage-2 TaskMoE training requires --stage1_checkpoint')
+    _sync_cppi_config_from_stage1(cfg, cfg.stage1_checkpoint)
+
     with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
         json.dump(vars(cfg), f, indent=2, default=str)
 
     train_loader, val_loader, _ = _loaders(cfg)
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)}', flush=True)
 
-    if not getattr(cfg, 'stage1_checkpoint', None):
-        raise ValueError('Stage-2 TaskMoE training requires --stage1_checkpoint')
-
-    _sync_cppi_config_from_stage1(cfg, cfg.stage1_checkpoint)
     networks = build_mdt_seg_teacher(cfg)
     model = networks['model']
     _load_stage1_for_taskmoe(model, cfg.stage1_checkpoint)
@@ -259,6 +260,9 @@ def main():
         'grad_full_enc_ct', 'grad_missing_enc_ct', 'grad_full_ct_align', 'grad_missing_ct_align', 'grad_full_decoder', 'grad_missing_decoder',
         'epoch_time',
         'cppi_bank_version', 'cppi_ready_slots', 'cppi_bg_candidates', 'cppi_fg_candidates',
+        'nonfinite_grad_steps', 'skipped_optimizer_steps',
+        'nonfinite_full_steps', 'nonfinite_missing_steps',
+        'train_moe_balance_loss', 'taskmoe_beta',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
 
@@ -276,6 +280,12 @@ def main():
         task.model.train()
         full_n = missing_n = 0
         full_loss = missing_loss = 0.0
+        moe_balance_accum = 0.0
+        moe_balance_steps = 0
+        nonfinite_grad_steps = 0
+        skipped_optimizer_steps = 0
+        nonfinite_full_steps = 0
+        nonfinite_missing_steps = 0
         grad_norm_accum = 0.0
         grad_norm_steps = 0
         grads = {
@@ -290,7 +300,7 @@ def main():
             route = 'full' if global_batch_step % 2 == 0 else 'missing'
             task.optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
-                loss, _, _, _ = task.train_step(batch, forward_mode=route)
+                loss, _, _, stats = task.train_step(batch, forward_mode=route)
             if not torch.isfinite(loss):
                 raise RuntimeError('loss became non-finite')
 
@@ -300,24 +310,63 @@ def main():
             else:
                 loss.backward()
 
-            grads[route]['enc_ct'].append(module_grad_norm(task.model.enc_ct))
-            grads[route]['ct_align'].append(module_grad_norm(task.model.ct_align))
-            grads[route]['decoder'].append(module_grad_norm(task.model.decoder))
-            total_grad_norm = torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip)) if float(cfg.grad_clip) > 0 else 0.0
-            grad_norm_accum += float(total_grad_norm)
-            grad_norm_steps += 1
+            has_nonfinite_grad = False
+            for name, p in task.model.named_parameters():
+                if not p.requires_grad or p.grad is None:
+                    continue
+                if not torch.isfinite(p.grad).all():
+                    has_nonfinite_grad = True
+                    print(
+                        '[NONFINITE GRAD]',
+                        epoch,
+                        batch_idx,
+                        route,
+                        name,
+                        'nan=',
+                        int(torch.isnan(p.grad).sum().item()),
+                        'inf=',
+                        int(torch.isinf(p.grad).sum().item()),
+                        flush=True,
+                    )
 
-            if task.scaler.is_enabled():
-                task.scaler.step(task.optimizer)
-                task.scaler.update()
+            if has_nonfinite_grad:
+                nonfinite_grad_steps += 1
+                skipped_optimizer_steps += 1
+                if route == 'full':
+                    nonfinite_full_steps += 1
+                else:
+                    nonfinite_missing_steps += 1
+                task.optimizer.zero_grad(set_to_none=True)
+                if task.scaler.is_enabled():
+                    task.scaler.update()
+                print(
+                    '[SKIP NONFINITE STEP]\n'
+                    f'epoch={epoch}\n'
+                    f'batch={batch_idx}\n'
+                    f'route={route}',
+                    flush=True,
+                )
             else:
-                task.optimizer.step()
+                grads[route]['enc_ct'].append(module_grad_norm(task.model.enc_ct))
+                grads[route]['ct_align'].append(module_grad_norm(task.model.ct_align))
+                grads[route]['decoder'].append(module_grad_norm(task.model.decoder))
+                total_grad_norm = torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip)) if float(cfg.grad_clip) > 0 else 0.0
+                grad_norm_accum += float(total_grad_norm)
+                grad_norm_steps += 1
 
-            task.scheduler.step()
+                if task.scaler.is_enabled():
+                    task.scaler.step(task.optimizer)
+                    task.scaler.update()
+                else:
+                    task.optimizer.step()
+
+                task.scheduler.step()
 
             if (batch_idx + 1) % 100 == 0:
                 print(f'[BATCH {batch_idx + 1}] route={route} loss={float(loss.detach()):.6f}', flush=True)
 
+            moe_balance_accum += float(stats['loss_moe_balance'].detach())
+            moe_balance_steps += 1
             if route == 'full':
                 full_n += 1
                 full_loss += float(loss.detach())
@@ -440,6 +489,12 @@ def main():
             'cppi_ready_slots': int(cppi_report.get('ready_count', cppi_report.get('ready_slots', 0))),
             'cppi_bg_candidates': int(cppi_report.get('classes', {}).get('background', {}).get('num_candidates', 0)),
             'cppi_fg_candidates': int(cppi_report.get('classes', {}).get('foreground', {}).get('num_candidates', 0)),
+            'nonfinite_grad_steps': nonfinite_grad_steps,
+            'skipped_optimizer_steps': skipped_optimizer_steps,
+            'nonfinite_full_steps': nonfinite_full_steps,
+            'nonfinite_missing_steps': nonfinite_missing_steps,
+            'train_moe_balance_loss': moe_balance_accum / max(1, moe_balance_steps),
+            'taskmoe_beta': float(task.model.taskmoe_s4.residual_scale.detach().item()) if hasattr(task.model, 'taskmoe_s4') else 0.0,
             **{f'diag_{k}': v for k, v in diag_stats.items()},
         }
         append_epoch_log(
