@@ -84,10 +84,135 @@ def _load_state_dict_with_report(model, checkpoint_path):
     return checkpoint
 
 
+def _sync_cppi_config_from_stage1(cfg, checkpoint_path):
+    cfg_path = os.path.join(os.path.dirname(checkpoint_path), 'config_args.json')
+    if not os.path.isfile(cfg_path):
+        print(f'[STAGE2 LOAD][WARN] Stage-1 config not found: {cfg_path}', flush=True)
+        return
+    with open(cfg_path, 'r') as f:
+        stage1_cfg = json.load(f)
+    for key in ('cppi_num_clusters', 'cppi_build_stage', 'ct_backbone', 'pet_backbone', 'decoder_channels'):
+        if key in stage1_cfg:
+            setattr(cfg, key, stage1_cfg[key])
+            print(f'[STAGE2 LOAD] sync {key}={stage1_cfg[key]} from Stage-1 config', flush=True)
+
+
+def _load_stage1_for_taskmoe(model, checkpoint_path):
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    state_dict = checkpoint.get('model', checkpoint)
+    result = model.load_state_dict(state_dict, strict=False)
+    missing_keys = list(result.missing_keys)
+    unexpected_keys = list(result.unexpected_keys)
+
+    missing_taskmoe = [k for k in missing_keys if k.startswith('taskmoe_s4.')]
+    missing_other = [k for k in missing_keys if not k.startswith('taskmoe_s4.')]
+    if missing_other:
+        raise RuntimeError(
+            'Stage-1 load has non-TaskMoE missing keys: '
+            f'{missing_other}'
+        )
+    if unexpected_keys:
+        raise RuntimeError(
+            f'Stage-1 load has unexpected keys: {unexpected_keys}'
+        )
+    if not bool(model.prototype_memory.bank_ready):
+        raise RuntimeError(
+            'Stage-1 checkpoint CPPI bank is not ready; Stage-2 requires a mature bank'
+        )
+
+    print('[STAGE2 LOAD]', flush=True)
+    print(f'checkpoint={checkpoint_path}', flush=True)
+    print(f'missing_taskmoe_keys={missing_taskmoe}', flush=True)
+    print(f'unexpected_keys={unexpected_keys}', flush=True)
+    print(f'cppi_bank_ready={bool(model.prototype_memory.bank_ready)}', flush=True)
+    return checkpoint
+
+
+@torch.no_grad()
+def _verify_stage2_zero_step(task, val_loader):
+    model = task.model
+    beta = float(model.taskmoe_s4.residual_scale.detach().abs().item())
+    if beta > 1e-12:
+        raise RuntimeError(
+            f'TaskMoE residual_scale beta must be ~0 at step-0, got {beta}'
+        )
+
+    batch = next(iter(val_loader))
+    ct = batch['ct'][:1].to(task.device, non_blocking=True)
+    pet = batch['pet'][:1].to(task.device, non_blocking=True)
+    was_training = model.training
+    model.eval()
+
+    diffs = {}
+    for route in ('full', 'missing'):
+        model.taskmoe_enabled = False
+        out_stage1 = model(ct, pet=pet, forward_mode=route, mask=None)
+        logits_stage1 = out_stage1['logits']
+
+        model.taskmoe_enabled = True
+        out_stage2 = model(ct, pet=pet, forward_mode=route, mask=None)
+        logits_stage2 = out_stage2['logits']
+
+        max_abs_diff = float((logits_stage1 - logits_stage2).abs().max().item())
+        diffs[route] = max_abs_diff
+        if max_abs_diff > 1e-6:
+            model.taskmoe_enabled = True
+            model.train(was_training)
+            raise RuntimeError(
+                f'Zero-step equivalence failed for {route}: '
+                f'max_abs_diff={max_abs_diff} > 1e-6'
+            )
+
+    model.taskmoe_enabled = True
+    model.train(was_training)
+    print('[ZERO-STEP]', flush=True)
+    print(f'full_max_abs_diff={diffs["full"]}', flush=True)
+    print(f'missing_max_abs_diff={diffs["missing"]}', flush=True)
+    print('passed=True', flush=True)
+    return diffs
+
+
 def _count_parameters(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
+
+
+def _print_stage2_startup(model, cfg, total_params, trainable_params):
+    stage1_trainable = sum(
+        p.numel()
+        for n, p in model.named_parameters()
+        if p.requires_grad and not n.startswith('taskmoe_s4.')
+    )
+    taskmoe_trainable = sum(
+        p.numel()
+        for n, p in model.named_parameters()
+        if p.requires_grad and n.startswith('taskmoe_s4.')
+    )
+    print('[TRAIN MODE]', flush=True)
+    print('mode=stage2_taskmoe', flush=True)
+    print('[STAGE1]', flush=True)
+    print(f'checkpoint={cfg.stage1_checkpoint}', flush=True)
+    print('loaded=True', flush=True)
+    print(f'frozen={bool(model.stage2_moe_only)}', flush=True)
+    print('[CPPI]', flush=True)
+    print(f'bank_ready={bool(model.prototype_memory.bank_ready)}', flush=True)
+    print('frozen=True', flush=True)
+    print('collect=False', flush=True)
+    print('finalize=False', flush=True)
+    print('retrieve=True', flush=True)
+    print('[TASKMOE]', flush=True)
+    print('stage=S4', flush=True)
+    print(f'channels={model.taskmoe_s4.channels}', flush=True)
+    print(f'num_experts={model.taskmoe_s4.num_experts}', flush=True)
+    print(f'top_k={model.taskmoe_s4.top_k}', flush=True)
+    print(f'residual_mode={model.taskmoe_s4.residual_mode}', flush=True)
+    print(f'beta_init={float(model.taskmoe_s4.residual_scale.detach().item())}', flush=True)
+    print(f'balance_loss_weight={model.taskmoe_s4.balance_loss_weight}', flush=True)
+    print('[PARAMS]', flush=True)
+    print(f'stage1_trainable={stage1_trainable}', flush=True)
+    print(f'taskmoe_trainable={taskmoe_trainable}', flush=True)
+    print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
 
 
 def main():
@@ -102,11 +227,20 @@ def main():
     train_loader, val_loader, _ = _loaders(cfg)
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)}', flush=True)
 
-    task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
-    if getattr(cfg, 'resume_checkpoint', None):
-        _load_state_dict_with_report(task.model, cfg.resume_checkpoint)
+    if not getattr(cfg, 'stage1_checkpoint', None):
+        raise ValueError('Stage-2 TaskMoE training requires --stage1_checkpoint')
+
+    _sync_cppi_config_from_stage1(cfg, cfg.stage1_checkpoint)
+    networks = build_mdt_seg_teacher(cfg)
+    model = networks['model']
+    _load_stage1_for_taskmoe(model, cfg.stage1_checkpoint)
+    model.enable_stage2_moe_only()
+    task = MDTSegTeacher(networks, cfg)
+
     total_params, trainable_params = _count_parameters(task.model)
-    print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
+    _print_stage2_startup(task.model, cfg, total_params, trainable_params)
+    _verify_stage2_zero_step(task, val_loader)
+
     task.scheduler = get_cosine_scheduler(
         task.optimizer,
         epochs=cfg.epochs,
@@ -200,24 +334,43 @@ def main():
                     'mask': batch['mask'][:1].detach().cpu(),
                 }
 
-        cppi_report = task.model.finalize_cppi_epoch(
-            epoch=epoch,
-            save_json=True,
-            save_visualizations=(
-                epoch == 1
-                or epoch % 5 == 0
-                or epoch == cfg.epochs
-            ),
-            print_info=True,
-        )
-        print(
-            f"[CPPI EPOCH {epoch}]\n"
-            f"bank_version={cppi_report.get('bank_version_after', cppi_report.get('bank_version_before', 0))}\n"
-            f"ready_slots={cppi_report.get('ready_count', cppi_report.get('ready_slots', 0))}\n"
-            f"bg_candidates={cppi_report.get('classes', {}).get('background', {}).get('num_candidates', 0)}\n"
-            f"fg_candidates={cppi_report.get('classes', {}).get('foreground', {}).get('num_candidates', 0)}",
-            flush=True,
-        )
+        if getattr(task.model, 'stage2_moe_only', False):
+            cppi_report = {
+                'bank_version_after': int(task.model.prototype_memory.bank_version.item()),
+                'ready_count': int(task.model.prototype_memory.prototype_ready.sum().item()),
+                'classes': {
+                    'background': {'num_candidates': 0},
+                    'foreground': {'num_candidates': 0},
+                },
+            }
+            print(
+                '[CPPI STAGE2]\n'
+                'frozen=True\n'
+                f'bank_ready={bool(task.model.prototype_memory.bank_ready)}\n'
+                'collect=False\n'
+                'finalize=False\n'
+                'retrieve=True',
+                flush=True,
+            )
+        else:
+            cppi_report = task.model.finalize_cppi_epoch(
+                epoch=epoch,
+                save_json=True,
+                save_visualizations=(
+                    epoch == 1
+                    or epoch % 5 == 0
+                    or epoch == cfg.epochs
+                ),
+                print_info=True,
+            )
+            print(
+                f"[CPPI EPOCH {epoch}]\n"
+                f"bank_version={cppi_report.get('bank_version_after', cppi_report.get('bank_version_before', 0))}\n"
+                f"ready_slots={cppi_report.get('ready_count', cppi_report.get('ready_slots', 0))}\n"
+                f"bg_candidates={cppi_report.get('classes', {}).get('background', {}).get('num_candidates', 0)}\n"
+                f"fg_candidates={cppi_report.get('classes', {}).get('foreground', {}).get('num_candidates', 0)}",
+                flush=True,
+            )
         if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is not None and epoch % int(cfg.gradient_diagnostics_interval) == 0:
             diag_stats = task.gradient_diagnostics(fixed_diag_batch, max_samples=min(1, int(cfg.gradient_diagnostics_num_samples))) or {}
 

@@ -39,6 +39,12 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
         p.add_argument('--resume_checkpoint', type=str, default=None)
+        p.add_argument(
+            '--stage1_checkpoint',
+            type=str,
+            default=None,
+            help='Stage-1 best checkpoint for frozen TaskMoE Stage-2 training',
+        )
         return p
 
     @staticmethod

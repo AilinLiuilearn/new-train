@@ -4,6 +4,7 @@ import torch.nn as nn
 from models.baseline_blocks import PrototypeReferencedPETAffineCalibration, StateAwareWeightedAddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.ct_pet_prototype_imputation import CrossScaleCTPETPrototypeMemory
+from models.taskmoe_s4_refiner import TaskMoEStage4Refiner
 
 
 class StageChannelAlign(nn.Module):
@@ -25,6 +26,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
     def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=6, cppi_build_stage=3, cppi_output_dir=None):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
+        self.stage2_moe_only = False
+        self.taskmoe_enabled = True
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
         load_local_weights_safe(self.enc_ct, ct_pretrained_path, name='CT_Encoder')
@@ -40,6 +43,21 @@ class DualSharedAddPETCTBaseline(nn.Module):
             num_clusters=cppi_num_clusters,
             build_stage=cppi_build_stage,
             output_dir=cppi_output_dir,
+        )
+        self.taskmoe_s4 = TaskMoEStage4Refiner(
+            channels=pet_channels[-1],
+            num_experts=6,
+            top_k=2,
+            prompt_atoms=32,
+            prompt_dim=256,
+            prompt_hidden_channels=64,
+            mlp_ratio=2.0,
+            dropout=0.0,
+            noisy_gating=True,
+            noise_epsilon=1e-2,
+            balance_loss_weight=0.1,
+            residual_mode='zero_start',
+            residual_scale_init=0.0,
         )
 
     @staticmethod
@@ -58,14 +76,49 @@ class DualSharedAddPETCTBaseline(nn.Module):
         _check_tensor_list('pet_feats', pet_feats)
         return pet_feats
 
-    def _decode(self, fused_feats, target_size):
+    def _refine_stage4(self, fused_feats):
+        fused_feats = list(fused_feats)
+        if not self.taskmoe_enabled:
+            zero = fused_feats[-1].new_zeros(())
+            return fused_feats, zero
+        # Sparse index_add_ is not AMP-safe (Half buffer vs Float source).
+        # Run TaskMoE in fp32, then cast back to the fused feature dtype.
+        f4 = fused_feats[3]
+        with torch.cuda.amp.autocast(enabled=False):
+            f4_out, moe_aux_loss = self.taskmoe_s4(f4.float())
+        fused_feats[3] = f4_out.to(dtype=f4.dtype)
+        return fused_feats, moe_aux_loss.to(dtype=f4.dtype)
+
+    def _decode(self, fused_feats, target_size, aux=None):
         out = self.decoder(fused_feats, target_size)
         _check_tensor('logits', out['logits'])
         out['pred'] = out['logits']
-        out['aux'] = {}
+        out['aux'] = {} if aux is None else aux
         return out
 
+    def enable_stage2_moe_only(self):
+        for p in self.parameters():
+            p.requires_grad = False
+        for p in self.taskmoe_s4.parameters():
+            p.requires_grad = True
+        self.stage2_moe_only = True
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.stage2_moe_only:
+            self.enc_ct.eval()
+            self.enc_pet.eval()
+            self.ct_align.eval()
+            self.pet_calibration.eval()
+            self.fusion.eval()
+            self.decoder.eval()
+            self.prototype_memory.eval()
+            self.taskmoe_s4.train(mode)
+        return self
+
     def _collect_cppi(self, ct_feats, pet_feats_real, mask):
+        if self.stage2_moe_only:
+            return None
         if self.training and mask is not None:
             return self.prototype_memory.collect(
                 ct_feats=ct_feats,
@@ -112,10 +165,38 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 reference_valid=False,
             )
         fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='full')
-        return self._decode(fused_feats, target_size)
+        fused_feats, moe_aux_loss = self._refine_stage4(fused_feats)
+        return self._decode(
+            fused_feats,
+            target_size,
+            aux={'taskmoe_balance_loss': moe_aux_loss},
+        )
 
     def _forward_missing(self, ct, pet, target_size, mask=None):
         ct_feats = self._encode_ct(ct)
+        if self.stage2_moe_only:
+            pet_feats_proxy, ct_reference_feats, _ = self._retrieve_cppi(
+                ct_feats,
+                compute_report=False,
+                save_diagnostics=False,
+                print_info=False,
+                return_ct_reference=True,
+            )
+            ct_reference_feats = [x.detach() for x in ct_reference_feats]
+            pet_feats_cal = self.pet_calibration(
+                ct_feats,
+                pet_feats_proxy,
+                ct_reference_feats,
+                reference_valid=self.prototype_memory.bank_ready,
+            )
+            fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='missing')
+            fused_feats, moe_aux_loss = self._refine_stage4(fused_feats)
+            return self._decode(
+                fused_feats,
+                target_size,
+                aux={'taskmoe_balance_loss': moe_aux_loss},
+            )
+
         pet_feats_real = self._encode_pet(pet)
         self._collect_cppi(ct_feats, pet_feats_real, mask)
         pet_feats_proxy, ct_reference_feats, _ = self._retrieve_cppi(
@@ -133,7 +214,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
             reference_valid=self.prototype_memory.bank_ready,
         )
         fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='missing')
-        return self._decode(fused_feats, target_size)
+        fused_feats, moe_aux_loss = self._refine_stage4(fused_feats)
+        return self._decode(
+            fused_feats,
+            target_size,
+            aux={'taskmoe_balance_loss': moe_aux_loss},
+        )
 
     def _forward_auto(self, ct, pet, pet_available, target_size, mask=None):
         ct_feats = self._encode_ct(ct)
@@ -169,7 +255,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
             mode='auto',
             pet_available=pet_available,
         )
-        return self._decode(fused_feats, target_size)
+        fused_feats, moe_aux_loss = self._refine_stage4(fused_feats)
+        return self._decode(
+            fused_feats,
+            target_size,
+            aux={'taskmoe_balance_loss': moe_aux_loss},
+        )
 
     @torch.no_grad()
     def finalize_cppi_epoch(self, epoch, save_json=True, save_visualizations=False, print_info=True):

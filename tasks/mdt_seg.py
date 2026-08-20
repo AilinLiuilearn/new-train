@@ -25,7 +25,25 @@ class MDTSegTeacher:
         self.model = networks['model']
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        trainable_names = [
+            name for name, p in self.model.named_parameters() if p.requires_grad
+        ]
+        print(f'[OPTIM] trainable_param_names={trainable_names}', flush=True)
+        if bool(getattr(self.model, 'stage2_moe_only', False)):
+            bad = [n for n in trainable_names if not n.startswith('taskmoe_s4.')]
+            if bad:
+                raise RuntimeError(
+                    'Stage-2 TaskMoE mode requires all trainable params under '
+                    f'taskmoe_s4.*, but found: {bad}'
+                )
+        if not trainable_params:
+            raise RuntimeError('No trainable parameters found for optimizer')
+        self.optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
         self.scheduler = None
         self.scaler = torch.cuda.amp.GradScaler(enabled=bool(config.mixed_precision))
         self.global_batch_step = 0
@@ -41,13 +59,20 @@ class MDTSegTeacher:
         mask = batch['mask'].to(self.device, non_blocking=True).float()
         outputs = self.model(ct, pet=pet, mask=mask, forward_mode=forward_mode)
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-        loss, loss_stats = self.criterion(logits, mask)
+        seg_loss, loss_stats = self.criterion(logits, mask)
+        moe_loss = outputs.get('aux', {}).get(
+            'taskmoe_balance_loss',
+            seg_loss.new_zeros(()),
+        )
+        total_loss = seg_loss + moe_loss
         stats = {
-            'loss_total': loss.detach(),
-            'loss_seg': loss_stats.get('loss_dice', loss.detach()),
-            'loss_boundary': torch.tensor(0.0, device=loss.device),
+            'loss_seg_total': seg_loss.detach(),
+            'loss_moe_balance': moe_loss.detach() if torch.is_tensor(moe_loss) else torch.tensor(float(moe_loss), device=seg_loss.device),
+            'loss_total': total_loss.detach(),
+            'loss_seg': loss_stats.get('loss_dice', seg_loss.detach()),
+            'loss_boundary': torch.tensor(0.0, device=seg_loss.device),
         }
-        return loss, logits, outputs, stats
+        return total_loss, logits, outputs, stats
 
     @torch.no_grad()
     def evaluate(self, loader, eval_mode='full', tag='val'):
