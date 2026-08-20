@@ -5,6 +5,7 @@ from models.baseline_blocks import PrototypeReferencedPETAffineCalibration, Stat
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.ct_pet_prototype_imputation import CrossScaleCTPETPrototypeMemory
 from models.taskmoe_s4_refiner import TaskMoEStage4Refiner
+from models.cross_scale_shared_taskmoe import CrossScaleSharedTaskMoE
 
 
 def _parse_taskmoe_scales(taskmoe_scales):
@@ -77,6 +78,7 @@ def _is_taskmoe_param_name(name):
         or name.startswith('taskmoe_s2.')
         or name.startswith('taskmoe_s3.')
         or name.startswith('taskmoe_s4.')
+        or name.startswith('cross_scale_taskmoe.')
     )
 
 
@@ -99,11 +101,17 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
-    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=6, cppi_build_stage=3, cppi_output_dir=None, taskmoe_scales='s4'):
+    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=6, cppi_build_stage=3, cppi_output_dir=None, taskmoe_scales='s4', taskmoe_mode='independent'):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.stage2_moe_only = False
         self.taskmoe_enabled = True
+        self.taskmoe_mode = str(taskmoe_mode or 'independent').strip().lower()
+        if self.taskmoe_mode not in ('independent', 'cross_scale_shared'):
+            raise ValueError(
+                f'Unsupported taskmoe_mode={taskmoe_mode!r}; '
+                'use independent or cross_scale_shared'
+            )
         self.taskmoe_scales = _parse_taskmoe_scales(taskmoe_scales)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
@@ -125,12 +133,35 @@ class DualSharedAddPETCTBaseline(nn.Module):
         self.taskmoe_s2 = None
         self.taskmoe_s3 = None
         self.taskmoe_s4 = None
+        self.cross_scale_taskmoe = None
         if len(pet_channels) < 4:
             raise ValueError(f'TaskMoE expects 4 encoder scales, got {len(pet_channels)}')
-        for scale_name in self.taskmoe_scales:
-            idx = _TASKMOE_SCALE_INDEX[scale_name]
-            module = self._build_taskmoe(pet_channels[idx])
-            setattr(self, f'taskmoe_{scale_name}', module)
+
+        if self.taskmoe_mode == 'cross_scale_shared':
+            if self.taskmoe_scales != ('s1', 's2', 's3', 's4'):
+                raise ValueError(
+                    'cross_scale_shared TaskMoE is an all-scale module; use --taskmoe_scales all'
+                )
+            self.cross_scale_taskmoe = CrossScaleSharedTaskMoE(
+                channels=pet_channels,
+                expert_dim=128,
+                num_experts=6,
+                top_k=2,
+                atom_num=32,
+                atom_dim=256,
+                prompt_hidden_channels=64,
+                mlp_ratio=2.0,
+                dropout=0.0,
+                noisy_gating=True,
+                noise_epsilon=1e-2,
+                balance_loss_weight=0.1,
+                zero_start=True,
+            )
+        else:
+            for scale_name in self.taskmoe_scales:
+                idx = _TASKMOE_SCALE_INDEX[scale_name]
+                module = self._build_taskmoe(pet_channels[idx])
+                setattr(self, f'taskmoe_{scale_name}', module)
 
     @staticmethod
     def _build_taskmoe(channels):
@@ -151,7 +182,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
         )
 
     def _iter_active_taskmoe(self):
-        """Yield (scale_name, feature_index, module) for enabled TaskMoE scales."""
+        """Yield (scale_name, feature_index, module) for independent TaskMoE scales."""
+        if self.taskmoe_mode != 'independent':
+            return
         for scale_name in self.taskmoe_scales:
             module = getattr(self, f'taskmoe_{scale_name}', None)
             if module is None:
@@ -175,12 +208,26 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return pet_feats
 
     def _refine_stage4(self, fused_feats):
-        """Refine configured TaskMoE scales (any of S1-S4). Name kept for compatibility."""
+        """Refine TaskMoE scales. Name kept for compatibility."""
         fused_feats = list(fused_feats)
         if not self.taskmoe_enabled:
             zero = fused_feats[-1].new_zeros((), dtype=torch.float32)
             return fused_feats, zero
-        # Sparse index_add_ is not AMP-safe. Run TaskMoE in fp32; keep aux loss float32.
+
+        if self.taskmoe_mode == 'cross_scale_shared':
+            if self.cross_scale_taskmoe is None:
+                raise RuntimeError('cross_scale_shared mode requires cross_scale_taskmoe module')
+            orig_dtypes = [feat.dtype for feat in fused_feats]
+            with torch.cuda.amp.autocast(enabled=False):
+                shared_input = [feat.float() for feat in fused_feats]
+                result = self.cross_scale_taskmoe(shared_input)
+            fused_feats = [
+                out.to(dtype=dtype)
+                for out, dtype in zip(result.features, orig_dtypes)
+            ]
+            return fused_feats, result.balance_loss.float()
+
+        # independent: Sparse index_add_ is not AMP-safe. Run TaskMoE in fp32.
         aux_loss = None
         with torch.cuda.amp.autocast(enabled=False):
             for _, feat_idx, module in self._iter_active_taskmoe():
@@ -203,9 +250,15 @@ class DualSharedAddPETCTBaseline(nn.Module):
     def enable_stage2_moe_only(self):
         for p in self.parameters():
             p.requires_grad = False
-        for _, _, module in self._iter_active_taskmoe():
-            for p in module.parameters():
+        if self.taskmoe_mode == 'cross_scale_shared':
+            if self.cross_scale_taskmoe is None:
+                raise RuntimeError('cross_scale_shared mode requires cross_scale_taskmoe module')
+            for p in self.cross_scale_taskmoe.parameters():
                 p.requires_grad = True
+        else:
+            for _, _, module in self._iter_active_taskmoe():
+                for p in module.parameters():
+                    p.requires_grad = True
         self.stage2_moe_only = True
 
     def train(self, mode=True):
@@ -222,8 +275,13 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 module = getattr(self, f'taskmoe_{scale_name}', None)
                 if module is not None:
                     module.eval()
-            for _, _, module in self._iter_active_taskmoe():
-                module.train(mode)
+            if self.cross_scale_taskmoe is not None:
+                self.cross_scale_taskmoe.eval()
+            if self.taskmoe_mode == 'cross_scale_shared':
+                self.cross_scale_taskmoe.train(mode)
+            else:
+                for _, _, module in self._iter_active_taskmoe():
+                    module.train(mode)
         return self
 
     def _collect_cppi(self, ct_feats, pet_feats_real, mask):

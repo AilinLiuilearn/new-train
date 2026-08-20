@@ -124,6 +124,7 @@ def _load_stage1_for_taskmoe(model, checkpoint_path):
 
     print('[STAGE2 LOAD]', flush=True)
     print(f'checkpoint={checkpoint_path}', flush=True)
+    print(f'taskmoe_mode={getattr(model, "taskmoe_mode", "independent")}', flush=True)
     print(f'taskmoe_scales={getattr(model, "taskmoe_scales", ())}', flush=True)
     print(f'missing_taskmoe_keys={missing_taskmoe}', flush=True)
     print(f'unexpected_keys={unexpected_keys}', flush=True)
@@ -134,12 +135,25 @@ def _load_stage1_for_taskmoe(model, checkpoint_path):
 @torch.no_grad()
 def _verify_stage2_zero_step(task, val_loader):
     model = task.model
-    for scale_name, _, module in model._iter_active_taskmoe():
-        beta = float(module.residual_scale.detach().abs().item())
-        if beta > 1e-12:
+    mode = getattr(model, 'taskmoe_mode', 'independent')
+
+    if mode == 'cross_scale_shared':
+        beta = model.cross_scale_taskmoe.beta.detach().float()
+        if float(beta.abs().max().item()) > 1e-12:
             raise RuntimeError(
-                f'TaskMoE {scale_name} residual_scale beta must be ~0 at step-0, got {beta}'
+                f'TaskMoE shared beta must be ~0 at step-0, got {beta.tolist()}'
             )
+        beta_vals = [float(beta[i].item()) for i in range(4)]
+    else:
+        for scale_name, _, module in model._iter_active_taskmoe():
+            b = float(module.residual_scale.detach().abs().item())
+            if b > 1e-12:
+                raise RuntimeError(
+                    f'TaskMoE {scale_name} residual_scale beta must be ~0 at step-0, got {b}'
+                )
+        beta_vals = [0.0, 0.0, 0.0, 0.0]
+        for scale_name, idx, module in model._iter_active_taskmoe():
+            beta_vals[idx] = float(module.residual_scale.detach().item())
 
     batch = next(iter(val_loader))
     ct = batch['ct'][:1].to(task.device, non_blocking=True)
@@ -170,6 +184,11 @@ def _verify_stage2_zero_step(task, val_loader):
     model.taskmoe_enabled = True
     model.train(was_training)
     print('[ZERO-STEP]', flush=True)
+    print(f'mode={mode}', flush=True)
+    print(f'beta_s1={beta_vals[0]}', flush=True)
+    print(f'beta_s2={beta_vals[1]}', flush=True)
+    print(f'beta_s3={beta_vals[2]}', flush=True)
+    print(f'beta_s4={beta_vals[3]}', flush=True)
     print(f'full_max_abs_diff={diffs["full"]}', flush=True)
     print(f'missing_max_abs_diff={diffs["missing"]}', flush=True)
     print('passed=True', flush=True)
@@ -195,6 +214,7 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params):
         for n, p in model.named_parameters()
         if p.requires_grad and _is_taskmoe_param_name(n)
     )
+    mode = getattr(model, 'taskmoe_mode', 'independent')
     print('[TRAIN MODE]', flush=True)
     print('mode=stage2_taskmoe', flush=True)
     print('[STAGE1]', flush=True)
@@ -208,16 +228,34 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params):
     print('finalize=False', flush=True)
     print('retrieve=True', flush=True)
     print('[TASKMOE]', flush=True)
-    print(f'scales={"+".join(model.taskmoe_scales).upper()}', flush=True)
-    for scale_name, _, module in model._iter_active_taskmoe():
-        print(
-            f'{scale_name}: channels={module.channels} '
-            f'num_experts={module.num_experts} top_k={module.top_k} '
-            f'residual_mode={module.residual_mode} '
-            f'beta_init={float(module.residual_scale.detach().item())} '
-            f'balance_loss_weight={module.balance_loss_weight}',
-            flush=True,
-        )
+    if mode == 'cross_scale_shared':
+        moe = model.cross_scale_taskmoe
+        beta = moe.beta.detach().float()
+        print('mode=cross_scale_shared', flush=True)
+        print('scales=S1+S2+S3+S4', flush=True)
+        print(f'expert_dim={moe.expert_dim}', flush=True)
+        print(f'num_experts={moe.num_experts}', flush=True)
+        print(f'top_k={moe.top_k}', flush=True)
+        print('shared_expert_bank=True', flush=True)
+        print('scale_specific_prompt=True', flush=True)
+        print('scale_specific_router=True', flush=True)
+        print(f'balance_loss_weight={moe.balance_loss_weight}', flush=True)
+        print(f'beta_s1={float(beta[0].item())}', flush=True)
+        print(f'beta_s2={float(beta[1].item())}', flush=True)
+        print(f'beta_s3={float(beta[2].item())}', flush=True)
+        print(f'beta_s4={float(beta[3].item())}', flush=True)
+    else:
+        print('mode=independent', flush=True)
+        print(f'scales={"+".join(model.taskmoe_scales).upper()}', flush=True)
+        for scale_name, _, module in model._iter_active_taskmoe():
+            print(
+                f'{scale_name}: channels={module.channels} '
+                f'num_experts={module.num_experts} top_k={module.top_k} '
+                f'residual_mode={module.residual_mode} '
+                f'beta_init={float(module.residual_scale.detach().item())} '
+                f'balance_loss_weight={module.balance_loss_weight}',
+                flush=True,
+            )
     print('[PARAMS]', flush=True)
     print(f'stage1_trainable={stage1_trainable}', flush=True)
     print(f'taskmoe_trainable={taskmoe_trainable}', flush=True)
@@ -233,6 +271,12 @@ def main():
 
     if not getattr(cfg, 'stage1_checkpoint', None):
         raise ValueError('Stage-2 TaskMoE training requires --stage1_checkpoint')
+    from models.dual_shared_add_baseline import _parse_taskmoe_scales
+    if str(getattr(cfg, 'taskmoe_mode', 'independent')).lower() == 'cross_scale_shared':
+        if _parse_taskmoe_scales(getattr(cfg, 'taskmoe_scales', 's4')) != ('s1', 's2', 's3', 's4'):
+            raise ValueError(
+                'cross_scale_shared TaskMoE is an all-scale module; use --taskmoe_scales all'
+            )
     _sync_cppi_config_from_stage1(cfg, cfg.stage1_checkpoint)
 
     with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
@@ -504,11 +548,51 @@ def main():
             'nonfinite_full_steps': nonfinite_full_steps,
             'nonfinite_missing_steps': nonfinite_missing_steps,
             'train_moe_balance_loss': moe_balance_accum / max(1, moe_balance_steps),
-            'taskmoe_beta': float(task.model.taskmoe_s4.residual_scale.detach().item()) if getattr(task.model, 'taskmoe_s4', None) is not None else 0.0,
-            'taskmoe_beta_s1': float(task.model.taskmoe_s1.residual_scale.detach().item()) if getattr(task.model, 'taskmoe_s1', None) is not None else 0.0,
-            'taskmoe_beta_s2': float(task.model.taskmoe_s2.residual_scale.detach().item()) if getattr(task.model, 'taskmoe_s2', None) is not None else 0.0,
-            'taskmoe_beta_s3': float(task.model.taskmoe_s3.residual_scale.detach().item()) if getattr(task.model, 'taskmoe_s3', None) is not None else 0.0,
-            'taskmoe_beta_s4': float(task.model.taskmoe_s4.residual_scale.detach().item()) if getattr(task.model, 'taskmoe_s4', None) is not None else 0.0,
+            'taskmoe_beta': (
+                float(task.model.cross_scale_taskmoe.beta[3].detach().item())
+                if getattr(task.model, 'taskmoe_mode', 'independent') == 'cross_scale_shared'
+                and getattr(task.model, 'cross_scale_taskmoe', None) is not None
+                else (
+                    float(task.model.taskmoe_s4.residual_scale.detach().item())
+                    if getattr(task.model, 'taskmoe_s4', None) is not None else 0.0
+                )
+            ),
+            'taskmoe_beta_s1': (
+                float(task.model.cross_scale_taskmoe.beta[0].detach().item())
+                if getattr(task.model, 'taskmoe_mode', 'independent') == 'cross_scale_shared'
+                and getattr(task.model, 'cross_scale_taskmoe', None) is not None
+                else (
+                    float(task.model.taskmoe_s1.residual_scale.detach().item())
+                    if getattr(task.model, 'taskmoe_s1', None) is not None else 0.0
+                )
+            ),
+            'taskmoe_beta_s2': (
+                float(task.model.cross_scale_taskmoe.beta[1].detach().item())
+                if getattr(task.model, 'taskmoe_mode', 'independent') == 'cross_scale_shared'
+                and getattr(task.model, 'cross_scale_taskmoe', None) is not None
+                else (
+                    float(task.model.taskmoe_s2.residual_scale.detach().item())
+                    if getattr(task.model, 'taskmoe_s2', None) is not None else 0.0
+                )
+            ),
+            'taskmoe_beta_s3': (
+                float(task.model.cross_scale_taskmoe.beta[2].detach().item())
+                if getattr(task.model, 'taskmoe_mode', 'independent') == 'cross_scale_shared'
+                and getattr(task.model, 'cross_scale_taskmoe', None) is not None
+                else (
+                    float(task.model.taskmoe_s3.residual_scale.detach().item())
+                    if getattr(task.model, 'taskmoe_s3', None) is not None else 0.0
+                )
+            ),
+            'taskmoe_beta_s4': (
+                float(task.model.cross_scale_taskmoe.beta[3].detach().item())
+                if getattr(task.model, 'taskmoe_mode', 'independent') == 'cross_scale_shared'
+                and getattr(task.model, 'cross_scale_taskmoe', None) is not None
+                else (
+                    float(task.model.taskmoe_s4.residual_scale.detach().item())
+                    if getattr(task.model, 'taskmoe_s4', None) is not None else 0.0
+                )
+            ),
             **{f'diag_{k}': v for k, v in diag_stats.items()},
         }
         append_epoch_log(

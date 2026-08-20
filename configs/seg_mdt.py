@@ -46,12 +46,25 @@ class SegMDTConfig(ConfigBase):
             help='Stage-1 best checkpoint for frozen TaskMoE Stage-2 training',
         )
         p.add_argument(
+            '--taskmoe_mode',
+            type=str,
+            default='independent',
+            choices=('independent', 'cross_scale_shared'),
+            help=(
+                'independent: per-scale TaskMoE (controlled by --taskmoe_scales). '
+                'cross_scale_shared: one CrossScaleSharedTaskMoE on S1-S4 with '
+                'scale-specific Prompt/Router and a shared Expert Bank '
+                '(requires --taskmoe_scales all).'
+            ),
+        )
+        p.add_argument(
             '--taskmoe_scales',
             type=str,
             default='s4',
             help=(
                 'TaskMoE insertion scales for Stage-2 ablation. '
-                'Examples: s4 | s3s4 | s2s3s4 | s1s2s3s4 | all | s1,s2,s3,s4'
+                'Examples: s4 | s3s4 | s2s3s4 | s1s2s3s4 | all | s1,s2,s3,s4. '
+                'For --taskmoe_mode cross_scale_shared, must be all/s1s2s3s4.'
             ),
         )
         return p

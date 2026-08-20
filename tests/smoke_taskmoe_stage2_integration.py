@@ -46,18 +46,24 @@ def _make_cfg(**kwargs):
         'stage1_checkpoint': DEFAULT_STAGE1_CKPT,
         'checkpoint_dir': '/tmp/taskmoe_stage2_smoke',
         'taskmoe_scales': 's4',
+        'taskmoe_mode': 'independent',
     }
     base.update(kwargs)
     return types.SimpleNamespace(**base)
 
 
-def _build_stage2(stage1_ckpt: str, taskmoe_scales: str = 's4'):
-    cfg = _make_cfg(stage1_checkpoint=stage1_ckpt, taskmoe_scales=taskmoe_scales)
+def _build_stage2(stage1_ckpt: str, taskmoe_scales: str = 's4', taskmoe_mode: str = 'independent'):
+    cfg = _make_cfg(
+        stage1_checkpoint=stage1_ckpt,
+        taskmoe_scales=taskmoe_scales,
+        taskmoe_mode=taskmoe_mode,
+    )
     _sync_cppi_config_from_stage1(cfg, stage1_ckpt)
     cfg.ct_pretrained_path = None
     cfg.pet_pretrained_path = None
     cfg.no_encoder_pretrained = True
     cfg.taskmoe_scales = taskmoe_scales
+    cfg.taskmoe_mode = taskmoe_mode
     networks = build_mdt_seg_teacher(cfg)
     model = networks['model']
     _load_stage1_for_taskmoe(model, stage1_ckpt)
@@ -242,6 +248,38 @@ def run_smoke(stage1_ckpt: str):
                 if n.startswith(f'taskmoe_{scale_name}.')
             ), scale_name
         print(f'[SMOKE] 13 multi_scale_ok scales={scales_opt}')
+
+    # 14) cross_scale_shared mode
+    model_s, task_s, _ = _build_stage2(
+        stage1_ckpt, taskmoe_scales='all', taskmoe_mode='cross_scale_shared'
+    )
+    model_s.to(device)
+    assert model_s.taskmoe_mode == 'cross_scale_shared'
+    assert model_s.cross_scale_taskmoe is not None
+    assert model_s.taskmoe_s1 is None and model_s.taskmoe_s4 is None
+    shared_names = [n for n, p in model_s.named_parameters() if p.requires_grad]
+    assert shared_names and all(n.startswith('cross_scale_taskmoe.') for n in shared_names)
+    batch_s = _fake_batch(device)
+    model_s.eval()
+    with torch.no_grad():
+        model_s.taskmoe_enabled = False
+        la = model_s(batch_s['ct'], pet=batch_s['pet'], forward_mode='full', mask=None)['logits']
+        model_s.taskmoe_enabled = True
+        lb = model_s(batch_s['ct'], pet=batch_s['pet'], forward_mode='full', mask=None)['logits']
+        assert float((la - lb).abs().max().item()) <= 1e-6
+        beta = model_s.cross_scale_taskmoe.beta.detach()
+        assert float(beta.abs().max().item()) <= 1e-12
+    model_s.train()
+    task_s.optimizer.zero_grad(set_to_none=True)
+    loss_s, _, _, stats_s = task_s.train_step(batch_s, forward_mode='missing')
+    assert stats_s['loss_moe_balance'].dtype == torch.float32
+    loss_s.backward()
+    assert any(
+        p.grad is not None and torch.isfinite(p.grad).all()
+        for n, p in model_s.named_parameters()
+        if n.startswith('cross_scale_taskmoe.') and p.requires_grad
+    )
+    print('[SMOKE] 14 cross_scale_shared_ok')
 
     trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
     print(f'[SMOKE] trainable_param_count={len(trainable_names)}')

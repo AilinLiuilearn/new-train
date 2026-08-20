@@ -368,12 +368,14 @@ def build_mdt_seg_teacher(config):
         cppi_build_stage=cppi_build_stage,
         cppi_output_dir=cppi_output_dir,
         taskmoe_scales=getattr(config, 'taskmoe_scales', 's4'),
+        taskmoe_mode=getattr(config, 'taskmoe_mode', 'independent'),
     )
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
         f'fusion=state_aware_weighted_add shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))} '
+        f'taskmoe_mode={getattr(config, "taskmoe_mode", "independent")} '
         f'taskmoe_scales={getattr(config, "taskmoe_scales", "s4")}'
     )
     print(f'[CPPI] enabled=True')

@@ -35,8 +35,8 @@ class MDTSegTeacher:
             bad = [n for n in trainable_names if not _is_taskmoe_param_name(n)]
             if bad:
                 raise RuntimeError(
-                    'Stage-2 TaskMoE mode requires all trainable params under '
-                    f'taskmoe_s{{1-4}}.*, but found: {bad}'
+                    'Stage-2 TaskMoE mode requires all trainable parameters '
+                    'to belong to the active TaskMoE module.'
                 )
         if not trainable_params:
             raise RuntimeError('No trainable parameters found for optimizer')
