@@ -79,6 +79,15 @@ class SegMDTConfig(ConfigBase):
                 'Applies to --taskmoe_mode cross_scale_shared; default preserves prior behavior.'
             ),
         )
+        p.add_argument(
+            '--stage2_train_decoder',
+            type=str2bool,
+            default=False,
+            help=(
+                'Whether to fine-tune the pretrained shared decoder together with TaskMoE '
+                'during Stage2. False preserves the original MoE-only Stage2 behavior.'
+            ),
+        )
         return p
 
     @staticmethod

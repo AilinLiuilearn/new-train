@@ -105,6 +105,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.stage2_moe_only = False
+        self.stage2_train_decoder = False
         self.taskmoe_enabled = True
         self.taskmoe_mode = str(taskmoe_mode or 'independent').strip().lower()
         if self.taskmoe_mode not in ('independent', 'cross_scale_shared'):
@@ -253,7 +254,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         out['aux'] = {} if aux is None else aux
         return out
 
-    def enable_stage2_moe_only(self):
+    def enable_stage2_moe_only(self, train_decoder=False):
         for p in self.parameters():
             p.requires_grad = False
         if self.taskmoe_mode == 'cross_scale_shared':
@@ -265,6 +266,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
             for _, _, module in self._iter_active_taskmoe():
                 for p in module.parameters():
                     p.requires_grad = True
+        self.stage2_train_decoder = bool(train_decoder)
+        if self.stage2_train_decoder:
+            for p in self.decoder.parameters():
+                p.requires_grad = True
         self.stage2_moe_only = True
 
     def train(self, mode=True):
@@ -275,8 +280,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
             self.ct_align.eval()
             self.pet_calibration.eval()
             self.fusion.eval()
-            self.decoder.eval()
             self.prototype_memory.eval()
+            if self.stage2_train_decoder:
+                self.decoder.train(mode)
+            else:
+                self.decoder.eval()
             for scale_name in ('s1', 's2', 's3', 's4'):
                 module = getattr(self, f'taskmoe_{scale_name}', None)
                 if module is not None:

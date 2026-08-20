@@ -48,6 +48,8 @@ def _make_cfg(**kwargs):
         'taskmoe_scales': 's4',
         'taskmoe_mode': 'independent',
         'taskmoe_residual_mode': 'zero_start',
+        'stage2_train_decoder': False,
+        'decoder_lr': 8e-6,
     }
     base.update(kwargs)
     return types.SimpleNamespace(**base)
@@ -58,12 +60,18 @@ def _build_stage2(
     taskmoe_scales: str = 's4',
     taskmoe_mode: str = 'independent',
     taskmoe_residual_mode: str = 'zero_start',
+    stage2_train_decoder: bool = False,
+    learning_rate: float = 8e-5,
+    decoder_lr: float = 8e-6,
 ):
     cfg = _make_cfg(
         stage1_checkpoint=stage1_ckpt,
         taskmoe_scales=taskmoe_scales,
         taskmoe_mode=taskmoe_mode,
         taskmoe_residual_mode=taskmoe_residual_mode,
+        stage2_train_decoder=stage2_train_decoder,
+        learning_rate=learning_rate,
+        decoder_lr=decoder_lr,
     )
     _sync_cppi_config_from_stage1(cfg, stage1_ckpt)
     cfg.ct_pretrained_path = None
@@ -72,10 +80,13 @@ def _build_stage2(
     cfg.taskmoe_scales = taskmoe_scales
     cfg.taskmoe_mode = taskmoe_mode
     cfg.taskmoe_residual_mode = taskmoe_residual_mode
+    cfg.stage2_train_decoder = stage2_train_decoder
+    cfg.learning_rate = learning_rate
+    cfg.decoder_lr = decoder_lr
     networks = build_mdt_seg_teacher(cfg)
     model = networks['model']
     _load_stage1_for_taskmoe(model, stage1_ckpt)
-    model.enable_stage2_moe_only()
+    model.enable_stage2_moe_only(train_decoder=bool(stage2_train_decoder))
     task = MDTSegTeacher(networks, cfg)
     return model, task, cfg
 

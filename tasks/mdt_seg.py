@@ -32,19 +32,82 @@ class MDTSegTeacher:
         print(f'[OPTIM] trainable_param_names={trainable_names}', flush=True)
         if bool(getattr(self.model, 'stage2_moe_only', False)):
             from models.dual_shared_add_baseline import _is_taskmoe_param_name
-            bad = [n for n in trainable_names if not _is_taskmoe_param_name(n)]
+            train_decoder = bool(getattr(self.model, 'stage2_train_decoder', False))
+
+            def _allowed(name):
+                if _is_taskmoe_param_name(name):
+                    return True
+                if train_decoder and name.startswith('decoder.'):
+                    return True
+                return False
+
+            bad = [n for n in trainable_names if not _allowed(n)]
             if bad:
                 raise RuntimeError(
-                    'Stage-2 TaskMoE mode requires all trainable parameters '
-                    'to belong to the active TaskMoE module.'
+                    'Stage-2 TaskMoE mode requires all trainable parameters to belong '
+                    'to the active TaskMoE module'
+                    + (' or decoder.' if train_decoder else '.')
+                    + f' Unexpected: {bad[:8]}'
                 )
-        if not trainable_params:
-            raise RuntimeError('No trainable parameters found for optimizer')
-        self.optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay,
-        )
+
+            taskmoe_params = [
+                p for n, p in self.model.named_parameters()
+                if p.requires_grad and _is_taskmoe_param_name(n)
+            ]
+            decoder_params = [
+                p for n, p in self.model.named_parameters()
+                if p.requires_grad and n.startswith('decoder.')
+            ]
+            if not taskmoe_params:
+                raise RuntimeError('Stage-2 requires non-empty TaskMoE trainable parameters')
+            if train_decoder:
+                if not decoder_params:
+                    raise RuntimeError('stage2_train_decoder=True but no decoder params trainable')
+                taskmoe_ids = {id(p) for p in taskmoe_params}
+                decoder_ids = {id(p) for p in decoder_params}
+                if taskmoe_ids & decoder_ids:
+                    raise RuntimeError('TaskMoE and decoder optimizer groups overlap')
+                other = [
+                    n for n, p in self.model.named_parameters()
+                    if p.requires_grad and id(p) not in taskmoe_ids and id(p) not in decoder_ids
+                ]
+                if other:
+                    raise RuntimeError(f'Unexpected trainable params outside TaskMoE/decoder: {other}')
+                self.optimizer = torch.optim.AdamW(
+                    [
+                        {
+                            'params': taskmoe_params,
+                            'lr': config.learning_rate,
+                            'name': 'taskmoe',
+                        },
+                        {
+                            'params': decoder_params,
+                            'lr': config.decoder_lr,
+                            'name': 'decoder',
+                        },
+                    ],
+                    weight_decay=config.weight_decay,
+                )
+                print(
+                    f'[OPTIM] dual_groups taskmoe_lr={config.learning_rate} '
+                    f'decoder_lr={config.decoder_lr} '
+                    f'taskmoe_n={len(taskmoe_params)} decoder_n={len(decoder_params)}',
+                    flush=True,
+                )
+            else:
+                self.optimizer = torch.optim.AdamW(
+                    taskmoe_params,
+                    lr=config.learning_rate,
+                    weight_decay=config.weight_decay,
+                )
+        else:
+            if not trainable_params:
+                raise RuntimeError('No trainable parameters found for optimizer')
+            self.optimizer = torch.optim.AdamW(
+                trainable_params,
+                lr=config.learning_rate,
+                weight_decay=config.weight_decay,
+            )
         self.scheduler = None
         self.scaler = torch.cuda.amp.GradScaler(enabled=bool(config.mixed_precision))
         self.global_batch_step = 0

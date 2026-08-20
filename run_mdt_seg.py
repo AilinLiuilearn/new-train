@@ -258,19 +258,37 @@ def _count_parameters(model):
     return total, trainable
 
 
-def _print_stage2_startup(model, cfg, total_params, trainable_params):
+def _optimizer_group_lr(optimizer, name, default=0.0):
+    for group in optimizer.param_groups:
+        if group.get('name') == name:
+            return float(group['lr'])
+    if name == 'taskmoe' and optimizer.param_groups:
+        # Legacy single-group Stage2 MoE-only optimizer.
+        return float(optimizer.param_groups[0]['lr'])
+    return float(default)
+
+
+def _print_stage2_startup(model, cfg, total_params, trainable_params, optimizer=None):
     from models.dual_shared_add_baseline import _is_taskmoe_param_name
 
-    stage1_trainable = sum(
-        p.numel()
-        for n, p in model.named_parameters()
-        if p.requires_grad and not _is_taskmoe_param_name(n)
-    )
     taskmoe_trainable = sum(
         p.numel()
         for n, p in model.named_parameters()
         if p.requires_grad and _is_taskmoe_param_name(n)
     )
+    decoder_trainable = sum(
+        p.numel()
+        for n, p in model.named_parameters()
+        if p.requires_grad and n.startswith('decoder.')
+    )
+    stage1_core_trainable = sum(
+        p.numel()
+        for n, p in model.named_parameters()
+        if p.requires_grad
+        and not _is_taskmoe_param_name(n)
+        and not n.startswith('decoder.')
+    )
+    train_decoder = bool(getattr(model, 'stage2_train_decoder', False))
     mode = getattr(model, 'taskmoe_mode', 'independent')
     print('[TRAIN MODE]', flush=True)
     print('mode=stage2_taskmoe', flush=True)
@@ -320,8 +338,24 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params):
                 f'balance_loss_weight={module.balance_loss_weight}',
                 flush=True,
             )
+    moe_lr = float(getattr(cfg, 'learning_rate', 0.0))
+    dec_lr = float(getattr(cfg, 'decoder_lr', 0.0)) if train_decoder else 0.0
+    if optimizer is not None:
+        moe_lr = _optimizer_group_lr(optimizer, 'taskmoe', default=moe_lr)
+        dec_lr = _optimizer_group_lr(optimizer, 'decoder', default=0.0) if train_decoder else 0.0
+    ratio = (dec_lr / moe_lr) if moe_lr > 0 else 0.0
+    print('[STAGE2 TRAINABLE]', flush=True)
+    print(f'taskmoe_trainable={taskmoe_trainable}', flush=True)
+    print(f'decoder_enabled={train_decoder}', flush=True)
+    print(f'decoder_trainable={decoder_trainable}', flush=True)
+    print(f'stage1_core_trainable={stage1_core_trainable}', flush=True)
+    print('[LEARNING RATE]', flush=True)
+    print(f'taskmoe_lr={moe_lr}', flush=True)
+    print(f'decoder_lr={dec_lr}', flush=True)
+    print(f'decoder_lr_ratio={ratio}', flush=True)
     print('[PARAMS]', flush=True)
-    print(f'stage1_trainable={stage1_trainable}', flush=True)
+    # Keep legacy key for older log parsers: stage1_core only.
+    print(f'stage1_trainable={stage1_core_trainable}', flush=True)
     print(f'taskmoe_trainable={taskmoe_trainable}', flush=True)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
 
@@ -352,11 +386,15 @@ def main():
     networks = build_mdt_seg_teacher(cfg)
     model = networks['model']
     _load_stage1_for_taskmoe(model, cfg.stage1_checkpoint)
-    model.enable_stage2_moe_only()
+    model.enable_stage2_moe_only(
+        train_decoder=bool(getattr(cfg, 'stage2_train_decoder', False))
+    )
     task = MDTSegTeacher(networks, cfg)
 
     total_params, trainable_params = _count_parameters(task.model)
-    _print_stage2_startup(task.model, cfg, total_params, trainable_params)
+    _print_stage2_startup(
+        task.model, cfg, total_params, trainable_params, optimizer=task.optimizer
+    )
     _verify_stage2_zero_step(task, val_loader)
 
     task.scheduler = get_cosine_scheduler(
@@ -385,6 +423,7 @@ def main():
         'taskmoe_delta_ratio_s3', 'taskmoe_delta_ratio_s4',
         'taskmoe_delta_l2_ratio_s1', 'taskmoe_delta_l2_ratio_s2',
         'taskmoe_delta_l2_ratio_s3', 'taskmoe_delta_l2_ratio_s4',
+        'lr_taskmoe', 'lr_decoder',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
 
@@ -683,19 +722,31 @@ def main():
             'taskmoe_delta_l2_ratio_s2': delta_l2_ratio_accum['s2'] / max(1, delta_ratio_steps),
             'taskmoe_delta_l2_ratio_s3': delta_l2_ratio_accum['s3'] / max(1, delta_ratio_steps),
             'taskmoe_delta_l2_ratio_s4': delta_l2_ratio_accum['s4'] / max(1, delta_ratio_steps),
+            'lr_taskmoe': _optimizer_group_lr(task.optimizer, 'taskmoe'),
+            'lr_decoder': (
+                _optimizer_group_lr(task.optimizer, 'decoder', default=0.0)
+                if bool(getattr(task.model, 'stage2_train_decoder', False))
+                else 0.0
+            ),
             **{f'diag_{k}': v for k, v in diag_stats.items()},
         }
+        lr_taskmoe = extra_metrics['lr_taskmoe']
+        lr_decoder = extra_metrics['lr_decoder']
         append_epoch_log(
             os.path.join(cfg.checkpoint_dir, 'train_log.csv'),
             epoch,
             train_loss,
             {'total_loss': val_loss, 'dice': val_dice, 'iou': val_iou, 'acc': val_acc, 'acc_pixel': val_acc_pixel, 'hd95': val_hd95},
-            lr=task.optimizer.param_groups[0]['lr'],
+            lr=lr_taskmoe,
             grad_norm=avg_grad_norm,
             extra_metrics=extra_metrics,
         )
 
-        print(f'[EPOCH {epoch}] joint_dice={joint_dice:.4f} best_joint={best_joint:.4f} lr={task.optimizer.param_groups[0]["lr"]:.8f}', flush=True)
+        print(
+            f'[EPOCH {epoch}] joint_dice={joint_dice:.4f} best_joint={best_joint:.4f} '
+            f'lr_taskmoe={lr_taskmoe:.8f} lr_decoder={lr_decoder:.8f}',
+            flush=True,
+        )
         if no_improve >= patience:
             print(f'[EARLY STOP] no improvement for {patience} epochs', flush=True)
             break
