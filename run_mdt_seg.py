@@ -136,8 +136,48 @@ def _load_stage1_for_taskmoe(model, checkpoint_path):
 def _verify_stage2_zero_step(task, val_loader):
     model = task.model
     mode = getattr(model, 'taskmoe_mode', 'independent')
+    residual_mode = getattr(model, 'taskmoe_residual_mode', 'zero_start')
+    if mode == 'cross_scale_shared':
+        residual_mode = getattr(model.cross_scale_taskmoe, 'residual_mode', residual_mode)
+
+    batch = next(iter(val_loader))
+    ct = batch['ct'][:1].to(task.device, non_blocking=True)
+    pet = batch['pet'][:1].to(task.device, non_blocking=True)
+    was_training = model.training
+    model.eval()
+
+    # paper residual: step-0 is NOT Stage-1 identity; run finite/shape checks only.
+    if mode == 'cross_scale_shared' and residual_mode == 'paper':
+        model.taskmoe_enabled = True
+        route_ok = {}
+        for route in ('full', 'missing'):
+            out = model(ct, pet=pet, forward_mode=route, mask=None)
+            logits = out['logits']
+            moe_loss = out.get('aux', {}).get('taskmoe_balance_loss')
+            moe_stats = out.get('aux', {}).get('taskmoe_stats', {}) or {}
+            if not torch.isfinite(logits).all():
+                model.train(was_training)
+                raise RuntimeError(f'paper residual: non-finite logits on {route}')
+            if moe_loss is None or not torch.isfinite(moe_loss):
+                model.train(was_training)
+                raise RuntimeError(f'paper residual: non-finite balance loss on {route}')
+            for s in (1, 2, 3, 4):
+                key = f's{s}_delta_feat_ratio'
+                if key not in moe_stats or not torch.isfinite(moe_stats[key]):
+                    model.train(was_training)
+                    raise RuntimeError(f'paper residual: bad residual stats {key} on {route}')
+            route_ok[route] = True
+        model.train(was_training)
+        print('[INITIAL RESIDUAL CHECK]', flush=True)
+        print('residual_mode=paper', flush=True)
+        print(f'full_forward_finite={route_ok["full"]}', flush=True)
+        print(f'missing_forward_finite={route_ok["missing"]}', flush=True)
+        print('passed=True', flush=True)
+        return {'full': None, 'missing': None, 'residual_mode': 'paper'}
 
     if mode == 'cross_scale_shared':
+        if model.cross_scale_taskmoe.beta is None:
+            raise RuntimeError('zero_start shared TaskMoE requires learnable beta')
         beta = model.cross_scale_taskmoe.beta.detach().float()
         if float(beta.abs().max().item()) > 1e-12:
             raise RuntimeError(
@@ -154,12 +194,6 @@ def _verify_stage2_zero_step(task, val_loader):
         beta_vals = [0.0, 0.0, 0.0, 0.0]
         for scale_name, idx, module in model._iter_active_taskmoe():
             beta_vals[idx] = float(module.residual_scale.detach().item())
-
-    batch = next(iter(val_loader))
-    ct = batch['ct'][:1].to(task.device, non_blocking=True)
-    pet = batch['pet'][:1].to(task.device, non_blocking=True)
-    was_training = model.training
-    model.eval()
 
     diffs = {}
     for route in ('full', 'missing'):
@@ -185,6 +219,7 @@ def _verify_stage2_zero_step(task, val_loader):
     model.train(was_training)
     print('[ZERO-STEP]', flush=True)
     print(f'mode={mode}', flush=True)
+    print(f'residual_mode={residual_mode}', flush=True)
     print(f'beta_s1={beta_vals[0]}', flush=True)
     print(f'beta_s2={beta_vals[1]}', flush=True)
     print(f'beta_s3={beta_vals[2]}', flush=True)
@@ -193,6 +228,28 @@ def _verify_stage2_zero_step(task, val_loader):
     print(f'missing_max_abs_diff={diffs["missing"]}', flush=True)
     print('passed=True', flush=True)
     return diffs
+
+
+def _shared_taskmoe_beta_log_values(model):
+    """CSV beta columns for shared TaskMoE.
+
+    zero_start: real learnable beta.
+    paper: display 1.0 meaning F + 1*DeltaF (NOT a learnable parameter).
+    """
+    moe = getattr(model, 'cross_scale_taskmoe', None)
+    if moe is None:
+        return None
+    if getattr(moe, 'residual_mode', 'zero_start') == 'paper' or moe.beta is None:
+        # Display-only identity coefficient for F_base + DeltaF logging.
+        return (1.0, 1.0, 1.0, 1.0, 1.0)  # beta, s1, s2, s3, s4
+    beta = moe.beta.detach().float()
+    return (
+        float(beta[3].item()),
+        float(beta[0].item()),
+        float(beta[1].item()),
+        float(beta[2].item()),
+        float(beta[3].item()),
+    )
 
 
 def _count_parameters(model):
@@ -230,8 +287,9 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params):
     print('[TASKMOE]', flush=True)
     if mode == 'cross_scale_shared':
         moe = model.cross_scale_taskmoe
-        beta = moe.beta.detach().float()
+        residual_mode = getattr(moe, 'residual_mode', 'zero_start')
         print('mode=cross_scale_shared', flush=True)
+        print(f'residual_mode={residual_mode}', flush=True)
         print('scales=S1+S2+S3+S4', flush=True)
         print(f'expert_dim={moe.expert_dim}', flush=True)
         print(f'num_experts={moe.num_experts}', flush=True)
@@ -240,10 +298,16 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params):
         print('scale_specific_prompt=True', flush=True)
         print('scale_specific_router=True', flush=True)
         print(f'balance_loss_weight={moe.balance_loss_weight}', flush=True)
-        print(f'beta_s1={float(beta[0].item())}', flush=True)
-        print(f'beta_s2={float(beta[1].item())}', flush=True)
-        print(f'beta_s3={float(beta[2].item())}', flush=True)
-        print(f'beta_s4={float(beta[3].item())}', flush=True)
+        if residual_mode == 'paper':
+            print('learnable_beta=False', flush=True)
+            print('residual_formula=F_base+DeltaF', flush=True)
+            print(f'has_beta_parameter={moe.beta is not None}', flush=True)
+        else:
+            beta = moe.beta.detach().float()
+            print(f'beta_s1={float(beta[0].item())}', flush=True)
+            print(f'beta_s2={float(beta[1].item())}', flush=True)
+            print(f'beta_s3={float(beta[2].item())}', flush=True)
+            print(f'beta_s4={float(beta[3].item())}', flush=True)
     else:
         print('mode=independent', flush=True)
         print(f'scales={"+".join(model.taskmoe_scales).upper()}', flush=True)
@@ -317,6 +381,10 @@ def main():
         'nonfinite_full_steps', 'nonfinite_missing_steps',
         'train_moe_balance_loss', 'taskmoe_beta',
         'taskmoe_beta_s1', 'taskmoe_beta_s2', 'taskmoe_beta_s3', 'taskmoe_beta_s4',
+        'taskmoe_delta_ratio_s1', 'taskmoe_delta_ratio_s2',
+        'taskmoe_delta_ratio_s3', 'taskmoe_delta_ratio_s4',
+        'taskmoe_delta_l2_ratio_s1', 'taskmoe_delta_l2_ratio_s2',
+        'taskmoe_delta_l2_ratio_s3', 'taskmoe_delta_l2_ratio_s4',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
 
@@ -336,6 +404,9 @@ def main():
         full_loss = missing_loss = 0.0
         moe_balance_accum = 0.0
         moe_balance_steps = 0
+        delta_ratio_accum = {f's{i}': 0.0 for i in range(1, 5)}
+        delta_l2_ratio_accum = {f's{i}': 0.0 for i in range(1, 5)}
+        delta_ratio_steps = 0
         nonfinite_grad_steps = 0
         skipped_optimizer_steps = 0
         nonfinite_full_steps = 0
@@ -354,9 +425,20 @@ def main():
             route = 'full' if global_batch_step % 2 == 0 else 'missing'
             task.optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
-                loss, _, _, stats = task.train_step(batch, forward_mode=route)
+                loss, _, outputs, stats = task.train_step(batch, forward_mode=route)
             if not torch.isfinite(loss):
                 raise RuntimeError('loss became non-finite')
+
+            moe_stats = (outputs.get('aux', {}) or {}).get('taskmoe_stats', {}) or {}
+            if moe_stats:
+                for i in range(1, 5):
+                    rkey = f's{i}_delta_feat_ratio'
+                    lkey = f's{i}_delta_feat_l2_ratio'
+                    if rkey in moe_stats:
+                        delta_ratio_accum[f's{i}'] += float(moe_stats[rkey].detach())
+                    if lkey in moe_stats:
+                        delta_l2_ratio_accum[f's{i}'] += float(moe_stats[lkey].detach())
+                delta_ratio_steps += 1
 
             if task.scaler.is_enabled():
                 task.scaler.scale(loss).backward()
@@ -549,7 +631,7 @@ def main():
             'nonfinite_missing_steps': nonfinite_missing_steps,
             'train_moe_balance_loss': moe_balance_accum / max(1, moe_balance_steps),
             'taskmoe_beta': (
-                float(task.model.cross_scale_taskmoe.beta[3].detach().item())
+                _shared_taskmoe_beta_log_values(task.model)[0]
                 if getattr(task.model, 'taskmoe_mode', 'independent') == 'cross_scale_shared'
                 and getattr(task.model, 'cross_scale_taskmoe', None) is not None
                 else (
@@ -558,7 +640,7 @@ def main():
                 )
             ),
             'taskmoe_beta_s1': (
-                float(task.model.cross_scale_taskmoe.beta[0].detach().item())
+                _shared_taskmoe_beta_log_values(task.model)[1]
                 if getattr(task.model, 'taskmoe_mode', 'independent') == 'cross_scale_shared'
                 and getattr(task.model, 'cross_scale_taskmoe', None) is not None
                 else (
@@ -567,7 +649,7 @@ def main():
                 )
             ),
             'taskmoe_beta_s2': (
-                float(task.model.cross_scale_taskmoe.beta[1].detach().item())
+                _shared_taskmoe_beta_log_values(task.model)[2]
                 if getattr(task.model, 'taskmoe_mode', 'independent') == 'cross_scale_shared'
                 and getattr(task.model, 'cross_scale_taskmoe', None) is not None
                 else (
@@ -576,7 +658,7 @@ def main():
                 )
             ),
             'taskmoe_beta_s3': (
-                float(task.model.cross_scale_taskmoe.beta[2].detach().item())
+                _shared_taskmoe_beta_log_values(task.model)[3]
                 if getattr(task.model, 'taskmoe_mode', 'independent') == 'cross_scale_shared'
                 and getattr(task.model, 'cross_scale_taskmoe', None) is not None
                 else (
@@ -585,7 +667,7 @@ def main():
                 )
             ),
             'taskmoe_beta_s4': (
-                float(task.model.cross_scale_taskmoe.beta[3].detach().item())
+                _shared_taskmoe_beta_log_values(task.model)[4]
                 if getattr(task.model, 'taskmoe_mode', 'independent') == 'cross_scale_shared'
                 and getattr(task.model, 'cross_scale_taskmoe', None) is not None
                 else (
@@ -593,6 +675,14 @@ def main():
                     if getattr(task.model, 'taskmoe_s4', None) is not None else 0.0
                 )
             ),
+            'taskmoe_delta_ratio_s1': delta_ratio_accum['s1'] / max(1, delta_ratio_steps),
+            'taskmoe_delta_ratio_s2': delta_ratio_accum['s2'] / max(1, delta_ratio_steps),
+            'taskmoe_delta_ratio_s3': delta_ratio_accum['s3'] / max(1, delta_ratio_steps),
+            'taskmoe_delta_ratio_s4': delta_ratio_accum['s4'] / max(1, delta_ratio_steps),
+            'taskmoe_delta_l2_ratio_s1': delta_l2_ratio_accum['s1'] / max(1, delta_ratio_steps),
+            'taskmoe_delta_l2_ratio_s2': delta_l2_ratio_accum['s2'] / max(1, delta_ratio_steps),
+            'taskmoe_delta_l2_ratio_s3': delta_l2_ratio_accum['s3'] / max(1, delta_ratio_steps),
+            'taskmoe_delta_l2_ratio_s4': delta_l2_ratio_accum['s4'] / max(1, delta_ratio_steps),
             **{f'diag_{k}': v for k, v in diag_stats.items()},
         }
         append_epoch_log(

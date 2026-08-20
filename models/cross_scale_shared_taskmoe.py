@@ -2,13 +2,12 @@
 
 Design goal
 -----------
-Keep the already-validated all-scale Stage-1 fused features unchanged on the
-main residual path, and refine all four scales with one *shared expert bank*.
-Each scale keeps its own:
+Keep the already-validated all-scale Stage-1 fused features on the main path,
+and refine all four scales with one *shared expert bank*. Each scale keeps:
     1) TG-ECNet-style TaskPrompt generator,
     2) input/output projection,
     3) task-aware Noisy Top-K router,
-    4) zero-start residual beta.
+    4) residual combination controlled by residual_mode.
 
 The expert bank itself is shared across S1/S2/S3/S4.
 
@@ -22,6 +21,15 @@ This file intentionally preserves the previously validated TaskMoE choices
 (num_experts=6, top_k=2, mlp_ratio=2.0) so that the *only major structural
 change* is: four independent expert banks -> one cross-scale shared expert bank.
 
+Residual modes:
+    - zero_start:
+      F_out = F_base + beta_s * DeltaF,
+      beta_s initialized from 0 (learnable).
+    - paper:
+      F_out = F_base + DeltaF,
+      no external learnable residual scaling.
+      Router + Expert themselves learn residual correction magnitude.
+
 Reference idea:
     TG-ECNet / TaskMoE (ICML 2025)
     - CondNet + GAP -> softmax prompt dictionary
@@ -33,7 +41,6 @@ PET-CT-specific adaptation:
     - all-scale fused features are Stage-1 outputs
     - scale-specific routers, shared expert bank
     - low-dimensional residual refinement branch
-    - beta is zero-initialized so step-0 output exactly equals Stage-1 input
 """
 
 from __future__ import annotations
@@ -370,7 +377,9 @@ class CrossScaleSharedTaskMoE(nn.Module):
           -> scale-specific router([token, prompt])
           -> SAME shared expert bank for all scales
           -> scale-specific out projection -> Delta F_s
-          -> F_s^out = F_s^base + beta_s * Delta F_s
+          -> residual:
+               zero_start: F_s^out = F_s^base + beta_s * Delta F_s
+               paper:      F_s^out = F_s^base + Delta F_s
 
     This keeps the all-stage paradigm while replacing four independent expert
     banks with one shared bank.
@@ -390,9 +399,19 @@ class CrossScaleSharedTaskMoE(nn.Module):
         noisy_gating: bool = True,
         noise_epsilon: float = 1e-2,
         balance_loss_weight: float = 0.1,
-        zero_start: bool = True,
+        residual_mode: str = "zero_start",
+        zero_start: bool | None = None,
     ) -> None:
         super().__init__()
+
+        # Backward-compatible alias: zero_start=True/False -> residual_mode.
+        if zero_start is not None:
+            residual_mode = "zero_start" if bool(zero_start) else "paper"
+        residual_mode = str(residual_mode).strip().lower()
+        if residual_mode not in {"zero_start", "paper"}:
+            raise ValueError(
+                f"residual_mode must be 'zero_start' or 'paper', got {residual_mode!r}"
+            )
 
         self.channels = tuple(channels)
         self.num_scales = len(self.channels)
@@ -400,6 +419,7 @@ class CrossScaleSharedTaskMoE(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.balance_loss_weight = float(balance_loss_weight)
+        self.residual_mode = residual_mode
 
         self.scale_adapters = nn.ModuleList(
             [
@@ -426,8 +446,11 @@ class CrossScaleSharedTaskMoE(nn.Module):
             dropout=dropout,
         )
 
-        beta_init = 0.0 if zero_start else 1.0
-        self.beta = nn.Parameter(torch.full((self.num_scales,), beta_init))
+        if self.residual_mode == "zero_start":
+            self.beta = nn.Parameter(torch.zeros(self.num_scales))
+        else:
+            # paper: no learnable residual scale; F_out = F_base + DeltaF.
+            self.register_parameter("beta", None)
 
     def forward(self, features: Sequence[torch.Tensor]) -> CrossScaleTaskMoEOutput:
         if len(features) != self.num_scales:
@@ -483,8 +506,12 @@ class CrossScaleSharedTaskMoE(nn.Module):
             delta = adapter.out_proj(expert_map)
             delta = delta.to(feat_dtype)
 
-            beta_s = self.beta[scale_idx - 1].to(dtype=feat_dtype)
-            out = feat + beta_s * delta
+            if self.residual_mode == "zero_start":
+                beta_s = self.beta[scale_idx - 1].to(dtype=feat_dtype)
+                out = feat + beta_s * delta
+            else:
+                # paper: no external residual scaling.
+                out = feat + delta
             out_features.append(out)
 
             # Keep the same per-scale balance regularization strength as the
@@ -494,7 +521,22 @@ class CrossScaleSharedTaskMoE(nn.Module):
 
             prefix = f"s{scale_idx}"
             stats[f"{prefix}_balance_raw"] = raw_balance.detach().float()
-            stats[f"{prefix}_beta"] = self.beta[scale_idx - 1].detach().float()
+            if self.residual_mode == "zero_start":
+                stats[f"{prefix}_beta"] = self.beta[scale_idx - 1].detach().float()
+            # Residual strength diagnostics (detached; never used in loss).
+            delta_f = delta.detach().float()
+            feat_f = feat.detach().float()
+            delta_abs_mean = delta_f.abs().mean()
+            feat_abs_mean = feat_f.abs().mean()
+            delta_l2 = torch.linalg.vector_norm(
+                delta_f.reshape(delta_f.shape[0], -1), dim=1
+            ).mean()
+            feat_l2 = torch.linalg.vector_norm(
+                feat_f.reshape(feat_f.shape[0], -1), dim=1
+            ).mean()
+            stats[f"{prefix}_delta_abs_mean"] = delta_abs_mean
+            stats[f"{prefix}_delta_feat_ratio"] = delta_abs_mean / (feat_abs_mean + 1e-8)
+            stats[f"{prefix}_delta_feat_l2_ratio"] = delta_l2 / (feat_l2 + 1e-8)
             stats[f"{prefix}_importance"] = router_stats["importance"]
             stats[f"{prefix}_load"] = router_stats["load"]
             stats[f"{prefix}_atom_entropy"] = (
@@ -505,6 +547,10 @@ class CrossScaleSharedTaskMoE(nn.Module):
             )
 
         stats["balance_loss"] = total_balance.detach().float()
+        stats["residual_mode"] = torch.tensor(
+            0 if self.residual_mode == "zero_start" else 1,
+            device=total_balance.device,
+        )
         return CrossScaleTaskMoEOutput(
             features=out_features,
             balance_loss=total_balance,
@@ -521,21 +567,8 @@ def count_trainable_parameters(module: nn.Module) -> int:
 
 
 def _smoke_test() -> None:
-    """CPU smoke test with reduced spatial sizes; validates shapes + zero-start."""
+    """CPU smoke test with reduced spatial sizes; validates both residual modes."""
     torch.manual_seed(0)
-
-    model = CrossScaleSharedTaskMoE(
-        channels=(64, 128, 320, 512),
-        expert_dim=128,
-        num_experts=6,
-        top_k=2,
-        atom_num=32,
-        atom_dim=256,
-        mlp_ratio=2.0,
-        balance_loss_weight=0.1,
-        zero_start=True,
-    )
-    model.train()
 
     # S4 must remain >= 9x9 because the original CondNet contains two
     # kernel=3,stride=3 convolutions without padding.
@@ -546,21 +579,38 @@ def _smoke_test() -> None:
         torch.randn(1, 512, 9, 9),
     ]
 
-    out = model(feats)
+    zs = CrossScaleSharedTaskMoE(
+        channels=(64, 128, 320, 512),
+        residual_mode="zero_start",
+    )
+    zs.train()
+    out_zs = zs(feats)
+    for i, (x, y) in enumerate(zip(feats, out_zs.features), start=1):
+        assert x.shape == y.shape
+        assert (x - y).abs().max().item() == 0.0
+    assert zs.beta is not None
 
-    for i, (x, y) in enumerate(zip(feats, out.features), start=1):
-        assert x.shape == y.shape, (i, x.shape, y.shape)
-        # beta=0 -> exact Stage-1 identity at step 0.
-        max_diff = (x - y).abs().max().item()
-        assert max_diff == 0.0, f"S{i} zero-start failed: max_diff={max_diff}"
-
-    loss = sum(y.mean() for y in out.features) + out.balance_loss
+    paper = CrossScaleSharedTaskMoE(
+        channels=(64, 128, 320, 512),
+        residual_mode="paper",
+    )
+    paper.train()
+    out_p = paper([f.clone() for f in feats])
+    for i, (x, y) in enumerate(zip(feats, out_p.features), start=1):
+        assert x.shape == y.shape
+        assert torch.isfinite(y).all()
+        assert torch.isfinite(out_p.stats[f"s{i}_delta_feat_ratio"])
+    assert paper.beta is None
+    assert torch.isfinite(out_p.balance_loss)
+    loss = sum(y.mean() for y in out_p.features) + out_p.balance_loss
     loss.backward()
+    for n, p in paper.named_parameters():
+        if p.grad is not None:
+            assert torch.isfinite(p.grad).all(), n
 
     print("CrossScaleSharedTaskMoE smoke test: PASS")
-    print(f"Trainable params: {count_trainable_parameters(model):,}")
-    print(f"Balance loss: {float(out.balance_loss.detach()):.6f}")
-    print("Betas:", [float(model.beta[i].detach()) for i in range(4)])
+    print(f"zero_start params: {count_trainable_parameters(zs):,}")
+    print(f"paper params: {count_trainable_parameters(paper):,}")
 
 
 if __name__ == "__main__":

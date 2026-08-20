@@ -67,6 +67,18 @@ class SegMDTConfig(ConfigBase):
                 'For --taskmoe_mode cross_scale_shared, must be all/s1s2s3s4.'
             ),
         )
+        p.add_argument(
+            '--taskmoe_residual_mode',
+            type=str,
+            default='zero_start',
+            choices=('zero_start', 'paper'),
+            help=(
+                'Shared TaskMoE residual combination. '
+                'zero_start: F_out = F_base + beta * DeltaF, learnable beta initialized to zero. '
+                'paper: F_out = F_base + DeltaF, no learnable residual scaling. '
+                'Applies to --taskmoe_mode cross_scale_shared; default preserves prior behavior.'
+            ),
+        )
         return p
 
     @staticmethod

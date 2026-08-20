@@ -369,6 +369,7 @@ def build_mdt_seg_teacher(config):
         cppi_output_dir=cppi_output_dir,
         taskmoe_scales=getattr(config, 'taskmoe_scales', 's4'),
         taskmoe_mode=getattr(config, 'taskmoe_mode', 'independent'),
+        taskmoe_residual_mode=getattr(config, 'taskmoe_residual_mode', 'zero_start'),
     )
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
@@ -376,7 +377,8 @@ def build_mdt_seg_teacher(config):
         f'fusion=state_aware_weighted_add shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))} '
         f'taskmoe_mode={getattr(config, "taskmoe_mode", "independent")} '
-        f'taskmoe_scales={getattr(config, "taskmoe_scales", "s4")}'
+        f'taskmoe_scales={getattr(config, "taskmoe_scales", "s4")} '
+        f'taskmoe_residual_mode={getattr(config, "taskmoe_residual_mode", "zero_start")}'
     )
     print(f'[CPPI] enabled=True')
     print(f'[CPPI] num_clusters={cppi_num_clusters}')

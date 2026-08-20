@@ -47,16 +47,23 @@ def _make_cfg(**kwargs):
         'checkpoint_dir': '/tmp/taskmoe_stage2_smoke',
         'taskmoe_scales': 's4',
         'taskmoe_mode': 'independent',
+        'taskmoe_residual_mode': 'zero_start',
     }
     base.update(kwargs)
     return types.SimpleNamespace(**base)
 
 
-def _build_stage2(stage1_ckpt: str, taskmoe_scales: str = 's4', taskmoe_mode: str = 'independent'):
+def _build_stage2(
+    stage1_ckpt: str,
+    taskmoe_scales: str = 's4',
+    taskmoe_mode: str = 'independent',
+    taskmoe_residual_mode: str = 'zero_start',
+):
     cfg = _make_cfg(
         stage1_checkpoint=stage1_ckpt,
         taskmoe_scales=taskmoe_scales,
         taskmoe_mode=taskmoe_mode,
+        taskmoe_residual_mode=taskmoe_residual_mode,
     )
     _sync_cppi_config_from_stage1(cfg, stage1_ckpt)
     cfg.ct_pretrained_path = None
@@ -64,6 +71,7 @@ def _build_stage2(stage1_ckpt: str, taskmoe_scales: str = 's4', taskmoe_mode: st
     cfg.no_encoder_pretrained = True
     cfg.taskmoe_scales = taskmoe_scales
     cfg.taskmoe_mode = taskmoe_mode
+    cfg.taskmoe_residual_mode = taskmoe_residual_mode
     networks = build_mdt_seg_teacher(cfg)
     model = networks['model']
     _load_stage1_for_taskmoe(model, stage1_ckpt)
@@ -156,7 +164,7 @@ def run_smoke(stage1_ckpt: str):
         f4_out, aux = model.taskmoe_s4(f4_in)
         assert f4_out.shape == f4_in.shape
         assert float((f4_out - f4_in).abs().max().item()) <= 1e-6
-        refined, _ = model._refine_stage4(fused_list)
+        refined, _, _ = model._refine_stage4(fused_list)
         for i in range(3):
             assert torch.equal(refined[i], fused_list[i])
         assert refined[3].shape == fused_list[3].shape
@@ -229,7 +237,7 @@ def run_smoke(stage1_ckpt: str):
             pet_cal = model_m.pet_calibration(ct_feats, pet_feats, None, reference_valid=False)
             fused = model_m.fusion(ct_feats, pet_cal, mode='full')
             fused_list = [f.detach().clone() for f in fused]
-            refined, aux = model_m._refine_stage4(fused_list)
+            refined, aux, _ = model_m._refine_stage4(fused_list)
             active_idx = {idx for _, idx, _ in model_m._iter_active_taskmoe()}
             for i in range(4):
                 if i in active_idx:
@@ -280,6 +288,43 @@ def run_smoke(stage1_ckpt: str):
         if n.startswith('cross_scale_taskmoe.') and p.requires_grad
     )
     print('[SMOKE] 14 cross_scale_shared_ok')
+
+    # 15) paper residual mode: no beta, first-step grads on MoE path
+    model_p, task_p, _ = _build_stage2(
+        stage1_ckpt,
+        taskmoe_scales='all',
+        taskmoe_mode='cross_scale_shared',
+        taskmoe_residual_mode='paper',
+    )
+    model_p.to(device)
+    assert model_p.cross_scale_taskmoe.beta is None
+    assert model_p.cross_scale_taskmoe.residual_mode == 'paper'
+    assert not any(n.endswith('.beta') for n, _ in model_p.named_parameters())
+    batch_p = _fake_batch(device)
+    model_p.eval()
+    with torch.no_grad():
+        out_f = model_p(batch_p['ct'], pet=batch_p['pet'], forward_mode='full', mask=None)
+        out_m = model_p(batch_p['ct'], pet=batch_p['pet'], forward_mode='missing', mask=None)
+        assert torch.isfinite(out_f['logits']).all() and torch.isfinite(out_m['logits']).all()
+        assert torch.isfinite(out_f['aux']['taskmoe_balance_loss'])
+        for i in range(1, 5):
+            assert torch.isfinite(out_f['aux']['taskmoe_stats'][f's{i}_delta_feat_ratio'])
+    model_p.train()
+    task_p.optimizer.zero_grad(set_to_none=True)
+    loss_p, _, _, _ = task_p.train_step(batch_p, forward_mode='full')
+    loss_p.backward()
+    def _has_finite(prefix):
+        return any(
+            p.grad is not None and torch.isfinite(p.grad).all()
+            for n, p in model_p.named_parameters()
+            if n.startswith(prefix) and p.requires_grad
+        )
+    assert _has_finite('cross_scale_taskmoe.scale_adapters.0.router')
+    assert _has_finite('cross_scale_taskmoe.shared_expert_bank.experts')
+    assert _has_finite('cross_scale_taskmoe.scale_adapters.0.out_proj')
+    assert _has_finite('cross_scale_taskmoe.scale_adapters.0.prompt')
+    task_p.optimizer.step()
+    print('[SMOKE] 15 paper_residual_ok')
 
     trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
     print(f'[SMOKE] trainable_param_count={len(trainable_names)}')

@@ -101,7 +101,7 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
-    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=6, cppi_build_stage=3, cppi_output_dir=None, taskmoe_scales='s4', taskmoe_mode='independent'):
+    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=6, cppi_build_stage=3, cppi_output_dir=None, taskmoe_scales='s4', taskmoe_mode='independent', taskmoe_residual_mode='zero_start'):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.stage2_moe_only = False
@@ -111,6 +111,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
             raise ValueError(
                 f'Unsupported taskmoe_mode={taskmoe_mode!r}; '
                 'use independent or cross_scale_shared'
+            )
+        self.taskmoe_residual_mode = str(taskmoe_residual_mode or 'zero_start').strip().lower()
+        if self.taskmoe_residual_mode not in ('zero_start', 'paper'):
+            raise ValueError(
+                f'Unsupported taskmoe_residual_mode={taskmoe_residual_mode!r}; '
+                'use zero_start or paper'
             )
         self.taskmoe_scales = _parse_taskmoe_scales(taskmoe_scales)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
@@ -155,7 +161,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 noisy_gating=True,
                 noise_epsilon=1e-2,
                 balance_loss_weight=0.1,
-                zero_start=True,
+                residual_mode=self.taskmoe_residual_mode,
             )
         else:
             for scale_name in self.taskmoe_scales:
@@ -212,7 +218,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         fused_feats = list(fused_feats)
         if not self.taskmoe_enabled:
             zero = fused_feats[-1].new_zeros((), dtype=torch.float32)
-            return fused_feats, zero
+            return fused_feats, zero, {}
 
         if self.taskmoe_mode == 'cross_scale_shared':
             if self.cross_scale_taskmoe is None:
@@ -225,7 +231,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 out.to(dtype=dtype)
                 for out, dtype in zip(result.features, orig_dtypes)
             ]
-            return fused_feats, result.balance_loss.float()
+            return fused_feats, result.balance_loss.float(), dict(result.stats)
 
         # independent: Sparse index_add_ is not AMP-safe. Run TaskMoE in fp32.
         aux_loss = None
@@ -238,7 +244,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 aux_loss = loss if aux_loss is None else (aux_loss + loss)
         if aux_loss is None:
             aux_loss = fused_feats[-1].new_zeros((), dtype=torch.float32)
-        return fused_feats, aux_loss
+        return fused_feats, aux_loss, {}
 
     def _decode(self, fused_feats, target_size, aux=None):
         out = self.decoder(fused_feats, target_size)
@@ -333,11 +339,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 reference_valid=False,
             )
         fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='full')
-        fused_feats, moe_aux_loss = self._refine_stage4(fused_feats)
+        fused_feats, moe_aux_loss, moe_stats = self._refine_stage4(fused_feats)
         return self._decode(
             fused_feats,
             target_size,
-            aux={'taskmoe_balance_loss': moe_aux_loss},
+            aux={'taskmoe_balance_loss': moe_aux_loss, 'taskmoe_stats': moe_stats},
         )
 
     def _forward_missing(self, ct, pet, target_size, mask=None):
@@ -358,11 +364,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 reference_valid=self.prototype_memory.bank_ready,
             )
             fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='missing')
-            fused_feats, moe_aux_loss = self._refine_stage4(fused_feats)
+            fused_feats, moe_aux_loss, moe_stats = self._refine_stage4(fused_feats)
             return self._decode(
                 fused_feats,
                 target_size,
-                aux={'taskmoe_balance_loss': moe_aux_loss},
+                aux={'taskmoe_balance_loss': moe_aux_loss, 'taskmoe_stats': moe_stats},
             )
 
         pet_feats_real = self._encode_pet(pet)
@@ -382,11 +388,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
             reference_valid=self.prototype_memory.bank_ready,
         )
         fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='missing')
-        fused_feats, moe_aux_loss = self._refine_stage4(fused_feats)
+        fused_feats, moe_aux_loss, moe_stats = self._refine_stage4(fused_feats)
         return self._decode(
             fused_feats,
             target_size,
-            aux={'taskmoe_balance_loss': moe_aux_loss},
+            aux={'taskmoe_balance_loss': moe_aux_loss, 'taskmoe_stats': moe_stats},
         )
 
     def _forward_auto(self, ct, pet, pet_available, target_size, mask=None):
@@ -423,11 +429,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
             mode='auto',
             pet_available=pet_available,
         )
-        fused_feats, moe_aux_loss = self._refine_stage4(fused_feats)
+        fused_feats, moe_aux_loss, moe_stats = self._refine_stage4(fused_feats)
         return self._decode(
             fused_feats,
             target_size,
-            aux={'taskmoe_balance_loss': moe_aux_loss},
+            aux={'taskmoe_balance_loss': moe_aux_loss, 'taskmoe_stats': moe_stats},
         )
 
     @torch.no_grad()
