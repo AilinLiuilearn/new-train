@@ -370,6 +370,10 @@ def build_mdt_seg_teacher(config):
         taskmoe_scales=getattr(config, 'taskmoe_scales', 's4'),
         taskmoe_mode=getattr(config, 'taskmoe_mode', 'independent'),
         taskmoe_residual_mode=getattr(config, 'taskmoe_residual_mode', 'zero_start'),
+        taskmoe_num_experts=int(getattr(config, 'taskmoe_num_experts', 6)),
+        taskmoe_use_text_prior=bool(getattr(config, 'taskmoe_use_text_prior', False)),
+        taskmoe_text_model_path=getattr(config, 'taskmoe_text_model_path', None),
+        taskmoe_text_tower_path=getattr(config, 'taskmoe_text_tower_path', None),
     )
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
@@ -378,7 +382,12 @@ def build_mdt_seg_teacher(config):
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))} '
         f'taskmoe_mode={getattr(config, "taskmoe_mode", "independent")} '
         f'taskmoe_scales={getattr(config, "taskmoe_scales", "s4")} '
-        f'taskmoe_residual_mode={getattr(config, "taskmoe_residual_mode", "zero_start")}'
+        f'taskmoe_num_experts={int(getattr(config, "taskmoe_num_experts", 6))} '
+        f'taskmoe_top_k=2 '
+        f'taskmoe_residual_mode={getattr(config, "taskmoe_residual_mode", "zero_start")} '
+        f'taskmoe_use_text_prior={bool(getattr(config, "taskmoe_use_text_prior", False))} '
+        f'taskmoe_text_model_path={getattr(config, "taskmoe_text_model_path", None)} '
+        f'taskmoe_text_tower_path={getattr(config, "taskmoe_text_tower_path", None)}'
     )
     print(f'[CPPI] enabled=True')
     print(f'[CPPI] num_clusters={cppi_num_clusters}')

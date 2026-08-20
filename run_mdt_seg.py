@@ -312,6 +312,8 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params, optimizer=
         print(f'expert_dim={moe.expert_dim}', flush=True)
         print(f'num_experts={moe.num_experts}', flush=True)
         print(f'top_k={moe.top_k}', flush=True)
+        activation_ratio = float(moe.top_k) / float(moe.num_experts)
+        print(f'expert_activation_ratio={activation_ratio:.4f}', flush=True)
         print('shared_expert_bank=True', flush=True)
         print('scale_specific_prompt=True', flush=True)
         print('scale_specific_router=True', flush=True)
@@ -326,6 +328,26 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params, optimizer=
             print(f'beta_s2={float(beta[1].item())}', flush=True)
             print(f'beta_s3={float(beta[2].item())}', flush=True)
             print(f'beta_s4={float(beta[3].item())}', flush=True)
+        use_text = bool(getattr(moe, 'use_text_prior', False))
+        print('[TEXT PRIOR]', flush=True)
+        print(f'enabled={use_text}', flush=True)
+        if use_text and getattr(moe, 'text_prior', None) is not None:
+            tp = moe.text_prior
+            print(f'biomedclip_model_path={tp.biomedclip_model_path}', flush=True)
+            print(f'text_tower_path={tp.text_tower_path}', flush=True)
+            print(f'backend={tp.backend}', flush=True)
+            print(f'local_only={tp.local_only}', flush=True)
+            print(f'text_encoder_trainable={tp.text_encoder_trainable}', flush=True)
+            print(f'text_encoder_retained={tp.text_encoder_retained}', flush=True)
+            print(f'text_embedding_dim={tp.text_embedding_dim}', flush=True)
+            print(f'Full text={tp.full_text}', flush=True)
+            print(f'Missing text={tp.missing_text}', flush=True)
+            print(f'Full/Missing embedding cosine={tp.embedding_cosine():.6f}', flush=True)
+            print('text_to_expert_shared_across_scales=True', flush=True)
+            print('text_encoder_frozen=True', flush=True)
+            print('text_encoder_runtime=False', flush=True)
+            print('text_prior_target=expert_router', flush=True)
+            print(f'num_text_expert_logits={tp.num_experts}', flush=True)
     else:
         print('mode=independent', flush=True)
         print(f'scales={"+".join(model.taskmoe_scales).upper()}', flush=True)
@@ -338,6 +360,13 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params, optimizer=
                 f'balance_loss_weight={module.balance_loss_weight}',
                 flush=True,
             )
+        print('[TEXT PRIOR]', flush=True)
+        print('enabled=False', flush=True)
+    text_to_expert_trainable = sum(
+        p.numel()
+        for n, p in model.named_parameters()
+        if p.requires_grad and 'text_to_expert' in n
+    )
     moe_lr = float(getattr(cfg, 'learning_rate', 0.0))
     dec_lr = float(getattr(cfg, 'decoder_lr', 0.0)) if train_decoder else 0.0
     if optimizer is not None:
@@ -346,6 +375,7 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params, optimizer=
     ratio = (dec_lr / moe_lr) if moe_lr > 0 else 0.0
     print('[STAGE2 TRAINABLE]', flush=True)
     print(f'taskmoe_trainable={taskmoe_trainable}', flush=True)
+    print(f'text_to_expert_trainable={text_to_expert_trainable}', flush=True)
     print(f'decoder_enabled={train_decoder}', flush=True)
     print(f'decoder_trainable={decoder_trainable}', flush=True)
     print(f'stage1_core_trainable={stage1_core_trainable}', flush=True)
@@ -358,6 +388,18 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params, optimizer=
     print(f'stage1_trainable={stage1_core_trainable}', flush=True)
     print(f'taskmoe_trainable={taskmoe_trainable}', flush=True)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
+    print('[EXPERT ABLATION]', flush=True)
+    if mode == 'cross_scale_shared' and getattr(model, 'cross_scale_taskmoe', None) is not None:
+        moe = model.cross_scale_taskmoe
+        print(f'num_experts={moe.num_experts}', flush=True)
+        print(f'top_k={moe.top_k}', flush=True)
+        print('shared_expert_bank=True', flush=True)
+    else:
+        print(f'num_experts={getattr(model, "taskmoe_num_experts", 6)}', flush=True)
+        print('top_k=2', flush=True)
+        print('shared_expert_bank=False', flush=True)
+    print(f'taskmoe_trainable={taskmoe_trainable}', flush=True)
+    print(f'total_trainable={trainable_params}', flush=True)
 
 
 def main():

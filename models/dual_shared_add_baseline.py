@@ -101,7 +101,7 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
-    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=6, cppi_build_stage=3, cppi_output_dir=None, taskmoe_scales='s4', taskmoe_mode='independent', taskmoe_residual_mode='zero_start'):
+    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=6, cppi_build_stage=3, cppi_output_dir=None, taskmoe_scales='s4', taskmoe_mode='independent', taskmoe_residual_mode='zero_start', taskmoe_num_experts=6, taskmoe_use_text_prior=False, taskmoe_text_model_path=None, taskmoe_text_tower_path=None):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.stage2_moe_only = False
@@ -118,6 +118,18 @@ class DualSharedAddPETCTBaseline(nn.Module):
             raise ValueError(
                 f'Unsupported taskmoe_residual_mode={taskmoe_residual_mode!r}; '
                 'use zero_start or paper'
+            )
+        self.taskmoe_num_experts = int(taskmoe_num_experts)
+        if self.taskmoe_num_experts < 2:
+            raise ValueError(
+                'taskmoe_num_experts must be >= TopK=2'
+            )
+        self.taskmoe_use_text_prior = bool(taskmoe_use_text_prior)
+        self.taskmoe_text_model_path = taskmoe_text_model_path
+        self.taskmoe_text_tower_path = taskmoe_text_tower_path
+        if self.taskmoe_use_text_prior and self.taskmoe_mode != 'cross_scale_shared':
+            raise ValueError(
+                'taskmoe_use_text_prior=True requires --taskmoe_mode cross_scale_shared'
             )
         self.taskmoe_scales = _parse_taskmoe_scales(taskmoe_scales)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
@@ -152,7 +164,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
             self.cross_scale_taskmoe = CrossScaleSharedTaskMoE(
                 channels=pet_channels,
                 expert_dim=128,
-                num_experts=6,
+                num_experts=self.taskmoe_num_experts,
                 top_k=2,
                 atom_num=32,
                 atom_dim=256,
@@ -163,18 +175,24 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 noise_epsilon=1e-2,
                 balance_loss_weight=0.1,
                 residual_mode=self.taskmoe_residual_mode,
+                use_text_prior=self.taskmoe_use_text_prior,
+                text_model_path=self.taskmoe_text_model_path,
+                text_tower_path=self.taskmoe_text_tower_path,
             )
         else:
             for scale_name in self.taskmoe_scales:
                 idx = _TASKMOE_SCALE_INDEX[scale_name]
-                module = self._build_taskmoe(pet_channels[idx])
+                module = self._build_taskmoe(
+                    pet_channels[idx],
+                    num_experts=self.taskmoe_num_experts,
+                )
                 setattr(self, f'taskmoe_{scale_name}', module)
 
     @staticmethod
-    def _build_taskmoe(channels):
+    def _build_taskmoe(channels, num_experts=6):
         return TaskMoEStage4Refiner(
             channels=channels,
-            num_experts=6,
+            num_experts=num_experts,
             top_k=2,
             prompt_atoms=32,
             prompt_dim=256,
@@ -214,7 +232,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         _check_tensor_list('pet_feats', pet_feats)
         return pet_feats
 
-    def _refine_stage4(self, fused_feats):
+    def _refine_stage4(self, fused_feats, route=None, pet_available=None):
         """Refine TaskMoE scales. Name kept for compatibility."""
         fused_feats = list(fused_feats)
         if not self.taskmoe_enabled:
@@ -227,7 +245,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
             orig_dtypes = [feat.dtype for feat in fused_feats]
             with torch.cuda.amp.autocast(enabled=False):
                 shared_input = [feat.float() for feat in fused_feats]
-                result = self.cross_scale_taskmoe(shared_input)
+                result = self.cross_scale_taskmoe(
+                    shared_input,
+                    route=route,
+                    pet_available=pet_available,
+                )
             fused_feats = [
                 out.to(dtype=dtype)
                 for out, dtype in zip(result.features, orig_dtypes)
@@ -347,7 +369,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 reference_valid=False,
             )
         fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='full')
-        fused_feats, moe_aux_loss, moe_stats = self._refine_stage4(fused_feats)
+        fused_feats, moe_aux_loss, moe_stats = self._refine_stage4(
+            fused_feats, route='full'
+        )
         return self._decode(
             fused_feats,
             target_size,
@@ -372,7 +396,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 reference_valid=self.prototype_memory.bank_ready,
             )
             fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='missing')
-            fused_feats, moe_aux_loss, moe_stats = self._refine_stage4(fused_feats)
+            fused_feats, moe_aux_loss, moe_stats = self._refine_stage4(
+                fused_feats, route='missing'
+            )
             return self._decode(
                 fused_feats,
                 target_size,
@@ -396,7 +422,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
             reference_valid=self.prototype_memory.bank_ready,
         )
         fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='missing')
-        fused_feats, moe_aux_loss, moe_stats = self._refine_stage4(fused_feats)
+        fused_feats, moe_aux_loss, moe_stats = self._refine_stage4(
+            fused_feats, route='missing'
+        )
         return self._decode(
             fused_feats,
             target_size,
@@ -437,7 +465,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
             mode='auto',
             pet_available=pet_available,
         )
-        fused_feats, moe_aux_loss, moe_stats = self._refine_stage4(fused_feats)
+        fused_feats, moe_aux_loss, moe_stats = self._refine_stage4(
+            fused_feats,
+            route='auto',
+            pet_available=pet_available,
+        )
         return self._decode(
             fused_feats,
             target_size,

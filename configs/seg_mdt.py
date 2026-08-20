@@ -80,6 +80,16 @@ class SegMDTConfig(ConfigBase):
             ),
         )
         p.add_argument(
+            '--taskmoe_num_experts',
+            type=int,
+            default=6,
+            help=(
+                'Number of experts in TaskMoE. '
+                'Used for expert-number ablation. '
+                'Recommended controlled settings: 4, 6, 8 with TopK fixed at 2.'
+            ),
+        )
+        p.add_argument(
             '--stage2_train_decoder',
             type=str2bool,
             default=False,
@@ -87,6 +97,27 @@ class SegMDTConfig(ConfigBase):
                 'Whether to fine-tune the pretrained shared decoder together with TaskMoE '
                 'during Stage2. False preserves the original MoE-only Stage2 behavior.'
             ),
+        )
+        p.add_argument(
+            '--taskmoe_use_text_prior',
+            type=str2bool,
+            default=False,
+            help=(
+                'Use fixed biomedical text semantics as an expert-routing prior '
+                'for cross-scale shared TaskMoE.'
+            ),
+        )
+        p.add_argument(
+            '--taskmoe_text_model_path',
+            type=str,
+            default='/root/autodl-tmp/mkd-main/new-train/pretrained/biomedclip_model',
+            help='Local BioMedCLIP model root (existence check; local_files_only).',
+        )
+        p.add_argument(
+            '--taskmoe_text_tower_path',
+            type=str,
+            default='/root/autodl-tmp/mkd-main/new-train/pretrained/biomedbert_text_tower',
+            help='Local biomedical text tower used to encode fixed Full/Missing texts.',
         )
         return p
 

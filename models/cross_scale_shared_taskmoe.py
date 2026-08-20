@@ -47,11 +47,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from models.fixed_medical_text_prior import FixedMedicalTextExpertPrior
 
 
 # -----------------------------------------------------------------------------
@@ -253,13 +255,52 @@ class NoisyTopKRouter(nn.Module):
         prob_if_out = _standard_normal_cdf(z_out)
         return torch.where(is_in, prob_if_in, prob_if_out)
 
-    def forward(self, router_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    def forward(
+        self,
+        router_input: torch.Tensor,
+        expert_logit_prior: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         # Route in FP32 for numerical stability. Gradients still flow to input/projections.
         x = torch.nan_to_num(router_input.float(), nan=0.0, posinf=20.0, neginf=-20.0)
 
-        clean_logits = x @ self.w_gate.float()
-        clean_logits = torch.nan_to_num(clean_logits, nan=0.0, posinf=20.0, neginf=-20.0)
-        clean_logits = clean_logits.clamp(-20.0, 20.0)
+        clean_logits_visual = x @ self.w_gate.float()
+        clean_logits_visual = torch.nan_to_num(
+            clean_logits_visual, nan=0.0, posinf=20.0, neginf=-20.0
+        )
+        clean_logits_visual = clean_logits_visual.clamp(-20.0, 20.0)
+
+        if expert_logit_prior is None:
+            clean_logits = clean_logits_visual
+        else:
+            # Additive text expert prior with scale matching; no learnable scalar.
+            # expert_logit_prior: [N, num_experts]
+            if expert_logit_prior.ndim != 2:
+                raise ValueError(
+                    f'expert_logit_prior must be [N,E], got shape={tuple(expert_logit_prior.shape)}'
+                )
+            if expert_logit_prior.shape != clean_logits_visual.shape:
+                raise ValueError(
+                    'expert_logit_prior shape mismatch: '
+                    f'prior={tuple(expert_logit_prior.shape)} '
+                    f'visual={tuple(clean_logits_visual.shape)}'
+                )
+            text = expert_logit_prior.float()
+            text = torch.nan_to_num(text, nan=0.0, posinf=20.0, neginf=-20.0)
+            text_centered = text - text.mean(dim=-1, keepdim=True)
+            text_std = text_centered.std(dim=-1, keepdim=True, unbiased=False).clamp_min(1e-6)
+            text_normalized = text_centered / text_std
+            visual_std = clean_logits_visual.detach().std(
+                dim=-1, keepdim=True, unbiased=False
+            ).clamp_min(1e-4)
+            matched_text_prior = text_normalized * visual_std
+            matched_text_prior = torch.nan_to_num(
+                matched_text_prior, nan=0.0, posinf=20.0, neginf=-20.0
+            )
+            if not torch.isfinite(matched_text_prior).all():
+                raise RuntimeError('matched text expert prior contains NaN/Inf')
+            clean_logits = clean_logits_visual + matched_text_prior
+            clean_logits = torch.nan_to_num(clean_logits, nan=0.0, posinf=20.0, neginf=-20.0)
+            clean_logits = clean_logits.clamp(-20.0, 20.0)
 
         if self.training and self.noisy_gating:
             raw_noise = x @ self.w_noise.float()
@@ -401,6 +442,9 @@ class CrossScaleSharedTaskMoE(nn.Module):
         balance_loss_weight: float = 0.1,
         residual_mode: str = "zero_start",
         zero_start: bool | None = None,
+        use_text_prior: bool = False,
+        text_model_path: Optional[str] = None,
+        text_tower_path: Optional[str] = None,
     ) -> None:
         super().__init__()
 
@@ -420,6 +464,7 @@ class CrossScaleSharedTaskMoE(nn.Module):
         self.top_k = top_k
         self.balance_loss_weight = float(balance_loss_weight)
         self.residual_mode = residual_mode
+        self.use_text_prior = bool(use_text_prior)
 
         self.scale_adapters = nn.ModuleList(
             [
@@ -452,7 +497,20 @@ class CrossScaleSharedTaskMoE(nn.Module):
             # paper: no learnable residual scale; F_out = F_base + DeltaF.
             self.register_parameter("beta", None)
 
-    def forward(self, features: Sequence[torch.Tensor]) -> CrossScaleTaskMoEOutput:
+        self.text_prior = None
+        if self.use_text_prior:
+            self.text_prior = FixedMedicalTextExpertPrior(
+                num_experts=num_experts,
+                text_model_path=text_model_path,
+                text_tower_path=text_tower_path,
+            )
+
+    def forward(
+        self,
+        features: Sequence[torch.Tensor],
+        route: Optional[str] = None,
+        pet_available: Optional[torch.Tensor] = None,
+    ) -> CrossScaleTaskMoEOutput:
         if len(features) != self.num_scales:
             raise ValueError(
                 f"Expected {self.num_scales} scales, got {len(features)}. "
@@ -462,6 +520,25 @@ class CrossScaleSharedTaskMoE(nn.Module):
         out_features: List[torch.Tensor] = []
         total_balance = features[0].new_zeros((), dtype=torch.float32)
         stats: Dict[str, torch.Tensor] = {}
+
+        text_expert_logits = None
+        if self.use_text_prior:
+            if self.text_prior is None:
+                raise RuntimeError('use_text_prior=True but text_prior module is missing')
+            if route is None:
+                raise ValueError(
+                    'use_text_prior=True requires route in {full, missing, auto}'
+                )
+            text_expert_logits, text_stats = self.text_prior(
+                batch_size=int(features[0].shape[0]),
+                route=route,
+                pet_available=pet_available,
+                device=features[0].device,
+            )
+            for k, v in text_stats.items():
+                stats[k] = v
+        else:
+            stats['text_prior_enabled'] = torch.tensor(0.0, device=features[0].device)
 
         for scale_idx, (feat, adapter, expected_c) in enumerate(
             zip(features, self.scale_adapters, self.channels), start=1
@@ -495,7 +572,21 @@ class CrossScaleSharedTaskMoE(nn.Module):
             )
 
             router_input = torch.cat([tokens.float(), prompt_tokens], dim=1)  # [BHW, 2D]
-            gates, raw_balance, router_stats = adapter.router(router_input)
+
+            expert_logit_prior = None
+            if text_expert_logits is not None:
+                # Sample-level [B,6] -> token-level [BHW,6], shared across scales.
+                expert_logit_prior = (
+                    text_expert_logits[:, None, None, :]
+                    .expand(b, h, w, self.num_experts)
+                    .reshape(-1, self.num_experts)
+                    .contiguous()
+                )
+
+            gates, raw_balance, router_stats = adapter.router(
+                router_input,
+                expert_logit_prior=expert_logit_prior,
+            )
 
             # Sparse shared experts. Run expert arithmetic in FP32 for stability,
             # then cast the residual correction back to the feature dtype.
