@@ -7,6 +7,82 @@ from models.ct_pet_prototype_imputation import CrossScaleCTPETPrototypeMemory
 from models.taskmoe_s4_refiner import TaskMoEStage4Refiner
 
 
+def _parse_taskmoe_scales(taskmoe_scales):
+    """Parse TaskMoE scale selection for ablation.
+
+    Accepted examples:
+      s4 | s3s4 | s2s3s4 | s1s2s3s4 | all
+      s1,s2,s3,s4 | s2+s3+s4
+    """
+    text = str(taskmoe_scales or 's4').strip().lower()
+    if text in ('all', 'full', 's1s2s3s4'):
+        return ('s1', 's2', 's3', 's4')
+
+    # Normalize separators then extract s1..s4 tokens in order.
+    normalized = (
+        text.replace('+', ',')
+        .replace('_', ',')
+        .replace('-', ',')
+        .replace(' ', ',')
+    )
+    # Also allow compact forms like s3s4 / s2s3s4 without commas.
+    compact = normalized.replace(',', '')
+    presets = {
+        's4': ('s4',),
+        '4': ('s4',),
+        's3s4': ('s3', 's4'),
+        's34': ('s3', 's4'),
+        '34': ('s3', 's4'),
+        's2s3s4': ('s2', 's3', 's4'),
+        's234': ('s2', 's3', 's4'),
+        '234': ('s2', 's3', 's4'),
+        's1s2s3s4': ('s1', 's2', 's3', 's4'),
+        's1234': ('s1', 's2', 's3', 's4'),
+        '1234': ('s1', 's2', 's3', 's4'),
+    }
+    if compact in presets:
+        return presets[compact]
+
+    found = []
+    for token in normalized.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        if token in ('s1', '1'):
+            found.append('s1')
+        elif token in ('s2', '2'):
+            found.append('s2')
+        elif token in ('s3', '3'):
+            found.append('s3')
+        elif token in ('s4', '4'):
+            found.append('s4')
+        else:
+            raise ValueError(
+                f'Unsupported taskmoe scale token={token!r} in {taskmoe_scales!r}'
+            )
+    # De-duplicate while preserving order s1->s4
+    order = ('s1', 's2', 's3', 's4')
+    selected = tuple(s for s in order if s in set(found))
+    if not selected:
+        raise ValueError(
+            f'Unsupported taskmoe_scales={taskmoe_scales!r}; '
+            'use s4 | s3s4 | s2s3s4 | s1s2s3s4/all | s1,s2,s3,s4'
+        )
+    return selected
+
+
+def _is_taskmoe_param_name(name):
+    return (
+        name.startswith('taskmoe_s1.')
+        or name.startswith('taskmoe_s2.')
+        or name.startswith('taskmoe_s3.')
+        or name.startswith('taskmoe_s4.')
+    )
+
+
+_TASKMOE_SCALE_INDEX = {'s1': 0, 's2': 1, 's3': 2, 's4': 3}
+
+
 class StageChannelAlign(nn.Module):
     def __init__(self, in_channels_list, out_channels_list):
         super().__init__()
@@ -23,11 +99,12 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
-    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=6, cppi_build_stage=3, cppi_output_dir=None):
+    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=6, cppi_build_stage=3, cppi_output_dir=None, taskmoe_scales='s4'):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.stage2_moe_only = False
         self.taskmoe_enabled = True
+        self.taskmoe_scales = _parse_taskmoe_scales(taskmoe_scales)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
         load_local_weights_safe(self.enc_ct, ct_pretrained_path, name='CT_Encoder')
@@ -44,8 +121,21 @@ class DualSharedAddPETCTBaseline(nn.Module):
             build_stage=cppi_build_stage,
             output_dir=cppi_output_dir,
         )
-        self.taskmoe_s4 = TaskMoEStage4Refiner(
-            channels=pet_channels[-1],
+        self.taskmoe_s1 = None
+        self.taskmoe_s2 = None
+        self.taskmoe_s3 = None
+        self.taskmoe_s4 = None
+        if len(pet_channels) < 4:
+            raise ValueError(f'TaskMoE expects 4 encoder scales, got {len(pet_channels)}')
+        for scale_name in self.taskmoe_scales:
+            idx = _TASKMOE_SCALE_INDEX[scale_name]
+            module = self._build_taskmoe(pet_channels[idx])
+            setattr(self, f'taskmoe_{scale_name}', module)
+
+    @staticmethod
+    def _build_taskmoe(channels):
+        return TaskMoEStage4Refiner(
+            channels=channels,
             num_experts=6,
             top_k=2,
             prompt_atoms=32,
@@ -59,6 +149,14 @@ class DualSharedAddPETCTBaseline(nn.Module):
             residual_mode='zero_start',
             residual_scale_init=0.0,
         )
+
+    def _iter_active_taskmoe(self):
+        """Yield (scale_name, feature_index, module) for enabled TaskMoE scales."""
+        for scale_name in self.taskmoe_scales:
+            module = getattr(self, f'taskmoe_{scale_name}', None)
+            if module is None:
+                continue
+            yield scale_name, _TASKMOE_SCALE_INDEX[scale_name], module
 
     @staticmethod
     def _to_3ch(x):
@@ -77,17 +175,23 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return pet_feats
 
     def _refine_stage4(self, fused_feats):
+        """Refine configured TaskMoE scales (any of S1-S4). Name kept for compatibility."""
         fused_feats = list(fused_feats)
         if not self.taskmoe_enabled:
-            zero = fused_feats[-1].new_zeros(())
+            zero = fused_feats[-1].new_zeros((), dtype=torch.float32)
             return fused_feats, zero
-        # Sparse index_add_ is not AMP-safe (Half buffer vs Float source).
-        # Run TaskMoE in fp32; keep moe_aux_loss in float32 (do not cast to FP16).
-        f4 = fused_feats[3]
+        # Sparse index_add_ is not AMP-safe. Run TaskMoE in fp32; keep aux loss float32.
+        aux_loss = None
         with torch.cuda.amp.autocast(enabled=False):
-            f4_out, moe_aux_loss = self.taskmoe_s4(f4.float())
-        fused_feats[3] = f4_out.to(dtype=f4.dtype)
-        return fused_feats, moe_aux_loss.float()
+            for _, feat_idx, module in self._iter_active_taskmoe():
+                feat = fused_feats[feat_idx]
+                out, loss = module(feat.float())
+                fused_feats[feat_idx] = out.to(dtype=feat.dtype)
+                loss = loss.float()
+                aux_loss = loss if aux_loss is None else (aux_loss + loss)
+        if aux_loss is None:
+            aux_loss = fused_feats[-1].new_zeros((), dtype=torch.float32)
+        return fused_feats, aux_loss
 
     def _decode(self, fused_feats, target_size, aux=None):
         out = self.decoder(fused_feats, target_size)
@@ -99,8 +203,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
     def enable_stage2_moe_only(self):
         for p in self.parameters():
             p.requires_grad = False
-        for p in self.taskmoe_s4.parameters():
-            p.requires_grad = True
+        for _, _, module in self._iter_active_taskmoe():
+            for p in module.parameters():
+                p.requires_grad = True
         self.stage2_moe_only = True
 
     def train(self, mode=True):
@@ -113,7 +218,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
             self.fusion.eval()
             self.decoder.eval()
             self.prototype_memory.eval()
-            self.taskmoe_s4.train(mode)
+            for scale_name in ('s1', 's2', 's3', 's4'):
+                module = getattr(self, f'taskmoe_{scale_name}', None)
+                if module is not None:
+                    module.eval()
+            for _, _, module in self._iter_active_taskmoe():
+                module.train(mode)
         return self
 
     def _collect_cppi(self, ct_feats, pet_feats_real, mask):

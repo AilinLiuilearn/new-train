@@ -98,14 +98,16 @@ def _sync_cppi_config_from_stage1(cfg, checkpoint_path):
 
 
 def _load_stage1_for_taskmoe(model, checkpoint_path):
+    from models.dual_shared_add_baseline import _is_taskmoe_param_name
+
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     state_dict = checkpoint.get('model', checkpoint)
     result = model.load_state_dict(state_dict, strict=False)
     missing_keys = list(result.missing_keys)
     unexpected_keys = list(result.unexpected_keys)
 
-    missing_taskmoe = [k for k in missing_keys if k.startswith('taskmoe_s4.')]
-    missing_other = [k for k in missing_keys if not k.startswith('taskmoe_s4.')]
+    missing_taskmoe = [k for k in missing_keys if _is_taskmoe_param_name(k)]
+    missing_other = [k for k in missing_keys if not _is_taskmoe_param_name(k)]
     if missing_other:
         raise RuntimeError(
             'Stage-1 load has non-TaskMoE missing keys: '
@@ -122,6 +124,7 @@ def _load_stage1_for_taskmoe(model, checkpoint_path):
 
     print('[STAGE2 LOAD]', flush=True)
     print(f'checkpoint={checkpoint_path}', flush=True)
+    print(f'taskmoe_scales={getattr(model, "taskmoe_scales", ())}', flush=True)
     print(f'missing_taskmoe_keys={missing_taskmoe}', flush=True)
     print(f'unexpected_keys={unexpected_keys}', flush=True)
     print(f'cppi_bank_ready={bool(model.prototype_memory.bank_ready)}', flush=True)
@@ -131,11 +134,12 @@ def _load_stage1_for_taskmoe(model, checkpoint_path):
 @torch.no_grad()
 def _verify_stage2_zero_step(task, val_loader):
     model = task.model
-    beta = float(model.taskmoe_s4.residual_scale.detach().abs().item())
-    if beta > 1e-12:
-        raise RuntimeError(
-            f'TaskMoE residual_scale beta must be ~0 at step-0, got {beta}'
-        )
+    for scale_name, _, module in model._iter_active_taskmoe():
+        beta = float(module.residual_scale.detach().abs().item())
+        if beta > 1e-12:
+            raise RuntimeError(
+                f'TaskMoE {scale_name} residual_scale beta must be ~0 at step-0, got {beta}'
+            )
 
     batch = next(iter(val_loader))
     ct = batch['ct'][:1].to(task.device, non_blocking=True)
@@ -179,15 +183,17 @@ def _count_parameters(model):
 
 
 def _print_stage2_startup(model, cfg, total_params, trainable_params):
+    from models.dual_shared_add_baseline import _is_taskmoe_param_name
+
     stage1_trainable = sum(
         p.numel()
         for n, p in model.named_parameters()
-        if p.requires_grad and not n.startswith('taskmoe_s4.')
+        if p.requires_grad and not _is_taskmoe_param_name(n)
     )
     taskmoe_trainable = sum(
         p.numel()
         for n, p in model.named_parameters()
-        if p.requires_grad and n.startswith('taskmoe_s4.')
+        if p.requires_grad and _is_taskmoe_param_name(n)
     )
     print('[TRAIN MODE]', flush=True)
     print('mode=stage2_taskmoe', flush=True)
@@ -202,13 +208,16 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params):
     print('finalize=False', flush=True)
     print('retrieve=True', flush=True)
     print('[TASKMOE]', flush=True)
-    print('stage=S4', flush=True)
-    print(f'channels={model.taskmoe_s4.channels}', flush=True)
-    print(f'num_experts={model.taskmoe_s4.num_experts}', flush=True)
-    print(f'top_k={model.taskmoe_s4.top_k}', flush=True)
-    print(f'residual_mode={model.taskmoe_s4.residual_mode}', flush=True)
-    print(f'beta_init={float(model.taskmoe_s4.residual_scale.detach().item())}', flush=True)
-    print(f'balance_loss_weight={model.taskmoe_s4.balance_loss_weight}', flush=True)
+    print(f'scales={"+".join(model.taskmoe_scales).upper()}', flush=True)
+    for scale_name, _, module in model._iter_active_taskmoe():
+        print(
+            f'{scale_name}: channels={module.channels} '
+            f'num_experts={module.num_experts} top_k={module.top_k} '
+            f'residual_mode={module.residual_mode} '
+            f'beta_init={float(module.residual_scale.detach().item())} '
+            f'balance_loss_weight={module.balance_loss_weight}',
+            flush=True,
+        )
     print('[PARAMS]', flush=True)
     print(f'stage1_trainable={stage1_trainable}', flush=True)
     print(f'taskmoe_trainable={taskmoe_trainable}', flush=True)
@@ -263,6 +272,7 @@ def main():
         'nonfinite_grad_steps', 'skipped_optimizer_steps',
         'nonfinite_full_steps', 'nonfinite_missing_steps',
         'train_moe_balance_loss', 'taskmoe_beta',
+        'taskmoe_beta_s1', 'taskmoe_beta_s2', 'taskmoe_beta_s3', 'taskmoe_beta_s4',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
 
@@ -494,7 +504,11 @@ def main():
             'nonfinite_full_steps': nonfinite_full_steps,
             'nonfinite_missing_steps': nonfinite_missing_steps,
             'train_moe_balance_loss': moe_balance_accum / max(1, moe_balance_steps),
-            'taskmoe_beta': float(task.model.taskmoe_s4.residual_scale.detach().item()) if hasattr(task.model, 'taskmoe_s4') else 0.0,
+            'taskmoe_beta': float(task.model.taskmoe_s4.residual_scale.detach().item()) if getattr(task.model, 'taskmoe_s4', None) is not None else 0.0,
+            'taskmoe_beta_s1': float(task.model.taskmoe_s1.residual_scale.detach().item()) if getattr(task.model, 'taskmoe_s1', None) is not None else 0.0,
+            'taskmoe_beta_s2': float(task.model.taskmoe_s2.residual_scale.detach().item()) if getattr(task.model, 'taskmoe_s2', None) is not None else 0.0,
+            'taskmoe_beta_s3': float(task.model.taskmoe_s3.residual_scale.detach().item()) if getattr(task.model, 'taskmoe_s3', None) is not None else 0.0,
+            'taskmoe_beta_s4': float(task.model.taskmoe_s4.residual_scale.detach().item()) if getattr(task.model, 'taskmoe_s4', None) is not None else 0.0,
             **{f'diag_{k}': v for k, v in diag_stats.items()},
         }
         append_epoch_log(

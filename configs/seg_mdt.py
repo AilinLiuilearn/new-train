@@ -45,6 +45,15 @@ class SegMDTConfig(ConfigBase):
             default=None,
             help='Stage-1 best checkpoint for frozen TaskMoE Stage-2 training',
         )
+        p.add_argument(
+            '--taskmoe_scales',
+            type=str,
+            default='s4',
+            help=(
+                'TaskMoE insertion scales for Stage-2 ablation. '
+                'Examples: s4 | s3s4 | s2s3s4 | s1s2s3s4 | all | s1,s2,s3,s4'
+            ),
+        )
         return p
 
     @staticmethod

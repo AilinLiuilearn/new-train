@@ -31,11 +31,12 @@ class MDTSegTeacher:
         ]
         print(f'[OPTIM] trainable_param_names={trainable_names}', flush=True)
         if bool(getattr(self.model, 'stage2_moe_only', False)):
-            bad = [n for n in trainable_names if not n.startswith('taskmoe_s4.')]
+            from models.dual_shared_add_baseline import _is_taskmoe_param_name
+            bad = [n for n in trainable_names if not _is_taskmoe_param_name(n)]
             if bad:
                 raise RuntimeError(
                     'Stage-2 TaskMoE mode requires all trainable params under '
-                    f'taskmoe_s4.*, but found: {bad}'
+                    f'taskmoe_s{{1-4}}.*, but found: {bad}'
                 )
         if not trainable_params:
             raise RuntimeError('No trainable parameters found for optimizer')
