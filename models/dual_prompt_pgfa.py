@@ -1002,4 +1002,4 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 if __name__ == "__main__":
-    run_smoke_test(build_argparser()
+    run_smoke_test(build_argparser().parse_args())

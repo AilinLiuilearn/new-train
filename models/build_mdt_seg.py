@@ -350,11 +350,13 @@ class ConvBNAct(nn.Module):
 
 
 def build_mdt_seg_teacher(config):
-    from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
+    from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline, parse_dp_pgfa_scales
     cppi_num_clusters = getattr(config, 'cppi_num_clusters', 6)
     cppi_build_stage = getattr(config, 'cppi_build_stage', 3)
     cppi_output_dir = os.path.join(config.checkpoint_dir, 'cppi')
     no_encoder_pretrained = bool(getattr(config, 'no_encoder_pretrained', False))
+    dp_pgfa_enabled = bool(getattr(config, 'dp_pgfa_enabled', False))
+    dp_pgfa_scales = getattr(config, 'dp_pgfa_scales', 's4')
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
@@ -367,6 +369,16 @@ def build_mdt_seg_teacher(config):
         cppi_num_clusters=cppi_num_clusters,
         cppi_build_stage=cppi_build_stage,
         cppi_output_dir=cppi_output_dir,
+        dp_pgfa_enabled=dp_pgfa_enabled,
+        dp_pgfa_scales=dp_pgfa_scales,
+        dp_text_tower_path=getattr(config, 'dp_text_tower_path', None),
+        dp_biomedclip_model_path=getattr(config, 'dp_biomedclip_model_path', None),
+        dp_window_size=int(getattr(config, 'dp_window_size', 8)),
+        dp_depth=int(getattr(config, 'dp_depth', 2)),
+        dp_prompt_len=int(getattr(config, 'dp_prompt_len', 128)),
+        dp_compress_ratio=int(getattr(config, 'dp_compress_ratio', 8)),
+        dp_use_task_prompt=bool(getattr(config, 'dp_use_task_prompt', True)),
+        dp_use_text_prompt=bool(getattr(config, 'dp_use_text_prompt', True)),
     )
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
@@ -378,4 +390,16 @@ def build_mdt_seg_teacher(config):
     print(f'[CPPI] num_clusters={cppi_num_clusters}')
     print(f'[CPPI] build_stage={cppi_build_stage}')
     print(f'[CPPI] output_dir={cppi_output_dir}')
+    print(f'[DP-PGFA] enabled={dp_pgfa_enabled}')
+    print(f'[DP-PGFA] scales={parse_dp_pgfa_scales(dp_pgfa_scales) if dp_pgfa_enabled else ()}')
+    print(f'[DP-PGFA] text_tower={getattr(config, "dp_text_tower_path", None)}')
+    print(f'[DP-PGFA] biomedclip_root={getattr(config, "dp_biomedclip_model_path", None)}')
+    print(
+        f'[DP-PGFA] window_size={getattr(config, "dp_window_size", 8)} '
+        f'depth={getattr(config, "dp_depth", 2)} '
+        f'prompt_len={getattr(config, "dp_prompt_len", 128)} '
+        f'compress_ratio={getattr(config, "dp_compress_ratio", 8)} '
+        f'task_prompt={getattr(config, "dp_use_task_prompt", True)} '
+        f'text_prompt={getattr(config, "dp_use_text_prompt", True)}'
+    )
     return {'model': model}

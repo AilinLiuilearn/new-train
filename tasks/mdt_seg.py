@@ -25,7 +25,26 @@ class MDTSegTeacher:
         self.model = networks['model']
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        if getattr(self.model, 'stage2_dp_only', False):
+            if not trainable_params:
+                raise RuntimeError('Stage2 DP-PGFA mode has zero trainable parameters')
+            bad = []
+            for name, p in self.model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if not name.startswith('dp_pgfa_'):
+                    bad.append(name)
+            if bad:
+                raise RuntimeError(
+                    'Stage2 DP-PGFA trainable names must start with dp_pgfa_, got: '
+                    + ', '.join(bad[:20])
+                )
+        self.optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
         self.scheduler = None
         self.scaler = torch.cuda.amp.GradScaler(enabled=bool(config.mixed_precision))
         self.global_batch_step = 0

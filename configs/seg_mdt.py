@@ -39,6 +39,25 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
         p.add_argument('--resume_checkpoint', type=str, default=None)
+        p.add_argument('--stage1_checkpoint', type=str, default=None)
+        p.add_argument('--dp_pgfa_enabled', type=str2bool, default=False)
+        p.add_argument('--dp_pgfa_scales', type=str, default='s4')
+        p.add_argument(
+            '--dp_text_tower_path',
+            type=str,
+            default='/root/autodl-tmp/mkd-main/new-train/pretrained/biomedbert_text_tower',
+        )
+        p.add_argument(
+            '--dp_biomedclip_model_path',
+            type=str,
+            default='/root/autodl-tmp/mkd-main/new-train/pretrained/biomedclip_model',
+        )
+        p.add_argument('--dp_window_size', type=int, default=8)
+        p.add_argument('--dp_depth', type=int, default=2)
+        p.add_argument('--dp_prompt_len', type=int, default=128)
+        p.add_argument('--dp_compress_ratio', type=int, default=8)
+        p.add_argument('--dp_use_task_prompt', type=str2bool, default=True)
+        p.add_argument('--dp_use_text_prompt', type=str2bool, default=True)
         return p
 
     @staticmethod
