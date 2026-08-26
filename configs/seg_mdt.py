@@ -49,12 +49,14 @@ class SegMDTConfig(ConfigBase):
             '--taskmoe_mode',
             type=str,
             default='independent',
-            choices=('independent', 'cross_scale_shared'),
+            choices=('independent', 'cross_scale_shared', 'state_scale_factorized'),
             help=(
                 'independent: per-scale TaskMoE (controlled by --taskmoe_scales). '
                 'cross_scale_shared: one CrossScaleSharedTaskMoE on S1-S4 with '
                 'scale-specific Prompt/Router and a shared Expert Bank '
-                '(requires --taskmoe_scales all).'
+                '(requires --taskmoe_scales all). '
+                'state_scale_factorized: SSF-SP TaskMoE with 1 shared + 4 scale-private '
+                '+ 2 state-private experts (requires --taskmoe_scales all).'
             ),
         )
         p.add_argument(
@@ -118,6 +120,44 @@ class SegMDTConfig(ConfigBase):
             type=str,
             default='/root/autodl-tmp/mkd-main/new-train/pretrained/biomedbert_text_tower',
             help='Local biomedical text tower used to encode fixed Full/Missing texts.',
+        )
+        p.add_argument(
+            '--taskmoe_private_rank',
+            type=int,
+            default=16,
+            choices=(8, 16, 32),
+            help='Low-rank width for scale/state private experts in state_scale_factorized.',
+        )
+        p.add_argument(
+            '--taskmoe_beta_max',
+            type=float,
+            default=1.0,
+            help='Bounded residual: beta_s = beta_max * tanh(raw_beta_s).',
+        )
+        p.add_argument(
+            '--taskmoe_shared_consistency_weight',
+            type=float,
+            default=0.01,
+            help='Weight for shared-expert Full–Missing consistency loss (factorized mode).',
+        )
+        p.add_argument(
+            '--taskmoe_shared_consistency_interval',
+            type=int,
+            default=1,
+            help='Compute shared consistency every N optimizer steps (factorized mode).',
+        )
+        p.add_argument(
+            '--stage2_decoder_adapter',
+            type=str2bool,
+            default=False,
+            help='Enable zero-start Stage2 decoder adapter after frozen d1 (not old-decoder fine-tune).',
+        )
+        p.add_argument(
+            '--stage2_decoder_adapter_level',
+            type=str,
+            default='d1',
+            choices=('d1',),
+            help='Decoder adapter insertion level. v1 only supports d1.',
         )
         return p
 

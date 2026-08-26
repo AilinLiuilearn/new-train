@@ -98,7 +98,7 @@ def _sync_cppi_config_from_stage1(cfg, checkpoint_path):
 
 
 def _load_stage1_for_taskmoe(model, checkpoint_path):
-    from models.dual_shared_add_baseline import _is_taskmoe_param_name
+    from models.dual_shared_add_baseline import _is_stage2_new_param_name
 
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     state_dict = checkpoint.get('model', checkpoint)
@@ -106,8 +106,8 @@ def _load_stage1_for_taskmoe(model, checkpoint_path):
     missing_keys = list(result.missing_keys)
     unexpected_keys = list(result.unexpected_keys)
 
-    missing_taskmoe = [k for k in missing_keys if _is_taskmoe_param_name(k)]
-    missing_other = [k for k in missing_keys if not _is_taskmoe_param_name(k)]
+    missing_taskmoe = [k for k in missing_keys if _is_stage2_new_param_name(k)]
+    missing_other = [k for k in missing_keys if not _is_stage2_new_param_name(k)]
     if missing_other:
         raise RuntimeError(
             'Stage-1 load has non-TaskMoE missing keys: '
@@ -139,6 +139,8 @@ def _verify_stage2_zero_step(task, val_loader):
     residual_mode = getattr(model, 'taskmoe_residual_mode', 'zero_start')
     if mode == 'cross_scale_shared':
         residual_mode = getattr(model.cross_scale_taskmoe, 'residual_mode', residual_mode)
+    elif mode == 'state_scale_factorized':
+        residual_mode = 'zero_start'
 
     batch = next(iter(val_loader))
     ct = batch['ct'][:1].to(task.device, non_blocking=True)
@@ -183,6 +185,24 @@ def _verify_stage2_zero_step(task, val_loader):
             raise RuntimeError(
                 f'TaskMoE shared beta must be ~0 at step-0, got {beta.tolist()}'
             )
+        beta_vals = [float(beta[i].item()) for i in range(4)]
+    elif mode == 'state_scale_factorized':
+        moe = model.state_scale_taskmoe
+        if moe is None:
+            raise RuntimeError('state_scale_factorized requires state_scale_taskmoe')
+        beta = moe.effective_beta().detach().float()
+        if float(beta.abs().max().item()) > 1e-12:
+            raise RuntimeError(
+                f'TaskMoE factorized effective beta must be ~0 at step-0, got {beta.tolist()}'
+            )
+        if float(moe.raw_beta.detach().abs().max().item()) > 1e-12:
+            raise RuntimeError('TaskMoE factorized raw_beta must be ~0 at step-0')
+        if model.stage2_decoder_adapter is not None:
+            # Adapter residual must be identity at init (zero-init up conv + FiLM).
+            dummy = torch.zeros(1, 64, 8, 8, device=task.device)
+            delta = model.stage2_decoder_adapter(dummy, None)
+            if float(delta.abs().max().item()) > 1e-12:
+                raise RuntimeError('stage2_decoder_adapter must be zero at step-0')
         beta_vals = [float(beta[i].item()) for i in range(4)]
     else:
         for scale_name, _, module in model._iter_active_taskmoe():
@@ -231,11 +251,24 @@ def _verify_stage2_zero_step(task, val_loader):
 
 
 def _shared_taskmoe_beta_log_values(model):
-    """CSV beta columns for shared TaskMoE.
+    """CSV beta columns for shared / factorized TaskMoE.
 
-    zero_start: real learnable beta.
+    zero_start: real learnable (or effective bounded) beta.
     paper: display 1.0 meaning F + 1*DeltaF (NOT a learnable parameter).
     """
+    mode = getattr(model, 'taskmoe_mode', 'independent')
+    if mode == 'state_scale_factorized':
+        moe = getattr(model, 'state_scale_taskmoe', None)
+        if moe is None:
+            return None
+        beta = moe.effective_beta().detach().float()
+        return (
+            float(beta[3].item()),
+            float(beta[0].item()),
+            float(beta[1].item()),
+            float(beta[2].item()),
+            float(beta[3].item()),
+        )
     moe = getattr(model, 'cross_scale_taskmoe', None)
     if moe is None:
         return None
@@ -263,18 +296,33 @@ def _optimizer_group_lr(optimizer, name, default=0.0):
         if group.get('name') == name:
             return float(group['lr'])
     if name == 'taskmoe' and optimizer.param_groups:
-        # Legacy single-group Stage2 MoE-only optimizer.
+        # Legacy single-group Stage2 MoE-only optimizer, or factorized alias.
+        for group in optimizer.param_groups:
+            if group.get('name') in ('factorized_taskmoe', 'taskmoe', None):
+                return float(group['lr'])
         return float(optimizer.param_groups[0]['lr'])
+    if name == 'decoder_adapter':
+        for group in optimizer.param_groups:
+            if group.get('name') == 'decoder_adapter':
+                return float(group['lr'])
     return float(default)
 
 
 def _print_stage2_startup(model, cfg, total_params, trainable_params, optimizer=None):
-    from models.dual_shared_add_baseline import _is_taskmoe_param_name
+    from models.dual_shared_add_baseline import (
+        _is_stage2_adapter_param_name,
+        _is_taskmoe_param_name,
+    )
 
     taskmoe_trainable = sum(
         p.numel()
         for n, p in model.named_parameters()
         if p.requires_grad and _is_taskmoe_param_name(n)
+    )
+    adapter_trainable = sum(
+        p.numel()
+        for n, p in model.named_parameters()
+        if p.requires_grad and _is_stage2_adapter_param_name(n)
     )
     decoder_trainable = sum(
         p.numel()
@@ -286,6 +334,7 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params, optimizer=
         for n, p in model.named_parameters()
         if p.requires_grad
         and not _is_taskmoe_param_name(n)
+        and not _is_stage2_adapter_param_name(n)
         and not n.startswith('decoder.')
     )
     train_decoder = bool(getattr(model, 'stage2_train_decoder', False))
@@ -348,6 +397,26 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params, optimizer=
             print('text_encoder_runtime=False', flush=True)
             print('text_prior_target=expert_router', flush=True)
             print(f'num_text_expert_logits={tp.num_experts}', flush=True)
+    elif mode == 'state_scale_factorized':
+        moe = model.state_scale_taskmoe
+        print('mode=state_scale_factorized', flush=True)
+        print('residual_mode=zero_start_bounded', flush=True)
+        print('scales=S1+S2+S3+S4', flush=True)
+        print(f'expert_dim={moe.expert_dim}', flush=True)
+        print('experts=E_shared+E_scale_s1..s4+E_state_full+E_state_missing', flush=True)
+        print(f'private_rank={moe.private_rank}', flush=True)
+        print(f'beta_max={moe.beta_max}', flush=True)
+        beta = moe.effective_beta().detach().float()
+        print(f'beta_s1={float(beta[0].item())}', flush=True)
+        print(f'beta_s2={float(beta[1].item())}', flush=True)
+        print(f'beta_s3={float(beta[2].item())}', flush=True)
+        print(f'beta_s4={float(beta[3].item())}', flush=True)
+        print(f'shared_consistency_weight={moe.shared_consistency_weight}', flush=True)
+        print(f'shared_consistency_interval={moe.shared_consistency_interval}', flush=True)
+        print('noisy_topk=False', flush=True)
+        print('balance_loss=False', flush=True)
+        print('[TEXT PRIOR]', flush=True)
+        print('enabled=False', flush=True)
     else:
         print('mode=independent', flush=True)
         print(f'scales={"+".join(model.taskmoe_scales).upper()}', flush=True)
@@ -362,6 +431,11 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params, optimizer=
             )
         print('[TEXT PRIOR]', flush=True)
         print('enabled=False', flush=True)
+    print('[DECODER ADAPTER]', flush=True)
+    print(f'enabled={model.stage2_decoder_adapter is not None}', flush=True)
+    if model.stage2_decoder_adapter is not None:
+        print(f'level={model.stage2_decoder_adapter.level}', flush=True)
+        print(f'trainable={adapter_trainable}', flush=True)
     text_to_expert_trainable = sum(
         p.numel()
         for n, p in model.named_parameters()
@@ -369,18 +443,24 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params, optimizer=
     )
     moe_lr = float(getattr(cfg, 'learning_rate', 0.0))
     dec_lr = float(getattr(cfg, 'decoder_lr', 0.0)) if train_decoder else 0.0
+    adapter_lr = 0.0
     if optimizer is not None:
         moe_lr = _optimizer_group_lr(optimizer, 'taskmoe', default=moe_lr)
+        if any(g.get('name') == 'factorized_taskmoe' for g in optimizer.param_groups):
+            moe_lr = _optimizer_group_lr(optimizer, 'factorized_taskmoe', default=moe_lr)
         dec_lr = _optimizer_group_lr(optimizer, 'decoder', default=0.0) if train_decoder else 0.0
+        adapter_lr = _optimizer_group_lr(optimizer, 'decoder_adapter', default=0.0)
     ratio = (dec_lr / moe_lr) if moe_lr > 0 else 0.0
     print('[STAGE2 TRAINABLE]', flush=True)
     print(f'taskmoe_trainable={taskmoe_trainable}', flush=True)
     print(f'text_to_expert_trainable={text_to_expert_trainable}', flush=True)
+    print(f'decoder_adapter_trainable={adapter_trainable}', flush=True)
     print(f'decoder_enabled={train_decoder}', flush=True)
     print(f'decoder_trainable={decoder_trainable}', flush=True)
     print(f'stage1_core_trainable={stage1_core_trainable}', flush=True)
     print('[LEARNING RATE]', flush=True)
     print(f'taskmoe_lr={moe_lr}', flush=True)
+    print(f'decoder_adapter_lr={adapter_lr}', flush=True)
     print(f'decoder_lr={dec_lr}', flush=True)
     print(f'decoder_lr_ratio={ratio}', flush=True)
     print('[PARAMS]', flush=True)
@@ -394,6 +474,10 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params, optimizer=
         print(f'num_experts={moe.num_experts}', flush=True)
         print(f'top_k={moe.top_k}', flush=True)
         print('shared_expert_bank=True', flush=True)
+    elif mode == 'state_scale_factorized':
+        print('num_experts=7', flush=True)
+        print('top_k=N/A', flush=True)
+        print('shared_expert_bank=factorized_shared_private', flush=True)
     else:
         print(f'num_experts={getattr(model, "taskmoe_num_experts", 6)}', flush=True)
         print('top_k=2', flush=True)
@@ -412,11 +496,26 @@ def main():
     if not getattr(cfg, 'stage1_checkpoint', None):
         raise ValueError('Stage-2 TaskMoE training requires --stage1_checkpoint')
     from models.dual_shared_add_baseline import _parse_taskmoe_scales
-    if str(getattr(cfg, 'taskmoe_mode', 'independent')).lower() == 'cross_scale_shared':
+    mode = str(getattr(cfg, 'taskmoe_mode', 'independent')).lower()
+    if mode in ('cross_scale_shared', 'state_scale_factorized'):
         if _parse_taskmoe_scales(getattr(cfg, 'taskmoe_scales', 's4')) != ('s1', 's2', 's3', 's4'):
             raise ValueError(
-                'cross_scale_shared TaskMoE is an all-scale module; use --taskmoe_scales all'
+                f'{mode} TaskMoE is an all-scale module; use --taskmoe_scales all'
             )
+    if mode == 'state_scale_factorized':
+        if bool(getattr(cfg, 'taskmoe_use_text_prior', False)):
+            raise ValueError('state_scale_factorized forbids --taskmoe_use_text_prior True')
+        if bool(getattr(cfg, 'stage2_train_decoder', False)):
+            raise ValueError(
+                'state_scale_factorized forbids --stage2_train_decoder True; '
+                'use --stage2_decoder_adapter'
+            )
+        if str(getattr(cfg, 'taskmoe_residual_mode', 'zero_start')).lower() == 'paper':
+            raise ValueError('state_scale_factorized forbids paper residual mode')
+    if bool(getattr(cfg, 'stage2_decoder_adapter', False)) and bool(
+        getattr(cfg, 'stage2_train_decoder', False)
+    ):
+        raise ValueError('Cannot combine --stage2_decoder_adapter with --stage2_train_decoder')
     _sync_cppi_config_from_stage1(cfg, cfg.stage1_checkpoint)
 
     with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
@@ -459,13 +558,14 @@ def main():
         'cppi_bank_version', 'cppi_ready_slots', 'cppi_bg_candidates', 'cppi_fg_candidates',
         'nonfinite_grad_steps', 'skipped_optimizer_steps',
         'nonfinite_full_steps', 'nonfinite_missing_steps',
-        'train_moe_balance_loss', 'taskmoe_beta',
+            'train_moe_balance_loss', 'taskmoe_beta',
         'taskmoe_beta_s1', 'taskmoe_beta_s2', 'taskmoe_beta_s3', 'taskmoe_beta_s4',
         'taskmoe_delta_ratio_s1', 'taskmoe_delta_ratio_s2',
         'taskmoe_delta_ratio_s3', 'taskmoe_delta_ratio_s4',
         'taskmoe_delta_l2_ratio_s1', 'taskmoe_delta_l2_ratio_s2',
         'taskmoe_delta_l2_ratio_s3', 'taskmoe_delta_l2_ratio_s4',
-        'lr_taskmoe', 'lr_decoder',
+        'train_shared_consistency_loss', 'shared_full_missing_cosine',
+        'lr_taskmoe', 'lr_decoder', 'lr_decoder_adapter',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
 
@@ -485,6 +585,10 @@ def main():
         full_loss = missing_loss = 0.0
         moe_balance_accum = 0.0
         moe_balance_steps = 0
+        shared_cons_accum = 0.0
+        shared_cons_steps = 0
+        shared_cos_accum = 0.0
+        shared_cos_steps = 0
         delta_ratio_accum = {f's{i}': 0.0 for i in range(1, 5)}
         delta_l2_ratio_accum = {f's{i}': 0.0 for i in range(1, 5)}
         delta_ratio_steps = 0
@@ -584,6 +688,13 @@ def main():
 
             moe_balance_accum += float(stats['loss_moe_balance'].detach())
             moe_balance_steps += 1
+            if 'loss_shared_consistency' in stats:
+                shared_cons_accum += float(stats['loss_shared_consistency'].detach())
+                shared_cons_steps += 1
+            moe_stats = (outputs.get('aux', {}) or {}).get('taskmoe_stats', {}) or {}
+            if 'shared_full_missing_cosine' in moe_stats:
+                shared_cos_accum += float(moe_stats['shared_full_missing_cosine'].detach())
+                shared_cos_steps += 1
             if route == 'full':
                 full_n += 1
                 full_loss += float(loss.detach())
@@ -713,8 +824,10 @@ def main():
             'train_moe_balance_loss': moe_balance_accum / max(1, moe_balance_steps),
             'taskmoe_beta': (
                 _shared_taskmoe_beta_log_values(task.model)[0]
-                if getattr(task.model, 'taskmoe_mode', 'independent') == 'cross_scale_shared'
-                and getattr(task.model, 'cross_scale_taskmoe', None) is not None
+                if getattr(task.model, 'taskmoe_mode', 'independent') in (
+                    'cross_scale_shared', 'state_scale_factorized'
+                )
+                and _shared_taskmoe_beta_log_values(task.model) is not None
                 else (
                     float(task.model.taskmoe_s4.residual_scale.detach().item())
                     if getattr(task.model, 'taskmoe_s4', None) is not None else 0.0
@@ -722,8 +835,10 @@ def main():
             ),
             'taskmoe_beta_s1': (
                 _shared_taskmoe_beta_log_values(task.model)[1]
-                if getattr(task.model, 'taskmoe_mode', 'independent') == 'cross_scale_shared'
-                and getattr(task.model, 'cross_scale_taskmoe', None) is not None
+                if getattr(task.model, 'taskmoe_mode', 'independent') in (
+                    'cross_scale_shared', 'state_scale_factorized'
+                )
+                and _shared_taskmoe_beta_log_values(task.model) is not None
                 else (
                     float(task.model.taskmoe_s1.residual_scale.detach().item())
                     if getattr(task.model, 'taskmoe_s1', None) is not None else 0.0
@@ -731,8 +846,10 @@ def main():
             ),
             'taskmoe_beta_s2': (
                 _shared_taskmoe_beta_log_values(task.model)[2]
-                if getattr(task.model, 'taskmoe_mode', 'independent') == 'cross_scale_shared'
-                and getattr(task.model, 'cross_scale_taskmoe', None) is not None
+                if getattr(task.model, 'taskmoe_mode', 'independent') in (
+                    'cross_scale_shared', 'state_scale_factorized'
+                )
+                and _shared_taskmoe_beta_log_values(task.model) is not None
                 else (
                     float(task.model.taskmoe_s2.residual_scale.detach().item())
                     if getattr(task.model, 'taskmoe_s2', None) is not None else 0.0
@@ -740,8 +857,10 @@ def main():
             ),
             'taskmoe_beta_s3': (
                 _shared_taskmoe_beta_log_values(task.model)[3]
-                if getattr(task.model, 'taskmoe_mode', 'independent') == 'cross_scale_shared'
-                and getattr(task.model, 'cross_scale_taskmoe', None) is not None
+                if getattr(task.model, 'taskmoe_mode', 'independent') in (
+                    'cross_scale_shared', 'state_scale_factorized'
+                )
+                and _shared_taskmoe_beta_log_values(task.model) is not None
                 else (
                     float(task.model.taskmoe_s3.residual_scale.detach().item())
                     if getattr(task.model, 'taskmoe_s3', None) is not None else 0.0
@@ -749,8 +868,10 @@ def main():
             ),
             'taskmoe_beta_s4': (
                 _shared_taskmoe_beta_log_values(task.model)[4]
-                if getattr(task.model, 'taskmoe_mode', 'independent') == 'cross_scale_shared'
-                and getattr(task.model, 'cross_scale_taskmoe', None) is not None
+                if getattr(task.model, 'taskmoe_mode', 'independent') in (
+                    'cross_scale_shared', 'state_scale_factorized'
+                )
+                and _shared_taskmoe_beta_log_values(task.model) is not None
                 else (
                     float(task.model.taskmoe_s4.residual_scale.detach().item())
                     if getattr(task.model, 'taskmoe_s4', None) is not None else 0.0
@@ -764,11 +885,16 @@ def main():
             'taskmoe_delta_l2_ratio_s2': delta_l2_ratio_accum['s2'] / max(1, delta_ratio_steps),
             'taskmoe_delta_l2_ratio_s3': delta_l2_ratio_accum['s3'] / max(1, delta_ratio_steps),
             'taskmoe_delta_l2_ratio_s4': delta_l2_ratio_accum['s4'] / max(1, delta_ratio_steps),
+            'train_shared_consistency_loss': shared_cons_accum / max(1, shared_cons_steps),
+            'shared_full_missing_cosine': shared_cos_accum / max(1, shared_cos_steps),
             'lr_taskmoe': _optimizer_group_lr(task.optimizer, 'taskmoe'),
             'lr_decoder': (
                 _optimizer_group_lr(task.optimizer, 'decoder', default=0.0)
                 if bool(getattr(task.model, 'stage2_train_decoder', False))
                 else 0.0
+            ),
+            'lr_decoder_adapter': _optimizer_group_lr(
+                task.optimizer, 'decoder_adapter', default=0.0
             ),
             **{f'diag_{k}': v for k, v in diag_stats.items()},
         }

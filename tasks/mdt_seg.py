@@ -31,11 +31,20 @@ class MDTSegTeacher:
         ]
         print(f'[OPTIM] trainable_param_names={trainable_names}', flush=True)
         if bool(getattr(self.model, 'stage2_moe_only', False)):
-            from models.dual_shared_add_baseline import _is_taskmoe_param_name
+            from models.dual_shared_add_baseline import (
+                _is_stage2_adapter_param_name,
+                _is_taskmoe_param_name,
+            )
             train_decoder = bool(getattr(self.model, 'stage2_train_decoder', False))
+            has_adapter = any(
+                p.requires_grad and _is_stage2_adapter_param_name(n)
+                for n, p in self.model.named_parameters()
+            )
 
             def _allowed(name):
                 if _is_taskmoe_param_name(name):
+                    return True
+                if _is_stage2_adapter_param_name(name):
                     return True
                 if train_decoder and name.startswith('decoder.'):
                     return True
@@ -46,6 +55,7 @@ class MDTSegTeacher:
                 raise RuntimeError(
                     'Stage-2 TaskMoE mode requires all trainable parameters to belong '
                     'to the active TaskMoE module'
+                    + (' / stage2_decoder_adapter' if has_adapter else '')
                     + (' or decoder.' if train_decoder else '.')
                     + f' Unexpected: {bad[:8]}'
                 )
@@ -54,15 +64,25 @@ class MDTSegTeacher:
                 p for n, p in self.model.named_parameters()
                 if p.requires_grad and _is_taskmoe_param_name(n)
             ]
+            adapter_params = [
+                p for n, p in self.model.named_parameters()
+                if p.requires_grad and _is_stage2_adapter_param_name(n)
+            ]
             decoder_params = [
                 p for n, p in self.model.named_parameters()
                 if p.requires_grad and n.startswith('decoder.')
             ]
-            if not taskmoe_params:
-                raise RuntimeError('Stage-2 requires non-empty TaskMoE trainable parameters')
+            if not taskmoe_params and not adapter_params:
+                raise RuntimeError(
+                    'Stage-2 requires non-empty TaskMoE and/or decoder-adapter trainable parameters'
+                )
             if train_decoder:
                 if not decoder_params:
                     raise RuntimeError('stage2_train_decoder=True but no decoder params trainable')
+                if adapter_params:
+                    raise RuntimeError(
+                        'Cannot combine stage2_train_decoder with stage2_decoder_adapter'
+                    )
                 taskmoe_ids = {id(p) for p in taskmoe_params}
                 decoder_ids = {id(p) for p in decoder_params}
                 if taskmoe_ids & decoder_ids:
@@ -94,10 +114,51 @@ class MDTSegTeacher:
                     f'taskmoe_n={len(taskmoe_params)} decoder_n={len(decoder_params)}',
                     flush=True,
                 )
+            elif adapter_params:
+                groups = []
+                moe_group_name = (
+                    'factorized_taskmoe'
+                    if getattr(self.model, 'taskmoe_mode', '') == 'state_scale_factorized'
+                    else 'taskmoe'
+                )
+                if taskmoe_params:
+                    groups.append(
+                        {
+                            'params': taskmoe_params,
+                            'lr': config.learning_rate,
+                            'name': moe_group_name,
+                        }
+                    )
+                groups.append(
+                    {
+                        'params': adapter_params,
+                        'lr': config.learning_rate,
+                        'name': 'decoder_adapter',
+                    }
+                )
+                self.optimizer = torch.optim.AdamW(
+                    groups,
+                    weight_decay=config.weight_decay,
+                )
+                print(
+                    f'[OPTIM] groups {moe_group_name}_n={len(taskmoe_params)} '
+                    f'decoder_adapter_n={len(adapter_params)} '
+                    f'lr={config.learning_rate}',
+                    flush=True,
+                )
             else:
                 self.optimizer = torch.optim.AdamW(
-                    taskmoe_params,
-                    lr=config.learning_rate,
+                    [
+                        {
+                            'params': taskmoe_params,
+                            'lr': config.learning_rate,
+                            'name': (
+                                'factorized_taskmoe'
+                                if getattr(self.model, 'taskmoe_mode', '') == 'state_scale_factorized'
+                                else 'taskmoe'
+                            ),
+                        }
+                    ],
                     weight_decay=config.weight_decay,
                 )
         else:
@@ -132,10 +193,26 @@ class MDTSegTeacher:
             moe_loss = torch.zeros((), device=seg_loss.device, dtype=torch.float32)
         else:
             moe_loss = moe_loss.float()
-        total_loss = seg_loss.float() + moe_loss
+
+        cons_loss = torch.zeros((), device=seg_loss.device, dtype=torch.float32)
+        cons_stats = {}
+        if (
+            getattr(self.model, 'taskmoe_mode', '') == 'state_scale_factorized'
+            and float(getattr(self.model, 'taskmoe_shared_consistency_weight', 0.0)) > 0
+        ):
+            cons_loss, cons_stats = self.model.compute_shared_consistency_loss(ct, pet)
+            cons_loss = cons_loss.float()
+            aux = outputs.setdefault('aux', {})
+            aux['taskmoe_shared_consistency_loss'] = cons_loss.detach()
+            moe_stats = aux.setdefault('taskmoe_stats', {})
+            for k, v in cons_stats.items():
+                moe_stats[k] = v
+
+        total_loss = seg_loss.float() + moe_loss + cons_loss
         stats = {
             'loss_seg_total': seg_loss.detach().float(),
             'loss_moe_balance': moe_loss.detach(),
+            'loss_shared_consistency': cons_loss.detach(),
             'loss_total': total_loss.detach(),
             'loss_seg': loss_stats.get('loss_dice', seg_loss.detach()),
             'loss_boundary': torch.tensor(0.0, device=seg_loss.device),

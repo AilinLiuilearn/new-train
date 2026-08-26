@@ -38,7 +38,7 @@ class UNetStyleDecoder(nn.Module):
             self.aux_head_d3 = nn.Conv2d(d3, out_channels, kernel_size=1)
             self.aux_head_d4 = nn.Conv2d(d4, out_channels, kernel_size=1)
 
-    def forward(self, features, target_size):
+    def forward(self, features, target_size, stage2_adapter=None, role_context=None):
         x1, x2, x3, x4 = features
         d4 = self.proj4(x4)
         s3 = self.proj3(x3)
@@ -47,11 +47,22 @@ class UNetStyleDecoder(nn.Module):
         d2 = self.fuse2(torch.cat([F.interpolate(d3, size=s2.shape[-2:], mode='bilinear', align_corners=False), s2], dim=1))
         s1 = self.proj1(x1)
         d1 = self.fuse1(torch.cat([F.interpolate(d2, size=s1.shape[-2:], mode='bilinear', align_corners=False), s1], dim=1))
+        if stage2_adapter is not None:
+            d1 = d1 + stage2_adapter(d1, role_context)
         logits = self.seg_head(d1)
         final_logits = F.interpolate(logits, size=target_size, mode='bilinear', align_corners=False)
         if not self.use_deep_supervision:
             return {'logits': final_logits}
         return {'logits': final_logits, 'aux_logits': [self.aux_head_d2(d2), self.aux_head_d3(d3), self.aux_head_d4(d4)]}
+
+    def forward_with_stage2_adapter(self, features, target_size, stage2_adapter, role_context=None):
+        """Explicit Stage-2 adapter path; old decoder weights stay unchanged."""
+        return self.forward(
+            features,
+            target_size,
+            stage2_adapter=stage2_adapter,
+            role_context=role_context,
+        )
 
 
 class AddFusion(nn.Module):

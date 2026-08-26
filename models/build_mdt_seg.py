@@ -374,6 +374,16 @@ def build_mdt_seg_teacher(config):
         taskmoe_use_text_prior=bool(getattr(config, 'taskmoe_use_text_prior', False)),
         taskmoe_text_model_path=getattr(config, 'taskmoe_text_model_path', None),
         taskmoe_text_tower_path=getattr(config, 'taskmoe_text_tower_path', None),
+        taskmoe_private_rank=int(getattr(config, 'taskmoe_private_rank', 16)),
+        taskmoe_beta_max=float(getattr(config, 'taskmoe_beta_max', 1.0)),
+        taskmoe_shared_consistency_weight=float(
+            getattr(config, 'taskmoe_shared_consistency_weight', 0.01)
+        ),
+        taskmoe_shared_consistency_interval=int(
+            getattr(config, 'taskmoe_shared_consistency_interval', 1)
+        ),
+        stage2_decoder_adapter=bool(getattr(config, 'stage2_decoder_adapter', False)),
+        stage2_decoder_adapter_level=getattr(config, 'stage2_decoder_adapter_level', 'd1'),
     )
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
@@ -385,6 +395,11 @@ def build_mdt_seg_teacher(config):
         f'taskmoe_num_experts={int(getattr(config, "taskmoe_num_experts", 6))} '
         f'taskmoe_top_k=2 '
         f'taskmoe_residual_mode={getattr(config, "taskmoe_residual_mode", "zero_start")} '
+        f'taskmoe_private_rank={int(getattr(config, "taskmoe_private_rank", 16))} '
+        f'taskmoe_beta_max={float(getattr(config, "taskmoe_beta_max", 1.0))} '
+        f'taskmoe_shared_consistency_weight={float(getattr(config, "taskmoe_shared_consistency_weight", 0.01))} '
+        f'stage2_decoder_adapter={bool(getattr(config, "stage2_decoder_adapter", False))} '
+        f'stage2_decoder_adapter_level={getattr(config, "stage2_decoder_adapter_level", "d1")} '
         f'taskmoe_use_text_prior={bool(getattr(config, "taskmoe_use_text_prior", False))} '
         f'taskmoe_text_model_path={getattr(config, "taskmoe_text_model_path", None)} '
         f'taskmoe_text_tower_path={getattr(config, "taskmoe_text_tower_path", None)}'

@@ -6,6 +6,8 @@ from models.build_mdt_seg import create_feature_backbone, load_local_weights_saf
 from models.ct_pet_prototype_imputation import CrossScaleCTPETPrototypeMemory
 from models.taskmoe_s4_refiner import TaskMoEStage4Refiner
 from models.cross_scale_shared_taskmoe import CrossScaleSharedTaskMoE
+from models.state_scale_factorized_taskmoe import StateScaleFactorizedTaskMoE
+from models.stage2_decoder_adapter import Stage2DecoderAdapter
 
 
 def _parse_taskmoe_scales(taskmoe_scales):
@@ -79,7 +81,17 @@ def _is_taskmoe_param_name(name):
         or name.startswith('taskmoe_s3.')
         or name.startswith('taskmoe_s4.')
         or name.startswith('cross_scale_taskmoe.')
+        or name.startswith('state_scale_taskmoe.')
     )
+
+
+def _is_stage2_adapter_param_name(name):
+    return name.startswith('stage2_decoder_adapter.')
+
+
+def _is_stage2_new_param_name(name):
+    """Parameters absent from Stage-1 checkpoints (TaskMoE / decoder adapter)."""
+    return _is_taskmoe_param_name(name) or _is_stage2_adapter_param_name(name)
 
 
 _TASKMOE_SCALE_INDEX = {'s1': 0, 's2': 1, 's3': 2, 's4': 3}
@@ -101,17 +113,43 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
-    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=6, cppi_build_stage=3, cppi_output_dir=None, taskmoe_scales='s4', taskmoe_mode='independent', taskmoe_residual_mode='zero_start', taskmoe_num_experts=6, taskmoe_use_text_prior=False, taskmoe_text_model_path=None, taskmoe_text_tower_path=None):
+    def __init__(
+        self,
+        ct_backbone='convnextv2_nano',
+        pet_backbone='mit_b1',
+        ct_pretrained_path=None,
+        pet_pretrained_path=None,
+        in_channels=3,
+        out_channels=1,
+        decoder_channels=(512, 256, 128, 64),
+        use_deep_supervision=False,
+        cppi_num_clusters=6,
+        cppi_build_stage=3,
+        cppi_output_dir=None,
+        taskmoe_scales='s4',
+        taskmoe_mode='independent',
+        taskmoe_residual_mode='zero_start',
+        taskmoe_num_experts=6,
+        taskmoe_use_text_prior=False,
+        taskmoe_text_model_path=None,
+        taskmoe_text_tower_path=None,
+        taskmoe_private_rank=16,
+        taskmoe_beta_max=1.0,
+        taskmoe_shared_consistency_weight=0.01,
+        taskmoe_shared_consistency_interval=1,
+        stage2_decoder_adapter=False,
+        stage2_decoder_adapter_level='d1',
+    ):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.stage2_moe_only = False
         self.stage2_train_decoder = False
         self.taskmoe_enabled = True
         self.taskmoe_mode = str(taskmoe_mode or 'independent').strip().lower()
-        if self.taskmoe_mode not in ('independent', 'cross_scale_shared'):
+        if self.taskmoe_mode not in ('independent', 'cross_scale_shared', 'state_scale_factorized'):
             raise ValueError(
                 f'Unsupported taskmoe_mode={taskmoe_mode!r}; '
-                'use independent or cross_scale_shared'
+                'use independent, cross_scale_shared, or state_scale_factorized'
             )
         self.taskmoe_residual_mode = str(taskmoe_residual_mode or 'zero_start').strip().lower()
         if self.taskmoe_residual_mode not in ('zero_start', 'paper'):
@@ -127,10 +165,27 @@ class DualSharedAddPETCTBaseline(nn.Module):
         self.taskmoe_use_text_prior = bool(taskmoe_use_text_prior)
         self.taskmoe_text_model_path = taskmoe_text_model_path
         self.taskmoe_text_tower_path = taskmoe_text_tower_path
+        self.taskmoe_private_rank = int(taskmoe_private_rank)
+        self.taskmoe_beta_max = float(taskmoe_beta_max)
+        self.taskmoe_shared_consistency_weight = float(taskmoe_shared_consistency_weight)
+        self.taskmoe_shared_consistency_interval = int(taskmoe_shared_consistency_interval)
+        self.stage2_decoder_adapter_enabled = bool(stage2_decoder_adapter)
+        self.stage2_decoder_adapter_level = str(stage2_decoder_adapter_level or 'd1').strip().lower()
+        self._last_role_context = None
+
         if self.taskmoe_use_text_prior and self.taskmoe_mode != 'cross_scale_shared':
             raise ValueError(
                 'taskmoe_use_text_prior=True requires --taskmoe_mode cross_scale_shared'
             )
+        if self.taskmoe_mode == 'state_scale_factorized':
+            if self.taskmoe_use_text_prior:
+                raise ValueError(
+                    'state_scale_factorized forbids taskmoe_use_text_prior=True'
+                )
+            if self.taskmoe_residual_mode == 'paper':
+                raise ValueError(
+                    'state_scale_factorized forbids paper residual mode; use zero_start'
+                )
         self.taskmoe_scales = _parse_taskmoe_scales(taskmoe_scales)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
@@ -153,6 +208,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
         self.taskmoe_s3 = None
         self.taskmoe_s4 = None
         self.cross_scale_taskmoe = None
+        self.state_scale_taskmoe = None
+        self.stage2_decoder_adapter = None
         if len(pet_channels) < 4:
             raise ValueError(f'TaskMoE expects 4 encoder scales, got {len(pet_channels)}')
 
@@ -179,6 +236,25 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 text_model_path=self.taskmoe_text_model_path,
                 text_tower_path=self.taskmoe_text_tower_path,
             )
+        elif self.taskmoe_mode == 'state_scale_factorized':
+            if self.taskmoe_scales != ('s1', 's2', 's3', 's4'):
+                raise ValueError(
+                    'state_scale_factorized TaskMoE is an all-scale module; use --taskmoe_scales all'
+                )
+            self.state_scale_taskmoe = StateScaleFactorizedTaskMoE(
+                channels=pet_channels,
+                expert_dim=128,
+                private_rank=self.taskmoe_private_rank,
+                atom_num=32,
+                atom_dim=256,
+                prompt_hidden_channels=64,
+                mlp_ratio=2.0,
+                dropout=0.0,
+                beta_max=self.taskmoe_beta_max,
+                shared_consistency_weight=self.taskmoe_shared_consistency_weight,
+                shared_consistency_interval=self.taskmoe_shared_consistency_interval,
+                role_context_dim=64,
+            )
         else:
             for scale_name in self.taskmoe_scales:
                 idx = _TASKMOE_SCALE_INDEX[scale_name]
@@ -187,6 +263,15 @@ class DualSharedAddPETCTBaseline(nn.Module):
                     num_experts=self.taskmoe_num_experts,
                 )
                 setattr(self, f'taskmoe_{scale_name}', module)
+
+        if self.stage2_decoder_adapter_enabled:
+            d1_channels = int(decoder_channels[-1])
+            self.stage2_decoder_adapter = Stage2DecoderAdapter(
+                channels=d1_channels,
+                bottleneck=16,
+                role_context_dim=64,
+                level=self.stage2_decoder_adapter_level,
+            )
 
     @staticmethod
     def _build_taskmoe(channels, num_experts=6):
@@ -235,6 +320,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
     def _refine_stage4(self, fused_feats, route=None, pet_available=None):
         """Refine TaskMoE scales. Name kept for compatibility."""
         fused_feats = list(fused_feats)
+        self._last_role_context = None
         if not self.taskmoe_enabled:
             zero = fused_feats[-1].new_zeros((), dtype=torch.float32)
             return fused_feats, zero, {}
@@ -254,7 +340,45 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 out.to(dtype=dtype)
                 for out, dtype in zip(result.features, orig_dtypes)
             ]
+            # Minimal role context for optional decoder adapter on A0/A1.
+            b = fused_feats[0].shape[0]
+            device = fused_feats[0].device
+            if route == 'full':
+                state = torch.ones(b, device=device, dtype=torch.float32)
+            elif route == 'missing':
+                state = torch.zeros(b, device=device, dtype=torch.float32)
+            elif route == 'auto' and pet_available is not None:
+                state = pet_available.to(device=device, dtype=torch.float32).view(-1)
+            else:
+                state = torch.ones(b, device=device, dtype=torch.float32)
+            self._last_role_context = torch.cat(
+                [
+                    state.unsqueeze(1),
+                    (1.0 - state).unsqueeze(1),
+                    torch.zeros(b, 62, device=device, dtype=torch.float32),
+                ],
+                dim=1,
+            )
             return fused_feats, result.balance_loss.float(), dict(result.stats)
+
+        if self.taskmoe_mode == 'state_scale_factorized':
+            if self.state_scale_taskmoe is None:
+                raise RuntimeError('state_scale_factorized mode requires state_scale_taskmoe module')
+            orig_dtypes = [feat.dtype for feat in fused_feats]
+            with torch.cuda.amp.autocast(enabled=False):
+                shared_input = [feat.float() for feat in fused_feats]
+                result = self.state_scale_taskmoe(
+                    shared_input,
+                    route=route,
+                    pet_available=pet_available,
+                )
+            fused_feats = [
+                out.to(dtype=dtype)
+                for out, dtype in zip(result.features, orig_dtypes)
+            ]
+            self._last_role_context = result.role_context
+            stats = dict(result.stats)
+            return fused_feats, result.aux_loss.float(), stats
 
         # independent: Sparse index_add_ is not AMP-safe. Run TaskMoE in fp32.
         aux_loss = None
@@ -270,13 +394,36 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return fused_feats, aux_loss, {}
 
     def _decode(self, fused_feats, target_size, aux=None):
-        out = self.decoder(fused_feats, target_size)
+        adapter = None
+        role_context = None
+        if (
+            self.stage2_decoder_adapter is not None
+            and self.stage2_moe_only
+            and self.taskmoe_enabled
+        ):
+            adapter = self.stage2_decoder_adapter
+            role_context = self._last_role_context
+        out = self.decoder(
+            fused_feats,
+            target_size,
+            stage2_adapter=adapter,
+            role_context=role_context,
+        )
         _check_tensor('logits', out['logits'])
         out['pred'] = out['logits']
         out['aux'] = {} if aux is None else aux
         return out
 
     def enable_stage2_moe_only(self, train_decoder=False):
+        if bool(train_decoder) and self.taskmoe_mode == 'state_scale_factorized':
+            raise ValueError(
+                'state_scale_factorized forbids stage2_train_decoder=True; '
+                'use --stage2_decoder_adapter instead'
+            )
+        if bool(train_decoder) and self.stage2_decoder_adapter is not None:
+            raise ValueError(
+                'Cannot combine stage2_train_decoder=True with stage2_decoder_adapter'
+            )
         for p in self.parameters():
             p.requires_grad = False
         if self.taskmoe_mode == 'cross_scale_shared':
@@ -284,10 +431,18 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 raise RuntimeError('cross_scale_shared mode requires cross_scale_taskmoe module')
             for p in self.cross_scale_taskmoe.parameters():
                 p.requires_grad = True
+        elif self.taskmoe_mode == 'state_scale_factorized':
+            if self.state_scale_taskmoe is None:
+                raise RuntimeError('state_scale_factorized mode requires state_scale_taskmoe module')
+            for p in self.state_scale_taskmoe.parameters():
+                p.requires_grad = True
         else:
             for _, _, module in self._iter_active_taskmoe():
                 for p in module.parameters():
                     p.requires_grad = True
+        if self.stage2_decoder_adapter is not None:
+            for p in self.stage2_decoder_adapter.parameters():
+                p.requires_grad = True
         self.stage2_train_decoder = bool(train_decoder)
         if self.stage2_train_decoder:
             for p in self.decoder.parameters():
@@ -313,12 +468,94 @@ class DualSharedAddPETCTBaseline(nn.Module):
                     module.eval()
             if self.cross_scale_taskmoe is not None:
                 self.cross_scale_taskmoe.eval()
+            if self.state_scale_taskmoe is not None:
+                self.state_scale_taskmoe.eval()
+            if self.stage2_decoder_adapter is not None:
+                self.stage2_decoder_adapter.eval()
             if self.taskmoe_mode == 'cross_scale_shared':
                 self.cross_scale_taskmoe.train(mode)
+            elif self.taskmoe_mode == 'state_scale_factorized':
+                self.state_scale_taskmoe.train(mode)
             else:
                 for _, _, module in self._iter_active_taskmoe():
                     module.train(mode)
+            if self.stage2_decoder_adapter is not None:
+                self.stage2_decoder_adapter.train(mode)
         return self
+
+    @torch.no_grad()
+    def _stage1_fused_features(self, ct, pet, route):
+        """Frozen Stage-1 fused features for Full/Missing (TaskMoE disabled)."""
+        was_enabled = self.taskmoe_enabled
+        self.taskmoe_enabled = False
+        try:
+            ct_feats = self._encode_ct(ct)
+            if route == 'full':
+                pet_feats_real = self._encode_pet(pet)
+                if self.prototype_memory.bank_ready:
+                    _, ct_reference_feats, _ = self._retrieve_cppi(
+                        ct_feats,
+                        compute_report=False,
+                        save_diagnostics=False,
+                        print_info=False,
+                        return_ct_reference=True,
+                    )
+                    ct_reference_feats = [x.detach() for x in ct_reference_feats]
+                    pet_feats_cal = self.pet_calibration(
+                        ct_feats,
+                        pet_feats_real,
+                        ct_reference_feats,
+                        reference_valid=True,
+                    )
+                else:
+                    pet_feats_cal = self.pet_calibration(
+                        ct_feats,
+                        pet_feats_real,
+                        None,
+                        reference_valid=False,
+                    )
+                fused = self.fusion(ct_feats, pet_feats_cal, mode='full')
+            elif route == 'missing':
+                pet_feats_proxy, ct_reference_feats, _ = self._retrieve_cppi(
+                    ct_feats,
+                    compute_report=False,
+                    save_diagnostics=False,
+                    print_info=False,
+                    return_ct_reference=True,
+                )
+                ct_reference_feats = [x.detach() for x in ct_reference_feats]
+                pet_feats_cal = self.pet_calibration(
+                    ct_feats,
+                    pet_feats_proxy,
+                    ct_reference_feats,
+                    reference_valid=self.prototype_memory.bank_ready,
+                )
+                fused = self.fusion(ct_feats, pet_feats_cal, mode='missing')
+            else:
+                raise ValueError(f'_stage1_fused_features route must be full/missing, got {route!r}')
+            return [f.detach() for f in fused]
+        finally:
+            self.taskmoe_enabled = was_enabled
+
+    def compute_shared_consistency_loss(self, ct, pet):
+        """Optional Full–Missing shared-expert consistency (Stage1 frozen)."""
+        if self.state_scale_taskmoe is None:
+            zero = ct.new_zeros((), dtype=torch.float32)
+            return zero, {}
+        if not self.state_scale_taskmoe.should_compute_shared_consistency():
+            zero = ct.new_zeros((), dtype=torch.float32)
+            return zero, {
+                'shared_consistency_skipped': torch.tensor(1.0, device=ct.device),
+            }
+        feats_full = self._stage1_fused_features(ct, pet, route='full')
+        feats_missing = self._stage1_fused_features(ct, pet, route='missing')
+        with torch.cuda.amp.autocast(enabled=False):
+            loss, stats = self.state_scale_taskmoe.compute_shared_consistency(
+                [f.float() for f in feats_full],
+                [f.float() for f in feats_missing],
+            )
+        weight = float(self.state_scale_taskmoe.shared_consistency_weight)
+        return (weight * loss.float()), stats
 
     def _collect_cppi(self, ct_feats, pet_feats_real, mask):
         if self.stage2_moe_only:

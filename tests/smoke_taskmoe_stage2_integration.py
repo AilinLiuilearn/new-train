@@ -14,7 +14,11 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from models.build_mdt_seg import build_mdt_seg_teacher
-from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline, _is_taskmoe_param_name
+from models.dual_shared_add_baseline import (
+    DualSharedAddPETCTBaseline,
+    _is_stage2_adapter_param_name,
+    _is_taskmoe_param_name,
+)
 from run_mdt_seg import _load_stage1_for_taskmoe, _sync_cppi_config_from_stage1
 from tasks.mdt_seg import MDTSegTeacher
 
@@ -22,6 +26,54 @@ DEFAULT_STAGE1_CKPT = (
     '/root/autodl-tmp/mkd-main/new-train/checkpoints_new/MDT/'
     'e1-api-masked-baseline-CPPI-k6-c4-affinecalib-pretrained/ckpt.best_joint.pth.tar'
 )
+SYNTH_STAGE1_CKPT = '/tmp/taskmoe_stage2_smoke/synth_stage1_ckpt.pth.tar'
+
+
+def _ensure_stage1_checkpoint(stage1_ckpt: str) -> str:
+    """Use real Stage-1 ckpt if present; otherwise synthesize a bank-ready stub."""
+    if stage1_ckpt and os.path.isfile(stage1_ckpt):
+        return stage1_ckpt
+    os.makedirs(os.path.dirname(SYNTH_STAGE1_CKPT), exist_ok=True)
+    if os.path.isfile(SYNTH_STAGE1_CKPT):
+        print(f'[SMOKE] using cached synth Stage-1 ckpt: {SYNTH_STAGE1_CKPT}', flush=True)
+        return SYNTH_STAGE1_CKPT
+    print('[SMOKE] synthesizing Stage-1 checkpoint (no real ckpt found)', flush=True)
+    cfg = _make_cfg(
+        stage1_checkpoint=None,
+        taskmoe_scales='s4',
+        taskmoe_mode='independent',
+        checkpoint_dir='/tmp/taskmoe_stage2_smoke',
+    )
+    networks = build_mdt_seg_teacher(cfg)
+    model = networks['model']
+    # Mark CPPI bank ready without running collect/finalize.
+    with torch.no_grad():
+        model.prototype_memory.prototype_ready.fill_(1)
+        model.prototype_memory.bank_version.fill_(1)
+    # Drop TaskMoE keys so Stage-2 load reports them as allowed missing.
+    state = {
+        k: v for k, v in model.state_dict().items()
+        if not _is_taskmoe_param_name(k) and not _is_stage2_adapter_param_name(k)
+    }
+    payload = {
+        'model': state,
+        'epoch': 0,
+        'config': {
+            'cppi_num_clusters': 6,
+            'cppi_build_stage': 4,
+            'ct_backbone': 'convnextv2_nano',
+            'pet_backbone': 'mit_b1',
+            'decoder_channels': [512, 256, 128, 64],
+        },
+    }
+    torch.save(payload, SYNTH_STAGE1_CKPT)
+    cfg_path = os.path.join(os.path.dirname(SYNTH_STAGE1_CKPT), 'config_args.json')
+    import json
+    with open(cfg_path, 'w') as f:
+        json.dump(payload['config'], f, indent=2)
+    # Also place config next to synth path expected by _sync if using that dir.
+    print(f'[SMOKE] wrote synth Stage-1 ckpt: {SYNTH_STAGE1_CKPT}', flush=True)
+    return SYNTH_STAGE1_CKPT
 
 
 def _make_cfg(**kwargs):
@@ -50,6 +102,14 @@ def _make_cfg(**kwargs):
         'taskmoe_residual_mode': 'zero_start',
         'stage2_train_decoder': False,
         'decoder_lr': 8e-6,
+        'taskmoe_private_rank': 16,
+        'taskmoe_beta_max': 1.0,
+        'taskmoe_shared_consistency_weight': 0.01,
+        'taskmoe_shared_consistency_interval': 1,
+        'stage2_decoder_adapter': False,
+        'stage2_decoder_adapter_level': 'd1',
+        'taskmoe_use_text_prior': False,
+        'taskmoe_num_experts': 6,
     }
     base.update(kwargs)
     return types.SimpleNamespace(**base)
@@ -63,6 +123,12 @@ def _build_stage2(
     stage2_train_decoder: bool = False,
     learning_rate: float = 8e-5,
     decoder_lr: float = 8e-6,
+    taskmoe_private_rank: int = 16,
+    taskmoe_beta_max: float = 1.0,
+    taskmoe_shared_consistency_weight: float = 0.01,
+    taskmoe_shared_consistency_interval: int = 1,
+    stage2_decoder_adapter: bool = False,
+    stage2_decoder_adapter_level: str = 'd1',
 ):
     cfg = _make_cfg(
         stage1_checkpoint=stage1_ckpt,
@@ -72,6 +138,12 @@ def _build_stage2(
         stage2_train_decoder=stage2_train_decoder,
         learning_rate=learning_rate,
         decoder_lr=decoder_lr,
+        taskmoe_private_rank=taskmoe_private_rank,
+        taskmoe_beta_max=taskmoe_beta_max,
+        taskmoe_shared_consistency_weight=taskmoe_shared_consistency_weight,
+        taskmoe_shared_consistency_interval=taskmoe_shared_consistency_interval,
+        stage2_decoder_adapter=stage2_decoder_adapter,
+        stage2_decoder_adapter_level=stage2_decoder_adapter_level,
     )
     _sync_cppi_config_from_stage1(cfg, stage1_ckpt)
     cfg.ct_pretrained_path = None
@@ -83,6 +155,12 @@ def _build_stage2(
     cfg.stage2_train_decoder = stage2_train_decoder
     cfg.learning_rate = learning_rate
     cfg.decoder_lr = decoder_lr
+    cfg.taskmoe_private_rank = taskmoe_private_rank
+    cfg.taskmoe_beta_max = taskmoe_beta_max
+    cfg.taskmoe_shared_consistency_weight = taskmoe_shared_consistency_weight
+    cfg.taskmoe_shared_consistency_interval = taskmoe_shared_consistency_interval
+    cfg.stage2_decoder_adapter = stage2_decoder_adapter
+    cfg.stage2_decoder_adapter_level = stage2_decoder_adapter_level
     networks = build_mdt_seg_teacher(cfg)
     model = networks['model']
     _load_stage1_for_taskmoe(model, stage1_ckpt)
@@ -100,6 +178,7 @@ def _fake_batch(device, size=288, batch=1):
 
 
 def run_smoke(stage1_ckpt: str):
+    stage1_ckpt = _ensure_stage1_checkpoint(stage1_ckpt)
     assert os.path.isfile(stage1_ckpt), f'missing Stage-1 checkpoint: {stage1_ckpt}'
     model, task, cfg = _build_stage2(stage1_ckpt, taskmoe_scales='s4')
     device = task.device
@@ -336,6 +415,167 @@ def run_smoke(stage1_ckpt: str):
     assert _has_finite('cross_scale_taskmoe.scale_adapters.0.prompt')
     task_p.optimizer.step()
     print('[SMOKE] 15 paper_residual_ok')
+
+    # 16) state_scale_factorized: freeze / identity / route / eligibility grads
+    model_f, task_f, _ = _build_stage2(
+        stage1_ckpt,
+        taskmoe_scales='all',
+        taskmoe_mode='state_scale_factorized',
+        taskmoe_shared_consistency_weight=0.01,
+        stage2_decoder_adapter=True,
+    )
+    model_f.to(device)
+    assert model_f.taskmoe_mode == 'state_scale_factorized'
+    assert model_f.state_scale_taskmoe is not None
+    assert model_f.stage2_decoder_adapter is not None
+    assert model_f.cross_scale_taskmoe is None
+    trainable = [n for n, p in model_f.named_parameters() if p.requires_grad]
+    assert trainable
+    assert all(
+        _is_taskmoe_param_name(n) or _is_stage2_adapter_param_name(n)
+        for n in trainable
+    )
+    assert not any(n.startswith('decoder.') for n in trainable)
+    batch_f = _fake_batch(device, batch=2)
+    model_f.eval()
+    with torch.no_grad():
+        beta = model_f.state_scale_taskmoe.effective_beta().detach()
+        assert float(beta.abs().max().item()) <= 1e-12
+        for route in ('full', 'missing'):
+            model_f.taskmoe_enabled = False
+            la = model_f(batch_f['ct'], pet=batch_f['pet'], forward_mode=route, mask=None)['logits']
+            model_f.taskmoe_enabled = True
+            lb = model_f(batch_f['ct'], pet=batch_f['pet'], forward_mode=route, mask=None)['logits']
+            diff = float((la - lb).abs().max().item())
+            assert diff <= 1e-6, (route, diff)
+    # Missing skips PET encoder
+    pet_calls = {'n': 0}
+    orig_encode_pet = model_f._encode_pet
+
+    def _encode_pet_guard(*args, **kwargs):
+        pet_calls['n'] += 1
+        return orig_encode_pet(*args, **kwargs)
+
+    model_f._encode_pet = _encode_pet_guard
+    model_f.train()
+    _ = model_f(batch_f['ct'], pet=batch_f['pet'], mask=batch_f['mask'], forward_mode='missing')
+    assert pet_calls['n'] == 0
+    model_f._encode_pet = orig_encode_pet
+
+    # CPPI bank version unchanged across an optimizer step
+    bank_before = int(model_f.prototype_memory.bank_version.item())
+    task_f.optimizer.zero_grad(set_to_none=True)
+    loss_f, _, _, stats_f = task_f.train_step(batch_f, forward_mode='full')
+    assert 'loss_shared_consistency' in stats_f
+    assert torch.isfinite(stats_f['loss_shared_consistency'])
+    loss_f.backward()
+    stage1_grad = any(
+        p.grad is not None and float(p.grad.abs().sum().item()) > 0
+        for n, p in model_f.named_parameters()
+        if not (_is_taskmoe_param_name(n) or _is_stage2_adapter_param_name(n))
+    )
+    assert stage1_grad is False
+    assert any(
+        p.grad is not None
+        for n, p in model_f.named_parameters()
+        if n.startswith('state_scale_taskmoe.shared_expert.')
+    )
+    assert any(
+        p.grad is not None
+        for n, p in model_f.named_parameters()
+        if n.startswith('stage2_decoder_adapter.')
+    )
+    task_f.optimizer.step()
+    bank_after = int(model_f.prototype_memory.bank_version.item())
+    assert bank_before == bank_after
+    print('[SMOKE] 16 state_scale_factorized_freeze_identity_ok')
+
+    # 17) eligibility: Full updates only full-state expert; S1 updates only scale-s1
+    model_e, task_e, _ = _build_stage2(
+        stage1_ckpt,
+        taskmoe_scales='all',
+        taskmoe_mode='state_scale_factorized',
+        taskmoe_shared_consistency_weight=0.0,
+        stage2_decoder_adapter=False,
+    )
+    model_e.to(device)
+    batch_e = _fake_batch(device, batch=1)
+    model_e.train()
+    task_e.optimizer.zero_grad(set_to_none=True)
+    out_full = model_e(batch_e['ct'], pet=batch_e['pet'], mask=batch_e['mask'], forward_mode='full')
+    out_full['logits'].mean().backward()
+    assert model_e.state_scale_taskmoe.state_experts[1].fc1.weight.grad is not None
+    assert model_e.state_scale_taskmoe.state_experts[0].fc1.weight.grad is None
+    task_e.optimizer.zero_grad(set_to_none=True)
+    out_miss = model_e(batch_e['ct'], pet=batch_e['pet'], mask=batch_e['mask'], forward_mode='missing')
+    out_miss['logits'].mean().backward()
+    assert model_e.state_scale_taskmoe.state_experts[0].fc1.weight.grad is not None
+    assert model_e.state_scale_taskmoe.state_experts[1].fc1.weight.grad is None
+    # auto route mixed batch
+    task_e.optimizer.zero_grad(set_to_none=True)
+    batch_mix = _fake_batch(device, batch=2)
+    pet_available = torch.tensor([1, 0], device=device, dtype=torch.long)
+    out_auto = model_e(
+        batch_mix['ct'],
+        pet=batch_mix['pet'],
+        pet_available=pet_available,
+        mask=batch_mix['mask'],
+        forward_mode='auto',
+    )
+    out_auto['logits'].mean().backward()
+    assert model_e.state_scale_taskmoe.state_experts[0].fc1.weight.grad is not None
+    assert model_e.state_scale_taskmoe.state_experts[1].fc1.weight.grad is not None
+    assert model_e.state_scale_taskmoe.shared_expert.fc1.weight.grad is not None
+    print('[SMOKE] 17 route_eligibility_ok')
+
+    # 18) forbidden combos raise
+    try:
+        _build_stage2(
+            stage1_ckpt,
+            taskmoe_scales='all',
+            taskmoe_mode='state_scale_factorized',
+            taskmoe_residual_mode='paper',
+        )
+        raise AssertionError('expected ValueError for paper residual')
+    except ValueError:
+        pass
+    try:
+        DualSharedAddPETCTBaseline(
+            ct_backbone='convnextv2_nano',
+            pet_backbone='mit_b1',
+            ct_pretrained_path=None,
+            pet_pretrained_path=None,
+            taskmoe_mode='state_scale_factorized',
+            taskmoe_scales='all',
+            taskmoe_use_text_prior=True,
+        )
+        raise AssertionError('expected ValueError for text prior')
+    except ValueError:
+        pass
+    print('[SMOKE] 18 forbidden_combos_ok')
+
+    # 19) numeric: gates in [0,1], beta bounded, finite AMP-ish fp32 path
+    model_n, _, _ = _build_stage2(
+        stage1_ckpt,
+        taskmoe_scales='all',
+        taskmoe_mode='state_scale_factorized',
+        taskmoe_shared_consistency_weight=0.0,
+        stage2_decoder_adapter=True,
+    )
+    model_n.to(device)
+    model_n.train()
+    batch_n = _fake_batch(device, batch=1)
+    out_n = model_n(batch_n['ct'], pet=batch_n['pet'], mask=batch_n['mask'], forward_mode='full')
+    assert torch.isfinite(out_n['logits']).all()
+    stats_n = out_n['aux']['taskmoe_stats']
+    for i in range(1, 5):
+        g_s = float(stats_n[f's{i}_scale_gate_mean'])
+        g_t = float(stats_n[f's{i}_state_gate_mean'])
+        assert 0.0 <= g_s <= 1.0
+        assert 0.0 <= g_t <= 1.0
+        b = float(stats_n[f's{i}_beta'])
+        assert abs(b) <= float(model_n.state_scale_taskmoe.beta_max) + 1e-6
+    print('[SMOKE] 19 numerical_contract_ok')
 
     trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
     print(f'[SMOKE] trainable_param_count={len(trainable_names)}')
