@@ -349,10 +349,61 @@ class ConvBNAct(nn.Module):
         return self.block(x)
 
 
-def build_mdt_seg_teacher(config):
+_STAGE1_CONFIG_KEYS = (
+    'ct_backbone',
+    'pet_backbone',
+    'cppi_num_clusters',
+    'cppi_build_stage',
+    'decoder_channels',
+)
+
+
+def _peek_checkpoint_payload(checkpoint_path):
+    try:
+        payload = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    except TypeError:
+        payload = torch.load(checkpoint_path, map_location='cpu')
+    return payload if isinstance(payload, dict) else {'model': payload}
+
+
+def _align_stage1_config_from_checkpoint(config, stage1_checkpoint):
+    """Prefer Stage-1 checkpoint config for architecture-critical fields."""
+    payload = _peek_checkpoint_payload(stage1_checkpoint)
+    ckpt_cfg = payload.get('config')
+    if not isinstance(ckpt_cfg, dict):
+        print(
+            f'[STAGE2][WARN] stage1_checkpoint has no embedded config; '
+            f'using current CLI values as-is: {stage1_checkpoint}',
+            flush=True,
+        )
+        return payload
+
+    mismatches = []
+    for key in _STAGE1_CONFIG_KEYS:
+        if key not in ckpt_cfg:
+            continue
+        cur = getattr(config, key, None)
+        ckpt_val = ckpt_cfg[key]
+        # Normalize list/tuple comparisons for decoder_channels etc.
+        cur_cmp = list(cur) if isinstance(cur, (list, tuple)) else cur
+        ckpt_cmp = list(ckpt_val) if isinstance(ckpt_val, (list, tuple)) else ckpt_val
+        if cur_cmp != ckpt_cmp:
+            mismatches.append((key, cur, ckpt_val))
+            setattr(config, key, ckpt_val)
+
+    if mismatches:
+        print('[STAGE2][ERROR] Stage1 checkpoint config mismatch; overriding with checkpoint values:', flush=True)
+        for key, cur, ckpt_val in mismatches:
+            print(f'  - {key}: cli/default={cur} -> checkpoint={ckpt_val}', flush=True)
+    else:
+        print('[STAGE2] Stage1 checkpoint config matches current architecture fields', flush=True)
+    return payload
+
+
+def _build_dual_shared_add_baseline(config):
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
     cppi_num_clusters = getattr(config, 'cppi_num_clusters', 6)
-    cppi_build_stage = getattr(config, 'cppi_build_stage', 3)
+    cppi_build_stage = getattr(config, 'cppi_build_stage', 4)
     cppi_output_dir = os.path.join(config.checkpoint_dir, 'cppi')
     no_encoder_pretrained = bool(getattr(config, 'no_encoder_pretrained', False))
     model = DualSharedAddPETCTBaseline(
@@ -378,4 +429,99 @@ def build_mdt_seg_teacher(config):
     print(f'[CPPI] num_clusters={cppi_num_clusters}')
     print(f'[CPPI] build_stage={cppi_build_stage}')
     print(f'[CPPI] output_dir={cppi_output_dir}')
-    return {'model': model}
+    return model
+
+
+def _summarize_trainable_names(names, max_groups=24):
+    groups = []
+    for name in names:
+        top = name.split('.', 2)[0]
+        if top not in groups:
+            groups.append(top)
+        if len(groups) >= max_groups:
+            break
+    return groups
+
+
+def _build_prompt_role_expert_stage2(config):
+    from models.stage2_prompt_role_expert_fusion import (
+        PromptRoleExpertStage2Seg,
+        load_stage1_checkpoint,
+    )
+
+    stage1_checkpoint = getattr(config, 'stage1_checkpoint', None)
+    if not stage1_checkpoint:
+        raise ValueError(
+            'model_arch=prompt_role_expert_stage2 requires --stage1_checkpoint '
+            '(frozen Stage-1 best checkpoint). Do NOT pass Stage-1 weights via --resume_checkpoint.'
+        )
+    if not os.path.exists(stage1_checkpoint):
+        raise FileNotFoundError(f'stage1_checkpoint not found: {stage1_checkpoint}')
+
+    # Align architecture fields with the Stage-1 checkpoint before construction.
+    _align_stage1_config_from_checkpoint(config, stage1_checkpoint)
+
+    stage1 = _build_dual_shared_add_baseline(config)
+    load_stage1_checkpoint(stage1, stage1_checkpoint, strict=True)
+
+    pm = stage1.prototype_memory
+    bank_ready = bool(pm.bank_ready)
+    bank_version = int(pm.bank_version.item()) if hasattr(pm, 'bank_version') else -1
+    ready = getattr(pm, 'prototype_ready', None)
+    ready_count = int(ready.sum().item()) if torch.is_tensor(ready) else 0
+
+    print(f'[STAGE2] stage1_checkpoint={stage1_checkpoint}', flush=True)
+    print(f'[STAGE2] CPPI bank_ready={bank_ready} bank_version={bank_version} ready_slots={ready_count}', flush=True)
+    if not bank_ready:
+        raise RuntimeError(
+            'Stage-2 requires a ready frozen CPPI bank in stage1_checkpoint, but '
+            f'prototype_memory.bank_ready=False (bank_version={bank_version}).'
+        )
+
+    model = PromptRoleExpertStage2Seg(
+        stage1_model=stage1,
+        channels=(64, 128, 320, 512),
+        decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
+        expert_dim=int(getattr(config, 'stage2_expert_dim', 128)),
+        atom_num=int(getattr(config, 'stage2_atom_num', 32)),
+        atom_dim=int(getattr(config, 'stage2_atom_dim', 256)),
+        prompt_hidden_channels=int(getattr(config, 'stage2_prompt_hidden_channels', 64)),
+        mlp_ratio=float(getattr(config, 'stage2_mlp_ratio', 2.0)),
+        dropout=float(getattr(config, 'stage2_dropout', 0.0)),
+        adapter_bottlenecks=getattr(config, 'stage2_adapter_bottlenecks', (64, 32, 16, 8)),
+        external_prompt_dim=None,  # Text OFF for the first experiment.
+        require_ready_cppi_for_missing=True,
+    )
+    model.assert_stage1_frozen()
+
+    stage1_total = sum(p.numel() for p in model.stage1.parameters())
+    stage1_trainable = sum(p.numel() for p in model.stage1.parameters() if p.requires_grad)
+    stage2_trainable = model.count_trainable_parameters()
+    trainable_names = model.trainable_parameter_names()
+    print(f'[STAGE2] Stage1 total params={stage1_total}', flush=True)
+    print(f'[STAGE2] Stage1 trainable params={stage1_trainable}', flush=True)
+    print(f'[STAGE2] Stage2 trainable params={stage2_trainable}', flush=True)
+    print(
+        f'[STAGE2] Stage2 trainable name groups={_summarize_trainable_names(trainable_names)} '
+        f'(num_tensors={len(trainable_names)})',
+        flush=True,
+    )
+    if stage1_trainable != 0:
+        raise RuntimeError(f'Stage-1 must be fully frozen, got trainable={stage1_trainable}')
+    if stage2_trainable <= 0:
+        raise RuntimeError('Stage-2 has no trainable parameters')
+    return model
+
+
+def build_mdt_seg_teacher(config):
+    model_arch = str(getattr(config, 'model_arch', 'dual_shared_add_baseline')).strip()
+    if model_arch == 'dual_shared_add_baseline':
+        model = _build_dual_shared_add_baseline(config)
+        return {'model': model}
+    if model_arch == 'prompt_role_expert_stage2':
+        model = _build_prompt_role_expert_stage2(config)
+        return {'model': model}
+    raise ValueError(
+        f'Unsupported model_arch={model_arch!r}; '
+        f'expected dual_shared_add_baseline or prompt_role_expert_stage2'
+    )

@@ -72,15 +72,35 @@ def _checkpoint_paths(checkpoint_dir):
     }
 
 
-def _load_state_dict_with_report(model, checkpoint_path):
+def _load_state_dict_with_report(model, checkpoint_path, expect_stage2=False):
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     state_dict = checkpoint.get('model', checkpoint)
+    if expect_stage2:
+        sample_keys = list(state_dict.keys())[:8] if isinstance(state_dict, dict) else []
+        looks_stage2 = any(
+            k.startswith('stage1.') or k.startswith('role_fusion.') or k.startswith('decoder_adapters.')
+            for k in state_dict.keys()
+        )
+        looks_stage1_only = any(k.startswith('enc_ct.') for k in state_dict.keys()) and not looks_stage2
+        if looks_stage1_only or not looks_stage2:
+            raise RuntimeError(
+                'resume_checkpoint does not look like a Stage2 wrapper state_dict. '
+                'Use --stage1_checkpoint for frozen Stage1 weights, and --resume_checkpoint '
+                f'only for Stage2 ckpts. path={checkpoint_path} sample_keys={sample_keys}'
+            )
     result = model.load_state_dict(state_dict, strict=False)
     missing_keys = list(result.missing_keys)
     unexpected_keys = list(result.unexpected_keys)
     print(f'[RESUME] checkpoint={checkpoint_path}', flush=True)
     print(f'[RESUME] missing_keys={missing_keys}', flush=True)
     print(f'[RESUME] unexpected_keys={unexpected_keys}', flush=True)
+    if expect_stage2 and len(missing_keys) > 0:
+        # Stage2 resume should match the wrapper closely; missing trainable keys are unsafe.
+        trainable_missing = [k for k in missing_keys if not k.startswith('stage1.')]
+        if trainable_missing:
+            raise RuntimeError(
+                f'Stage2 resume is missing trainable keys: {trainable_missing[:20]}'
+            )
     return checkpoint
 
 
@@ -90,9 +110,41 @@ def _count_parameters(model):
     return total, trainable
 
 
+def _log_stage2_stats(outputs, route, batch_idx):
+    if not isinstance(outputs, dict):
+        return
+    aux = outputs.get('aux') or {}
+    stats = aux.get('stage2_stats')
+    if not isinstance(stats, dict) or not stats:
+        return
+    parts = [f'[STAGE2 STATS] batch={batch_idx + 1} route={route}']
+    for scale_idx in (1, 2, 3, 4):
+        prefix = f's{scale_idx}_'
+        entropy = stats.get(f'{prefix}router_entropy')
+        prompt_h = stats.get(f'{prefix}prompt_atom_entropy')
+        role_mean = stats.get(f'{prefix}role_mean')
+        top_freq = stats.get(f'{prefix}top_role_freq')
+        if entropy is None:
+            continue
+        role_sum = float(role_mean.float().sum().item()) if torch.is_tensor(role_mean) else float('nan')
+        top_list = top_freq.detach().float().cpu().tolist() if torch.is_tensor(top_freq) else top_freq
+        parts.append(
+            f"S{scale_idx}: entropy={float(entropy):.4f} "
+            f"prompt_H={float(prompt_h) if prompt_h is not None else float('nan'):.4f} "
+            f"role_sum={role_sum:.4f} top={top_list}"
+        )
+    print(' | '.join(parts), flush=True)
+
+
 def main():
-    print('[INFO] starting baseline training', flush=True)
     cfg = SegMDTConfig.parse_arguments()
+    is_stage2 = str(getattr(cfg, 'model_arch', '')).strip() == 'prompt_role_expert_stage2'
+    print(f"[INFO] starting {'stage2' if is_stage2 else 'baseline'} training", flush=True)
+    if is_stage2 and not getattr(cfg, 'stage1_checkpoint', None):
+        raise ValueError(
+            'prompt_role_expert_stage2 requires --stage1_checkpoint. '
+            'resume_checkpoint is only for restoring a Stage2 run.'
+        )
     _assert_baseline(cfg)
     _seed(cfg)
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
@@ -103,8 +155,11 @@ def main():
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)}', flush=True)
 
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
+    # Re-save after Stage2 build so auto-aligned Stage1 fields (e.g. cppi_build_stage) are persisted.
+    with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
+        json.dump(vars(cfg), f, indent=2, default=str)
     if getattr(cfg, 'resume_checkpoint', None):
-        _load_state_dict_with_report(task.model, cfg.resume_checkpoint)
+        _load_state_dict_with_report(task.model, cfg.resume_checkpoint, expect_stage2=is_stage2)
     total_params, trainable_params = _count_parameters(task.model)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
     task.scheduler = get_cosine_scheduler(
@@ -156,7 +211,7 @@ def main():
             route = 'full' if global_batch_step % 2 == 0 else 'missing'
             task.optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
-                loss, _, _, _ = task.train_step(batch, forward_mode=route)
+                loss, _, outputs, _ = task.train_step(batch, forward_mode=route)
             if not torch.isfinite(loss):
                 raise RuntimeError('loss became non-finite')
 
@@ -183,6 +238,8 @@ def main():
 
             if (batch_idx + 1) % 100 == 0:
                 print(f'[BATCH {batch_idx + 1}] route={route} loss={float(loss.detach()):.6f}', flush=True)
+                if is_stage2:
+                    _log_stage2_stats(outputs, route, batch_idx)
 
             if route == 'full':
                 full_n += 1
