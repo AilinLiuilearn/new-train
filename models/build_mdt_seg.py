@@ -380,12 +380,25 @@ def build_mdt_seg_teacher(config):
         taskmoe_fers_mode=getattr(config, 'taskmoe_fers_mode', 'both'),
         stage2_decoder_adapter=bool(getattr(config, 'stage2_decoder_adapter', False)),
         stage2_decoder_adapter_level=getattr(config, 'stage2_decoder_adapter_level', 'd1'),
+        stage2_strategy=getattr(config, 'stage2_strategy', 'legacy_taskmoe'),
+        stage2_residual_channels=int(getattr(config, 'stage2_residual_channels', 64)),
+        stage2_residual_state_conditioned=bool(
+            getattr(config, 'stage2_residual_state_conditioned', False)
+        ),
+        stage2_delta_logit_max=float(getattr(config, 'stage2_delta_logit_max', 2.0)),
+        stage2_residual_dropout=float(getattr(config, 'stage2_residual_dropout', 0.0)),
     )
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
         f'fusion=state_aware_weighted_add shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))} '
+        f'stage2_strategy={getattr(config, "stage2_strategy", "legacy_taskmoe")} '
+        f'stage2_residual_channels={int(getattr(config, "stage2_residual_channels", 64))} '
+        f'stage2_residual_state_conditioned={bool(getattr(config, "stage2_residual_state_conditioned", False))} '
+        f'stage2_delta_logit_max={float(getattr(config, "stage2_delta_logit_max", 2.0))} '
+        f'stage2_residual_dropout={float(getattr(config, "stage2_residual_dropout", 0.0))} '
+        f'stage2_residual_lr={float(getattr(config, "stage2_residual_lr", 5e-5))} '
         f'taskmoe_mode={getattr(config, "taskmoe_mode", "independent")} '
         f'taskmoe_scales={getattr(config, "taskmoe_scales", "s4")} '
         f'taskmoe_num_experts={int(getattr(config, "taskmoe_num_experts", 6))} '

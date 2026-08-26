@@ -166,6 +166,50 @@ class SegMDTConfig(ConfigBase):
             choices=('d1',),
             help='Decoder adapter insertion level. v1 only supports d1.',
         )
+        p.add_argument(
+            '--stage2_strategy',
+            type=str,
+            default='legacy_taskmoe',
+            choices=('legacy_taskmoe', 'logit_residual_decoder'),
+            help=(
+                'Stage-2 strategy. legacy_taskmoe keeps existing TaskMoE/FERS paths; '
+                'logit_residual_decoder freezes Stage1 and trains only a lightweight '
+                'logit residual decoder (E1/E2).'
+            ),
+        )
+        p.add_argument(
+            '--stage2_residual_channels',
+            type=int,
+            default=64,
+            help='Hidden channels for Stage2 logit residual decoder (E1/E2).',
+        )
+        p.add_argument(
+            '--stage2_residual_state_conditioned',
+            type=str2bool,
+            default=False,
+            help=(
+                'E1: False (no state modulation). '
+                'E2: True enables deterministic Full/Missing FiLM on residual decoder.'
+            ),
+        )
+        p.add_argument(
+            '--stage2_delta_logit_max',
+            type=float,
+            default=2.0,
+            help='Bound M for delta = M * tanh(raw / M) in logit residual decoder.',
+        )
+        p.add_argument(
+            '--stage2_residual_dropout',
+            type=float,
+            default=0.0,
+            help='Dropout before residual delta_head. Must be in [0, 1).',
+        )
+        p.add_argument(
+            '--stage2_residual_lr',
+            type=float,
+            default=5e-5,
+            help='Learning rate for stage2_residual_decoder only (logit_residual_decoder).',
+        )
         return p
 
     @staticmethod

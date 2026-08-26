@@ -8,6 +8,7 @@ from models.taskmoe_s4_refiner import TaskMoEStage4Refiner
 from models.cross_scale_shared_taskmoe import CrossScaleSharedTaskMoE
 from models.state_scale_factorized_taskmoe import StateScaleFactorizedTaskMoE
 from models.stage2_decoder_adapter import Stage2DecoderAdapter
+from models.stage2_logit_residual_decoder import Stage2LogitResidualDecoder
 
 
 def _parse_taskmoe_scales(taskmoe_scales):
@@ -89,9 +90,17 @@ def _is_stage2_adapter_param_name(name):
     return name.startswith('stage2_decoder_adapter.')
 
 
+def _is_stage2_residual_decoder_param_name(name):
+    return name.startswith('stage2_residual_decoder.')
+
+
 def _is_stage2_new_param_name(name):
-    """Parameters absent from Stage-1 checkpoints (TaskMoE / decoder adapter)."""
-    return _is_taskmoe_param_name(name) or _is_stage2_adapter_param_name(name)
+    """Parameters absent from Stage-1 checkpoints (TaskMoE / adapters / residual decoder)."""
+    return (
+        _is_taskmoe_param_name(name)
+        or _is_stage2_adapter_param_name(name)
+        or _is_stage2_residual_decoder_param_name(name)
+    )
 
 
 _TASKMOE_SCALE_INDEX = {'s1': 0, 's2': 1, 's3': 2, 's4': 3}
@@ -139,11 +148,29 @@ class DualSharedAddPETCTBaseline(nn.Module):
         taskmoe_fers_mode='both',
         stage2_decoder_adapter=False,
         stage2_decoder_adapter_level='d1',
+        stage2_strategy='legacy_taskmoe',
+        stage2_residual_channels=64,
+        stage2_residual_state_conditioned=False,
+        stage2_delta_logit_max=2.0,
+        stage2_residual_dropout=0.0,
     ):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.stage2_moe_only = False
         self.stage2_train_decoder = False
+        self.stage2_strategy = str(stage2_strategy or 'legacy_taskmoe').strip().lower()
+        if self.stage2_strategy not in ('legacy_taskmoe', 'logit_residual_decoder'):
+            raise ValueError(
+                f'Unsupported stage2_strategy={stage2_strategy!r}; '
+                'use legacy_taskmoe or logit_residual_decoder'
+            )
+        self.stage2_residual_channels = int(stage2_residual_channels)
+        self.stage2_residual_state_conditioned = bool(stage2_residual_state_conditioned)
+        self.stage2_delta_logit_max = float(stage2_delta_logit_max)
+        self.stage2_residual_dropout = float(stage2_residual_dropout)
+        self.stage2_residual_enabled = False
+        self.stage2_residual_decoder = None
+
         self.taskmoe_enabled = True
         self.taskmoe_mode = str(taskmoe_mode or 'independent').strip().lower()
         if self.taskmoe_mode not in ('independent', 'cross_scale_shared', 'state_scale_factorized'):
@@ -172,6 +199,18 @@ class DualSharedAddPETCTBaseline(nn.Module):
         self.stage2_decoder_adapter_enabled = bool(stage2_decoder_adapter)
         self.stage2_decoder_adapter_level = str(stage2_decoder_adapter_level or 'd1').strip().lower()
         self._last_role_context = None
+
+        if self.stage2_strategy == 'logit_residual_decoder':
+            if self.stage2_decoder_adapter_enabled:
+                raise ValueError(
+                    'logit_residual_decoder forbids stage2_decoder_adapter=True'
+                )
+            if self.stage2_residual_channels <= 0:
+                raise ValueError('stage2_residual_channels must be > 0')
+            if self.stage2_delta_logit_max <= 0:
+                raise ValueError('stage2_delta_logit_max must be > 0')
+            if not (0.0 <= self.stage2_residual_dropout < 1.0):
+                raise ValueError('stage2_residual_dropout must be in [0, 1)')
 
         if self.taskmoe_use_text_prior and self.taskmoe_mode != 'cross_scale_shared':
             raise ValueError(
@@ -278,6 +317,23 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 level=self.stage2_decoder_adapter_level,
             )
 
+        if self.stage2_strategy == 'logit_residual_decoder':
+            self.stage2_residual_decoder = Stage2LogitResidualDecoder(
+                encoder_channels=pet_channels,
+                hidden_channels=self.stage2_residual_channels,
+                out_channels=out_channels,
+                state_conditioned=self.stage2_residual_state_conditioned,
+                delta_logit_max=self.stage2_delta_logit_max,
+                dropout=self.stage2_residual_dropout,
+            )
+            # Eval/forward must use residual branch and skip TaskMoE without
+            # requiring the training freeze helper to be called.
+            self.taskmoe_enabled = False
+            self.stage2_residual_enabled = True
+        else:
+            self.stage2_residual_decoder = None
+            self.stage2_residual_enabled = False
+
     @staticmethod
     def _build_taskmoe(channels, num_experts=6):
         return TaskMoEStage4Refiner(
@@ -326,7 +382,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
         """Refine TaskMoE scales. Name kept for compatibility."""
         fused_feats = list(fused_feats)
         self._last_role_context = None
-        if not self.taskmoe_enabled:
+        if (
+            not self.taskmoe_enabled
+            or self.stage2_strategy == 'logit_residual_decoder'
+        ):
             zero = fused_feats[-1].new_zeros((), dtype=torch.float32)
             return fused_feats, zero, {}
 
@@ -398,7 +457,45 @@ class DualSharedAddPETCTBaseline(nn.Module):
             aux_loss = fused_feats[-1].new_zeros((), dtype=torch.float32)
         return fused_feats, aux_loss, {}
 
-    def _decode(self, fused_feats, target_size, aux=None):
+    def _decode(self, fused_feats, target_size, aux=None, route=None, pet_available=None):
+        aux = {} if aux is None else dict(aux)
+
+        if self.stage2_strategy == 'logit_residual_decoder' and self.stage2_residual_decoder is not None:
+            # Independent residual path: frozen Stage1 fused feats -> frozen decoder
+            # and the same feats -> residual decoder. TaskMoE is never applied.
+            base_features = [f.detach() for f in fused_feats]
+            with torch.no_grad():
+                base_out = self.decoder(base_features, target_size)
+            stage1_logits = base_out['logits'].detach()
+            if self.stage2_residual_enabled:
+                residual_out = self.stage2_residual_decoder(
+                    base_features,
+                    target_size,
+                    route=route,
+                    pet_available=pet_available,
+                )
+                delta = residual_out['delta_logits']
+                final_logits = stage1_logits + delta
+                res_stats = {
+                    k: v.detach() if torch.is_tensor(v) else v
+                    for k, v in residual_out.get('stats', {}).items()
+                }
+                stage1_abs = stage1_logits.detach().float().abs().mean()
+                delta_abs = delta.detach().float().abs().mean()
+                res_stats['delta_logit_ratio'] = delta_abs / (stage1_abs + 1e-6)
+                aux['stage2_residual_stats'] = res_stats
+                aux['taskmoe_balance_loss'] = final_logits.new_zeros((), dtype=torch.float32)
+                aux['taskmoe_stats'] = {}
+            else:
+                final_logits = stage1_logits
+                aux['taskmoe_balance_loss'] = final_logits.new_zeros((), dtype=torch.float32)
+                aux['taskmoe_stats'] = {}
+            _check_tensor('logits', final_logits)
+            out = {'logits': final_logits, 'pred': final_logits, 'aux': aux}
+            if 'aux_logits' in base_out:
+                out['aux_logits'] = base_out['aux_logits']
+            return out
+
         adapter = None
         role_context = None
         if (
@@ -416,10 +513,15 @@ class DualSharedAddPETCTBaseline(nn.Module):
         )
         _check_tensor('logits', out['logits'])
         out['pred'] = out['logits']
-        out['aux'] = {} if aux is None else aux
+        out['aux'] = aux
         return out
 
     def enable_stage2_moe_only(self, train_decoder=False):
+        if self.stage2_strategy == 'logit_residual_decoder':
+            raise ValueError(
+                'logit_residual_decoder requires enable_stage2_residual_decoder_only(); '
+                'do not call enable_stage2_moe_only()'
+            )
         if bool(train_decoder) and self.taskmoe_mode == 'state_scale_factorized':
             raise ValueError(
                 'state_scale_factorized forbids stage2_train_decoder=True; '
@@ -454,6 +556,36 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 p.requires_grad = True
         self.stage2_moe_only = True
 
+    def enable_stage2_residual_decoder_only(self):
+        if self.stage2_strategy != 'logit_residual_decoder':
+            raise ValueError(
+                'enable_stage2_residual_decoder_only requires '
+                "--stage2_strategy logit_residual_decoder"
+            )
+        if self.stage2_residual_decoder is None:
+            raise RuntimeError('stage2_residual_decoder module is missing')
+        for p in self.parameters():
+            p.requires_grad = False
+        for p in self.stage2_residual_decoder.parameters():
+            p.requires_grad = True
+        self.taskmoe_enabled = False
+        self.stage2_residual_enabled = True
+        self.stage2_train_decoder = False
+        # Reuse stage2_moe_only so CPPI collect is skipped / Missing skips PET encoder.
+        self.stage2_moe_only = True
+
+        bad = [
+            n for n, p in self.named_parameters()
+            if p.requires_grad and not _is_stage2_residual_decoder_param_name(n)
+        ]
+        if bad:
+            raise RuntimeError(
+                'Stage-2 residual decoder mode allows only stage2_residual_decoder.* '
+                f'trainable; unexpected: {bad[:8]}'
+            )
+        if not any(p.requires_grad for p in self.stage2_residual_decoder.parameters()):
+            raise RuntimeError('stage2_residual_decoder has no trainable parameters')
+
     def train(self, mode=True):
         super().train(mode)
         if self.stage2_moe_only:
@@ -463,10 +595,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
             self.pet_calibration.eval()
             self.fusion.eval()
             self.prototype_memory.eval()
-            if self.stage2_train_decoder:
-                self.decoder.train(mode)
-            else:
-                self.decoder.eval()
+            self.decoder.eval()
             for scale_name in ('s1', 's2', 's3', 's4'):
                 module = getattr(self, f'taskmoe_{scale_name}', None)
                 if module is not None:
@@ -477,16 +606,38 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 self.state_scale_taskmoe.eval()
             if self.stage2_decoder_adapter is not None:
                 self.stage2_decoder_adapter.eval()
-            if self.taskmoe_mode == 'cross_scale_shared':
-                self.cross_scale_taskmoe.train(mode)
-            elif self.taskmoe_mode == 'state_scale_factorized':
-                self.state_scale_taskmoe.train(mode)
+            if self.stage2_residual_decoder is not None:
+                self.stage2_residual_decoder.eval()
+
+            if self.stage2_strategy == 'logit_residual_decoder':
+                if self.stage2_residual_decoder is not None:
+                    self.stage2_residual_decoder.train(mode)
             else:
-                for _, _, module in self._iter_active_taskmoe():
-                    module.train(mode)
-            if self.stage2_decoder_adapter is not None:
-                self.stage2_decoder_adapter.train(mode)
+                if self.stage2_train_decoder:
+                    self.decoder.train(mode)
+                if self.taskmoe_mode == 'cross_scale_shared':
+                    self.cross_scale_taskmoe.train(mode)
+                elif self.taskmoe_mode == 'state_scale_factorized':
+                    self.state_scale_taskmoe.train(mode)
+                else:
+                    for _, _, module in self._iter_active_taskmoe():
+                        module.train(mode)
+                if self.stage2_decoder_adapter is not None:
+                    self.stage2_decoder_adapter.train(mode)
         return self
+
+    def _collect_cppi(self, ct_feats, pet_feats_real, mask):
+        if self.stage2_moe_only or self.stage2_residual_enabled:
+            return None
+        if self.training and mask is not None:
+            return self.prototype_memory.collect(
+                ct_feats=ct_feats,
+                pet_feats=pet_feats_real,
+                mask=mask,
+                print_info=False,
+                compute_report=False,
+            )
+        return None
 
     @torch.no_grad()
     def _stage1_fused_features(self, ct, pet, route):
@@ -549,19 +700,6 @@ class DualSharedAddPETCTBaseline(nn.Module):
             'use --taskmoe_role_loss_weight / --taskmoe_fers_mode (FERS) instead'
         )
 
-    def _collect_cppi(self, ct_feats, pet_feats_real, mask):
-        if self.stage2_moe_only:
-            return None
-        if self.training and mask is not None:
-            return self.prototype_memory.collect(
-                ct_feats=ct_feats,
-                pet_feats=pet_feats_real,
-                mask=mask,
-                print_info=False,
-                compute_report=False,
-            )
-        return None
-
     def _retrieve_cppi(self, ct_feats, compute_report=False, save_diagnostics=False, print_info=False, return_ct_reference=False):
         return self.prototype_memory.retrieve(
             ct_feats,
@@ -605,11 +743,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
             fused_feats,
             target_size,
             aux={'taskmoe_balance_loss': moe_aux_loss, 'taskmoe_stats': moe_stats},
+            route='full',
         )
 
     def _forward_missing(self, ct, pet, target_size, mask=None):
         ct_feats = self._encode_ct(ct)
-        if self.stage2_moe_only:
+        if self.stage2_moe_only or self.stage2_residual_enabled:
             pet_feats_proxy, ct_reference_feats, _ = self._retrieve_cppi(
                 ct_feats,
                 compute_report=False,
@@ -632,6 +771,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 fused_feats,
                 target_size,
                 aux={'taskmoe_balance_loss': moe_aux_loss, 'taskmoe_stats': moe_stats},
+                route='missing',
             )
 
         pet_feats_real = self._encode_pet(pet)
@@ -658,6 +798,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
             fused_feats,
             target_size,
             aux={'taskmoe_balance_loss': moe_aux_loss, 'taskmoe_stats': moe_stats},
+            route='missing',
         )
 
     def _forward_auto(self, ct, pet, pet_available, target_size, mask=None):
@@ -703,6 +844,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
             fused_feats,
             target_size,
             aux={'taskmoe_balance_loss': moe_aux_loss, 'taskmoe_stats': moe_stats},
+            route='auto',
+            pet_available=pet_available,
         )
 
     @torch.no_grad()

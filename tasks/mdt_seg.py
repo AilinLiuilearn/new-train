@@ -30,7 +30,51 @@ class MDTSegTeacher:
             name for name, p in self.model.named_parameters() if p.requires_grad
         ]
         print(f'[OPTIM] trainable_param_names={trainable_names}', flush=True)
-        if bool(getattr(self.model, 'stage2_moe_only', False)):
+        stage2_strategy = str(
+            getattr(self.model, 'stage2_strategy', 'legacy_taskmoe')
+        ).strip().lower()
+        if (
+            bool(getattr(self.model, 'stage2_moe_only', False))
+            and stage2_strategy == 'logit_residual_decoder'
+        ):
+            from models.dual_shared_add_baseline import (
+                _is_stage2_residual_decoder_param_name,
+            )
+            residual_params = [
+                p for n, p in self.model.named_parameters()
+                if p.requires_grad and _is_stage2_residual_decoder_param_name(n)
+            ]
+            bad = [
+                n for n in trainable_names
+                if not _is_stage2_residual_decoder_param_name(n)
+            ]
+            if bad:
+                raise RuntimeError(
+                    'Stage-2 logit residual decoder mode allows only '
+                    f'stage2_residual_decoder.* trainable; unexpected: {bad[:8]}'
+                )
+            if not residual_params:
+                raise RuntimeError(
+                    'Stage-2 logit residual decoder requires non-empty '
+                    'stage2_residual_decoder trainable parameters'
+                )
+            residual_lr = float(getattr(config, 'stage2_residual_lr', 5e-5))
+            self.optimizer = torch.optim.AdamW(
+                [
+                    {
+                        'params': residual_params,
+                        'lr': residual_lr,
+                        'name': 'residual_decoder',
+                    }
+                ],
+                weight_decay=config.weight_decay,
+            )
+            print(
+                f'[OPTIM] residual_decoder_lr={residual_lr} '
+                f'residual_decoder_n={len(residual_params)}',
+                flush=True,
+            )
+        elif bool(getattr(self.model, 'stage2_moe_only', False)):
             from models.dual_shared_add_baseline import (
                 _is_stage2_adapter_param_name,
                 _is_taskmoe_param_name,
@@ -185,13 +229,48 @@ class MDTSegTeacher:
         outputs = self.model(ct, pet=pet, mask=mask, forward_mode=forward_mode)
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
         seg_loss, loss_stats = self.criterion(logits, mask)
+        stage2_strategy = str(
+            getattr(self.model, 'stage2_strategy', 'legacy_taskmoe')
+        ).strip().lower()
+        zero = torch.zeros((), device=seg_loss.device, dtype=torch.float32)
+
+        if stage2_strategy == 'logit_residual_decoder':
+            # Seg-only: no FERS / balance / shared-consistency.
+            moe_loss = zero
+            total_loss = seg_loss.float()
+            residual_stats = (outputs.get('aux', {}) or {}).get('stage2_residual_stats', {}) or {}
+            stats = {
+                'loss_seg_total': seg_loss.detach().float(),
+                'loss_moe_balance': zero.detach(),
+                'loss_fers': zero.detach(),
+                'loss_fers_scale': zero.detach(),
+                'loss_fers_state': zero.detach(),
+                'scale_role_acc': zero.detach(),
+                'state_role_acc': zero.detach(),
+                'loss_shared_consistency': zero.detach(),
+                'loss_stage2_aux': zero.detach(),
+                'loss_total': total_loss.detach(),
+                'loss_seg': loss_stats.get('loss_dice', seg_loss.detach()),
+                'loss_boundary': zero.detach(),
+                'delta_logit_abs_mean': residual_stats.get(
+                    'delta_logit_abs_mean', zero
+                ).detach() if torch.is_tensor(residual_stats.get('delta_logit_abs_mean', None)) else zero.detach(),
+                'delta_logit_abs_max': residual_stats.get(
+                    'delta_logit_abs_max', zero
+                ).detach() if torch.is_tensor(residual_stats.get('delta_logit_abs_max', None)) else zero.detach(),
+                'delta_logit_ratio': residual_stats.get(
+                    'delta_logit_ratio', zero
+                ).detach() if torch.is_tensor(residual_stats.get('delta_logit_ratio', None)) else zero.detach(),
+            }
+            return total_loss, logits, outputs, stats
+
         # For factorized mode this slot carries weighted FERS (no balance loss).
         moe_loss = outputs.get('aux', {}).get(
             'taskmoe_balance_loss',
             None,
         )
         if moe_loss is None:
-            moe_loss = torch.zeros((), device=seg_loss.device, dtype=torch.float32)
+            moe_loss = zero
         else:
             moe_loss = moe_loss.float()
 
@@ -201,23 +280,27 @@ class MDTSegTeacher:
             'loss_seg_total': seg_loss.detach().float(),
             'loss_moe_balance': moe_loss.detach(),
             'loss_fers': moe_stats.get(
-                'fers_loss', torch.zeros((), device=seg_loss.device)
-            ).detach() if torch.is_tensor(moe_stats.get('fers_loss', None)) else torch.zeros((), device=seg_loss.device),
+                'fers_loss', zero
+            ).detach() if torch.is_tensor(moe_stats.get('fers_loss', None)) else zero.detach(),
             'loss_fers_scale': moe_stats.get(
-                'fers_scale_loss', torch.zeros((), device=seg_loss.device)
-            ).detach() if torch.is_tensor(moe_stats.get('fers_scale_loss', None)) else torch.zeros((), device=seg_loss.device),
+                'fers_scale_loss', zero
+            ).detach() if torch.is_tensor(moe_stats.get('fers_scale_loss', None)) else zero.detach(),
             'loss_fers_state': moe_stats.get(
-                'fers_state_loss', torch.zeros((), device=seg_loss.device)
-            ).detach() if torch.is_tensor(moe_stats.get('fers_state_loss', None)) else torch.zeros((), device=seg_loss.device),
+                'fers_state_loss', zero
+            ).detach() if torch.is_tensor(moe_stats.get('fers_state_loss', None)) else zero.detach(),
             'scale_role_acc': moe_stats.get(
-                'scale_role_acc', torch.zeros((), device=seg_loss.device)
-            ).detach() if torch.is_tensor(moe_stats.get('scale_role_acc', None)) else torch.zeros((), device=seg_loss.device),
+                'scale_role_acc', zero
+            ).detach() if torch.is_tensor(moe_stats.get('scale_role_acc', None)) else zero.detach(),
             'state_role_acc': moe_stats.get(
-                'state_role_acc', torch.zeros((), device=seg_loss.device)
-            ).detach() if torch.is_tensor(moe_stats.get('state_role_acc', None)) else torch.zeros((), device=seg_loss.device),
+                'state_role_acc', zero
+            ).detach() if torch.is_tensor(moe_stats.get('state_role_acc', None)) else zero.detach(),
+            'loss_shared_consistency': zero.detach(),
             'loss_total': total_loss.detach(),
             'loss_seg': loss_stats.get('loss_dice', seg_loss.detach()),
-            'loss_boundary': torch.tensor(0.0, device=seg_loss.device),
+            'loss_boundary': zero.detach(),
+            'delta_logit_abs_mean': zero.detach(),
+            'delta_logit_abs_max': zero.detach(),
+            'delta_logit_ratio': zero.detach(),
         }
         return total_loss, logits, outputs, stats
 

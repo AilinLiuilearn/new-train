@@ -110,7 +110,7 @@ def _load_stage1_for_taskmoe(model, checkpoint_path):
     missing_other = [k for k in missing_keys if not _is_stage2_new_param_name(k)]
     if missing_other:
         raise RuntimeError(
-            'Stage-1 load has non-TaskMoE missing keys: '
+            'Stage-1 load has non-Stage2 missing keys: '
             f'{missing_other}'
         )
     if unexpected_keys:
@@ -124,9 +124,10 @@ def _load_stage1_for_taskmoe(model, checkpoint_path):
 
     print('[STAGE2 LOAD]', flush=True)
     print(f'checkpoint={checkpoint_path}', flush=True)
+    print(f'stage2_strategy={getattr(model, "stage2_strategy", "legacy_taskmoe")}', flush=True)
     print(f'taskmoe_mode={getattr(model, "taskmoe_mode", "independent")}', flush=True)
     print(f'taskmoe_scales={getattr(model, "taskmoe_scales", ())}', flush=True)
-    print(f'missing_taskmoe_keys={missing_taskmoe}', flush=True)
+    print(f'missing_stage2_keys={missing_taskmoe}', flush=True)
     print(f'unexpected_keys={unexpected_keys}', flush=True)
     print(f'cppi_bank_ready={bool(model.prototype_memory.bank_ready)}', flush=True)
     return checkpoint
@@ -135,6 +136,7 @@ def _load_stage1_for_taskmoe(model, checkpoint_path):
 @torch.no_grad()
 def _verify_stage2_zero_step(task, val_loader):
     model = task.model
+    stage2_strategy = str(getattr(model, 'stage2_strategy', 'legacy_taskmoe')).strip().lower()
     mode = getattr(model, 'taskmoe_mode', 'independent')
     residual_mode = getattr(model, 'taskmoe_residual_mode', 'zero_start')
     if mode == 'cross_scale_shared':
@@ -147,6 +149,61 @@ def _verify_stage2_zero_step(task, val_loader):
     pet = batch['pet'][:1].to(task.device, non_blocking=True)
     was_training = model.training
     model.eval()
+
+    if stage2_strategy == 'logit_residual_decoder':
+        if model.stage2_residual_decoder is None:
+            model.train(was_training)
+            raise RuntimeError('logit_residual_decoder zero-step requires residual module')
+        decoder_before = {
+            k: v.detach().cpu().clone()
+            for k, v in model.decoder.state_dict().items()
+        }
+        diffs = {}
+        for route in ('full', 'missing'):
+            model.stage2_residual_enabled = False
+            out_stage1 = model(ct, pet=pet, forward_mode=route, mask=None)
+            logits_stage1 = out_stage1['logits']
+
+            model.stage2_residual_enabled = True
+            out_stage2 = model(ct, pet=pet, forward_mode=route, mask=None)
+            logits_stage2 = out_stage2['logits']
+            res_stats = (out_stage2.get('aux', {}) or {}).get('stage2_residual_stats', {}) or {}
+
+            if not torch.isfinite(logits_stage2).all():
+                model.train(was_training)
+                raise RuntimeError(f'residual zero-step: non-finite logits on {route}')
+            max_abs_diff = float((logits_stage1 - logits_stage2).abs().max().item())
+            diffs[route] = max_abs_diff
+            delta_abs_max = float(res_stats.get('delta_logit_abs_max', logits_stage2.new_zeros(())).item())
+            if max_abs_diff > 1e-6:
+                model.stage2_residual_enabled = True
+                model.train(was_training)
+                raise RuntimeError(
+                    f'Residual zero-step equivalence failed for {route}: '
+                    f'max_abs_diff={max_abs_diff} > 1e-6'
+                )
+            if delta_abs_max > 1e-6:
+                model.stage2_residual_enabled = True
+                model.train(was_training)
+                raise RuntimeError(
+                    f'Residual zero-step delta_logit_abs_max={delta_abs_max} > 1e-6 on {route}'
+                )
+
+        for k, v_before in decoder_before.items():
+            v_after = model.decoder.state_dict()[k].detach().cpu()
+            if not torch.equal(v_before, v_after):
+                model.stage2_residual_enabled = True
+                model.train(was_training)
+                raise RuntimeError(f'Stage1 decoder weight changed during zero-step: {k}')
+
+        model.stage2_residual_enabled = True
+        model.train(was_training)
+        print('[ZERO-STEP]', flush=True)
+        print('mode=logit_residual_decoder', flush=True)
+        print(f'full_max_abs_diff={diffs["full"]}', flush=True)
+        print(f'missing_max_abs_diff={diffs["missing"]}', flush=True)
+        print('passed=True', flush=True)
+        return diffs
 
     # paper residual: step-0 is NOT Stage-1 identity; run finite/shape checks only.
     if mode == 'cross_scale_shared' and residual_mode == 'paper':
@@ -305,12 +362,17 @@ def _optimizer_group_lr(optimizer, name, default=0.0):
         for group in optimizer.param_groups:
             if group.get('name') == 'decoder_adapter':
                 return float(group['lr'])
+    if name == 'residual_decoder':
+        for group in optimizer.param_groups:
+            if group.get('name') == 'residual_decoder':
+                return float(group['lr'])
     return float(default)
 
 
 def _print_stage2_startup(model, cfg, total_params, trainable_params, optimizer=None):
     from models.dual_shared_add_baseline import (
         _is_stage2_adapter_param_name,
+        _is_stage2_residual_decoder_param_name,
         _is_taskmoe_param_name,
     )
 
@@ -324,6 +386,11 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params, optimizer=
         for n, p in model.named_parameters()
         if p.requires_grad and _is_stage2_adapter_param_name(n)
     )
+    residual_trainable = sum(
+        p.numel()
+        for n, p in model.named_parameters()
+        if p.requires_grad and _is_stage2_residual_decoder_param_name(n)
+    )
     decoder_trainable = sum(
         p.numel()
         for n, p in model.named_parameters()
@@ -335,10 +402,56 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params, optimizer=
         if p.requires_grad
         and not _is_taskmoe_param_name(n)
         and not _is_stage2_adapter_param_name(n)
+        and not _is_stage2_residual_decoder_param_name(n)
         and not n.startswith('decoder.')
     )
     train_decoder = bool(getattr(model, 'stage2_train_decoder', False))
     mode = getattr(model, 'taskmoe_mode', 'independent')
+    stage2_strategy = str(getattr(model, 'stage2_strategy', 'legacy_taskmoe')).strip().lower()
+
+    if stage2_strategy == 'logit_residual_decoder':
+        print('[TRAIN MODE]', flush=True)
+        print('mode=stage2_logit_residual_decoder', flush=True)
+        print('[STAGE1]', flush=True)
+        print(f'checkpoint={cfg.stage1_checkpoint}', flush=True)
+        print('loaded=True', flush=True)
+        print('frozen=True', flush=True)
+        print('decoder_frozen=True', flush=True)
+        print('[CPPI]', flush=True)
+        print(f'bank_ready={bool(model.prototype_memory.bank_ready)}', flush=True)
+        print('collect=False', flush=True)
+        print('retrieve=True', flush=True)
+        print('[RESIDUAL DECODER]', flush=True)
+        print(f'enabled={model.stage2_residual_decoder is not None}', flush=True)
+        print(
+            f'state_conditioned={bool(getattr(model, "stage2_residual_state_conditioned", False))}',
+            flush=True,
+        )
+        print(
+            f'hidden_channels={int(getattr(model, "stage2_residual_channels", 64))}',
+            flush=True,
+        )
+        print(
+            f'delta_logit_max={float(getattr(model, "stage2_delta_logit_max", 2.0))}',
+            flush=True,
+        )
+        print(f'trainable={residual_trainable}', flush=True)
+        residual_lr = float(getattr(cfg, 'stage2_residual_lr', 5e-5))
+        if optimizer is not None:
+            residual_lr = _optimizer_group_lr(optimizer, 'residual_decoder', default=residual_lr)
+        print('[STAGE2 TRAINABLE]', flush=True)
+        print(f'residual_decoder_trainable={residual_trainable}', flush=True)
+        print(f'taskmoe_trainable={taskmoe_trainable}', flush=True)
+        print(f'decoder_adapter_trainable={adapter_trainable}', flush=True)
+        print(f'decoder_trainable={decoder_trainable}', flush=True)
+        print(f'stage1_core_trainable={stage1_core_trainable}', flush=True)
+        print('[LEARNING RATE]', flush=True)
+        print(f'residual_decoder_lr={residual_lr}', flush=True)
+        print('[PARAMS]', flush=True)
+        print(f'stage1_trainable={stage1_core_trainable}', flush=True)
+        print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
+        return
+
     print('[TRAIN MODE]', flush=True)
     print('mode=stage2_taskmoe', flush=True)
     print('[STAGE1]', flush=True)
@@ -497,13 +610,30 @@ def main():
     if not getattr(cfg, 'stage1_checkpoint', None):
         raise ValueError('Stage-2 TaskMoE training requires --stage1_checkpoint')
     from models.dual_shared_add_baseline import _parse_taskmoe_scales
+    stage2_strategy = str(getattr(cfg, 'stage2_strategy', 'legacy_taskmoe')).strip().lower()
     mode = str(getattr(cfg, 'taskmoe_mode', 'independent')).lower()
-    if mode in ('cross_scale_shared', 'state_scale_factorized'):
+    if stage2_strategy == 'logit_residual_decoder':
+        if bool(getattr(cfg, 'stage2_train_decoder', False)):
+            raise ValueError(
+                'logit_residual_decoder forbids --stage2_train_decoder True'
+            )
+        if bool(getattr(cfg, 'stage2_decoder_adapter', False)):
+            raise ValueError(
+                'logit_residual_decoder forbids --stage2_decoder_adapter True'
+            )
+        if int(getattr(cfg, 'stage2_residual_channels', 64)) <= 0:
+            raise ValueError('--stage2_residual_channels must be > 0')
+        if float(getattr(cfg, 'stage2_delta_logit_max', 2.0)) <= 0:
+            raise ValueError('--stage2_delta_logit_max must be > 0')
+        dropout = float(getattr(cfg, 'stage2_residual_dropout', 0.0))
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError('--stage2_residual_dropout must be in [0, 1)')
+    if mode in ('cross_scale_shared', 'state_scale_factorized') and stage2_strategy == 'legacy_taskmoe':
         if _parse_taskmoe_scales(getattr(cfg, 'taskmoe_scales', 's4')) != ('s1', 's2', 's3', 's4'):
             raise ValueError(
                 f'{mode} TaskMoE is an all-scale module; use --taskmoe_scales all'
             )
-    if mode == 'state_scale_factorized':
+    if mode == 'state_scale_factorized' and stage2_strategy == 'legacy_taskmoe':
         if bool(getattr(cfg, 'taskmoe_use_text_prior', False)):
             raise ValueError('state_scale_factorized forbids --taskmoe_use_text_prior True')
         if bool(getattr(cfg, 'stage2_train_decoder', False)):
@@ -528,9 +658,14 @@ def main():
     networks = build_mdt_seg_teacher(cfg)
     model = networks['model']
     _load_stage1_for_taskmoe(model, cfg.stage1_checkpoint)
-    model.enable_stage2_moe_only(
-        train_decoder=bool(getattr(cfg, 'stage2_train_decoder', False))
-    )
+    if stage2_strategy == 'logit_residual_decoder':
+        if model.stage2_residual_decoder is None:
+            raise RuntimeError('logit_residual_decoder module was not constructed')
+        model.enable_stage2_residual_decoder_only()
+    else:
+        model.enable_stage2_moe_only(
+            train_decoder=bool(getattr(cfg, 'stage2_train_decoder', False))
+        )
     task = MDTSegTeacher(networks, cfg)
 
     total_params, trainable_params = _count_parameters(task.model)
@@ -567,7 +702,8 @@ def main():
         'taskmoe_delta_l2_ratio_s3', 'taskmoe_delta_l2_ratio_s4',
         'train_fers_loss', 'train_fers_scale_loss', 'train_fers_state_loss',
         'scale_role_acc', 'state_role_acc',
-        'lr_taskmoe', 'lr_decoder', 'lr_decoder_adapter',
+        'train_delta_logit_abs_mean', 'train_delta_logit_abs_max', 'train_delta_logit_ratio',
+        'lr_taskmoe', 'lr_decoder', 'lr_decoder_adapter', 'lr_residual_decoder',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
 
@@ -593,6 +729,10 @@ def main():
         scale_role_acc_accum = 0.0
         state_role_acc_accum = 0.0
         fers_steps = 0
+        delta_logit_abs_mean_accum = 0.0
+        delta_logit_abs_max_accum = 0.0
+        delta_logit_ratio_accum = 0.0
+        delta_logit_steps = 0
         delta_ratio_accum = {f's{i}': 0.0 for i in range(1, 5)}
         delta_l2_ratio_accum = {f's{i}': 0.0 for i in range(1, 5)}
         delta_ratio_steps = 0
@@ -699,6 +839,11 @@ def main():
                 scale_role_acc_accum += float(stats['scale_role_acc'].detach())
                 state_role_acc_accum += float(stats['state_role_acc'].detach())
                 fers_steps += 1
+            if 'delta_logit_abs_mean' in stats:
+                delta_logit_abs_mean_accum += float(stats['delta_logit_abs_mean'].detach())
+                delta_logit_abs_max_accum += float(stats['delta_logit_abs_max'].detach())
+                delta_logit_ratio_accum += float(stats['delta_logit_ratio'].detach())
+                delta_logit_steps += 1
             if route == 'full':
                 full_n += 1
                 full_loss += float(loss.detach())
@@ -894,6 +1039,9 @@ def main():
             'train_fers_state_loss': fers_state_accum / max(1, fers_steps),
             'scale_role_acc': scale_role_acc_accum / max(1, fers_steps),
             'state_role_acc': state_role_acc_accum / max(1, fers_steps),
+            'train_delta_logit_abs_mean': delta_logit_abs_mean_accum / max(1, delta_logit_steps),
+            'train_delta_logit_abs_max': delta_logit_abs_max_accum / max(1, delta_logit_steps),
+            'train_delta_logit_ratio': delta_logit_ratio_accum / max(1, delta_logit_steps),
             'lr_taskmoe': _optimizer_group_lr(task.optimizer, 'taskmoe'),
             'lr_decoder': (
                 _optimizer_group_lr(task.optimizer, 'decoder', default=0.0)
@@ -902,6 +1050,9 @@ def main():
             ),
             'lr_decoder_adapter': _optimizer_group_lr(
                 task.optimizer, 'decoder_adapter', default=0.0
+            ),
+            'lr_residual_decoder': _optimizer_group_lr(
+                task.optimizer, 'residual_decoder', default=0.0
             ),
             **{f'diag_{k}': v for k, v in diag_stats.items()},
         }
