@@ -135,16 +135,23 @@ class SegMDTConfig(ConfigBase):
             help='Bounded residual: beta_s = beta_max * tanh(raw_beta_s).',
         )
         p.add_argument(
-            '--taskmoe_shared_consistency_weight',
+            '--taskmoe_role_loss_weight',
             type=float,
-            default=0.01,
-            help='Weight for shared-expert Full–Missing consistency loss (factorized mode).',
+            default=0.02,
+            help=(
+                'lambda_role for Factorized Expert Role Supervision (FERS). '
+                'L_total = L_seg + lambda_role * L_FERS. Use 0 to disable.'
+            ),
         )
         p.add_argument(
-            '--taskmoe_shared_consistency_interval',
-            type=int,
-            default=1,
-            help='Compute shared consistency every N optimizer steps (factorized mode).',
+            '--taskmoe_fers_mode',
+            type=str,
+            default='both',
+            choices=('both', 'scale', 'state', 'none'),
+            help=(
+                'FERS components: both=0.5*(scale+state), scale only, state only, or none. '
+                'Replaces the removed shared Full-Missing consistency loss.'
+            ),
         )
         p.add_argument(
             '--stage2_decoder_adapter',

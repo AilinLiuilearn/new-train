@@ -104,8 +104,8 @@ def _make_cfg(**kwargs):
         'decoder_lr': 8e-6,
         'taskmoe_private_rank': 16,
         'taskmoe_beta_max': 1.0,
-        'taskmoe_shared_consistency_weight': 0.01,
-        'taskmoe_shared_consistency_interval': 1,
+        'taskmoe_role_loss_weight': 0.02,
+        'taskmoe_fers_mode': 'both',
         'stage2_decoder_adapter': False,
         'stage2_decoder_adapter_level': 'd1',
         'taskmoe_use_text_prior': False,
@@ -125,8 +125,8 @@ def _build_stage2(
     decoder_lr: float = 8e-6,
     taskmoe_private_rank: int = 16,
     taskmoe_beta_max: float = 1.0,
-    taskmoe_shared_consistency_weight: float = 0.01,
-    taskmoe_shared_consistency_interval: int = 1,
+    taskmoe_role_loss_weight: float = 0.02,
+    taskmoe_fers_mode: str = 'both',
     stage2_decoder_adapter: bool = False,
     stage2_decoder_adapter_level: str = 'd1',
 ):
@@ -140,8 +140,8 @@ def _build_stage2(
         decoder_lr=decoder_lr,
         taskmoe_private_rank=taskmoe_private_rank,
         taskmoe_beta_max=taskmoe_beta_max,
-        taskmoe_shared_consistency_weight=taskmoe_shared_consistency_weight,
-        taskmoe_shared_consistency_interval=taskmoe_shared_consistency_interval,
+        taskmoe_role_loss_weight=taskmoe_role_loss_weight,
+        taskmoe_fers_mode=taskmoe_fers_mode,
         stage2_decoder_adapter=stage2_decoder_adapter,
         stage2_decoder_adapter_level=stage2_decoder_adapter_level,
     )
@@ -157,8 +157,8 @@ def _build_stage2(
     cfg.decoder_lr = decoder_lr
     cfg.taskmoe_private_rank = taskmoe_private_rank
     cfg.taskmoe_beta_max = taskmoe_beta_max
-    cfg.taskmoe_shared_consistency_weight = taskmoe_shared_consistency_weight
-    cfg.taskmoe_shared_consistency_interval = taskmoe_shared_consistency_interval
+    cfg.taskmoe_role_loss_weight = taskmoe_role_loss_weight
+    cfg.taskmoe_fers_mode = taskmoe_fers_mode
     cfg.stage2_decoder_adapter = stage2_decoder_adapter
     cfg.stage2_decoder_adapter_level = stage2_decoder_adapter_level
     networks = build_mdt_seg_teacher(cfg)
@@ -421,7 +421,8 @@ def run_smoke(stage1_ckpt: str):
         stage1_ckpt,
         taskmoe_scales='all',
         taskmoe_mode='state_scale_factorized',
-        taskmoe_shared_consistency_weight=0.01,
+        taskmoe_role_loss_weight=0.02,
+        taskmoe_fers_mode='both',
         stage2_decoder_adapter=True,
     )
     model_f.to(device)
@@ -466,8 +467,9 @@ def run_smoke(stage1_ckpt: str):
     bank_before = int(model_f.prototype_memory.bank_version.item())
     task_f.optimizer.zero_grad(set_to_none=True)
     loss_f, _, _, stats_f = task_f.train_step(batch_f, forward_mode='full')
-    assert 'loss_shared_consistency' in stats_f
-    assert torch.isfinite(stats_f['loss_shared_consistency'])
+    assert 'loss_fers' in stats_f
+    assert torch.isfinite(stats_f['loss_fers'])
+    assert float(stats_f['loss_moe_balance'].detach()) > 0.0  # weighted FERS in aux slot
     loss_f.backward()
     stage1_grad = any(
         p.grad is not None and float(p.grad.abs().sum().item()) > 0
@@ -479,6 +481,12 @@ def run_smoke(stage1_ckpt: str):
         p.grad is not None
         for n, p in model_f.named_parameters()
         if n.startswith('state_scale_taskmoe.shared_expert.')
+    )
+    # FERS should give non-zero grads to private expert fc2 even at beta=0.
+    assert any(
+        p.grad is not None and float(p.grad.abs().sum().item()) > 0
+        for n, p in model_f.named_parameters()
+        if 'scale_experts.0.fc2' in n
     )
     assert any(
         p.grad is not None
@@ -495,7 +503,8 @@ def run_smoke(stage1_ckpt: str):
         stage1_ckpt,
         taskmoe_scales='all',
         taskmoe_mode='state_scale_factorized',
-        taskmoe_shared_consistency_weight=0.0,
+        taskmoe_role_loss_weight=0.0,
+        taskmoe_fers_mode='none',
         stage2_decoder_adapter=False,
     )
     model_e.to(device)
@@ -559,7 +568,8 @@ def run_smoke(stage1_ckpt: str):
         stage1_ckpt,
         taskmoe_scales='all',
         taskmoe_mode='state_scale_factorized',
-        taskmoe_shared_consistency_weight=0.0,
+        taskmoe_role_loss_weight=0.0,
+        taskmoe_fers_mode='none',
         stage2_decoder_adapter=True,
     )
     model_n.to(device)
@@ -576,6 +586,36 @@ def run_smoke(stage1_ckpt: str):
         b = float(stats_n[f's{i}_beta'])
         assert abs(b) <= float(model_n.state_scale_taskmoe.beta_max) + 1e-6
     print('[SMOKE] 19 numerical_contract_ok')
+
+    # 20) FERS single-forward: no dual-route consistency call
+    model_r, task_r, _ = _build_stage2(
+        stage1_ckpt,
+        taskmoe_scales='all',
+        taskmoe_mode='state_scale_factorized',
+        taskmoe_role_loss_weight=0.02,
+        taskmoe_fers_mode='both',
+        stage2_decoder_adapter=False,
+    )
+    model_r.to(device)
+    called = {'cons': False}
+    orig_cons = model_r.compute_shared_consistency_loss
+
+    def _cons_guard(*args, **kwargs):
+        called['cons'] = True
+        return orig_cons(*args, **kwargs)
+
+    model_r.compute_shared_consistency_loss = _cons_guard
+    model_r.train()
+    batch_r = _fake_batch(device, batch=1)
+    task_r.optimizer.zero_grad(set_to_none=True)
+    loss_r, _, out_r, stats_r = task_r.train_step(batch_r, forward_mode='missing')
+    assert called['cons'] is False
+    assert float(stats_r['loss_fers'].detach()) > 0
+    assert 'scale_role_acc' in stats_r and 'state_role_acc' in stats_r
+    loss_r.backward()
+    assert model_r.state_scale_taskmoe.scale_role_head.weight.grad is not None
+    assert model_r.state_scale_taskmoe.state_role_head.weight.grad is not None
+    print('[SMOKE] 20 fers_single_forward_ok')
 
     trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
     print(f'[SMOKE] trainable_param_count={len(trainable_names)}')

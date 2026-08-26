@@ -137,13 +137,18 @@ class StateScaleFactorizedTaskMoE(nn.Module):
         beta_max: float = 1.0,
         gate_bias_init: float = -2.0,
         role_context_dim: int = 64,
-        shared_consistency_weight: float = 0.01,
-        shared_consistency_interval: int = 1,
+        role_loss_weight: float = 0.02,
+        fers_mode: str = 'both',
     ) -> None:
         super().__init__()
         if int(private_rank) not in (8, 16, 32):
             raise ValueError(
                 f'taskmoe_private_rank must be in {{8,16,32}}, got {private_rank}'
+            )
+        fers_mode = str(fers_mode or 'both').strip().lower()
+        if fers_mode not in ('both', 'scale', 'state', 'none'):
+            raise ValueError(
+                f'taskmoe_fers_mode must be both|scale|state|none, got {fers_mode!r}'
             )
         self.channels = tuple(channels)
         self.num_scales = len(self.channels)
@@ -154,10 +159,9 @@ class StateScaleFactorizedTaskMoE(nn.Module):
         self.beta_max = float(beta_max)
         if self.beta_max <= 0:
             raise ValueError(f'beta_max must be > 0, got {self.beta_max}')
-        self.shared_consistency_weight = float(shared_consistency_weight)
-        self.shared_consistency_interval = max(1, int(shared_consistency_interval))
+        self.role_loss_weight = float(role_loss_weight)
+        self.fers_mode = fers_mode
         self.role_context_dim = int(role_context_dim)
-        self._consistency_step = 0
 
         self.scale_adapters = nn.ModuleList(
             [
@@ -202,6 +206,10 @@ class StateScaleFactorizedTaskMoE(nn.Module):
 
         # Bounded residual: beta_s = beta_max * tanh(raw_beta_s), raw init 0.
         self.raw_beta = nn.Parameter(torch.zeros(self.num_scales))
+
+        # FERS: tiny shared role classifiers (train-only supervision; unused at inference).
+        self.scale_role_head = nn.Linear(self.expert_dim, self.num_scales)
+        self.state_role_head = nn.Linear(self.expert_dim, 2)
 
         # Sample-level role context for optional decoder adapter (FiLM).
         self.role_context_proj = nn.Sequential(
@@ -317,7 +325,7 @@ class StateScaleFactorizedTaskMoE(nn.Module):
             f's{scale_idx + 1}_scale_gate_per_sample': scale_gate_mean,
             f's{scale_idx + 1}_state_gate_per_sample': state_gate_mean,
         }
-        return out, z_shared_map, stats
+        return out, z_shared_map, z_scale, z_state, stats
 
     def build_role_context(
         self,
@@ -354,6 +362,33 @@ class StateScaleFactorizedTaskMoE(nn.Module):
             raise RuntimeError('role_context batch mismatch')
         return ctx.to(device=device)
 
+    def _fers_from_private(
+        self,
+        z_scale: torch.Tensor,
+        z_state: torch.Tensor,
+        scale_idx: int,
+        state_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Single-scale role CE from already-computed private expert maps.
+
+        z_*: [B,H,W,D]; returns (scale_ce, state_ce, scale_acc, state_acc).
+        """
+        v_scale = z_scale.float().mean(dim=(1, 2))  # GAP over HW -> [B,D]
+        v_state = z_state.float().mean(dim=(1, 2))
+        scale_logits = self.scale_role_head(v_scale)
+        state_logits = self.state_role_head(v_state)
+        scale_target = torch.full(
+            (v_scale.shape[0],),
+            int(scale_idx),
+            device=v_scale.device,
+            dtype=torch.long,
+        )
+        scale_ce = F.cross_entropy(scale_logits, scale_target)
+        state_ce = F.cross_entropy(state_logits, state_ids.long())
+        scale_acc = (scale_logits.argmax(dim=-1) == scale_target).float().mean().detach()
+        state_acc = (state_logits.argmax(dim=-1) == state_ids.long()).float().mean().detach()
+        return scale_ce, state_ce, scale_acc, state_acc
+
     def forward(
         self,
         features: Sequence[torch.Tensor],
@@ -372,6 +407,13 @@ class StateScaleFactorizedTaskMoE(nn.Module):
         out_features: List[torch.Tensor] = []
         z_shared_maps: List[torch.Tensor] = []
         stats: Dict[str, torch.Tensor] = {}
+        scale_ces: List[torch.Tensor] = []
+        state_ces: List[torch.Tensor] = []
+        scale_accs: List[torch.Tensor] = []
+        state_accs: List[torch.Tensor] = []
+        z_scale_pooled: List[torch.Tensor] = []
+        z_state_pooled: List[torch.Tensor] = []
+
         for scale_idx, (feat, adapter, expected_c) in enumerate(
             zip(features, self.scale_adapters, self.channels)
         ):
@@ -381,12 +423,34 @@ class StateScaleFactorizedTaskMoE(nn.Module):
                 raise ValueError(
                     f'S{scale_idx + 1} channel mismatch: expected {expected_c}, got {feat.shape[1]}'
                 )
-            out, z_shared_map, scale_stats = self._forward_scale(
+            out, z_shared_map, z_scale, z_state, scale_stats = self._forward_scale(
                 feat, adapter, scale_idx, state_ids
             )
             out_features.append(out)
             z_shared_maps.append(z_shared_map)
             stats.update(scale_stats)
+
+            # FERS uses private outputs already produced by this forward (no extra Stage1/route).
+            use_fers_grad = (
+                self.training
+                and self.role_loss_weight > 0
+                and self.fers_mode != 'none'
+            )
+            if use_fers_grad:
+                scale_ce, state_ce, scale_acc, state_acc = self._fers_from_private(
+                    z_scale, z_state, scale_idx, state_ids
+                )
+            else:
+                with torch.no_grad():
+                    scale_ce, state_ce, scale_acc, state_acc = self._fers_from_private(
+                        z_scale, z_state, scale_idx, state_ids
+                    )
+            scale_ces.append(scale_ce)
+            state_ces.append(state_ce)
+            scale_accs.append(scale_acc)
+            state_accs.append(state_acc)
+            z_scale_pooled.append(F.normalize(z_scale.detach().float().mean(dim=(1, 2)), dim=-1))
+            z_state_pooled.append(F.normalize(z_state.detach().float().mean(dim=(1, 2)), dim=-1))
 
         role_context = self.build_role_context(state_ids, stats)
         # Drop bulky per-sample tensors from exportable diagnostics.
@@ -394,9 +458,51 @@ class StateScaleFactorizedTaskMoE(nn.Module):
             stats.pop(f's{i}_scale_gate_per_sample', None)
             stats.pop(f's{i}_state_gate_per_sample', None)
         stats['role_context'] = role_context.detach()
-        # Factorized mode has no balance loss.
-        aux_loss = features[0].new_zeros((), dtype=torch.float32)
-        stats['balance_loss'] = aux_loss.detach()
+
+        # L_scale-role = mean over 4 scales of CE (equiv. 1/(4B) sum_s sum_b)
+        l_scale = torch.stack(scale_ces).mean()
+        l_state = torch.stack(state_ces).mean()
+        if self.fers_mode == 'scale':
+            l_fers = l_scale
+        elif self.fers_mode == 'state':
+            l_fers = l_state
+        elif self.fers_mode == 'none':
+            l_fers = features[0].new_zeros((), dtype=torch.float32)
+        else:
+            l_fers = 0.5 * (l_scale + l_state)
+
+        if self.training and self.role_loss_weight > 0 and self.fers_mode != 'none':
+            aux_loss = (self.role_loss_weight * l_fers).float()
+        else:
+            aux_loss = features[0].new_zeros((), dtype=torch.float32)
+
+        stats['balance_loss'] = aux_loss.detach()  # legacy slot: now carries weighted FERS
+        stats['fers_loss'] = l_fers.detach().float()
+        stats['fers_scale_loss'] = l_scale.detach().float()
+        stats['fers_state_loss'] = l_state.detach().float()
+        stats['scale_role_acc'] = torch.stack(scale_accs).mean()
+        stats['state_role_acc'] = torch.stack(state_accs).mean()
+        stats['role_loss_weight'] = torch.tensor(
+            self.role_loss_weight, device=features[0].device, dtype=torch.float32
+        )
+
+        # Offline-style similarity diagnostics (detached).
+        # Mean pairwise cosine among 4 scale-private pooled vectors (batch-mean).
+        scale_stack = torch.stack(z_scale_pooled, dim=0)  # [4,B,D]
+        scale_mean = F.normalize(scale_stack.mean(dim=1), dim=-1)  # [4,D]
+        scale_sim = scale_mean @ scale_mean.t()
+        # Average off-diagonal similarity.
+        eye = torch.eye(4, device=scale_sim.device, dtype=scale_sim.dtype)
+        stats['scale_expert_mean_pairwise_cosine'] = (
+            (scale_sim * (1.0 - eye)).sum() / 12.0
+        ).detach()
+        # State expert similarity: compare mean Full vs Missing pooled over scales
+        # using current-batch activated state outputs only (same state in batch-level alt).
+        state_mean = F.normalize(
+            torch.stack(z_state_pooled, dim=0).mean(dim=0).mean(dim=0), dim=-1
+        )
+        stats['state_private_output_unit_norm'] = state_mean.norm().detach()
+
         return StateScaleFactorizedTaskMoEOutput(
             features=out_features,
             aux_loss=aux_loss,
@@ -404,50 +510,6 @@ class StateScaleFactorizedTaskMoE(nn.Module):
             role_context=role_context,
             z_shared_maps=z_shared_maps,
         )
-
-    def shared_consistency_from_z(
-        self,
-        z_shared_full: Sequence[torch.Tensor],
-        z_shared_missing: Sequence[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """L_shared_cons = mean_s (1 - cos(u_full, stopgrad(u_missing)))."""
-        if len(z_shared_full) != self.num_scales or len(z_shared_missing) != self.num_scales:
-            raise ValueError('shared consistency expects 4-scale z_shared maps')
-        losses = []
-        cosines = []
-        for z_f, z_m in zip(z_shared_full, z_shared_missing):
-            u_f = F.normalize(F.adaptive_avg_pool2d(z_f.float(), 1).flatten(1), dim=-1)
-            u_m = F.normalize(F.adaptive_avg_pool2d(z_m.float(), 1).flatten(1), dim=-1)
-            cos = (u_f * u_m.detach()).sum(dim=-1).mean()
-            losses.append(1.0 - cos)
-            cosines.append(cos.detach())
-        loss = torch.stack(losses).mean()
-        mean_cos = torch.stack(cosines).mean()
-        return loss, mean_cos
-
-    def compute_shared_consistency(
-        self,
-        features_full: Sequence[torch.Tensor],
-        features_missing: Sequence[torch.Tensor],
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Run shared expert on both routes and return consistency loss."""
-        out_full = self.forward(features_full, route='full')
-        out_missing = self.forward(features_missing, route='missing')
-        loss, mean_cos = self.shared_consistency_from_z(
-            out_full.z_shared_maps, out_missing.z_shared_maps
-        )
-        stats = {
-            'shared_full_missing_cosine': mean_cos,
-            'shared_consistency_loss': loss.detach().float(),
-        }
-        return loss, stats
-
-    def should_compute_shared_consistency(self) -> bool:
-        if self.shared_consistency_weight <= 0:
-            return False
-        step = self._consistency_step
-        self._consistency_step += 1
-        return (step % self.shared_consistency_interval) == 0
 
 
 def count_trainable_parameters(module: nn.Module) -> int:
@@ -488,6 +550,17 @@ def _smoke_test() -> None:
     assert moe.scale_experts[3].fc1.weight.grad is None
     assert moe.state_experts[0].fc1.weight.grad is not None
     assert moe.state_experts[1].fc1.weight.grad is None
+
+    # FERS: private experts get grads even when beta=0 (bypasses residual).
+    moe.zero_grad(set_to_none=True)
+    out3 = moe(feats, route='full')
+    assert float(out3.aux_loss.detach()) > 0.0
+    out3.aux_loss.backward()
+    assert moe.scale_experts[0].fc2.weight.grad is not None
+    assert float(moe.scale_experts[0].fc2.weight.grad.abs().sum()) > 0
+    assert moe.state_experts[1].fc2.weight.grad is not None
+    assert moe.state_experts[0].fc2.weight.grad is None
+    assert 'scale_role_acc' in out3.stats and 'state_role_acc' in out3.stats
 
     print('StateScaleFactorizedTaskMoE smoke test: PASS')
     print(f'params: {count_trainable_parameters(moe):,}')

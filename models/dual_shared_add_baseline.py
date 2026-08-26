@@ -135,8 +135,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
         taskmoe_text_tower_path=None,
         taskmoe_private_rank=16,
         taskmoe_beta_max=1.0,
-        taskmoe_shared_consistency_weight=0.01,
-        taskmoe_shared_consistency_interval=1,
+        taskmoe_role_loss_weight=0.02,
+        taskmoe_fers_mode='both',
         stage2_decoder_adapter=False,
         stage2_decoder_adapter_level='d1',
     ):
@@ -167,8 +167,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
         self.taskmoe_text_tower_path = taskmoe_text_tower_path
         self.taskmoe_private_rank = int(taskmoe_private_rank)
         self.taskmoe_beta_max = float(taskmoe_beta_max)
-        self.taskmoe_shared_consistency_weight = float(taskmoe_shared_consistency_weight)
-        self.taskmoe_shared_consistency_interval = int(taskmoe_shared_consistency_interval)
+        self.taskmoe_role_loss_weight = float(taskmoe_role_loss_weight)
+        self.taskmoe_fers_mode = str(taskmoe_fers_mode or 'both').strip().lower()
         self.stage2_decoder_adapter_enabled = bool(stage2_decoder_adapter)
         self.stage2_decoder_adapter_level = str(stage2_decoder_adapter_level or 'd1').strip().lower()
         self._last_role_context = None
@@ -185,6 +185,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
             if self.taskmoe_residual_mode == 'paper':
                 raise ValueError(
                     'state_scale_factorized forbids paper residual mode; use zero_start'
+                )
+            if self.taskmoe_fers_mode not in ('both', 'scale', 'state', 'none'):
+                raise ValueError(
+                    f'Unsupported taskmoe_fers_mode={taskmoe_fers_mode!r}; '
+                    'use both, scale, state, or none'
                 )
         self.taskmoe_scales = _parse_taskmoe_scales(taskmoe_scales)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
@@ -251,8 +256,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 mlp_ratio=2.0,
                 dropout=0.0,
                 beta_max=self.taskmoe_beta_max,
-                shared_consistency_weight=self.taskmoe_shared_consistency_weight,
-                shared_consistency_interval=self.taskmoe_shared_consistency_interval,
+                role_loss_weight=self.taskmoe_role_loss_weight,
+                fers_mode=self.taskmoe_fers_mode,
                 role_context_dim=64,
             )
         else:
@@ -538,24 +543,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
             self.taskmoe_enabled = was_enabled
 
     def compute_shared_consistency_loss(self, ct, pet):
-        """Optional Full–Missing shared-expert consistency (Stage1 frozen)."""
-        if self.state_scale_taskmoe is None:
-            zero = ct.new_zeros((), dtype=torch.float32)
-            return zero, {}
-        if not self.state_scale_taskmoe.should_compute_shared_consistency():
-            zero = ct.new_zeros((), dtype=torch.float32)
-            return zero, {
-                'shared_consistency_skipped': torch.tensor(1.0, device=ct.device),
-            }
-        feats_full = self._stage1_fused_features(ct, pet, route='full')
-        feats_missing = self._stage1_fused_features(ct, pet, route='missing')
-        with torch.cuda.amp.autocast(enabled=False):
-            loss, stats = self.state_scale_taskmoe.compute_shared_consistency(
-                [f.float() for f in feats_full],
-                [f.float() for f in feats_missing],
-            )
-        weight = float(self.state_scale_taskmoe.shared_consistency_weight)
-        return (weight * loss.float()), stats
+        """Removed: shared Full–Missing consistency is replaced by single-forward FERS."""
+        raise RuntimeError(
+            'shared consistency loss has been removed; '
+            'use --taskmoe_role_loss_weight / --taskmoe_fers_mode (FERS) instead'
+        )
 
     def _collect_cppi(self, ct_feats, pet_feats_real, mask):
         if self.stage2_moe_only:

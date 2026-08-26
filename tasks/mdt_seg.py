@@ -185,6 +185,7 @@ class MDTSegTeacher:
         outputs = self.model(ct, pet=pet, mask=mask, forward_mode=forward_mode)
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
         seg_loss, loss_stats = self.criterion(logits, mask)
+        # For factorized mode this slot carries weighted FERS (no balance loss).
         moe_loss = outputs.get('aux', {}).get(
             'taskmoe_balance_loss',
             None,
@@ -194,25 +195,26 @@ class MDTSegTeacher:
         else:
             moe_loss = moe_loss.float()
 
-        cons_loss = torch.zeros((), device=seg_loss.device, dtype=torch.float32)
-        cons_stats = {}
-        if (
-            getattr(self.model, 'taskmoe_mode', '') == 'state_scale_factorized'
-            and float(getattr(self.model, 'taskmoe_shared_consistency_weight', 0.0)) > 0
-        ):
-            cons_loss, cons_stats = self.model.compute_shared_consistency_loss(ct, pet)
-            cons_loss = cons_loss.float()
-            aux = outputs.setdefault('aux', {})
-            aux['taskmoe_shared_consistency_loss'] = cons_loss.detach()
-            moe_stats = aux.setdefault('taskmoe_stats', {})
-            for k, v in cons_stats.items():
-                moe_stats[k] = v
-
-        total_loss = seg_loss.float() + moe_loss + cons_loss
+        total_loss = seg_loss.float() + moe_loss
+        moe_stats = (outputs.get('aux', {}) or {}).get('taskmoe_stats', {}) or {}
         stats = {
             'loss_seg_total': seg_loss.detach().float(),
             'loss_moe_balance': moe_loss.detach(),
-            'loss_shared_consistency': cons_loss.detach(),
+            'loss_fers': moe_stats.get(
+                'fers_loss', torch.zeros((), device=seg_loss.device)
+            ).detach() if torch.is_tensor(moe_stats.get('fers_loss', None)) else torch.zeros((), device=seg_loss.device),
+            'loss_fers_scale': moe_stats.get(
+                'fers_scale_loss', torch.zeros((), device=seg_loss.device)
+            ).detach() if torch.is_tensor(moe_stats.get('fers_scale_loss', None)) else torch.zeros((), device=seg_loss.device),
+            'loss_fers_state': moe_stats.get(
+                'fers_state_loss', torch.zeros((), device=seg_loss.device)
+            ).detach() if torch.is_tensor(moe_stats.get('fers_state_loss', None)) else torch.zeros((), device=seg_loss.device),
+            'scale_role_acc': moe_stats.get(
+                'scale_role_acc', torch.zeros((), device=seg_loss.device)
+            ).detach() if torch.is_tensor(moe_stats.get('scale_role_acc', None)) else torch.zeros((), device=seg_loss.device),
+            'state_role_acc': moe_stats.get(
+                'state_role_acc', torch.zeros((), device=seg_loss.device)
+            ).detach() if torch.is_tensor(moe_stats.get('state_role_acc', None)) else torch.zeros((), device=seg_loss.device),
             'loss_total': total_loss.detach(),
             'loss_seg': loss_stats.get('loss_dice', seg_loss.detach()),
             'loss_boundary': torch.tensor(0.0, device=seg_loss.device),

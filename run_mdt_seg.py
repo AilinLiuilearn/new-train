@@ -411,8 +411,9 @@ def _print_stage2_startup(model, cfg, total_params, trainable_params, optimizer=
         print(f'beta_s2={float(beta[1].item())}', flush=True)
         print(f'beta_s3={float(beta[2].item())}', flush=True)
         print(f'beta_s4={float(beta[3].item())}', flush=True)
-        print(f'shared_consistency_weight={moe.shared_consistency_weight}', flush=True)
-        print(f'shared_consistency_interval={moe.shared_consistency_interval}', flush=True)
+        print(f'role_loss_weight={moe.role_loss_weight}', flush=True)
+        print(f'fers_mode={moe.fers_mode}', flush=True)
+        print('shared_consistency=removed', flush=True)
         print('noisy_topk=False', flush=True)
         print('balance_loss=False', flush=True)
         print('[TEXT PRIOR]', flush=True)
@@ -564,7 +565,8 @@ def main():
         'taskmoe_delta_ratio_s3', 'taskmoe_delta_ratio_s4',
         'taskmoe_delta_l2_ratio_s1', 'taskmoe_delta_l2_ratio_s2',
         'taskmoe_delta_l2_ratio_s3', 'taskmoe_delta_l2_ratio_s4',
-        'train_shared_consistency_loss', 'shared_full_missing_cosine',
+        'train_fers_loss', 'train_fers_scale_loss', 'train_fers_state_loss',
+        'scale_role_acc', 'state_role_acc',
         'lr_taskmoe', 'lr_decoder', 'lr_decoder_adapter',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
@@ -585,10 +587,12 @@ def main():
         full_loss = missing_loss = 0.0
         moe_balance_accum = 0.0
         moe_balance_steps = 0
-        shared_cons_accum = 0.0
-        shared_cons_steps = 0
-        shared_cos_accum = 0.0
-        shared_cos_steps = 0
+        fers_accum = 0.0
+        fers_scale_accum = 0.0
+        fers_state_accum = 0.0
+        scale_role_acc_accum = 0.0
+        state_role_acc_accum = 0.0
+        fers_steps = 0
         delta_ratio_accum = {f's{i}': 0.0 for i in range(1, 5)}
         delta_l2_ratio_accum = {f's{i}': 0.0 for i in range(1, 5)}
         delta_ratio_steps = 0
@@ -688,13 +692,13 @@ def main():
 
             moe_balance_accum += float(stats['loss_moe_balance'].detach())
             moe_balance_steps += 1
-            if 'loss_shared_consistency' in stats:
-                shared_cons_accum += float(stats['loss_shared_consistency'].detach())
-                shared_cons_steps += 1
-            moe_stats = (outputs.get('aux', {}) or {}).get('taskmoe_stats', {}) or {}
-            if 'shared_full_missing_cosine' in moe_stats:
-                shared_cos_accum += float(moe_stats['shared_full_missing_cosine'].detach())
-                shared_cos_steps += 1
+            if 'loss_fers' in stats:
+                fers_accum += float(stats['loss_fers'].detach())
+                fers_scale_accum += float(stats['loss_fers_scale'].detach())
+                fers_state_accum += float(stats['loss_fers_state'].detach())
+                scale_role_acc_accum += float(stats['scale_role_acc'].detach())
+                state_role_acc_accum += float(stats['state_role_acc'].detach())
+                fers_steps += 1
             if route == 'full':
                 full_n += 1
                 full_loss += float(loss.detach())
@@ -885,8 +889,11 @@ def main():
             'taskmoe_delta_l2_ratio_s2': delta_l2_ratio_accum['s2'] / max(1, delta_ratio_steps),
             'taskmoe_delta_l2_ratio_s3': delta_l2_ratio_accum['s3'] / max(1, delta_ratio_steps),
             'taskmoe_delta_l2_ratio_s4': delta_l2_ratio_accum['s4'] / max(1, delta_ratio_steps),
-            'train_shared_consistency_loss': shared_cons_accum / max(1, shared_cons_steps),
-            'shared_full_missing_cosine': shared_cos_accum / max(1, shared_cos_steps),
+            'train_fers_loss': fers_accum / max(1, fers_steps),
+            'train_fers_scale_loss': fers_scale_accum / max(1, fers_steps),
+            'train_fers_state_loss': fers_state_accum / max(1, fers_steps),
+            'scale_role_acc': scale_role_acc_accum / max(1, fers_steps),
+            'state_role_acc': state_role_acc_accum / max(1, fers_steps),
             'lr_taskmoe': _optimizer_group_lr(task.optimizer, 'taskmoe'),
             'lr_decoder': (
                 _optimizer_group_lr(task.optimizer, 'decoder', default=0.0)
