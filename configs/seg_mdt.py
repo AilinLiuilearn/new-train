@@ -55,6 +55,25 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--stage2_mlp_ratio', type=float, default=2.0)
         p.add_argument('--stage2_dropout', type=float, default=0.0)
         p.add_argument('--stage2_adapter_bottlenecks', type=int, nargs=4, default=[64, 32, 16, 8])
+        p.add_argument(
+            '--stage2_train_strategy',
+            type=str,
+            default='alternating_frozen',
+            choices=(
+                'alternating_frozen',
+                'paired_frozen',
+                'paired_joint_affine',
+                'paired_anga_affine',
+            ),
+        )
+        p.add_argument(
+            '--stage2_affine_learning_rate',
+            type=float,
+            default=None,
+            help='Affine head LR; None => learning_rate * 0.1',
+        )
+        p.add_argument('--stage2_affine_warmup_epochs', type=int, default=1)
+        p.add_argument('--stage2_anga_tau', type=float, default=0.7)
         return p
 
     @staticmethod

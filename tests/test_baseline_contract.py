@@ -20,6 +20,11 @@ def _make_cfg(**kwargs):
         'bce_weight': 1.0,
         'dice_weight': 1.0,
         'random_state': 2023,
+        'checkpoint_dir': '/tmp/mdt_test_ckpt',
+        'cppi_num_clusters': 6,
+        'cppi_build_stage': 4,
+        'model_arch': 'dual_shared_add_baseline',
+        'stage2_train_strategy': 'alternating_frozen',
     }
     base.update(kwargs)
     return type('C', (), base)()
@@ -35,7 +40,8 @@ def test_forward_full_missing_shapes():
     ct = torch.randn(2, 1, 64, 64)
     pet = torch.randn(2, 1, 64, 64)
     out_full = model(ct, pet, forward_mode='full')
-    out_missing = model(ct, None, forward_mode='missing')
+    # Stage-1 Missing still encodes real PET for CPPI collect; pet must be provided.
+    out_missing = model(ct, pet, forward_mode='missing')
     assert out_full['logits'].shape == out_missing['logits'].shape
 
 
@@ -88,7 +94,11 @@ def test_module_grad_norm_preserves_grad_and_value():
         assert torch.allclose(b, a)
 
 
-def test_missing_path_pet_encoder_not_called(monkeypatch):
+def test_stage1_missing_path_calls_pet_encoder_for_cppi_collect(monkeypatch):
+    """Stage-1 Missing currently encodes PET to collect CPPI candidates.
+
+    'Missing must not call PET encoder' applies only to Stage-2 retrieve-only.
+    """
     model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
     calls = {'n': 0}
     orig = model.enc_pet.forward
@@ -99,9 +109,10 @@ def test_missing_path_pet_encoder_not_called(monkeypatch):
 
     monkeypatch.setattr(model.enc_pet, 'forward', wrapped)
     ct = torch.randn(1, 1, 64, 64)
-    out = model(ct, None, forward_mode='missing')
+    pet = torch.randn(1, 1, 64, 64)
+    out = model(ct, pet, forward_mode='missing')
     assert 'logits' in out
-    assert calls['n'] == 0
+    assert calls['n'] == 1
 
 
 def test_checkpoint_save_and_eval_config_contract(tmp_path):

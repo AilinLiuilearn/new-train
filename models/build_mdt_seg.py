@@ -461,6 +461,13 @@ def _build_prompt_role_expert_stage2(config):
     # Align architecture fields with the Stage-1 checkpoint before construction.
     _align_stage1_config_from_checkpoint(config, stage1_checkpoint)
 
+    strategy = str(getattr(config, 'stage2_train_strategy', 'alternating_frozen')).strip()
+    allow_affine = strategy in ('paired_joint_affine', 'paired_anga_affine')
+    if strategy == 'paired_anga_affine':
+        tau = float(getattr(config, 'stage2_anga_tau', 0.7))
+        if not (0.0 < tau < 1.0):
+            raise ValueError(f'stage2_anga_tau must satisfy 0 < tau < 1, got {tau}')
+
     stage1 = _build_dual_shared_add_baseline(config)
     load_stage1_checkpoint(stage1, stage1_checkpoint, strict=True)
 
@@ -471,6 +478,7 @@ def _build_prompt_role_expert_stage2(config):
     ready_count = int(ready.sum().item()) if torch.is_tensor(ready) else 0
 
     print(f'[STAGE2] stage1_checkpoint={stage1_checkpoint}', flush=True)
+    print(f'[STAGE2] train_strategy={strategy} allow_affine_trainable={allow_affine}', flush=True)
     print(f'[STAGE2] CPPI bank_ready={bank_ready} bank_version={bank_version} ready_slots={ready_count}', flush=True)
     if not bank_ready:
         raise RuntimeError(
@@ -491,25 +499,38 @@ def _build_prompt_role_expert_stage2(config):
         adapter_bottlenecks=getattr(config, 'stage2_adapter_bottlenecks', (64, 32, 16, 8)),
         external_prompt_dim=None,  # Text OFF for the first experiment.
         require_ready_cppi_for_missing=True,
+        allow_affine_trainable=allow_affine,
     )
-    model.assert_stage1_frozen()
+    model.assert_stage1_boundary_contract(allow_affine=allow_affine)
 
     stage1_total = sum(p.numel() for p in model.stage1.parameters())
-    stage1_trainable = sum(p.numel() for p in model.stage1.parameters() if p.requires_grad)
-    stage2_trainable = model.count_trainable_parameters()
+    affine_trainable = sum(p.numel() for p in model.stage1.pet_calibration.parameters() if p.requires_grad)
+    stage1_other_trainable = sum(
+        p.numel()
+        for n, p in model.stage1.named_parameters()
+        if p.requires_grad and not n.startswith('pet_calibration.')
+    )
+    stage2_modules_trainable = sum(
+        p.numel() for p in list(model.role_fusion.parameters()) + list(model.decoder_adapters.parameters()) if p.requires_grad
+    )
     trainable_names = model.trainable_parameter_names()
     print(f'[STAGE2] Stage1 total params={stage1_total}', flush=True)
-    print(f'[STAGE2] Stage1 trainable params={stage1_trainable}', flush=True)
-    print(f'[STAGE2] Stage2 trainable params={stage2_trainable}', flush=True)
+    print(f'[STAGE2] Stage1 affine trainable params={affine_trainable}', flush=True)
+    print(f'[STAGE2] Stage1 non-affine trainable params={stage1_other_trainable}', flush=True)
+    print(f'[STAGE2] SPRE+adapters trainable params={stage2_modules_trainable}', flush=True)
     print(
-        f'[STAGE2] Stage2 trainable name groups={_summarize_trainable_names(trainable_names)} '
+        f'[STAGE2] Trainable name groups={_summarize_trainable_names(trainable_names)} '
         f'(num_tensors={len(trainable_names)})',
         flush=True,
     )
-    if stage1_trainable != 0:
-        raise RuntimeError(f'Stage-1 must be fully frozen, got trainable={stage1_trainable}')
-    if stage2_trainable <= 0:
-        raise RuntimeError('Stage-2 has no trainable parameters')
+    if stage1_other_trainable != 0:
+        raise RuntimeError(f'Stage-1 non-affine must stay frozen, got trainable={stage1_other_trainable}')
+    if allow_affine and affine_trainable <= 0:
+        raise RuntimeError('Affine strategy selected but pet_calibration has no trainable params')
+    if not allow_affine and affine_trainable != 0:
+        raise RuntimeError(f'Frozen strategy but affine trainable={affine_trainable}')
+    if stage2_modules_trainable <= 0:
+        raise RuntimeError('Stage-2 has no trainable SPRE/adapter parameters')
     return model
 
 

@@ -10,6 +10,12 @@ import torch
 from configs.seg_mdt import SegMDTConfig
 from models.build_mdt_seg import build_mdt_seg_teacher
 from tasks.mdt_seg import MDTSegTeacher
+from utils.affine_gradient_alignment import (
+    clear_all_affine_grads,
+    get_affine_head_param_groups,
+    merge_affine_grads_per_scale,
+    snapshot_all_affine_grads,
+)
 from utils.optimization import get_cosine_scheduler
 from utils.train_logger import append_epoch_log, init_train_log
 
@@ -51,6 +57,10 @@ def _assert_baseline(cfg):
     assert bool(cfg.use_deep_supervision) is False
     assert bool(cfg.deep_supervision) is False
     assert float(cfg.boundary_loss_weight) == 0.0
+    strategy = str(getattr(cfg, 'stage2_train_strategy', 'alternating_frozen')).strip()
+    if strategy == 'paired_anga_affine':
+        tau = float(getattr(cfg, 'stage2_anga_tau', 0.7))
+        assert 0.0 < tau < 1.0, f'stage2_anga_tau must be in (0,1), got {tau}'
 
 
 def module_grad_norm(module):
@@ -95,12 +105,16 @@ def _load_state_dict_with_report(model, checkpoint_path, expect_stage2=False):
     print(f'[RESUME] missing_keys={missing_keys}', flush=True)
     print(f'[RESUME] unexpected_keys={unexpected_keys}', flush=True)
     if expect_stage2 and len(missing_keys) > 0:
-        # Stage2 resume should match the wrapper closely; missing trainable keys are unsafe.
         trainable_missing = [k for k in missing_keys if not k.startswith('stage1.')]
+        # Affine keys under stage1.pet_calibration must not be silently dropped
+        # when the current strategy trains affine.
+        affine_missing = [k for k in missing_keys if k.startswith('stage1.pet_calibration.')]
         if trainable_missing:
             raise RuntimeError(
                 f'Stage2 resume is missing trainable keys: {trainable_missing[:20]}'
             )
+        if affine_missing:
+            print(f'[RESUME][WARN] missing affine keys={affine_missing[:20]}', flush=True)
     return checkpoint
 
 
@@ -136,10 +150,139 @@ def _log_stage2_stats(outputs, route, batch_idx):
     print(' | '.join(parts), flush=True)
 
 
+def _mean_or_zero(values):
+    return float(np.mean(values)) if values else 0.0
+
+
+def _accumulate_affine_stats(dst, src):
+    for k, v in src.items():
+        dst.setdefault(k, []).append(float(v))
+
+
+def _summarize_affine_stats(accum):
+    return {k: _mean_or_zero(vs) for k, vs in accum.items()}
+
+
+def _run_alternating_step(task, batch, route, amp_enabled, cfg):
+    task.optimizer.zero_grad(set_to_none=True)
+    with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
+        loss, _, outputs, _ = task.train_step(batch, forward_mode=route)
+    if not torch.isfinite(loss):
+        raise RuntimeError('loss became non-finite')
+
+    if task.scaler.is_enabled():
+        task.scaler.scale(loss).backward()
+        task.scaler.unscale_(task.optimizer)
+    else:
+        loss.backward()
+
+    total_grad_norm = (
+        torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip))
+        if float(cfg.grad_clip) > 0 else 0.0
+    )
+
+    if task.scaler.is_enabled():
+        task.scaler.step(task.optimizer)
+        task.scaler.update()
+    else:
+        task.optimizer.step()
+    task.scheduler.step()
+    return loss, outputs, float(total_grad_norm), {}
+
+
+def _run_paired_step(task, batch, strategy, amp_enabled, cfg, epoch, affine_warmup_active):
+    """One dataloader batch -> Full then Missing -> one optimizer update."""
+    head_groups = None
+    if task.allow_affine:
+        head_groups = get_affine_head_param_groups(task.model.stage1.pet_calibration)
+
+    task.optimizer.zero_grad(set_to_none=True)
+
+    # ---- Full ----
+    with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
+        loss_full, _, outputs_full, _ = task.train_step(batch, forward_mode='full')
+    if not torch.isfinite(loss_full):
+        raise RuntimeError('full loss became non-finite')
+    scaled_full = 0.5 * loss_full
+    if task.scaler.is_enabled():
+        task.scaler.scale(scaled_full).backward()
+    else:
+        scaled_full.backward()
+
+    g_full = None
+    if task.allow_affine:
+        g_full = snapshot_all_affine_grads(head_groups)
+        clear_all_affine_grads(head_groups)
+
+    # ---- Missing (same batch) ----
+    with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
+        loss_missing, _, outputs_missing, _ = task.train_step(batch, forward_mode='missing')
+    if not torch.isfinite(loss_missing):
+        raise RuntimeError('missing loss became non-finite')
+    scaled_missing = 0.5 * loss_missing
+    if task.scaler.is_enabled():
+        task.scaler.scale(scaled_missing).backward()
+    else:
+        scaled_missing.backward()
+
+    affine_stats = {}
+    if task.allow_affine:
+        g_missing = snapshot_all_affine_grads(head_groups)
+        if affine_warmup_active:
+            clear_all_affine_grads(head_groups)
+            affine_stats = {
+                'affine_warmup_active': 1.0,
+                'affine_mean_cosine': 0.0,
+                'affine_mean_zero_ratio': 0.0,
+                'affine_mean_project_ratio': 0.0,
+                'affine_mean_inside_ratio': 0.0,
+                'affine_mean_conflict_ratio': 0.0,
+            }
+            for i in range(1, 5):
+                affine_stats[f'affine_s{i}_cosine'] = 0.0
+                affine_stats[f'affine_s{i}_full_grad_norm'] = 0.0
+                affine_stats[f'affine_s{i}_missing_grad_norm'] = 0.0
+                affine_stats[f'affine_s{i}_aligned_missing_norm'] = 0.0
+                affine_stats[f'affine_s{i}_zero_ratio'] = 0.0
+                affine_stats[f'affine_s{i}_project_ratio'] = 0.0
+                affine_stats[f'affine_s{i}_inside_ratio'] = 0.0
+        else:
+            merge_mode = 'anga' if strategy == 'paired_anga_affine' else 'joint'
+            affine_stats = merge_affine_grads_per_scale(
+                head_groups,
+                g_full,
+                g_missing,
+                mode=merge_mode,
+                tau=float(task.anga_tau),
+            )
+            affine_stats['affine_warmup_active'] = 0.0
+    else:
+        affine_stats = {'affine_warmup_active': 0.0}
+
+    if task.scaler.is_enabled():
+        task.scaler.unscale_(task.optimizer)
+
+    total_grad_norm = (
+        torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip))
+        if float(cfg.grad_clip) > 0 else 0.0
+    )
+
+    if task.scaler.is_enabled():
+        task.scaler.step(task.optimizer)
+        task.scaler.update()
+    else:
+        task.optimizer.step()
+    task.scheduler.step()
+
+    loss_total = 0.5 * loss_full.detach() + 0.5 * loss_missing.detach()
+    return loss_full, loss_missing, loss_total, outputs_full, outputs_missing, float(total_grad_norm), affine_stats
+
+
 def main():
     cfg = SegMDTConfig.parse_arguments()
     is_stage2 = str(getattr(cfg, 'model_arch', '')).strip() == 'prompt_role_expert_stage2'
-    print(f"[INFO] starting {'stage2' if is_stage2 else 'baseline'} training", flush=True)
+    strategy = str(getattr(cfg, 'stage2_train_strategy', 'alternating_frozen')).strip()
+    print(f"[INFO] starting {'stage2' if is_stage2 else 'baseline'} training strategy={strategy}", flush=True)
     if is_stage2 and not getattr(cfg, 'stage1_checkpoint', None):
         raise ValueError(
             'prompt_role_expert_stage2 requires --stage1_checkpoint. '
@@ -155,11 +298,14 @@ def main():
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)}', flush=True)
 
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
-    # Re-save after Stage2 build so auto-aligned Stage1 fields (e.g. cppi_build_stage) are persisted.
+    # Re-save after Stage2 build so auto-aligned Stage1 fields are persisted.
     with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
         json.dump(vars(cfg), f, indent=2, default=str)
     if getattr(cfg, 'resume_checkpoint', None):
+        # NOTE: current resume path restores model weights only.
+        # optimizer/scheduler/scaler states are NOT restored here.
         _load_state_dict_with_report(task.model, cfg.resume_checkpoint, expect_stage2=is_stage2)
+        print('[RESUME][NOTE] model weights loaded; optimizer/scheduler/scaler NOT restored', flush=True)
     total_params, trainable_params = _count_parameters(task.model)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
     task.scheduler = get_cosine_scheduler(
@@ -180,7 +326,20 @@ def main():
         'grad_full_enc_ct', 'grad_missing_enc_ct', 'grad_full_ct_align', 'grad_missing_ct_align', 'grad_full_decoder', 'grad_missing_decoder',
         'epoch_time',
         'cppi_bank_version', 'cppi_ready_slots', 'cppi_bg_candidates', 'cppi_fg_candidates',
+        'lr_stage2', 'lr_affine', 'affine_warmup_active',
+        'affine_mean_cosine', 'affine_mean_zero_ratio', 'affine_mean_project_ratio',
+        'affine_mean_inside_ratio', 'affine_mean_conflict_ratio',
     ]
+    for i in range(1, 5):
+        extra_headers.extend([
+            f'affine_s{i}_cosine',
+            f'affine_s{i}_full_grad_norm',
+            f'affine_s{i}_missing_grad_norm',
+            f'affine_s{i}_aligned_missing_norm',
+            f'affine_s{i}_zero_ratio',
+            f'affine_s{i}_project_ratio',
+            f'affine_s{i}_inside_ratio',
+        ])
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
 
     best_joint = -1.0
@@ -192,6 +351,7 @@ def main():
     patience = int(getattr(cfg, 'early_stop_patience', 10))
     no_improve = 0
     paths = _checkpoint_paths(cfg.checkpoint_dir)
+    paired = is_stage2 and strategy != 'alternating_frozen'
 
     for epoch in range(1, cfg.epochs + 1):
         task.model.train()
@@ -206,47 +366,75 @@ def main():
         epoch_start = time.time()
         fixed_diag_batch = None
         diag_stats = {}
+        affine_stats_accum = {}
+        affine_warmup_active = bool(
+            task.allow_affine and epoch <= int(task.affine_warmup_epochs)
+        )
 
         for batch_idx, batch in enumerate(train_loader):
-            route = 'full' if global_batch_step % 2 == 0 else 'missing'
-            task.optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
-                loss, _, outputs, _ = task.train_step(batch, forward_mode=route)
-            if not torch.isfinite(loss):
-                raise RuntimeError('loss became non-finite')
+            if paired:
+                (
+                    loss_f,
+                    loss_m,
+                    loss_total,
+                    outputs_full,
+                    outputs_missing,
+                    total_grad_norm,
+                    affine_stats,
+                ) = _run_paired_step(
+                    task,
+                    batch,
+                    strategy,
+                    amp_enabled,
+                    cfg,
+                    epoch,
+                    affine_warmup_active,
+                )
+                grads['full']['enc_ct'].append(module_grad_norm(task.model.enc_ct))
+                grads['full']['ct_align'].append(module_grad_norm(task.model.ct_align))
+                grads['full']['decoder'].append(module_grad_norm(task.model.decoder))
+                grads['missing']['enc_ct'].append(0.0)
+                grads['missing']['ct_align'].append(0.0)
+                grads['missing']['decoder'].append(0.0)
 
-            if task.scaler.is_enabled():
-                task.scaler.scale(loss).backward()
-                task.scaler.unscale_(task.optimizer)
-            else:
-                loss.backward()
-
-            grads[route]['enc_ct'].append(module_grad_norm(task.model.enc_ct))
-            grads[route]['ct_align'].append(module_grad_norm(task.model.ct_align))
-            grads[route]['decoder'].append(module_grad_norm(task.model.decoder))
-            total_grad_norm = torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip)) if float(cfg.grad_clip) > 0 else 0.0
-            grad_norm_accum += float(total_grad_norm)
-            grad_norm_steps += 1
-
-            if task.scaler.is_enabled():
-                task.scaler.step(task.optimizer)
-                task.scaler.update()
-            else:
-                task.optimizer.step()
-
-            task.scheduler.step()
-
-            if (batch_idx + 1) % 100 == 0:
-                print(f'[BATCH {batch_idx + 1}] route={route} loss={float(loss.detach()):.6f}', flush=True)
-                if is_stage2:
-                    _log_stage2_stats(outputs, route, batch_idx)
-
-            if route == 'full':
                 full_n += 1
-                full_loss += float(loss.detach())
-            else:
                 missing_n += 1
-                missing_loss += float(loss.detach())
+                full_loss += float(loss_f.detach())
+                missing_loss += float(loss_m.detach())
+                grad_norm_accum += total_grad_norm
+                grad_norm_steps += 1
+                _accumulate_affine_stats(affine_stats_accum, affine_stats)
+
+                if (batch_idx + 1) % 100 == 0:
+                    print(
+                        f'[BATCH {batch_idx + 1}] paired full={float(loss_f.detach()):.6f} '
+                        f'missing={float(loss_m.detach()):.6f} total={float(loss_total):.6f} '
+                        f'warmup={int(affine_warmup_active)}',
+                        flush=True,
+                    )
+                    if is_stage2:
+                        _log_stage2_stats(outputs_full, 'full', batch_idx)
+                        _log_stage2_stats(outputs_missing, 'missing', batch_idx)
+            else:
+                route = 'full' if global_batch_step % 2 == 0 else 'missing'
+                loss, outputs, total_grad_norm, _ = _run_alternating_step(
+                    task, batch, route, amp_enabled, cfg
+                )
+                grads[route]['enc_ct'].append(module_grad_norm(task.model.enc_ct))
+                grads[route]['ct_align'].append(module_grad_norm(task.model.ct_align))
+                grads[route]['decoder'].append(module_grad_norm(task.model.decoder))
+                grad_norm_accum += total_grad_norm
+                grad_norm_steps += 1
+                if route == 'full':
+                    full_n += 1
+                    full_loss += float(loss.detach())
+                else:
+                    missing_n += 1
+                    missing_loss += float(loss.detach())
+                if (batch_idx + 1) % 100 == 0:
+                    print(f'[BATCH {batch_idx + 1}] route={route} loss={float(loss.detach()):.6f}', flush=True)
+                    if is_stage2:
+                        _log_stage2_stats(outputs, route, batch_idx)
 
             global_batch_step += 1
             task.global_batch_step = global_batch_step
@@ -312,6 +500,8 @@ def main():
         val_acc_pixel = 0.5 * val_full.get('acc_pixel', 0.0) + 0.5 * val_missing.get('acc_pixel', 0.0)
         val_hd95 = 0.5 * val_full['hd95'] + 0.5 * val_missing['hd95']
         avg_grad_norm = grad_norm_accum / max(1, grad_norm_steps)
+        lrs = task.optimizer_group_lrs()
+        affine_epoch_stats = _summarize_affine_stats(affine_stats_accum)
         extra_metrics = {
             'train_full_loss': full_loss / max(1, full_n),
             'train_missing_loss': missing_loss / max(1, missing_n),
@@ -333,19 +523,35 @@ def main():
             'joint_dice': joint_dice,
             'best_joint': best_joint,
             'best_joint_epoch': best_joint_epoch,
-            'grad_full_enc_ct': float(np.mean(grads['full']['enc_ct'])) if grads['full']['enc_ct'] else 0.0,
-            'grad_missing_enc_ct': float(np.mean(grads['missing']['enc_ct'])) if grads['missing']['enc_ct'] else 0.0,
-            'grad_full_ct_align': float(np.mean(grads['full']['ct_align'])) if grads['full']['ct_align'] else 0.0,
-            'grad_missing_ct_align': float(np.mean(grads['missing']['ct_align'])) if grads['missing']['ct_align'] else 0.0,
-            'grad_full_decoder': float(np.mean(grads['full']['decoder'])) if grads['full']['decoder'] else 0.0,
-            'grad_missing_decoder': float(np.mean(grads['missing']['decoder'])) if grads['missing']['decoder'] else 0.0,
+            'grad_full_enc_ct': _mean_or_zero(grads['full']['enc_ct']),
+            'grad_missing_enc_ct': _mean_or_zero(grads['missing']['enc_ct']),
+            'grad_full_ct_align': _mean_or_zero(grads['full']['ct_align']),
+            'grad_missing_ct_align': _mean_or_zero(grads['missing']['ct_align']),
+            'grad_full_decoder': _mean_or_zero(grads['full']['decoder']),
+            'grad_missing_decoder': _mean_or_zero(grads['missing']['decoder']),
             'epoch_time': time.time() - epoch_start,
             'cppi_bank_version': int(cppi_report.get('bank_version_after', cppi_report.get('bank_version_before', 0))),
             'cppi_ready_slots': int(cppi_report.get('ready_count', cppi_report.get('ready_slots', 0))),
             'cppi_bg_candidates': int(cppi_report.get('classes', {}).get('background', {}).get('num_candidates', 0)),
             'cppi_fg_candidates': int(cppi_report.get('classes', {}).get('foreground', {}).get('num_candidates', 0)),
+            'lr_stage2': float(lrs.get('stage2', lrs.get('default', task.optimizer.param_groups[0]['lr']))),
+            'lr_affine': float(lrs.get('stage1_affine', 0.0)),
+            'affine_warmup_active': float(affine_warmup_active),
+            'affine_mean_cosine': float(affine_epoch_stats.get('affine_mean_cosine', 0.0)),
+            'affine_mean_zero_ratio': float(affine_epoch_stats.get('affine_mean_zero_ratio', 0.0)),
+            'affine_mean_project_ratio': float(affine_epoch_stats.get('affine_mean_project_ratio', 0.0)),
+            'affine_mean_inside_ratio': float(affine_epoch_stats.get('affine_mean_inside_ratio', 0.0)),
+            'affine_mean_conflict_ratio': float(affine_epoch_stats.get('affine_mean_conflict_ratio', 0.0)),
             **{f'diag_{k}': v for k, v in diag_stats.items()},
         }
+        for i in range(1, 5):
+            for key in (
+                'cosine', 'full_grad_norm', 'missing_grad_norm', 'aligned_missing_norm',
+                'zero_ratio', 'project_ratio', 'inside_ratio',
+            ):
+                full_key = f'affine_s{i}_{key}'
+                extra_metrics[full_key] = float(affine_epoch_stats.get(full_key, 0.0))
+
         append_epoch_log(
             os.path.join(cfg.checkpoint_dir, 'train_log.csv'),
             epoch,
@@ -356,7 +562,11 @@ def main():
             extra_metrics=extra_metrics,
         )
 
-        print(f'[EPOCH {epoch}] joint_dice={joint_dice:.4f} best_joint={best_joint:.4f} lr={task.optimizer.param_groups[0]["lr"]:.8f}', flush=True)
+        print(
+            f'[EPOCH {epoch}] joint_dice={joint_dice:.4f} best_joint={best_joint:.4f} '
+            f'lr_stage2={extra_metrics["lr_stage2"]:.8f} lr_affine={extra_metrics["lr_affine"]:.8f}',
+            flush=True,
+        )
         if no_improve >= patience:
             print(f'[EARLY STOP] no improvement for {patience} epochs', flush=True)
             break

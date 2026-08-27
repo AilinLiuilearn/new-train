@@ -800,11 +800,13 @@ class PromptRoleExpertStage2Seg(nn.Module):
         adapter_bottlenecks: Sequence[int] = (64, 32, 16, 8),
         external_prompt_dim: Optional[int] = None,
         require_ready_cppi_for_missing: bool = True,
+        allow_affine_trainable: bool = False,
     ) -> None:
         super().__init__()
         self.stage1 = stage1_model
         self.channels = tuple(int(c) for c in channels)
         self.require_ready_cppi_for_missing = bool(require_ready_cppi_for_missing)
+        self.allow_affine_trainable = bool(allow_affine_trainable)
 
         required_attrs = (
             "_encode_ct",
@@ -824,6 +826,9 @@ class PromptRoleExpertStage2Seg(nn.Module):
         # Stage-1 is a frozen evidence generator / decoder backbone.
         for p in self.stage1.parameters():
             p.requires_grad = False
+        if self.allow_affine_trainable:
+            for p in self.stage1.pet_calibration.parameters():
+                p.requires_grad = True
         self.stage1.eval()
 
         self.role_fusion = PromptGuidedRoleExpertFusion(
@@ -841,6 +846,7 @@ class PromptRoleExpertStage2Seg(nn.Module):
             decoder_channels=decoder_channels,
             bottlenecks=adapter_bottlenecks,
         )
+        self.assert_stage1_boundary_contract(allow_affine=self.allow_affine_trainable)
 
     # ----- keep Stage-1 frozen/eval even when the Stage-2 wrapper trains -----
     def train(self, mode: bool = True):
@@ -876,44 +882,44 @@ class PromptRoleExpertStage2Seg(nn.Module):
     def cppi_ready(self) -> bool:
         return bool(self.stage1.prototype_memory.bank_ready)
 
-    @torch.no_grad()
     def _calibrate_real_pet(
         self,
         ct_feats: Sequence[torch.Tensor],
         pet_feats_real: Sequence[torch.Tensor],
     ) -> List[torch.Tensor]:
-        if self.cppi_ready:
-            _, ct_reference_feats, _ = self.stage1._retrieve_cppi(
-                ct_feats,
-                compute_report=False,
-                save_diagnostics=False,
-                print_info=False,
-                return_ct_reference=True,
-            )
-            ct_reference_feats = [x.detach() for x in ct_reference_feats]
-            return list(
-                self.stage1.pet_calibration(
+        """Affine-calibrate real PET. Encoders/CPPI stay detached; heads may train."""
+        ct_feats = [x.detach() for x in ct_feats]
+        pet_feats_real = [x.detach() for x in pet_feats_real]
+        with torch.no_grad():
+            if self.cppi_ready:
+                _, ct_reference_feats, _ = self.stage1._retrieve_cppi(
                     ct_feats,
-                    pet_feats_real,
-                    ct_reference_feats,
-                    reference_valid=True,
+                    compute_report=False,
+                    save_diagnostics=False,
+                    print_info=False,
+                    return_ct_reference=True,
                 )
-            )
+                ct_reference_feats = [x.detach() for x in ct_reference_feats]
+                reference_valid = True
+            else:
+                ct_reference_feats = None
+                reference_valid = False
 
+        # Must run outside no_grad so gradients can enter pet_calibration.heads.
         return list(
             self.stage1.pet_calibration(
                 ct_feats,
                 pet_feats_real,
-                None,
-                reference_valid=False,
+                ct_reference_feats,
+                reference_valid=reference_valid,
             )
         )
 
-    @torch.no_grad()
     def _retrieve_and_calibrate_proxy(
         self,
         ct_feats: Sequence[torch.Tensor],
     ) -> List[torch.Tensor]:
+        """CPPI retrieve-only + affine calibrate proxy PET."""
         if self.require_ready_cppi_for_missing and not self.cppi_ready:
             raise RuntimeError(
                 "Stage-2 Missing requires a ready frozen CPPI bank. Load the "
@@ -921,14 +927,18 @@ class PromptRoleExpertStage2Seg(nn.Module):
                 "constructing/running Stage-2."
             )
 
-        pet_proxy, ct_reference_feats, _ = self.stage1._retrieve_cppi(
-            ct_feats,
-            compute_report=False,
-            save_diagnostics=False,
-            print_info=False,
-            return_ct_reference=True,
-        )
-        ct_reference_feats = [x.detach() for x in ct_reference_feats]
+        ct_feats = [x.detach() for x in ct_feats]
+        with torch.no_grad():
+            pet_proxy, ct_reference_feats, _ = self.stage1._retrieve_cppi(
+                ct_feats,
+                compute_report=False,
+                save_diagnostics=False,
+                print_info=False,
+                return_ct_reference=True,
+            )
+            pet_proxy = [x.detach() for x in pet_proxy]
+            ct_reference_feats = [x.detach() for x in ct_reference_feats]
+
         return list(
             self.stage1.pet_calibration(
                 ct_feats,
@@ -938,7 +948,6 @@ class PromptRoleExpertStage2Seg(nn.Module):
             )
         )
 
-    @torch.no_grad()
     def _extract_full_evidence(
         self,
         ct: torch.Tensor,
@@ -946,22 +955,23 @@ class PromptRoleExpertStage2Seg(nn.Module):
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         if pet is None:
             raise ValueError("Full Stage-2 path requires real PET input")
-        ct_feats = list(self.stage1._encode_ct(ct))
-        pet_real = list(self.stage1._encode_pet(pet))
+        with torch.no_grad():
+            ct_feats = [x.detach() for x in self.stage1._encode_ct(ct)]
+            pet_real = [x.detach() for x in self.stage1._encode_pet(pet)]
+        # pet_cal keeps grad w.r.t. affine heads when they are trainable.
         pet_cal = self._calibrate_real_pet(ct_feats, pet_real)
-        return [x.detach() for x in ct_feats], [x.detach() for x in pet_cal]
+        return ct_feats, pet_cal
 
-    @torch.no_grad()
     def _extract_missing_evidence(
         self,
         ct: torch.Tensor,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         # Critical: real PET encoder is NEVER called here.
-        ct_feats = list(self.stage1._encode_ct(ct))
+        with torch.no_grad():
+            ct_feats = [x.detach() for x in self.stage1._encode_ct(ct)]
         pet_cal = self._retrieve_and_calibrate_proxy(ct_feats)
-        return [x.detach() for x in ct_feats], [x.detach() for x in pet_cal]
+        return ct_feats, pet_cal
 
-    @torch.no_grad()
     def _extract_auto_evidence(
         self,
         ct: torch.Tensor,
@@ -972,6 +982,8 @@ class PromptRoleExpertStage2Seg(nn.Module):
 
         Real PET encoder is run ONLY on the subset where pet_available==1.
         Missing samples use CPPI retrieve-only.
+
+        Auto is primarily for validation; returned tensors are detached.
         """
         availability = pet_available.to(device=ct.device).long().view(-1)
         if availability.numel() != ct.shape[0]:
@@ -979,7 +991,9 @@ class PromptRoleExpertStage2Seg(nn.Module):
         if not torch.all((availability == 0) | (availability == 1)):
             raise ValueError("pet_available values must be 0/1")
 
-        ct_feats_all = list(self.stage1._encode_ct(ct))
+        with torch.no_grad():
+            ct_feats_all = [x.detach() for x in self.stage1._encode_ct(ct)]
+
         pet_cal_all = [torch.empty_like(x) for x in ct_feats_all]
 
         full_idx = torch.nonzero(availability == 1, as_tuple=False).flatten()
@@ -989,19 +1003,20 @@ class PromptRoleExpertStage2Seg(nn.Module):
             if pet is None:
                 raise ValueError("auto path has Full samples but pet=None")
             ct_full = [x.index_select(0, full_idx) for x in ct_feats_all]
-            pet_input_full = pet.index_select(0, full_idx)
-            pet_real_full = list(self.stage1._encode_pet(pet_input_full))
+            with torch.no_grad():
+                pet_input_full = pet.index_select(0, full_idx)
+                pet_real_full = [x.detach() for x in self.stage1._encode_pet(pet_input_full)]
             pet_cal_full = self._calibrate_real_pet(ct_full, pet_real_full)
             for dst, src in zip(pet_cal_all, pet_cal_full):
-                dst.index_copy_(0, full_idx, src)
+                dst.index_copy_(0, full_idx, src.detach())
 
         if miss_idx.numel() > 0:
             ct_miss = [x.index_select(0, miss_idx) for x in ct_feats_all]
             pet_cal_miss = self._retrieve_and_calibrate_proxy(ct_miss)
             for dst, src in zip(pet_cal_all, pet_cal_miss):
-                dst.index_copy_(0, miss_idx, src)
+                dst.index_copy_(0, miss_idx, src.detach())
 
-        return [x.detach() for x in ct_feats_all], [x.detach() for x in pet_cal_all]
+        return ct_feats_all, [x.detach() for x in pet_cal_all]
 
     # ----- forward -----
     def forward(
@@ -1080,10 +1095,36 @@ class PromptRoleExpertStage2Seg(nn.Module):
     def trainable_parameter_names(self) -> List[str]:
         return [name for name, p in self.named_parameters() if p.requires_grad]
 
-    def assert_stage1_frozen(self) -> None:
-        bad = [name for name, p in self.stage1.named_parameters() if p.requires_grad]
+    def assert_stage1_boundary_contract(self, allow_affine: bool = False) -> None:
+        """Validate Stage-1 requires_grad boundary.
+
+        When ``allow_affine`` is False, every Stage-1 parameter must be frozen.
+        When True, only ``pet_calibration.*`` may be trainable.
+        """
+        allow_affine = bool(allow_affine)
+        bad = []
+        for name, p in self.stage1.named_parameters():
+            if not p.requires_grad:
+                continue
+            if allow_affine and name.startswith("pet_calibration."):
+                continue
+            bad.append(name)
         if bad:
-            raise RuntimeError(f"Stage-1 unexpectedly trainable: {bad[:10]}")
+            raise RuntimeError(
+                "Stage-1 boundary violated; unexpected trainable params: "
+                f"{bad[:20]}"
+            )
+        if allow_affine:
+            affine_train = [
+                p for p in self.stage1.pet_calibration.parameters() if p.requires_grad
+            ]
+            if not affine_train:
+                raise RuntimeError(
+                    "allow_affine=True but pet_calibration has no trainable params"
+                )
+
+    def assert_stage1_frozen(self) -> None:
+        self.assert_stage1_boundary_contract(allow_affine=False)
 
     def count_trainable_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
