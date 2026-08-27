@@ -27,6 +27,7 @@ class SegMDTConfig(ConfigBase):
             type=str,
             default='dual_shared_add_baseline',
             choices=('dual_shared_add_baseline', 'prompt_role_expert_stage2'),
+            help='prompt_role_expert_stage2 = joint end-to-end Recovery+SPRE+Decoder',
         )
         p.add_argument('--ct_backbone', type=str, default='convnextv2_nano')
         p.add_argument('--pet_backbone', type=str, default='mit_b1')
@@ -43,37 +44,15 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--enable_gradient_diagnostics', type=str2bool, default=False)
         p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
-        # Stage1 frozen weights for Stage2; NOT the same as resume_checkpoint.
-        p.add_argument('--stage1_checkpoint', type=str, default=None)
-        # Resume an already-trained Stage2 (or Stage1) run only.
+        # Resume a full joint-model training run (not a frozen Stage-1 warm start).
         p.add_argument('--resume_checkpoint', type=str, default=None)
-        # Stage2 Prompt-Role-Expert defaults (Text OFF: external_prompt_dim=None).
+        # SPRE hyperparameters (Text OFF: external_prompt_dim=None).
         p.add_argument('--stage2_expert_dim', type=int, default=128)
         p.add_argument('--stage2_atom_num', type=int, default=32)
         p.add_argument('--stage2_atom_dim', type=int, default=256)
         p.add_argument('--stage2_prompt_hidden_channels', type=int, default=64)
         p.add_argument('--stage2_mlp_ratio', type=float, default=2.0)
         p.add_argument('--stage2_dropout', type=float, default=0.0)
-        p.add_argument('--stage2_adapter_bottlenecks', type=int, nargs=4, default=[64, 32, 16, 8])
-        p.add_argument(
-            '--stage2_train_strategy',
-            type=str,
-            default='alternating_frozen',
-            choices=(
-                'alternating_frozen',
-                'paired_frozen',
-                'paired_joint_affine',
-                'paired_anga_affine',
-            ),
-        )
-        p.add_argument(
-            '--stage2_affine_learning_rate',
-            type=float,
-            default=None,
-            help='Affine head LR; None => learning_rate * 0.1',
-        )
-        p.add_argument('--stage2_affine_warmup_epochs', type=int, default=1)
-        p.add_argument('--stage2_anga_tau', type=float, default=0.7)
         return p
 
     @staticmethod

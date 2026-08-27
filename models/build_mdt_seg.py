@@ -349,56 +349,6 @@ class ConvBNAct(nn.Module):
         return self.block(x)
 
 
-_STAGE1_CONFIG_KEYS = (
-    'ct_backbone',
-    'pet_backbone',
-    'cppi_num_clusters',
-    'cppi_build_stage',
-    'decoder_channels',
-)
-
-
-def _peek_checkpoint_payload(checkpoint_path):
-    try:
-        payload = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    except TypeError:
-        payload = torch.load(checkpoint_path, map_location='cpu')
-    return payload if isinstance(payload, dict) else {'model': payload}
-
-
-def _align_stage1_config_from_checkpoint(config, stage1_checkpoint):
-    """Prefer Stage-1 checkpoint config for architecture-critical fields."""
-    payload = _peek_checkpoint_payload(stage1_checkpoint)
-    ckpt_cfg = payload.get('config')
-    if not isinstance(ckpt_cfg, dict):
-        print(
-            f'[STAGE2][WARN] stage1_checkpoint has no embedded config; '
-            f'using current CLI values as-is: {stage1_checkpoint}',
-            flush=True,
-        )
-        return payload
-
-    mismatches = []
-    for key in _STAGE1_CONFIG_KEYS:
-        if key not in ckpt_cfg:
-            continue
-        cur = getattr(config, key, None)
-        ckpt_val = ckpt_cfg[key]
-        # Normalize list/tuple comparisons for decoder_channels etc.
-        cur_cmp = list(cur) if isinstance(cur, (list, tuple)) else cur
-        ckpt_cmp = list(ckpt_val) if isinstance(ckpt_val, (list, tuple)) else ckpt_val
-        if cur_cmp != ckpt_cmp:
-            mismatches.append((key, cur, ckpt_val))
-            setattr(config, key, ckpt_val)
-
-    if mismatches:
-        print('[STAGE2][ERROR] Stage1 checkpoint config mismatch; overriding with checkpoint values:', flush=True)
-        for key, cur, ckpt_val in mismatches:
-            print(f'  - {key}: cli/default={cur} -> checkpoint={ckpt_val}', flush=True)
-    else:
-        print('[STAGE2] Stage1 checkpoint config matches current architecture fields', flush=True)
-    return payload
-
 
 def _build_dual_shared_add_baseline(config):
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
@@ -444,93 +394,55 @@ def _summarize_trainable_names(names, max_groups=24):
 
 
 def _build_prompt_role_expert_stage2(config):
-    from models.stage2_prompt_role_expert_fusion import (
-        PromptRoleExpertStage2Seg,
-        load_stage1_checkpoint,
-    )
+    """Build joint Recovery+SPRE+Decoder model from scratch (no Stage-1 ckpt)."""
+    from models.stage2_prompt_role_expert_fusion import PromptRoleExpertStage2Seg
 
-    stage1_checkpoint = getattr(config, 'stage1_checkpoint', None)
-    if not stage1_checkpoint:
-        raise ValueError(
-            'model_arch=prompt_role_expert_stage2 requires --stage1_checkpoint '
-            '(frozen Stage-1 best checkpoint). Do NOT pass Stage-1 weights via --resume_checkpoint.'
-        )
-    if not os.path.exists(stage1_checkpoint):
-        raise FileNotFoundError(f'stage1_checkpoint not found: {stage1_checkpoint}')
-
-    # Align architecture fields with the Stage-1 checkpoint before construction.
-    _align_stage1_config_from_checkpoint(config, stage1_checkpoint)
-
-    strategy = str(getattr(config, 'stage2_train_strategy', 'alternating_frozen')).strip()
-    allow_affine = strategy in ('paired_joint_affine', 'paired_anga_affine')
-    if strategy == 'paired_anga_affine':
-        tau = float(getattr(config, 'stage2_anga_tau', 0.7))
-        if not (0.0 < tau < 1.0):
-            raise ValueError(f'stage2_anga_tau must satisfy 0 < tau < 1, got {tau}')
-
-    stage1 = _build_dual_shared_add_baseline(config)
-    load_stage1_checkpoint(stage1, stage1_checkpoint, strict=True)
-
-    pm = stage1.prototype_memory
+    base = _build_dual_shared_add_baseline(config)
+    pm = base.prototype_memory
     bank_ready = bool(pm.bank_ready)
-    bank_version = int(pm.bank_version.item()) if hasattr(pm, 'bank_version') else -1
-    ready = getattr(pm, 'prototype_ready', None)
-    ready_count = int(ready.sum().item()) if torch.is_tensor(ready) else 0
-
-    print(f'[STAGE2] stage1_checkpoint={stage1_checkpoint}', flush=True)
-    print(f'[STAGE2] train_strategy={strategy} allow_affine_trainable={allow_affine}', flush=True)
-    print(f'[STAGE2] CPPI bank_ready={bank_ready} bank_version={bank_version} ready_slots={ready_count}', flush=True)
-    if not bank_ready:
-        raise RuntimeError(
-            'Stage-2 requires a ready frozen CPPI bank in stage1_checkpoint, but '
-            f'prototype_memory.bank_ready=False (bank_version={bank_version}).'
-        )
+    bank_version = int(pm.bank_version.item()) if hasattr(pm, 'bank_version') else 0
 
     model = PromptRoleExpertStage2Seg(
-        stage1_model=stage1,
+        stage1_model=base,
         channels=(64, 128, 320, 512),
-        decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
         expert_dim=int(getattr(config, 'stage2_expert_dim', 128)),
         atom_num=int(getattr(config, 'stage2_atom_num', 32)),
         atom_dim=int(getattr(config, 'stage2_atom_dim', 256)),
         prompt_hidden_channels=int(getattr(config, 'stage2_prompt_hidden_channels', 64)),
         mlp_ratio=float(getattr(config, 'stage2_mlp_ratio', 2.0)),
         dropout=float(getattr(config, 'stage2_dropout', 0.0)),
-        adapter_bottlenecks=getattr(config, 'stage2_adapter_bottlenecks', (64, 32, 16, 8)),
-        external_prompt_dim=None,  # Text OFF for the first experiment.
-        require_ready_cppi_for_missing=True,
-        allow_affine_trainable=allow_affine,
+        external_prompt_dim=None,
     )
-    model.assert_stage1_boundary_contract(allow_affine=allow_affine)
 
-    stage1_total = sum(p.numel() for p in model.stage1.parameters())
-    affine_trainable = sum(p.numel() for p in model.stage1.pet_calibration.parameters() if p.requires_grad)
-    stage1_other_trainable = sum(
-        p.numel()
-        for n, p in model.stage1.named_parameters()
-        if p.requires_grad and not n.startswith('pet_calibration.')
-    )
-    stage2_modules_trainable = sum(
-        p.numel() for p in list(model.role_fusion.parameters()) + list(model.decoder_adapters.parameters()) if p.requires_grad
-    )
-    trainable_names = model.trainable_parameter_names()
-    print(f'[STAGE2] Stage1 total params={stage1_total}', flush=True)
-    print(f'[STAGE2] Stage1 affine trainable params={affine_trainable}', flush=True)
-    print(f'[STAGE2] Stage1 non-affine trainable params={stage1_other_trainable}', flush=True)
-    print(f'[STAGE2] SPRE+adapters trainable params={stage2_modules_trainable}', flush=True)
+    print('[JOINT] pretrained Stage1 checkpoint loaded=False', flush=True)
+    print(f'[JOINT] CPPI initial bank_ready={bank_ready}', flush=True)
+    print(f'[JOINT] CPPI bank_version={bank_version}', flush=True)
+
+    counts = {
+        'enc_ct': model.count_module_trainable(model.stage1.enc_ct),
+        'enc_pet': model.count_module_trainable(model.stage1.enc_pet),
+        'ct_align': model.count_module_trainable(model.stage1.ct_align),
+        'prototype_attention': model.count_module_trainable(model.stage1.prototype_memory.attention),
+        'pet_calibration': model.count_module_trainable(model.stage1.pet_calibration),
+        'legacy_fusion': model.count_module_trainable(model.stage1.fusion) if hasattr(model.stage1, 'fusion') else 0,
+        'decoder': model.count_module_trainable(model.stage1.decoder),
+        'role_fusion': model.count_module_trainable(model.role_fusion),
+    }
+    for k, v in counts.items():
+        print(f'[JOINT] trainable[{k}]={v}', flush=True)
+    print(f'[JOINT] trainable_total={model.count_trainable_parameters()}', flush=True)
     print(
-        f'[STAGE2] Trainable name groups={_summarize_trainable_names(trainable_names)} '
-        f'(num_tensors={len(trainable_names)})',
+        f'[JOINT] trainable name groups={_summarize_trainable_names(model.trainable_parameter_names())}',
         flush=True,
     )
-    if stage1_other_trainable != 0:
-        raise RuntimeError(f'Stage-1 non-affine must stay frozen, got trainable={stage1_other_trainable}')
-    if allow_affine and affine_trainable <= 0:
-        raise RuntimeError('Affine strategy selected but pet_calibration has no trainable params')
-    if not allow_affine and affine_trainable != 0:
-        raise RuntimeError(f'Frozen strategy but affine trainable={affine_trainable}')
-    if stage2_modules_trainable <= 0:
-        raise RuntimeError('Stage-2 has no trainable SPRE/adapter parameters')
+
+    if counts['legacy_fusion'] != 0:
+        raise RuntimeError('legacy fusion must remain non-trainable')
+    for key in ('enc_ct', 'enc_pet', 'ct_align', 'prototype_attention', 'pet_calibration', 'decoder', 'role_fusion'):
+        if counts[key] <= 0:
+            raise RuntimeError(f'expected trainable module {key}, got 0')
+    if bank_ready:
+        print('[JOINT][WARN] unexpected initial bank_ready=True for fresh joint build', flush=True)
     return model
 
 

@@ -1,58 +1,23 @@
-"""Prompt-Guided Role-Specialized Expert Fusion + Hierarchical Decoder Adaptation.
+"""End-to-End Joint Recovery-Fusion-Segmentation model.
 
-Designed for direct integration with:
-    AilinLiuilearn/new-train
-    branch: e1-api-masked-baseline-CPPI-affine-calibration
+Joint architecture (no frozen Stage-1 / no decoder adapters):
 
-Stage-1 is treated as a *frozen evidence generator*:
-    Full    -> (CT features, real-PET calibrated features)
-    Missing -> (CT features, CPPI proxy-PET calibrated features)
+    CT/PET Encoders
+        -> Dynamic CT-PET Prototype Memory (CPPI)
+        -> Missing PET Retrieval / Real PET
+        -> PET Affine Calibration
+        -> Prompt-Guided Role-Specialized Expert Fusion (SPRE)
+        -> Trainable original UNetStyleDecoder
+        -> Segmentation
 
-Stage-2 bypasses Stage-1 StateAwareWeightedAddFusion and learns a new fusion:
-    1) scale-specific CT/PET projections to a shared expert space;
-    2) TG-ECNet-style learnable TaskPrompt (CondNet + GAP + prompt dictionary);
-    3) role-specialized experts:
-         - one cross-scale CT expert,
-         - one cross-scale Real-PET expert,
-         - one cross-scale Proxy-PET expert,
-         - four scale experts (S1..S4),
-         - one all-scale shared expert;
-    4) scale-specific role router conditioned on local CT/PET evidence + TaskPrompt;
-    5) weighted role features -> concatenate -> learned fusion projection;
-    6) frozen original U-Net decoder + trainable fusion-conditioned adapters.
+Module-1 components live on ``stage1`` (DualSharedAddPETCTBaseline container).
+Module-2 is ``role_fusion`` (PromptGuidedRoleExpertFusion).
 
-The module intentionally does NOT use:
-    - Stage-1 C + alpha*P as the Stage-2 input/anchor;
-    - |C-P| or C*P hand-crafted interaction terms;
-    - Noisy Top-K / load-balancing loss;
-    - text by default.
+Stage-1 StateAwareWeightedAddFusion is bypassed and disabled
+(requires_grad=False) because SPRE fully replaces it.
 
-A future fixed-text prior is reserved through ``external_prompt``.  If
-``external_prompt_dim`` is provided at construction, each scale can fuse a
-sample-level external state embedding with its learnable TaskPrompt *before*
-routing.  Experts never directly consume text/prompt embeddings.
-
-TG-ECNet adaptation note
-------------------------
-The official TG-ECNet TaskMoE uses:
-    local feature token + projected TaskPrompt -> gating;
-    experts process the visual token only.
-This file preserves that separation, while replacing anonymous sparse experts
-with PET-CT-specific role experts and replacing noisy Top-K with a four-role
-soft router whose legal experts are structurally defined by scale/state.
-
-Typical integration
--------------------
-    stage1 = DualSharedAddPETCTBaseline(...)
-    # load your Stage-1 best checkpoint into ``stage1`` first
-    model = PromptRoleExpertStage2Seg(stage1)
-
-    out = model(ct, pet, forward_mode="full")
-    loss = criterion(out["logits"], mask)
-
-For Stage-2 training, only this module's fusion/prompt/router/experts/adapters
-remain trainable; all Stage-1 parameters (including the original decoder) are
-frozen and kept in eval mode.
+Text OFF by default (external_prompt_dim=None).
+No balance / ANGA / adapter / distillation losses in the first joint experiment.
 """
 
 from __future__ import annotations
@@ -612,206 +577,39 @@ class PromptGuidedRoleExpertFusion(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# 6. Frozen decoder + fusion-conditioned hierarchical adapters
-# -----------------------------------------------------------------------------
-
-
-class FusionConditionedDecoderAdapter(nn.Module):
-    """Adapt a frozen decoder stage using its corresponding new fused feature.
-
-    d' = d + Up( DWConv( GELU( GN( Down_d(d) + Down_f(F_new) ) ) ) )
-
-    ``Up`` is zero-initialized, so the adapter starts as identity while the
-    Stage-2 fusion itself remains fully unconstrained by Stage-1 fusion.
-    """
-
-    def __init__(
-        self,
-        decoder_channels: int,
-        fusion_channels: int,
-        bottleneck_channels: int,
-    ) -> None:
-        super().__init__()
-        b = int(bottleneck_channels)
-        self.dec_down = nn.Conv2d(decoder_channels, b, kernel_size=1, bias=False)
-        self.fuse_down = nn.Conv2d(fusion_channels, b, kernel_size=1, bias=False)
-        self.norm = nn.GroupNorm(1, b)
-        self.act1 = nn.GELU()
-        self.dwconv = nn.Conv2d(
-            b, b, kernel_size=3, stride=1, padding=1, groups=b, bias=False
-        )
-        self.act2 = nn.GELU()
-        self.up = nn.Conv2d(b, decoder_channels, kernel_size=1, bias=True)
-
-        nn.init.zeros_(self.up.weight)
-        nn.init.zeros_(self.up.bias)
-
-    def forward(self, decoder_feat: torch.Tensor, fusion_feat: torch.Tensor) -> torch.Tensor:
-        if fusion_feat.shape[-2:] != decoder_feat.shape[-2:]:
-            fusion_feat = F.interpolate(
-                fusion_feat,
-                size=decoder_feat.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-        h = self.dec_down(decoder_feat) + self.fuse_down(fusion_feat)
-        h = self.norm(h)
-        h = self.act1(h)
-        h = self.dwconv(h)
-        h = self.act2(h)
-        return decoder_feat + self.up(h).to(dtype=decoder_feat.dtype)
-
-
-class HierarchicalDecoderAdapters(nn.Module):
-    """Trainable adapters for the frozen Stage-1 UNetStyleDecoder.
-
-    The base decoder is *not* registered inside this module; the parent model
-    passes ``stage1.decoder`` into ``forward``. This avoids duplicate module/state
-    registration while reusing the exact Stage-1 decoder weights.
-    """
-
-    def __init__(
-        self,
-        encoder_channels: Sequence[int] = (64, 128, 320, 512),
-        decoder_channels: Sequence[int] = (512, 256, 128, 64),
-        bottlenecks: Sequence[int] = (64, 32, 16, 8),
-    ) -> None:
-        super().__init__()
-        if len(encoder_channels) != 4 or len(decoder_channels) != 4 or len(bottlenecks) != 4:
-            raise ValueError("encoder/decoder/bottleneck configs must all have four entries")
-
-        c1, c2, c3, c4 = [int(x) for x in encoder_channels]
-        d4, d3, d2, d1 = [int(x) for x in decoder_channels]
-        b4, b3, b2, b1 = [int(x) for x in bottlenecks]
-
-        self.adapter4 = FusionConditionedDecoderAdapter(d4, c4, b4)
-        self.adapter3 = FusionConditionedDecoderAdapter(d3, c3, b3)
-        self.adapter2 = FusionConditionedDecoderAdapter(d2, c2, b2)
-        self.adapter1 = FusionConditionedDecoderAdapter(d1, c1, b1)
-
-    def forward(
-        self,
-        base_decoder: nn.Module,
-        features: Sequence[torch.Tensor],
-        target_size: Tuple[int, int],
-    ) -> Dict[str, torch.Tensor]:
-        if len(features) != 4:
-            raise ValueError(f"Expected four decoder features, got {len(features)}")
-
-        x1, x2, x3, x4 = features
-
-        # Exact Stage-1 decoder skeleton, with an adapter inserted after each
-        # frozen decoding stage.
-        d4 = base_decoder.proj4(x4)
-        d4 = self.adapter4(d4, x4)
-
-        s3 = base_decoder.proj3(x3)
-        d3 = base_decoder.fuse3(
-            torch.cat(
-                [
-                    F.interpolate(d4, size=s3.shape[-2:], mode="bilinear", align_corners=False),
-                    s3,
-                ],
-                dim=1,
-            )
-        )
-        d3 = self.adapter3(d3, x3)
-
-        s2 = base_decoder.proj2(x2)
-        d2 = base_decoder.fuse2(
-            torch.cat(
-                [
-                    F.interpolate(d3, size=s2.shape[-2:], mode="bilinear", align_corners=False),
-                    s2,
-                ],
-                dim=1,
-            )
-        )
-        d2 = self.adapter2(d2, x2)
-
-        s1 = base_decoder.proj1(x1)
-        d1 = base_decoder.fuse1(
-            torch.cat(
-                [
-                    F.interpolate(d2, size=s1.shape[-2:], mode="bilinear", align_corners=False),
-                    s1,
-                ],
-                dim=1,
-            )
-        )
-        d1 = self.adapter1(d1, x1)
-
-        logits_low = base_decoder.seg_head(d1)
-        logits = F.interpolate(
-            logits_low,
-            size=target_size,
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        out: Dict[str, torch.Tensor] = {"logits": logits}
-        if bool(getattr(base_decoder, "use_deep_supervision", False)):
-            if all(
-                hasattr(base_decoder, name)
-                for name in ("aux_head_d2", "aux_head_d3", "aux_head_d4")
-            ):
-                out["aux_logits"] = [
-                    base_decoder.aux_head_d2(d2),
-                    base_decoder.aux_head_d3(d3),
-                    base_decoder.aux_head_d4(d4),
-                ]
-        return out
-
-
-# -----------------------------------------------------------------------------
-# 7. Complete Stage-2 wrapper around the frozen Stage-1 model
+# 6. Joint end-to-end Recovery + Role Fusion segmentation model
 # -----------------------------------------------------------------------------
 
 
 class PromptRoleExpertStage2Seg(nn.Module):
-    """Complete drop-in Stage-2 segmentation model.
+    """Joint PET recovery + role-specialized fusion segmentation model.
 
-    Expected Stage-1 object is the branch's ``DualSharedAddPETCTBaseline`` and
-    must already contain the loaded best Stage-1 checkpoint/prototype bank.
-
-    The wrapper uses Stage-1 private helpers intentionally because the current
-    branch already exposes the exact evidence path through:
-        _encode_ct
-        _encode_pet
-        _retrieve_cppi
-        pet_calibration
-        prototype_memory
-        decoder
-
-    Stage-1 ``fusion`` is bypassed by design.
+    ``stage1`` is a DualSharedAddPETCTBaseline used as a Module-1 component
+    container (encoders / CPPI / calibration / decoder). Its legacy
+    ``StateAwareWeightedAddFusion`` is NOT used in the forward path.
     """
 
     def __init__(
         self,
         stage1_model: nn.Module,
         channels: Sequence[int] = (64, 128, 320, 512),
-        decoder_channels: Sequence[int] = (512, 256, 128, 64),
         expert_dim: int = 128,
         atom_num: int = 32,
         atom_dim: int = 256,
         prompt_hidden_channels: int = 64,
         mlp_ratio: float = 2.0,
         dropout: float = 0.0,
-        adapter_bottlenecks: Sequence[int] = (64, 32, 16, 8),
         external_prompt_dim: Optional[int] = None,
-        require_ready_cppi_for_missing: bool = True,
-        allow_affine_trainable: bool = False,
     ) -> None:
         super().__init__()
         self.stage1 = stage1_model
         self.channels = tuple(int(c) for c in channels)
-        self.require_ready_cppi_for_missing = bool(require_ready_cppi_for_missing)
-        self.allow_affine_trainable = bool(allow_affine_trainable)
 
         required_attrs = (
             "_encode_ct",
             "_encode_pet",
             "_retrieve_cppi",
+            "_collect_cppi",
             "pet_calibration",
             "prototype_memory",
             "decoder",
@@ -823,13 +621,12 @@ class PromptRoleExpertStage2Seg(nn.Module):
                 f"missing attributes: {missing}"
             )
 
-        # Stage-1 is a frozen evidence generator / decoder backbone.
-        for p in self.stage1.parameters():
-            p.requires_grad = False
-        if self.allow_affine_trainable:
-            for p in self.stage1.pet_calibration.parameters():
-                p.requires_grad = True
-        self.stage1.eval()
+        # All active Module-1 networks remain trainable. Only the unused legacy
+        # weighted-add fusion is disabled because SPRE replaces it.
+        if hasattr(self.stage1, "fusion"):
+            for p in self.stage1.fusion.parameters():
+                p.requires_grad = False
+            print("[JOINT] legacy weighted-add fusion disabled=True", flush=True)
 
         self.role_fusion = PromptGuidedRoleExpertFusion(
             channels=self.channels,
@@ -841,23 +638,7 @@ class PromptRoleExpertStage2Seg(nn.Module):
             dropout=dropout,
             external_prompt_dim=external_prompt_dim,
         )
-        self.decoder_adapters = HierarchicalDecoderAdapters(
-            encoder_channels=self.channels,
-            decoder_channels=decoder_channels,
-            bottlenecks=adapter_bottlenecks,
-        )
-        self.assert_stage1_boundary_contract(allow_affine=self.allow_affine_trainable)
 
-    # ----- keep Stage-1 frozen/eval even when the Stage-2 wrapper trains -----
-    def train(self, mode: bool = True):
-        super().train(mode)
-        self.stage1.eval()
-        return self
-
-    # ----- evidence extraction -----
-    # Compatibility views used by the existing branch's training/logger code.
-    # They are properties (not registered aliases), so Stage-1 modules are not
-    # duplicated in this wrapper's state_dict.
     @property
     def enc_ct(self) -> nn.Module:
         return self.stage1.enc_ct
@@ -887,31 +668,31 @@ class PromptRoleExpertStage2Seg(nn.Module):
         ct_feats: Sequence[torch.Tensor],
         pet_feats_real: Sequence[torch.Tensor],
     ) -> List[torch.Tensor]:
-        """Affine-calibrate real PET. Encoders/CPPI stay detached; heads may train."""
-        ct_feats = [x.detach() for x in ct_feats]
-        pet_feats_real = [x.detach() for x in pet_feats_real]
-        with torch.no_grad():
-            if self.cppi_ready:
-                _, ct_reference_feats, _ = self.stage1._retrieve_cppi(
+        """Affine-calibrate real PET. Keep encoder/PET grads; detach only CT ref."""
+        if self.cppi_ready:
+            _, ct_reference_feats, _ = self.stage1._retrieve_cppi(
+                ct_feats,
+                compute_report=False,
+                save_diagnostics=False,
+                print_info=False,
+                return_ct_reference=True,
+            )
+            # Module-1 calibration design: CT reference is detached.
+            ct_reference_feats = [x.detach() for x in ct_reference_feats]
+            return list(
+                self.stage1.pet_calibration(
                     ct_feats,
-                    compute_report=False,
-                    save_diagnostics=False,
-                    print_info=False,
-                    return_ct_reference=True,
+                    pet_feats_real,
+                    ct_reference_feats,
+                    reference_valid=True,
                 )
-                ct_reference_feats = [x.detach() for x in ct_reference_feats]
-                reference_valid = True
-            else:
-                ct_reference_feats = None
-                reference_valid = False
-
-        # Must run outside no_grad so gradients can enter pet_calibration.heads.
+            )
         return list(
             self.stage1.pet_calibration(
                 ct_feats,
                 pet_feats_real,
-                ct_reference_feats,
-                reference_valid=reference_valid,
+                None,
+                reference_valid=False,
             )
         )
 
@@ -919,26 +700,16 @@ class PromptRoleExpertStage2Seg(nn.Module):
         self,
         ct_feats: Sequence[torch.Tensor],
     ) -> List[torch.Tensor]:
-        """CPPI retrieve-only + affine calibrate proxy PET."""
-        if self.require_ready_cppi_for_missing and not self.cppi_ready:
-            raise RuntimeError(
-                "Stage-2 Missing requires a ready frozen CPPI bank. Load the "
-                "Stage-1 best checkpoint (including prototype buffers) before "
-                "constructing/running Stage-2."
-            )
-
-        ct_feats = [x.detach() for x in ct_feats]
-        with torch.no_grad():
-            pet_proxy, ct_reference_feats, _ = self.stage1._retrieve_cppi(
-                ct_feats,
-                compute_report=False,
-                save_diagnostics=False,
-                print_info=False,
-                return_ct_reference=True,
-            )
-            pet_proxy = [x.detach() for x in pet_proxy]
-            ct_reference_feats = [x.detach() for x in ct_reference_feats]
-
+        """Retrieve proxy PET (grad through attention) and affine-calibrate."""
+        pet_proxy, ct_reference_feats, _ = self.stage1._retrieve_cppi(
+            ct_feats,
+            compute_report=False,
+            save_diagnostics=False,
+            print_info=False,
+            return_ct_reference=True,
+        )
+        # Keep pet_proxy in the graph so Missing loss updates PrototypeCrossAttention.
+        ct_reference_feats = [x.detach() for x in ct_reference_feats]
         return list(
             self.stage1.pet_calibration(
                 ct_feats,
@@ -952,23 +723,36 @@ class PromptRoleExpertStage2Seg(nn.Module):
         self,
         ct: torch.Tensor,
         pet: Optional[torch.Tensor],
+        mask: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         if pet is None:
-            raise ValueError("Full Stage-2 path requires real PET input")
-        with torch.no_grad():
-            ct_feats = [x.detach() for x in self.stage1._encode_ct(ct)]
-            pet_real = [x.detach() for x in self.stage1._encode_pet(pet)]
-        # pet_cal keeps grad w.r.t. affine heads when they are trainable.
+            raise ValueError("Full path requires real PET input")
+        ct_feats = list(self.stage1._encode_ct(ct))
+        pet_real = list(self.stage1._encode_pet(pet))
+        # collect is @torch.no_grad internally; does not pollute the main graph.
+        self.stage1._collect_cppi(ct_feats, pet_real, mask)
         pet_cal = self._calibrate_real_pet(ct_feats, pet_real)
         return ct_feats, pet_cal
 
     def _extract_missing_evidence(
         self,
         ct: torch.Tensor,
+        pet: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        # Critical: real PET encoder is NEVER called here.
-        with torch.no_grad():
-            ct_feats = [x.detach() for x in self.stage1._encode_ct(ct)]
+        """Missing prediction uses CPPI proxy only; real PET is collect-only."""
+        ct_feats = list(self.stage1._encode_ct(ct))
+
+        # Training-time memory construction mirrors Stage-1 Missing:
+        # real PET encoder may run for collect, but must NOT enter prediction.
+        if self.training and mask is not None:
+            if pet is None:
+                raise ValueError(
+                    "Missing training with mask requires real PET for CPPI collect"
+                )
+            pet_real_for_memory = list(self.stage1._encode_pet(pet))
+            self.stage1._collect_cppi(ct_feats, pet_real_for_memory, mask)
+
         pet_cal = self._retrieve_and_calibrate_proxy(ct_feats)
         return ct_feats, pet_cal
 
@@ -977,48 +761,44 @@ class PromptRoleExpertStage2Seg(nn.Module):
         ct: torch.Tensor,
         pet: Optional[torch.Tensor],
         pet_available: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """Per-sample Full/Missing evidence without leaking real PET to Missing.
-
-        Real PET encoder is run ONLY on the subset where pet_available==1.
-        Missing samples use CPPI retrieve-only.
-
-        Auto is primarily for validation; returned tensors are detached.
-        """
+        """Per-sample Full/Missing. Eval must not update the prototype bank."""
         availability = pet_available.to(device=ct.device).long().view(-1)
         if availability.numel() != ct.shape[0]:
             raise ValueError("pet_available must contain one state per sample")
         if not torch.all((availability == 0) | (availability == 1)):
             raise ValueError("pet_available values must be 0/1")
 
-        with torch.no_grad():
-            ct_feats_all = [x.detach() for x in self.stage1._encode_ct(ct)]
-
+        ct_feats_all = list(self.stage1._encode_ct(ct))
         pet_cal_all = [torch.empty_like(x) for x in ct_feats_all]
 
         full_idx = torch.nonzero(availability == 1, as_tuple=False).flatten()
         miss_idx = torch.nonzero(availability == 0, as_tuple=False).flatten()
 
+        # Optional collect only in train with mask; uses full PET if present.
+        if self.training and mask is not None and pet is not None:
+            pet_real_all = list(self.stage1._encode_pet(pet))
+            self.stage1._collect_cppi(ct_feats_all, pet_real_all, mask)
+
         if full_idx.numel() > 0:
             if pet is None:
                 raise ValueError("auto path has Full samples but pet=None")
             ct_full = [x.index_select(0, full_idx) for x in ct_feats_all]
-            with torch.no_grad():
-                pet_input_full = pet.index_select(0, full_idx)
-                pet_real_full = [x.detach() for x in self.stage1._encode_pet(pet_input_full)]
+            pet_input_full = pet.index_select(0, full_idx)
+            pet_real_full = list(self.stage1._encode_pet(pet_input_full))
             pet_cal_full = self._calibrate_real_pet(ct_full, pet_real_full)
             for dst, src in zip(pet_cal_all, pet_cal_full):
-                dst.index_copy_(0, full_idx, src.detach())
+                dst.index_copy_(0, full_idx, src)
 
         if miss_idx.numel() > 0:
             ct_miss = [x.index_select(0, miss_idx) for x in ct_feats_all]
             pet_cal_miss = self._retrieve_and_calibrate_proxy(ct_miss)
             for dst, src in zip(pet_cal_all, pet_cal_miss):
-                dst.index_copy_(0, miss_idx, src.detach())
+                dst.index_copy_(0, miss_idx, src)
 
-        return ct_feats_all, [x.detach() for x in pet_cal_all]
+        return ct_feats_all, pet_cal_all
 
-    # ----- forward -----
     def forward(
         self,
         ct: torch.Tensor,
@@ -1030,18 +810,16 @@ class PromptRoleExpertStage2Seg(nn.Module):
         external_prompt: Optional[torch.Tensor] = None,
         return_features: bool = False,
     ) -> Dict[str, object]:
-        del mask  # Stage-2 is retrieve-only; GT mask must never update CPPI.
-
         if target_size is None:
             target_size = tuple(ct.shape[-2:])
 
         mode = str(forward_mode).strip().lower()
         if mode == "full":
-            ct_feats, pet_cal = self._extract_full_evidence(ct, pet)
+            ct_feats, pet_cal = self._extract_full_evidence(ct, pet, mask=mask)
             fusion_route = "full"
             state = None
         elif mode == "missing":
-            ct_feats, pet_cal = self._extract_missing_evidence(ct)
+            ct_feats, pet_cal = self._extract_missing_evidence(ct, pet=pet, mask=mask)
             fusion_route = "missing"
             state = None
         elif mode == "auto":
@@ -1050,7 +828,7 @@ class PromptRoleExpertStage2Seg(nn.Module):
                     ct.shape[0], device=ct.device, dtype=torch.long
                 )
             ct_feats, pet_cal = self._extract_auto_evidence(
-                ct, pet, pet_available
+                ct, pet, pet_available, mask=mask
             )
             fusion_route = "auto"
             state = pet_available
@@ -1059,7 +837,6 @@ class PromptRoleExpertStage2Seg(nn.Module):
                 f"Unsupported forward_mode={forward_mode!r}; use full/missing/auto"
             )
 
-        # Stage-2 direct fusion: Stage-1 StateAwareWeightedAddFusion is bypassed.
         fusion = self.role_fusion(
             ct_feats=ct_feats,
             pet_feats_cal=pet_cal,
@@ -1068,20 +845,14 @@ class PromptRoleExpertStage2Seg(nn.Module):
             pet_available=state,
         )
 
-        dec_out = self.decoder_adapters(
-            base_decoder=self.stage1.decoder,
-            features=fusion.features,
-            target_size=target_size,
-        )
+        # Direct trainable original UNet decoder (no adapters).
+        dec_out = self.stage1.decoder(fusion.features, target_size)
         logits = dec_out["logits"]
 
         out: Dict[str, object] = dict(dec_out)
         out["pred"] = logits
         out["aux"] = {
             "stage2_stats": fusion.stats,
-            # Explicit zero auxiliary loss keeps compatibility with training code
-            # that expects an aux loss slot, while the first experiment uses only
-            # BCE+Dice as requested.
             "stage2_aux_loss": logits.new_zeros((), dtype=torch.float32),
         }
 
@@ -1091,43 +862,14 @@ class PromptRoleExpertStage2Seg(nn.Module):
             out["stage1_pet_cal_evidence"] = pet_cal
         return out
 
-    # ----- diagnostics / safety checks -----
     def trainable_parameter_names(self) -> List[str]:
         return [name for name, p in self.named_parameters() if p.requires_grad]
 
-    def assert_stage1_boundary_contract(self, allow_affine: bool = False) -> None:
-        """Validate Stage-1 requires_grad boundary.
-
-        When ``allow_affine`` is False, every Stage-1 parameter must be frozen.
-        When True, only ``pet_calibration.*`` may be trainable.
-        """
-        allow_affine = bool(allow_affine)
-        bad = []
-        for name, p in self.stage1.named_parameters():
-            if not p.requires_grad:
-                continue
-            if allow_affine and name.startswith("pet_calibration."):
-                continue
-            bad.append(name)
-        if bad:
-            raise RuntimeError(
-                "Stage-1 boundary violated; unexpected trainable params: "
-                f"{bad[:20]}"
-            )
-        if allow_affine:
-            affine_train = [
-                p for p in self.stage1.pet_calibration.parameters() if p.requires_grad
-            ]
-            if not affine_train:
-                raise RuntimeError(
-                    "allow_affine=True but pet_calibration has no trainable params"
-                )
-
-    def assert_stage1_frozen(self) -> None:
-        self.assert_stage1_boundary_contract(allow_affine=False)
-
     def count_trainable_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def count_module_trainable(self, module: nn.Module) -> int:
+        return sum(p.numel() for p in module.parameters() if p.requires_grad)
 
     @torch.no_grad()
     def finalize_cppi_epoch(
@@ -1137,77 +879,24 @@ class PromptRoleExpertStage2Seg(nn.Module):
         save_visualizations: bool = False,
         print_info: bool = True,
     ) -> Dict[str, object]:
-        """Stage-2 compatibility no-op: NEVER rebuild/update the frozen bank.
-
-        The original branch's ``run_mdt_seg.py`` calls ``finalize_cppi_epoch``
-        after every epoch. Calling Stage-1's real finalizer here would violate
-        the Stage-2 retrieve-only rule and contaminate the experimental variable.
-        We therefore return a read-only report with an unchanged bank version.
-        """
-        del epoch, save_json, save_visualizations
-        pm = self.stage1.prototype_memory
-        bank_version = int(pm.bank_version.item()) if hasattr(pm, "bank_version") else 0
-        ready = getattr(pm, "prototype_ready", None)
-        ready_count = int(ready.sum().item()) if torch.is_tensor(ready) else 0
-        report = {
-            "bank_version_before": bank_version,
-            "bank_version_after": bank_version,
-            "ready_count": ready_count,
-            "ready_slots": ready_count,
-            "classes": {
-                "background": {"num_candidates": 0},
-                "foreground": {"num_candidates": 0},
-            },
-            "stage2_retrieve_only": True,
-        }
-        if print_info:
-            print(
-                "[CPPI STAGE2] frozen=True collect=False finalize=False "
-                f"retrieve=True bank_version={bank_version} ready_slots={ready_count}",
-                flush=True,
-            )
-        return report
+        """Rebuild the dynamic prototype bank from this epoch's collect cache."""
+        return self.stage1.prototype_memory.finalize_epoch(
+            epoch=epoch,
+            save_json=save_json,
+            save_visualizations=save_visualizations,
+            print_info=print_info,
+        )
 
 
 # -----------------------------------------------------------------------------
-# 8. Convenience checkpoint helper
-# -----------------------------------------------------------------------------
-
-
-def load_stage1_checkpoint(
-    stage1_model: nn.Module,
-    checkpoint_path: str,
-    map_location: str | torch.device = "cpu",
-    strict: bool = True,
-) -> Dict[str, object]:
-    """Load the branch's Stage-1 checkpoint before wrapping it with Stage-2.
-
-    Supports both:
-        torch.save(model.state_dict(), path)
-    and repository-style payloads containing a ``model`` key.
-    """
-    payload = torch.load(checkpoint_path, map_location=map_location)
-    if isinstance(payload, dict) and "model" in payload:
-        state_dict = payload["model"]
-    else:
-        state_dict = payload
-
-    if not isinstance(state_dict, dict):
-        raise TypeError("Checkpoint does not contain a valid model state_dict")
-    stage1_model.load_state_dict(state_dict, strict=strict)
-    return payload if isinstance(payload, dict) else {"model": state_dict}
-
-
-# -----------------------------------------------------------------------------
-# 9. Optional core smoke test
+# 7. Optional core smoke test
 # -----------------------------------------------------------------------------
 
 
 def _smoke_test_core() -> None:
-    """Tests the new Stage-2 fusion without requiring encoders/CPPI data."""
+    """Tests PromptGuidedRoleExpertFusion without encoders/CPPI data."""
     torch.manual_seed(0)
     channels = (64, 128, 320, 512)
-    # All scales >= 9x9 so the TG-ECNet-style TaskPrompt CondNet is valid.
     spatial = ((32, 32), (24, 24), (18, 18), (16, 16))
     ct = [torch.randn(1, c, h, w) for c, (h, w) in zip(channels, spatial)]
     pet = [torch.randn_like(x) for x in ct]

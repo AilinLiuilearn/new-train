@@ -24,7 +24,6 @@ def _make_cfg(**kwargs):
         'cppi_num_clusters': 6,
         'cppi_build_stage': 4,
         'model_arch': 'dual_shared_add_baseline',
-        'stage2_train_strategy': 'alternating_frozen',
     }
     base.update(kwargs)
     return type('C', (), base)()
