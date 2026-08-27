@@ -349,7 +349,7 @@ class ConvBNAct(nn.Module):
         return self.block(x)
 
 
-def build_mdt_seg_teacher(config):
+def _build_dual_shared_add_baseline(config):
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
     cppi_num_clusters = getattr(config, 'cppi_num_clusters', 6)
     cppi_build_stage = getattr(config, 'cppi_build_stage', 3)
@@ -378,4 +378,97 @@ def build_mdt_seg_teacher(config):
     print(f'[CPPI] num_clusters={cppi_num_clusters}')
     print(f'[CPPI] build_stage={cppi_build_stage}')
     print(f'[CPPI] output_dir={cppi_output_dir}')
-    return {'model': model}
+    return model
+
+
+def _summarize_trainable_names(names, max_groups=24):
+    groups = []
+    for name in names:
+        top = name.split('.', 2)[0]
+        if top not in groups:
+            groups.append(top)
+        if len(groups) >= max_groups:
+            break
+    return groups
+
+
+def _build_dopr_stage2(config):
+    """Build joint Recovery+DOPR+Decoder model from scratch (no Stage-1 ckpt)."""
+    from models.dopr_stage2_seg import DOPRStage2Seg
+
+    base = _build_dual_shared_add_baseline(config)
+    pm = base.prototype_memory
+    bank_ready = bool(pm.bank_ready)
+    bank_version = int(pm.bank_version.item()) if hasattr(pm, 'bank_version') else 0
+
+    model = DOPRStage2Seg(
+        stage1_model=base,
+        channels=(64, 128, 320, 512),
+        latent_cap=int(getattr(config, 'dopr_latent_cap', 128)),
+        num_heads=int(getattr(config, 'dopr_num_heads', 4)),
+        ffn_expansion=float(getattr(config, 'dopr_ffn_expansion', 2.0)),
+        layer_scale_init=float(getattr(config, 'dopr_layer_scale_init', 1e-3)),
+    )
+
+    print('[DOPR] pretrained Stage1 checkpoint loaded=False', flush=True)
+    print(f'[DOPR] CPPI initial bank_ready={bank_ready}', flush=True)
+    print(f'[DOPR] CPPI bank_version={bank_version}', flush=True)
+
+    real_rectifiers = sum(
+        model.count_module_trainable(unit.real_rectifier)
+        for unit in model.dopr_fusion.scale_units
+    )
+    proxy_rectifiers = sum(
+        model.count_module_trainable(unit.proxy_rectifier)
+        for unit in model.dopr_fusion.scale_units
+    )
+    shared_fusions = sum(
+        model.count_module_trainable(unit.shared_fusion)
+        for unit in model.dopr_fusion.scale_units
+    )
+    counts = {
+        'enc_ct': model.count_module_trainable(model.stage1.enc_ct),
+        'enc_pet': model.count_module_trainable(model.stage1.enc_pet),
+        'ct_align': model.count_module_trainable(model.stage1.ct_align),
+        'prototype_attention': model.count_module_trainable(model.stage1.prototype_memory.attention),
+        'pet_calibration': model.count_module_trainable(model.stage1.pet_calibration),
+        'legacy_fusion': model.count_module_trainable(model.stage1.fusion) if hasattr(model.stage1, 'fusion') else 0,
+        'decoder': model.count_module_trainable(model.stage1.decoder),
+        'dopr_fusion': model.count_module_trainable(model.dopr_fusion),
+        'real_rectifiers': real_rectifiers,
+        'proxy_rectifiers': proxy_rectifiers,
+        'shared_fusions': shared_fusions,
+    }
+    for k, v in counts.items():
+        print(f'[DOPR] trainable[{k}]={v}', flush=True)
+    print(f'[DOPR] trainable_total={model.count_trainable_parameters()}', flush=True)
+    print(
+        f'[DOPR] trainable name groups={_summarize_trainable_names(model.trainable_parameter_names())}',
+        flush=True,
+    )
+
+    if counts['legacy_fusion'] != 0:
+        raise RuntimeError('legacy fusion must remain non-trainable')
+    for key in (
+        'enc_ct', 'enc_pet', 'ct_align', 'prototype_attention', 'pet_calibration',
+        'decoder', 'dopr_fusion', 'real_rectifiers', 'proxy_rectifiers', 'shared_fusions',
+    ):
+        if counts[key] <= 0:
+            raise RuntimeError(f'expected trainable module {key}, got 0')
+    if bank_ready:
+        print('[DOPR][WARN] unexpected initial bank_ready=True for fresh DOPR build', flush=True)
+    return model
+
+
+def build_mdt_seg_teacher(config):
+    model_arch = str(getattr(config, 'model_arch', 'dual_shared_add_baseline')).strip()
+    if model_arch == 'dual_shared_add_baseline':
+        model = _build_dual_shared_add_baseline(config)
+        return {'model': model}
+    if model_arch == 'dopr_stage2':
+        model = _build_dopr_stage2(config)
+        return {'model': model}
+    raise ValueError(
+        f'Unsupported model_arch={model_arch!r}; '
+        f'expected dual_shared_add_baseline or dopr_stage2'
+    )

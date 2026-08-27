@@ -22,7 +22,13 @@ class SegMDTConfig(ConfigBase):
     @staticmethod
     def model_parser():
         p = argparse.ArgumentParser('Model', add_help=False)
-        p.add_argument('--model_arch', type=str, default='dual_shared_add_baseline', choices=('dual_shared_add_baseline',))
+        p.add_argument(
+            '--model_arch',
+            type=str,
+            default='dual_shared_add_baseline',
+            choices=('dual_shared_add_baseline', 'dopr_stage2'),
+            help='dopr_stage2 = joint end-to-end Recovery+DOPR+Decoder',
+        )
         p.add_argument('--ct_backbone', type=str, default='convnextv2_nano')
         p.add_argument('--pet_backbone', type=str, default='mit_b1')
         p.add_argument('--ct_pretrained_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano')
@@ -35,6 +41,10 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--joint_missing_weight', type=float, default=0.5)
         p.add_argument('--cppi_num_clusters', type=int, default=6)
         p.add_argument('--cppi_build_stage', type=int, default=3)
+        p.add_argument('--dopr_latent_cap', type=int, default=128)
+        p.add_argument('--dopr_num_heads', type=int, default=4)
+        p.add_argument('--dopr_ffn_expansion', type=float, default=2.0)
+        p.add_argument('--dopr_layer_scale_init', type=float, default=1e-3)
         p.add_argument('--enable_gradient_diagnostics', type=str2bool, default=False)
         p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)

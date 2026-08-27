@@ -91,8 +91,8 @@ def _count_parameters(model):
 
 
 def main():
-    print('[INFO] starting baseline training', flush=True)
     cfg = SegMDTConfig.parse_arguments()
+    print(f'[INFO] starting training model_arch={cfg.model_arch}', flush=True)
     _assert_baseline(cfg)
     _seed(cfg)
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
@@ -123,6 +123,7 @@ def main():
         'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
         'joint_dice', 'best_joint', 'best_joint_epoch',
         'grad_full_enc_ct', 'grad_missing_enc_ct', 'grad_full_ct_align', 'grad_missing_ct_align', 'grad_full_decoder', 'grad_missing_decoder',
+        'grad_full_dopr', 'grad_missing_dopr',
         'epoch_time',
         'cppi_bank_version', 'cppi_ready_slots', 'cppi_bg_candidates', 'cppi_fg_candidates',
     ]
@@ -145,8 +146,8 @@ def main():
         grad_norm_accum = 0.0
         grad_norm_steps = 0
         grads = {
-            'full': {'enc_ct': [], 'ct_align': [], 'decoder': []},
-            'missing': {'enc_ct': [], 'ct_align': [], 'decoder': []},
+            'full': {'enc_ct': [], 'ct_align': [], 'decoder': [], 'dopr': []},
+            'missing': {'enc_ct': [], 'ct_align': [], 'decoder': [], 'dopr': []},
         }
         epoch_start = time.time()
         fixed_diag_batch = None
@@ -169,6 +170,10 @@ def main():
             grads[route]['enc_ct'].append(module_grad_norm(task.model.enc_ct))
             grads[route]['ct_align'].append(module_grad_norm(task.model.ct_align))
             grads[route]['decoder'].append(module_grad_norm(task.model.decoder))
+            if hasattr(task.model, 'dopr_fusion'):
+                grads[route]['dopr'].append(module_grad_norm(task.model.dopr_fusion))
+            else:
+                grads[route]['dopr'].append(0.0)
             total_grad_norm = torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip)) if float(cfg.grad_clip) > 0 else 0.0
             grad_norm_accum += float(total_grad_norm)
             grad_norm_steps += 1
@@ -282,6 +287,8 @@ def main():
             'grad_missing_ct_align': float(np.mean(grads['missing']['ct_align'])) if grads['missing']['ct_align'] else 0.0,
             'grad_full_decoder': float(np.mean(grads['full']['decoder'])) if grads['full']['decoder'] else 0.0,
             'grad_missing_decoder': float(np.mean(grads['missing']['decoder'])) if grads['missing']['decoder'] else 0.0,
+            'grad_full_dopr': float(np.mean(grads['full']['dopr'])) if grads['full']['dopr'] else 0.0,
+            'grad_missing_dopr': float(np.mean(grads['missing']['dopr'])) if grads['missing']['dopr'] else 0.0,
             'epoch_time': time.time() - epoch_start,
             'cppi_bank_version': int(cppi_report.get('bank_version_after', cppi_report.get('bank_version_before', 0))),
             'cppi_ready_slots': int(cppi_report.get('ready_count', cppi_report.get('ready_slots', 0))),

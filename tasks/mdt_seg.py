@@ -25,12 +25,25 @@ class MDTSegTeacher:
         self.model = networks['model']
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        if not trainable_params:
+            raise RuntimeError('No trainable parameters found for optimizer')
+        self.optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
         self.scheduler = None
         self.scaler = torch.cuda.amp.GradScaler(enabled=bool(config.mixed_precision))
         self.global_batch_step = 0
         self.criterion = BCEDiceLoss(smooth=config.loss_smooth, bce_weight=config.bce_weight, dice_weight=config.dice_weight)
         self.metrics = SegmentationMetricsCIPA()
+        print(
+            f'[OPT] trainable_tensors={len(trainable_params)} '
+            f'trainable_params={sum(p.numel() for p in trainable_params)} '
+            f'lr={config.learning_rate}',
+            flush=True,
+        )
 
     def trainable_parameters(self):
         return [p for p in self.model.parameters() if p.requires_grad]
@@ -65,7 +78,8 @@ class MDTSegTeacher:
                 forward_mode = 'full'
                 pet_available = None
             elif eval_mode == 'fixed_missing':
-                pet = batch['pet'].to(self.device, non_blocking=True)
+                # Missing-modality protocol: no real PET tensor is provided.
+                pet = None
                 forward_mode = 'missing'
                 pet_available = None
             else:
@@ -89,6 +103,11 @@ class MDTSegTeacher:
         return [p.grad for p in module.parameters() if p.requires_grad and p.grad is not None]
 
     def gradient_diagnostics(self, batch, max_samples=1):
+        """Report Full/Missing grads without polluting prototype cache / BN stats.
+
+        Uses eval() (not no_grad) so backward still works, and mask=None so
+        diagnostics never call _collect_cppi. Missing diagnostics pass pet=None.
+        """
         was_training = self.model.training
         self.model.eval()
         bn_states = []
@@ -105,7 +124,8 @@ class MDTSegTeacher:
             params_align = list(self.model.ct_align.parameters())
             params_dec = list(self.model.decoder.parameters())
             outputs_full = self.model(ct, pet=pet, forward_mode='full', mask=None)
-            outputs_missing = self.model(ct, pet=pet, forward_mode='missing', mask=None)
+            # Missing diagnostics: strict no-PET protocol.
+            outputs_missing = self.model(ct, pet=None, forward_mode='missing', mask=None)
             logits_full = outputs_full['logits'] if isinstance(outputs_full, dict) else outputs_full
             logits_missing = outputs_missing['logits'] if isinstance(outputs_missing, dict) else outputs_missing
             loss_full, _ = self.criterion(logits_full.float(), mask.float())
