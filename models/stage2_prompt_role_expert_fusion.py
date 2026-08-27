@@ -745,12 +745,14 @@ class PromptRoleExpertStage2Seg(nn.Module):
 
         # Training-time memory construction mirrors Stage-1 Missing:
         # real PET encoder may run for collect, but must NOT enter prediction.
+        # Collect-only PET forward does not need an autograd graph.
         if self.training and mask is not None:
             if pet is None:
                 raise ValueError(
                     "Missing training with mask requires real PET for CPPI collect"
                 )
-            pet_real_for_memory = list(self.stage1._encode_pet(pet))
+            with torch.no_grad():
+                pet_real_for_memory = list(self.stage1._encode_pet(pet))
             self.stage1._collect_cppi(ct_feats, pet_real_for_memory, mask)
 
         pet_cal = self._retrieve_and_calibrate_proxy(ct_feats)

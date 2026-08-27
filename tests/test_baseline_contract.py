@@ -22,7 +22,7 @@ def _make_cfg(**kwargs):
         'random_state': 2023,
         'checkpoint_dir': '/tmp/mdt_test_ckpt',
         'cppi_num_clusters': 6,
-        'cppi_build_stage': 4,
+        'cppi_build_stage': 3,
         'model_arch': 'dual_shared_add_baseline',
     }
     base.update(kwargs)

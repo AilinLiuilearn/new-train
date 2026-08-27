@@ -40,7 +40,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--joint_full_weight', type=float, default=0.5)
         p.add_argument('--joint_missing_weight', type=float, default=0.5)
         p.add_argument('--cppi_num_clusters', type=int, default=6)
-        p.add_argument('--cppi_build_stage', type=int, default=4)
+        p.add_argument('--cppi_build_stage', type=int, default=3)
         p.add_argument('--enable_gradient_diagnostics', type=str2bool, default=False)
         p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
@@ -61,8 +61,10 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--epochs', type=int, default=60)
         p.add_argument('--batch_size', type=int, default=16)
         p.add_argument('--accumulation_steps', type=int, default=1)
+        # Currently unused: MDTSegTeacher always builds AdamW (kept for CLI compatibility).
         p.add_argument('--optimizer', type=str, default='adamw', choices=('adamw', 'sgd'))
         p.add_argument('--learning_rate', type=float, default=8e-5)
+        # Currently unused in joint experiment (single LR for all active modules).
         p.add_argument('--decoder_lr', type=float, default=8e-5)
         p.add_argument('--weight_decay', type=float, default=1e-4)
         p.add_argument('--cosine_warmup', type=int, default=3)
@@ -80,6 +82,9 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--eval_full_pet', type=str2bool, default=True)
         p.add_argument('--eval_fixed_missing_pet', type=str2bool, default=True)
         p.add_argument('--eval_random_missing_pet', type=str2bool, default=False)
+        # HD95 is expensive (~minutes/epoch on full val); off by default during training.
+        # Final/standalone eval scripts still compute HD95 unless overridden.
+        p.add_argument('--val_compute_hd95', type=str2bool, default=False)
         return p
 
     @staticmethod

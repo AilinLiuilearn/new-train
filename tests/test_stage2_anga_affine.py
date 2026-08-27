@@ -273,7 +273,7 @@ def test_joint_missing_empty_bank_ok_and_eval_no_pet_encoder():
 
     model.eval()
     model.stage1.enc_pet.calls = 0
-    _ = model(ct, pet=pet, mask=None, forward_mode="missing")
+    _ = model(ct, pet=None, mask=None, forward_mode="missing")
     assert model.stage1.enc_pet.calls == 0
 
 
@@ -292,7 +292,9 @@ def test_joint_finalize_and_missing_graph_connectivity():
     assert model.cppi_ready is True
 
     model.zero_grad(set_to_none=True)
+    model.stage1.enc_pet.calls = 0
     out = model(ct, pet=pet, mask=mask, forward_mode="missing")
+    assert model.stage1.enc_pet.calls > 0  # collect-only under no_grad
     loss = F.binary_cross_entropy_with_logits(out["logits"], mask)
     loss.backward()
 
@@ -302,8 +304,11 @@ def test_joint_finalize_and_missing_graph_connectivity():
     assert ct_proj.grad is not None and ct_proj.grad.abs().sum() > 0
     assert model.stage1.decoder.seg_head.weight.grad is not None
     assert model.stage1.enc_ct.probe.grad is not None
-    # Missing prediction does not require PET-encoder task grads.
-    # (collect may have run earlier, but current backward is Missing-only)
+    # Collect-only PET encoder forward must not create Missing seg grads.
+    assert model.stage1.enc_pet.probe.grad is None
+    for p in model.stage1.enc_pet.parameters():
+        assert p.grad is None
+
 
 
 def test_joint_optimizer_excludes_legacy_fusion():

@@ -39,10 +39,12 @@ class MDTSegTeacher:
         self.scaler = torch.cuda.amp.GradScaler(enabled=bool(config.mixed_precision))
         self.global_batch_step = 0
         self.criterion = BCEDiceLoss(smooth=config.loss_smooth, bce_weight=config.bce_weight, dice_weight=config.dice_weight)
-        self.metrics = SegmentationMetricsCIPA()
+        self.val_compute_hd95 = bool(getattr(config, 'val_compute_hd95', False))
+        self.metrics = SegmentationMetricsCIPA(compute_hd95=self.val_compute_hd95)
         print(
             f'[OPT] joint={self.is_joint} trainable_tensors={len(trainable_params)} '
-            f'trainable_params={sum(p.numel() for p in trainable_params)} lr={config.learning_rate}',
+            f'trainable_params={sum(p.numel() for p in trainable_params)} lr={config.learning_rate} '
+            f'val_compute_hd95={self.val_compute_hd95}',
             flush=True,
         )
 
@@ -64,11 +66,14 @@ class MDTSegTeacher:
         return loss, logits, outputs, stats
 
     @torch.no_grad()
-    def evaluate(self, loader, eval_mode='full', tag='val'):
+    def evaluate(self, loader, eval_mode='full', tag='val', compute_hd95=None):
         was_training = self.model.training
         self.model.eval()
         total_loss = 0.0
         sample_count = 0
+        if compute_hd95 is None:
+            compute_hd95 = self.val_compute_hd95
+        self.metrics.compute_hd95 = bool(compute_hd95)
         self.metrics.reset()
         for batch in loader:
             ct = batch['ct'].to(self.device, non_blocking=True)
@@ -79,7 +84,8 @@ class MDTSegTeacher:
                 forward_mode = 'full'
                 pet_available = None
             elif eval_mode == 'fixed_missing':
-                pet = batch['pet'].to(self.device, non_blocking=True)
+                # Missing-modality protocol: no real PET tensor is provided.
+                pet = None
                 forward_mode = 'missing'
                 pet_available = None
             else:
@@ -101,9 +107,13 @@ class MDTSegTeacher:
         return out
 
     def gradient_diagnostics(self, batch, max_samples=1):
-        """Report Full/Missing grads on active joint modules (or Stage-1 shared)."""
+        """Report Full/Missing grads without polluting prototype cache / BN stats.
+
+        Uses eval() (not no_grad) so backward still works, and mask=None so
+        diagnostics never call _collect_cppi or update BN running statistics.
+        """
         was_training = self.model.training
-        self.model.train(True)
+        self.model.eval()
         try:
             ct = batch['ct'][:max_samples].to(self.device, non_blocking=True)
             mask = batch['mask'][:max_samples].to(self.device, non_blocking=True).float()
@@ -120,7 +130,8 @@ class MDTSegTeacher:
 
             def _run(route):
                 self.model.zero_grad(set_to_none=True)
-                out = self.model(ct, pet=pet, mask=mask, forward_mode=route)
+                # mask=None: do not collect prototypes or alter epoch cache.
+                out = self.model(ct, pet=pet, mask=None, forward_mode=route)
                 loss, _ = self.criterion(out['logits'].float(), mask.float())
                 loss.backward()
                 if self.is_joint:

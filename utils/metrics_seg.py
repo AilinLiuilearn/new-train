@@ -79,18 +79,47 @@ def _hd95_numpy_fallback(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
     return float(np.percentile(np.concatenate(dists), 95))
 
 
+_HD95_BACKEND = None  # 'medpy' | 'scipy' | 'numpy'
+_HD95_WARNED = False
+
+
+def _resolve_hd95_backend():
+    global _HD95_BACKEND, _HD95_WARNED
+    if _HD95_BACKEND is not None:
+        return _HD95_BACKEND
+    try:
+        from medpy.metric.binary import hd95 as _medpy_hd95  # noqa: F401
+        _HD95_BACKEND = 'medpy'
+    except Exception:
+        try:
+            from scipy.ndimage import distance_transform_edt  # noqa: F401
+            _HD95_BACKEND = 'scipy'
+        except Exception:
+            _HD95_BACKEND = 'numpy'
+        if not _HD95_WARNED:
+            print(f'[WARN] medpy unavailable; HD95 backend={_HD95_BACKEND}', flush=True)
+            _HD95_WARNED = True
+    return _HD95_BACKEND
+
+
 def compute_hd95_pair(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
     """单张 2D 二值图 HD95；优先 medpy，其次 scipy，最后 numpy fallback。"""
     pred_bin = pred_bin.astype(bool)
     gt_bin = gt_bin.astype(bool)
-    try:
-        from medpy.metric.binary import hd95 as medpy_hd95
-        return float(medpy_hd95(pred_bin.astype(np.uint8), gt_bin.astype(np.uint8)))
-    except Exception:
+    backend = _resolve_hd95_backend()
+    if backend == 'medpy':
+        try:
+            from medpy.metric.binary import hd95 as medpy_hd95
+            return float(medpy_hd95(pred_bin.astype(np.uint8), gt_bin.astype(np.uint8)))
+        except Exception:
+            # medpy raises on empty masks; fall through
+            pass
+    if backend in ('medpy', 'scipy'):
         try:
             return _hd95_scipy(pred_bin, gt_bin)
         except Exception:
-            return _hd95_numpy_fallback(pred_bin, gt_bin)
+            pass
+    return _hd95_numpy_fallback(pred_bin, gt_bin)
 
 
 def _compute_metrics_from_counts(tp, fp, fn, tn):
@@ -197,9 +226,10 @@ def segmentation_metrics_cipa(pred_logits, target, threshold=0.5):
 class SegmentationMetricsCIPA(torch.nn.Module):
     """累积 TP/FP/FN/TN + 逐样本 HD95（与 CIPA 测试脚本一致）。"""
 
-    def __init__(self, threshold=0.5):
+    def __init__(self, threshold=0.5, compute_hd95=True):
         super().__init__()
         self.threshold = threshold
+        self.compute_hd95 = bool(compute_hd95)
         self.reset()
 
     def reset(self):
@@ -229,6 +259,8 @@ class SegmentationMetricsCIPA(torch.nn.Module):
         self.fn += ((1 - pred_flat) * target_flat).sum().item()
         self.tn += ((1 - pred_flat) * (1 - target_flat)).sum().item()
 
+        if not self.compute_hd95:
+            return
         pb = pred_bin.cpu().numpy()
         tb = target.cpu().numpy()
         for b in range(pb.shape[0]):
