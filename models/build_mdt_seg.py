@@ -349,10 +349,18 @@ class ConvBNAct(nn.Module):
         return self.block(x)
 
 
-def build_mdt_seg_teacher(config):
+def _read_stage1_checkpoint_cppi_config(stage1_checkpoint):
+    checkpoint = torch.load(stage1_checkpoint, map_location='cpu', weights_only=False)
+    ckpt_cfg = checkpoint.get('config', {})
+    cppi_build_stage = int(ckpt_cfg.get('cppi_build_stage', 4))
+    cppi_num_clusters = int(ckpt_cfg.get('cppi_num_clusters', 6))
+    return cppi_build_stage, cppi_num_clusters
+
+
+def _build_dual_shared_add_baseline(config):
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
     cppi_num_clusters = getattr(config, 'cppi_num_clusters', 6)
-    cppi_build_stage = getattr(config, 'cppi_build_stage', 3)
+    cppi_build_stage = getattr(config, 'cppi_build_stage', 4)
     cppi_output_dir = os.path.join(config.checkpoint_dir, 'cppi')
     no_encoder_pretrained = bool(getattr(config, 'no_encoder_pretrained', False))
     model = DualSharedAddPETCTBaseline(
@@ -378,4 +386,42 @@ def build_mdt_seg_teacher(config):
     print(f'[CPPI] num_clusters={cppi_num_clusters}')
     print(f'[CPPI] build_stage={cppi_build_stage}')
     print(f'[CPPI] output_dir={cppi_output_dir}')
-    return {'model': model}
+    return model
+
+
+def _build_fgms_stage2_model(config):
+    from models.fgms_stage2_model import (
+        FGMSStage2PETCTModel,
+        freeze_stage1,
+        load_stage1_checkpoint,
+    )
+
+    stage1_checkpoint = getattr(config, 'stage1_checkpoint', None)
+    if not stage1_checkpoint:
+        raise ValueError('Stage2 mode requires --stage1_checkpoint to load frozen Stage1 anchor.')
+    if not os.path.exists(stage1_checkpoint):
+        raise FileNotFoundError(f'Stage1 checkpoint not found: {stage1_checkpoint}')
+
+    ckpt_build_stage, ckpt_num_clusters = _read_stage1_checkpoint_cppi_config(stage1_checkpoint)
+    config.cppi_build_stage = ckpt_build_stage
+    config.cppi_num_clusters = ckpt_num_clusters
+    print(
+        f'[STAGE2] CPPI config from Stage1 checkpoint: '
+        f'build_stage={ckpt_build_stage} num_clusters={ckpt_num_clusters}',
+        flush=True,
+    )
+
+    stage1 = _build_dual_shared_add_baseline(config)
+    load_stage1_checkpoint(stage1, stage1_checkpoint)
+    freeze_stage1(stage1)
+    stage2_model = FGMSStage2PETCTModel(stage1=stage1, config=config)
+    return stage2_model
+
+
+def build_mdt_seg_teacher(config):
+    model_arch = getattr(config, 'model_arch', 'dual_shared_add_baseline')
+    if model_arch == 'dual_shared_add_baseline':
+        return {'model': _build_dual_shared_add_baseline(config)}
+    if model_arch == 'dual_shared_add_fgms_stage2':
+        return {'model': _build_fgms_stage2_model(config)}
+    raise ValueError(f'Unsupported model_arch={model_arch!r}')
