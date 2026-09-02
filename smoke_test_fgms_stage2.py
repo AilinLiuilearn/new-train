@@ -35,7 +35,7 @@ def make_config(**overrides):
         fgms_enable_balance_loss=True,
         fgms_balance_loss_weight=0.1,
         fgms_residual_mode='zero_start',
-        learning_rate=6e-5,
+        learning_rate=8e-5,
         decoder_lr=2e-5,
         weight_decay=1e-4,
         mixed_precision=False,
@@ -155,6 +155,7 @@ def test_cppi_readonly(task):
 def test_gradient(task):
     print('[TEST 7] Gradient flow')
     model = task.model
+    model.configure_trainable_phase(2)
     model.train()
     b, h, w = 1, SMOKE_SIZE, SMOKE_SIZE
     ct = torch.randn(b, 1, h, w, device=task.device)
@@ -166,7 +167,7 @@ def test_gradient(task):
         loss, _, _, _ = task.train_step(batch, forward_mode='full')
         loss.backward()
         task.optimizer.step()
-    stage1_grad = model.count_stage1_nonzero_grads()
+    stage1_grad = model.count_forbidden_stage1_nonzero_grads()
     moe_grad = sum(
         1 for p in model.stage2_moe.parameters()
         if p.grad is not None and p.grad.abs().sum().item() > 0
@@ -193,18 +194,19 @@ def test_optimizer(task):
                     names.append(name)
                     break
     bad = [n for n in names if not (n.startswith('stage2_moe.') or n.startswith('stage2_decoder.'))]
-    assert not bad, f'unexpected optimizer params: {bad[:5]}'
+    assert not bad, f'unexpected optimizer params in stage2 groups: {bad[:5]}'
     moe_lr = task.get_lr_by_name('stage2_moe')
     dec_lr = task.get_lr_by_name('stage2_decoder')
+    boundary_lr = task.get_lr_by_name('stage1_boundary')
     print(f'  optimizer params count={len(names)}')
-    print(f'  all stage2_moe/stage2_decoder PASS')
+    print(f'  stage2 groups only PASS (boundary group exists separately)')
     print('  PASS')
     return moe_lr, dec_lr
 
 
 def test_lr(task, moe_lr, dec_lr):
     print('[TEST 9] Learning rates')
-    assert abs(moe_lr - 6e-5) < 1e-10, f'moe lr={moe_lr}'
+    assert abs(moe_lr - 8e-5) < 1e-10, f'moe lr={moe_lr}'
     assert abs(dec_lr - 2e-5) < 1e-10, f'dec lr={dec_lr}'
     from utils.optimization import get_cosine_scheduler
     scheduler = get_cosine_scheduler(

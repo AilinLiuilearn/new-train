@@ -22,6 +22,13 @@ def _is_stage2_model(model) -> bool:
     return bool(getattr(model, 'is_fgms_stage2', False))
 
 
+STAGE2_BASE_LRS = {
+    'stage2_moe': 8e-5,
+    'stage2_decoder': 2e-5,
+    'stage1_boundary': 5e-6,
+}
+
+
 class MDTSegTeacher:
     def __init__(self, networks, config):
         self.networks = networks
@@ -32,6 +39,7 @@ class MDTSegTeacher:
         self.is_stage2 = _is_stage2_model(self.model)
         if self.is_stage2:
             self.optimizer = self._build_stage2_optimizer()
+            self.print_stage2_optimizer_groups()
         else:
             self.optimizer = torch.optim.AdamW(
                 self.model.parameters(),
@@ -45,19 +53,66 @@ class MDTSegTeacher:
         self.metrics = SegmentationMetricsCIPA()
 
     def _build_stage2_optimizer(self):
-        moe_params = [p for p in self.model.stage2_moe.parameters() if p.requires_grad]
-        dec_params = [p for p in self.model.stage2_decoder.parameters() if p.requires_grad]
+        moe_params = list(self.model.stage2_moe.parameters())
+        dec_params = list(self.model.stage2_decoder.parameters())
+        boundary_params = (
+            list(self.model.stage1.pet_calibration.parameters())
+            + list(self.model.stage1.fusion.parameters())
+        )
         if not moe_params:
-            raise RuntimeError('stage2_moe has no trainable parameters for optimizer.')
+            raise RuntimeError('stage2_moe has no parameters for optimizer.')
         if not dec_params:
-            raise RuntimeError('stage2_decoder has no trainable parameters for optimizer.')
+            raise RuntimeError('stage2_decoder has no parameters for optimizer.')
+        if not boundary_params:
+            raise RuntimeError('stage1 boundary has no parameters for optimizer.')
         return torch.optim.AdamW(
             [
                 {'name': 'stage2_moe', 'params': moe_params, 'lr': self.config.learning_rate},
                 {'name': 'stage2_decoder', 'params': dec_params, 'lr': self.config.decoder_lr},
+                {
+                    'name': 'stage1_boundary',
+                    'params': boundary_params,
+                    'lr': float(getattr(self.config, 'stage1_boundary_lr', 5e-6)),
+                },
             ],
             weight_decay=self.config.weight_decay,
         )
+
+    def print_stage2_optimizer_groups(self):
+        print('[OPTIMIZER][STAGE2] param groups:', flush=True)
+        for group in self.optimizer.param_groups:
+            name = group.get('name', 'unknown')
+            lr = float(group['lr'])
+            expected = STAGE2_BASE_LRS.get(name)
+            print(f'  {name:16s} base_lr={lr:.8g}', flush=True)
+            if expected is not None and abs(lr - expected) > 1e-12:
+                raise RuntimeError(
+                    f'Stage2 optimizer group {name} base_lr={lr}, expected {expected}'
+                )
+
+    def verify_stage2_lr_ratio(self, tag=''):
+        snap = {
+            group.get('name'): float(group['lr'])
+            for group in self.optimizer.param_groups
+            if group.get('name') in STAGE2_BASE_LRS
+        }
+        if len(snap) != 3:
+            raise RuntimeError(f'Missing stage2 optimizer groups: {snap}')
+        mult = snap['stage2_moe'] / STAGE2_BASE_LRS['stage2_moe']
+        dec_ratio = snap['stage2_decoder'] / STAGE2_BASE_LRS['stage2_decoder']
+        bnd_ratio = snap['stage1_boundary'] / STAGE2_BASE_LRS['stage1_boundary']
+        if not (abs(dec_ratio - mult) < 1e-4 and abs(bnd_ratio - mult) < 1e-4):
+            raise RuntimeError(
+                f'Stage2 LR multiplier mismatch {tag}: moe_mult={mult:.6f} '
+                f'dec_mult={dec_ratio:.6f} boundary_mult={bnd_ratio:.6f}'
+            )
+        print(
+            f'[OPTIMIZER][STAGE2] LR ratio ok {tag}: '
+            f'mult={mult:.6f} moe={snap["stage2_moe"]:.8g} '
+            f'dec={snap["stage2_decoder"]:.8g} boundary={snap["stage1_boundary"]:.8g}',
+            flush=True,
+        )
+        return mult
 
     def get_lr_by_name(self, name: str):
         for group in self.optimizer.param_groups:
@@ -221,7 +276,8 @@ class MDTSegTeacher:
                 'missing_stage2_moe_grad_norm': float(_flatten_grads(g_missing_moe).norm()),
                 'full_stage2_decoder_grad_norm': float(_flatten_grads(g_full_dec).norm()),
                 'missing_stage2_decoder_grad_norm': float(_flatten_grads(g_missing_dec).norm()),
-                'stage1_grad_nonzero_count': float(self.model.count_stage1_nonzero_grads()),
+                'forbidden_stage1_grad_nonzero_count': float(self.model.count_forbidden_stage1_nonzero_grads()),
+                'boundary_grad_nonzero_count': float(self.model.count_boundary_nonzero_grads()),
             }
         finally:
             self.model.train(was_training)

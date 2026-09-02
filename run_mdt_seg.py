@@ -96,21 +96,66 @@ def _get_lr(task, name=None):
     return float(task.optimizer.param_groups[0]['lr'])
 
 
-def _extract_fgms_metrics(outputs):
+PHASE_CODE = {
+    'moe_warmup': 1.0,
+    'stage2_adapt': 2.0,
+    'boundary_coadapt': 3.0,
+}
+
+
+def _stage2_fgms_route_headers(route):
+    headers = []
+    for scale in range(1, 5):
+        headers.extend([
+            f'{route}_s{scale}_effective_delta_l2_ratio',
+            f'{route}_s{scale}_importance_ct',
+            f'{route}_s{scale}_importance_real_pet',
+            f'{route}_s{scale}_importance_proxy_pet',
+            f'{route}_s{scale}_routing_entropy',
+        ])
+    headers.append(f'{route}_balance_loss')
+    return headers
+
+
+def _stage2_extra_headers():
+    headers = [
+        'progressive_phase', 'decoder_unlocked', 'stage1_boundary_unlocked',
+        'lr_stage2_moe', 'lr_stage2_decoder', 'lr_stage1_boundary',
+        'grad_full_stage2_moe', 'grad_missing_stage2_moe',
+        'grad_full_stage2_decoder', 'grad_missing_stage2_decoder',
+        'grad_full_stage1_calibration', 'grad_missing_stage1_calibration',
+        'grad_full_stage1_fusion', 'grad_missing_stage1_fusion',
+        'boundary_grad_nonzero_count', 'forbidden_stage1_grad_nonzero_count',
+        'calibration_param_relative_drift',
+        'fusion_alpha_full_current', 'fusion_alpha_missing_current',
+    ]
+    for scale in range(1, 5):
+        headers.append(f'alpha_full_s{scale}')
+        headers.append(f'alpha_missing_s{scale}')
+    headers.extend(['s1_beta', 's2_beta', 's3_beta', 's4_beta'])
+    headers.extend(_stage2_fgms_route_headers('full'))
+    headers.extend(_stage2_fgms_route_headers('missing'))
+    return headers
+
+
+def _extract_fgms_route_metrics(outputs, route_prefix):
     stats = outputs.get('moe_stats', {}) if isinstance(outputs, dict) else {}
     metrics = {}
-    for key in (
-        's1_beta', 's2_beta', 's3_beta', 's4_beta',
-        's1_effective_delta_l2_ratio', 's2_effective_delta_l2_ratio',
-        's3_effective_delta_l2_ratio', 's4_effective_delta_l2_ratio',
-        's1_importance_ct', 's2_importance_ct', 's3_importance_ct', 's4_importance_ct',
-        's1_importance_real_pet', 's2_importance_real_pet', 's3_importance_real_pet', 's4_importance_real_pet',
-        's1_importance_proxy_pet', 's2_importance_proxy_pet', 's3_importance_proxy_pet', 's4_importance_proxy_pet',
-        'balance_loss', 's1_routing_entropy',
-    ):
-        if key in stats:
-            val = stats[key]
-            metrics[key] = float(val.item()) if torch.is_tensor(val) else float(val)
+    for scale in range(1, 5):
+        mapping = {
+            f'{route_prefix}_s{scale}_effective_delta_l2_ratio': f's{scale}_effective_delta_l2_ratio',
+            f'{route_prefix}_s{scale}_importance_ct': f's{scale}_importance_ct',
+            f'{route_prefix}_s{scale}_importance_real_pet': f's{scale}_importance_real_pet',
+            f'{route_prefix}_s{scale}_importance_proxy_pet': f's{scale}_importance_proxy_pet',
+            f'{route_prefix}_s{scale}_routing_entropy': f's{scale}_routing_entropy',
+        }
+        for out_key, stat_key in mapping.items():
+            if stat_key in stats:
+                val = stats[stat_key]
+                metrics[out_key] = float(val.item()) if torch.is_tensor(val) else float(val)
+    if 'balance_loss' in stats:
+        val = stats['balance_loss']
+        metrics[f'{route_prefix}_balance_loss'] = float(val.item()) if torch.is_tensor(val) else float(val)
     return metrics
 
 
@@ -172,18 +217,7 @@ def main():
         'cppi_bank_version', 'cppi_ready_slots', 'cppi_bg_candidates', 'cppi_fg_candidates',
     ]
     if is_stage2:
-        extra_headers.extend([
-            'lr_stage2_moe', 'lr_stage2_decoder',
-            'grad_full_stage2_moe', 'grad_missing_stage2_moe',
-            'grad_full_stage2_decoder', 'grad_missing_stage2_decoder',
-            'stage1_grad_nonzero_count',
-            's1_beta', 's2_beta', 's3_beta', 's4_beta',
-            's1_effective_delta_l2_ratio', 's2_effective_delta_l2_ratio', 's3_effective_delta_l2_ratio', 's4_effective_delta_l2_ratio',
-            's1_importance_ct', 's2_importance_ct', 's3_importance_ct', 's4_importance_ct',
-            's1_importance_real_pet', 's2_importance_real_pet', 's3_importance_real_pet', 's4_importance_real_pet',
-            's1_importance_proxy_pet', 's2_importance_proxy_pet', 's3_importance_proxy_pet', 's4_importance_proxy_pet',
-            'balance_loss', 's1_routing_entropy',
-        ])
+        extra_headers.extend(_stage2_extra_headers())
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
 
     best_joint = -1.0
@@ -205,6 +239,10 @@ def main():
         print(f'[CPPI][STAGE2] ready_slots={int(proto.prototype_ready.sum().item())}', flush=True)
 
     for epoch in range(1, cfg.epochs + 1):
+        if is_stage2:
+            task.model.configure_trainable_phase(epoch)
+            if epoch in (2, 4):
+                task.verify_stage2_lr_ratio(tag=f'epoch={epoch}_phase_switch')
         task.model.train()
         full_n = missing_n = 0
         full_loss = missing_loss = 0.0
@@ -212,11 +250,18 @@ def main():
         grad_norm_steps = 0
         if is_stage2:
             grads = {
-                'full': {'stage2_moe': [], 'stage2_decoder': []},
-                'missing': {'stage2_moe': [], 'stage2_decoder': []},
+                'full': {
+                    'stage2_moe': [], 'stage2_decoder': [],
+                    'stage1_calibration': [], 'stage1_fusion': [],
+                },
+                'missing': {
+                    'stage2_moe': [], 'stage2_decoder': [],
+                    'stage1_calibration': [], 'stage1_fusion': [],
+                },
             }
             fgms_metrics_accum = {'full': {}, 'missing': {}}
-            stage1_grad_nonzero_total = 0
+            forbidden_stage1_grad_total = 0
+            boundary_grad_total = 0
         else:
             grads = {
                 'full': {'enc_ct': [], 'ct_align': [], 'decoder': []},
@@ -243,8 +288,11 @@ def main():
             if is_stage2:
                 grads[route]['stage2_moe'].append(module_grad_norm(task.model.stage2_moe))
                 grads[route]['stage2_decoder'].append(module_grad_norm(task.model.stage2_decoder))
-                stage1_grad_nonzero_total += task.model.count_stage1_nonzero_grads()
-                fgms_batch_metrics = _extract_fgms_metrics(outputs)
+                grads[route]['stage1_calibration'].append(module_grad_norm(task.model.stage1.pet_calibration))
+                grads[route]['stage1_fusion'].append(module_grad_norm(task.model.stage1.fusion))
+                forbidden_stage1_grad_total += task.model.count_forbidden_stage1_nonzero_grads()
+                boundary_grad_total += task.model.count_boundary_nonzero_grads()
+                fgms_batch_metrics = _extract_fgms_route_metrics(outputs, route)
                 for key, val in fgms_batch_metrics.items():
                     fgms_metrics_accum[route][key] = fgms_metrics_accum[route].get(key, 0.0) + val
             else:
@@ -383,9 +431,16 @@ def main():
             missing_route_n = max(1, missing_n)
             fgms_full = {k: v / full_route_n for k, v in fgms_metrics_accum['full'].items()}
             fgms_missing = {k: v / missing_route_n for k, v in fgms_metrics_accum['missing'].items()}
-            extra_metrics.update({
+            drift_metrics = task.model.get_boundary_drift_metrics()
+            beta_metrics = task.model.get_beta_metrics()
+            phase_name = task.model.current_phase
+            stage2_metrics = {
+                'progressive_phase': PHASE_CODE.get(phase_name, 0.0),
+                'decoder_unlocked': float(task.model.decoder_unlocked),
+                'stage1_boundary_unlocked': float(task.model.stage1_boundary_unlocked),
                 'lr_stage2_moe': _get_lr(task, 'stage2_moe'),
                 'lr_stage2_decoder': _get_lr(task, 'stage2_decoder'),
+                'lr_stage1_boundary': _get_lr(task, 'stage1_boundary'),
                 'grad_full_enc_ct': 0.0,
                 'grad_missing_enc_ct': 0.0,
                 'grad_full_ct_align': 0.0,
@@ -396,9 +451,20 @@ def main():
                 'grad_missing_stage2_moe': float(np.mean(grads['missing']['stage2_moe'])) if grads['missing']['stage2_moe'] else 0.0,
                 'grad_full_stage2_decoder': float(np.mean(grads['full']['stage2_decoder'])) if grads['full']['stage2_decoder'] else 0.0,
                 'grad_missing_stage2_decoder': float(np.mean(grads['missing']['stage2_decoder'])) if grads['missing']['stage2_decoder'] else 0.0,
-                'stage1_grad_nonzero_count': float(stage1_grad_nonzero_total),
-                **{k: fgms_full.get(k, fgms_missing.get(k, 0.0)) for k in set(list(fgms_full.keys()) + list(fgms_missing.keys()))},
-            })
+                'grad_full_stage1_calibration': float(np.mean(grads['full']['stage1_calibration'])) if grads['full']['stage1_calibration'] else 0.0,
+                'grad_missing_stage1_calibration': float(np.mean(grads['missing']['stage1_calibration'])) if grads['missing']['stage1_calibration'] else 0.0,
+                'grad_full_stage1_fusion': float(np.mean(grads['full']['stage1_fusion'])) if grads['full']['stage1_fusion'] else 0.0,
+                'grad_missing_stage1_fusion': float(np.mean(grads['missing']['stage1_fusion'])) if grads['missing']['stage1_fusion'] else 0.0,
+                'boundary_grad_nonzero_count': float(boundary_grad_total),
+                'forbidden_stage1_grad_nonzero_count': float(forbidden_stage1_grad_total),
+                **drift_metrics,
+                **beta_metrics,
+                **fgms_full,
+                **fgms_missing,
+            }
+            for header in _stage2_extra_headers():
+                stage2_metrics.setdefault(header, 0.0)
+            extra_metrics.update(stage2_metrics)
         else:
             extra_metrics.update({
                 'grad_full_enc_ct': float(np.mean(grads['full']['enc_ct'])) if grads['full']['enc_ct'] else 0.0,
@@ -420,7 +486,12 @@ def main():
 
         lr_msg = _get_lr(task, 'stage2_moe' if is_stage2 else None)
         if is_stage2:
-            lr_msg = f"moe={_get_lr(task, 'stage2_moe'):.8f} dec={_get_lr(task, 'stage2_decoder'):.8f}"
+            lr_msg = (
+                f"moe={_get_lr(task, 'stage2_moe'):.8f} "
+                f"dec={_get_lr(task, 'stage2_decoder'):.8f} "
+                f"boundary={_get_lr(task, 'stage1_boundary'):.8f} "
+                f"phase={task.model.current_phase}"
+            )
         print(f'[EPOCH {epoch}] joint_dice={joint_dice:.4f} best_joint={best_joint:.4f} lr={lr_msg}', flush=True)
         if no_improve >= patience:
             print(f'[EARLY STOP] no improvement for {patience} epochs', flush=True)
