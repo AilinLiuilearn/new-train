@@ -41,12 +41,37 @@ class MDTSegTeacher:
         mask = batch['mask'].to(self.device, non_blocking=True).float()
         outputs = self.model(ct, pet=pet, mask=mask, forward_mode=forward_mode)
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-        loss, loss_stats = self.criterion(logits, mask)
+        loss_seg, loss_stats = self.criterion(logits, mask)
+
+        zero = loss_seg.new_zeros(())
+        loss_pet_rec = zero
+        if isinstance(outputs, dict):
+            aux = outputs.get('aux', {})
+            loss_pet_rec = aux.get('pet_recon_loss', zero)
+
+        if forward_mode == 'missing':
+            loss = loss_seg + float(self.config.pet_recon_weight) * loss_pet_rec
+        else:
+            loss = loss_seg
+
         stats = {
             'loss_total': loss.detach(),
-            'loss_seg': loss_stats.get('loss_dice', loss.detach()),
+            'loss_seg': loss_seg.detach(),
+            'loss_pet_recon': loss_pet_rec.detach(),
+            'loss_pet_recon_weighted': (
+                float(self.config.pet_recon_weight) * loss_pet_rec
+            ).detach(),
             'loss_boundary': torch.tensor(0.0, device=loss.device),
         }
+        if isinstance(outputs, dict):
+            aux = outputs.get('aux', {})
+            for scale_idx in range(1, 5):
+                key = f'pet_recon_s{scale_idx}'
+                stats_key = f'loss_pet_recon_s{scale_idx}'
+                if key in aux:
+                    stats[stats_key] = aux[key].detach()
+                else:
+                    stats[stats_key] = zero.detach()
         return loss, logits, outputs, stats
 
     @torch.no_grad()

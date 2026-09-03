@@ -117,7 +117,11 @@ def main():
     )
 
     extra_headers = [
-        'train_full_loss', 'train_missing_loss', 'train_overall_loss',
+        'train_full_loss', 'train_missing_loss', 'train_missing_seg_loss',
+        'train_missing_pet_recon', 'train_missing_pet_recon_weighted',
+        'train_missing_pet_recon_s1', 'train_missing_pet_recon_s2',
+        'train_missing_pet_recon_s3', 'train_missing_pet_recon_s4',
+        'train_overall_loss',
         'full_train_batches', 'missing_train_batches',
         'val_full_loss', 'val_full_dice', 'val_full_iou', 'val_full_acc', 'val_full_acc_pixel', 'val_full_hd95',
         'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
@@ -142,6 +146,13 @@ def main():
         task.model.train()
         full_n = missing_n = 0
         full_loss = missing_loss = 0.0
+        missing_seg_loss = 0.0
+        missing_pet_recon = 0.0
+        missing_pet_recon_weighted = 0.0
+        missing_pet_recon_s1 = 0.0
+        missing_pet_recon_s2 = 0.0
+        missing_pet_recon_s3 = 0.0
+        missing_pet_recon_s4 = 0.0
         grad_norm_accum = 0.0
         grad_norm_steps = 0
         grads = {
@@ -156,7 +167,7 @@ def main():
             route = 'full' if global_batch_step % 2 == 0 else 'missing'
             task.optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
-                loss, _, _, _ = task.train_step(batch, forward_mode=route)
+                loss, _, _, stats = task.train_step(batch, forward_mode=route)
             if not torch.isfinite(loss):
                 raise RuntimeError('loss became non-finite')
 
@@ -190,6 +201,13 @@ def main():
             else:
                 missing_n += 1
                 missing_loss += float(loss.detach())
+                missing_seg_loss += float(stats.get('loss_seg', 0.0))
+                missing_pet_recon += float(stats.get('loss_pet_recon', 0.0))
+                missing_pet_recon_weighted += float(stats.get('loss_pet_recon_weighted', 0.0))
+                missing_pet_recon_s1 += float(stats.get('loss_pet_recon_s1', 0.0))
+                missing_pet_recon_s2 += float(stats.get('loss_pet_recon_s2', 0.0))
+                missing_pet_recon_s3 += float(stats.get('loss_pet_recon_s3', 0.0))
+                missing_pet_recon_s4 += float(stats.get('loss_pet_recon_s4', 0.0))
 
             global_batch_step += 1
             task.global_batch_step = global_batch_step
@@ -258,6 +276,13 @@ def main():
         extra_metrics = {
             'train_full_loss': full_loss / max(1, full_n),
             'train_missing_loss': missing_loss / max(1, missing_n),
+            'train_missing_seg_loss': missing_seg_loss / max(1, missing_n),
+            'train_missing_pet_recon': missing_pet_recon / max(1, missing_n),
+            'train_missing_pet_recon_weighted': missing_pet_recon_weighted / max(1, missing_n),
+            'train_missing_pet_recon_s1': missing_pet_recon_s1 / max(1, missing_n),
+            'train_missing_pet_recon_s2': missing_pet_recon_s2 / max(1, missing_n),
+            'train_missing_pet_recon_s3': missing_pet_recon_s3 / max(1, missing_n),
+            'train_missing_pet_recon_s4': missing_pet_recon_s4 / max(1, missing_n),
             'train_overall_loss': train_loss,
             'full_train_batches': full_n,
             'missing_train_batches': missing_n,

@@ -75,6 +75,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--bce_weight', type=float, default=1.0)
         p.add_argument('--dice_weight', type=float, default=1.0)
         p.add_argument('--boundary_loss_weight', type=float, default=0.0)
+        p.add_argument('--pet_recon_weight', type=float, default=0.1)
         return p
 
     @classmethod
@@ -83,5 +84,7 @@ class SegMDTConfig(ConfigBase):
         parser = argparse.ArgumentParser(add_help=True, parents=parents)
         config = cls()
         parser.parse_args(namespace=config)
+        if float(config.pet_recon_weight) < 0:
+            raise ValueError(f'pet_recon_weight must be >= 0, got {config.pet_recon_weight}')
         config._ensure_hash()
         return config

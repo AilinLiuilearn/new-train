@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from models.baseline_blocks import PrototypeReferencedPETAffineCalibration, StateAwareWeightedAddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list, _sanitize
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
@@ -125,6 +126,33 @@ class DualSharedAddPETCTBaseline(nn.Module):
             print_info=False,
             return_ct_reference=True,
         )
+
+        # API-style direct PET imputation supervision.
+        # Training-only real PET feature serves as
+        # a stop-gradient reconstruction target.
+        # The real PET feature is NOT used by
+        # the Missing segmentation prediction path.
+        # Loss is applied BEFORE PET affine calibration
+        # to directly supervise CPPI retrieval quality.
+        if self.training and self.prototype_memory.bank_ready:
+            pet_recon_losses = [
+                F.mse_loss(
+                    proxy.float(),
+                    real.detach().float(),
+                    reduction='mean',
+                )
+                for proxy, real in zip(pet_feats_proxy, pet_feats_real)
+            ]
+            pet_recon_loss = torch.stack(pet_recon_losses).mean()
+            if not torch.isfinite(pet_recon_loss):
+                raise RuntimeError('pet_recon_loss became non-finite')
+        else:
+            pet_recon_losses = [
+                ct_feats[0].new_zeros(())
+                for _ in range(len(ct_feats))
+            ]
+            pet_recon_loss = ct_feats[0].new_zeros(())
+
         ct_reference_feats = [x.detach() for x in ct_reference_feats]
         pet_feats_cal = self.pet_calibration(
             ct_feats,
@@ -133,7 +161,13 @@ class DualSharedAddPETCTBaseline(nn.Module):
             reference_valid=self.prototype_memory.bank_ready,
         )
         fused_feats = self.fusion(ct_feats, pet_feats_cal, mode='missing')
-        return self._decode(fused_feats, target_size)
+        out = self._decode(fused_feats, target_size)
+        out['aux']['pet_recon_loss'] = pet_recon_loss
+        out['aux']['pet_recon_s1'] = pet_recon_losses[0].detach()
+        out['aux']['pet_recon_s2'] = pet_recon_losses[1].detach()
+        out['aux']['pet_recon_s3'] = pet_recon_losses[2].detach()
+        out['aux']['pet_recon_s4'] = pet_recon_losses[3].detach()
+        return out
 
     def _forward_auto(self, ct, pet, pet_available, target_size, mask=None):
         ct_feats = self._encode_ct(ct)

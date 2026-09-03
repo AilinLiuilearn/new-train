@@ -20,6 +20,7 @@ def _make_cfg(**kwargs):
         'bce_weight': 1.0,
         'dice_weight': 1.0,
         'random_state': 2023,
+        'pet_recon_weight': 0.1,
     }
     base.update(kwargs)
     return type('C', (), base)()
