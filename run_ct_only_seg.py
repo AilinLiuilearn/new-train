@@ -15,6 +15,11 @@ import argparse
 import csv
 import json
 import os
+
+# Strict cuBLAS reproducibility.
+# Must be set before importing torch / initializing CUDA.
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
 import random
 import time
 
@@ -171,13 +176,37 @@ def _parse_arguments():
 
 
 def _seed(cfg):
-    random.seed(cfg.random_state)
-    np.random.seed(cfg.random_state)
-    torch.manual_seed(cfg.random_state)
+    seed = int(cfg.random_state)
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(cfg.random_state)
+        torch.cuda.manual_seed_all(seed)
+
+    # Enforce deterministic implementations globally.
+    torch.use_deterministic_algorithms(
+        True,
+        warn_only=False,
+    )
+
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+    # Disable TF32 for stricter numerical reproducibility.
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+
+    print(
+        f"[REPRO] seed={seed} "
+        f"deterministic_algorithms=True "
+        f"CUBLAS_WORKSPACE_CONFIG="
+        f"{os.environ.get('CUBLAS_WORKSPACE_CONFIG')} "
+        f"TF32=False",
+        flush=True,
+    )
 
 
 def _loaders(cfg):
