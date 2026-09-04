@@ -45,44 +45,31 @@ Integration sketch
 ------------------
 memory = CrossScaleCTPETPrototypeMemory(
     channels=(64, 128, 320, 512),
-    num_clusters=4,
+    num_clusters=6,
     build_stage=4,
     output_dir="runs/prototype_memory",
 )
 
-ct_feats = encode_ct(ct)
-pet_feats_real = encode_pet(pet)
+# Training forwards do NOT collect. After each epoch:
+#   model.eval(); no_grad; autocast disabled
+#   collect_cppi_snapshot over a clean train loader
+#   finalize_epoch(ema_momentum=0.9)
 
-# Full and Missing batches both collect BEFORE masking PET.
-if model.training:
-    memory.collect(ct_feats, pet_feats_real, mask)
-
-if forward_mode == "full":
-    pet_for_fusion = pet_feats_real
-else:
-    pet_for_fusion, retrieval_info = memory.retrieve(
-        ct_feats,
-        save_diagnostics=True,
-        tag=f"epoch_{epoch}_step_{step}",
-    )
-
-fused_feats = [c + p for c, p in zip(ct_feats, pet_for_fusion)]
-output = shared_decoder(fused_feats)
-
-# Once per epoch, after all training batches:
-memory.finalize_epoch(epoch=epoch)
 
 Notes
 -----
 - Prototype tensors are registered buffers and are saved in model checkpoints.
-- Cache tensors are detached and kept on CPU in float16 to reduce memory.
+- Cache tensors are detached and kept on CPU in float32 for stable clustering.
+- Bank candidates come from a clean snapshot pass (eval/no_grad/FP32), not from
+  online training forwards.
 - Current Missing predictions read the frozen bank from the previous finalize call.
-- The current batch's real PET only enters the temporary cache.
+- Epoch finalize: candidate bank -> cluster matching -> EMA -> commit.
 """
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import random
@@ -262,6 +249,9 @@ def spherical_kmeans(
     returns:
         labels:  [N]
         centers: [K_eff,D], L2-normalized
+
+    First center is the candidate farthest from the global mean direction
+    (not argmax of row norms, which are ~1 after L2 normalization).
     """
     if x.ndim != 2:
         raise ValueError(f"x must be [N,D], got {tuple(x.shape)}")
@@ -269,10 +259,17 @@ def spherical_kmeans(
     if n == 0:
         raise ValueError("Cannot cluster an empty tensor")
     k = min(int(num_clusters), n)
-    x = _normalize_rows(x.float())
+    x = F.normalize(x.float(), p=2, dim=-1, eps=EPS)
 
-    # Deterministic farthest-point initialization.
-    first_idx = int(torch.argmax(x.norm(dim=1)).item())
+    # Deterministic farthest-point initialization from mean direction.
+    mean_vec = x.mean(dim=0)
+    if float(mean_vec.norm().item()) > EPS:
+        mean_dir = F.normalize(mean_vec, dim=0, eps=EPS)
+        distance_from_mean = 1.0 - torch.matmul(x, mean_dir)
+        first_idx = int(torch.argmax(distance_from_mean).item())
+    else:
+        first_idx = 0
+
     center_indices = [first_idx]
     min_dist = torch.full((n,), float("inf"), device=x.device)
 
@@ -309,6 +306,56 @@ def spherical_kmeans(
         centers = torch.stack(new_centers, dim=0)
 
     return labels, centers
+
+
+@torch.no_grad()
+def match_cluster_slots(
+    old_keys: torch.Tensor,
+    new_keys: torch.Tensor,
+) -> Tuple[List[int], float, float]:
+    """
+    Exact one-to-one cluster matching by maximizing total cosine similarity.
+
+    old_keys / new_keys: [N, C], N <= 8.
+    Returns:
+        permutation pi such that new_keys[pi[i]] aligns with old_keys[i],
+        mean cosine, min cosine over matched pairs.
+
+    Ties keep the lexicographically first permutation (stable).
+    """
+    if old_keys.ndim != 2 or new_keys.ndim != 2:
+        raise ValueError("old_keys and new_keys must be [N,C]")
+    if old_keys.shape != new_keys.shape:
+        raise ValueError(
+            f"old/new key shape mismatch: {tuple(old_keys.shape)} vs {tuple(new_keys.shape)}"
+        )
+    n = int(old_keys.shape[0])
+    if n == 0:
+        return [], 1.0, 1.0
+    if n > 8:
+        raise ValueError(
+            f"Exact permutation matching only supports N<=8, got N={n}. "
+            "Do not silently fall back to greedy approximation."
+        )
+
+    old_n = _normalize_rows(old_keys.float())
+    new_n = _normalize_rows(new_keys.float())
+    sim = torch.matmul(old_n, new_n.t())  # [N,N], S_ij = cos(old_i, new_j)
+
+    best_perm = None
+    best_score = None
+    for perm in itertools.permutations(range(n)):
+        score = float(sum(sim[i, perm[i]].item() for i in range(n)))
+        if best_score is None or score > best_score + 1e-12:
+            best_score = score
+            best_perm = list(perm)
+        # equal scores: keep lexicographically first (itertools order)
+
+    assert best_perm is not None
+    pair_cos = [float(sim[i, best_perm[i]].item()) for i in range(n)]
+    mean_cos = float(sum(pair_cos) / max(1, n))
+    min_cos = float(min(pair_cos)) if pair_cos else 1.0
+    return best_perm, mean_cos, min_cos
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +552,24 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
         self._collect_calls = 0
         self._collected_slices = 0
 
+    def epoch_cache_num_candidates(self) -> Dict[str, int]:
+        """Number of cached slice candidates per class at the build stage."""
+        counts = {}
+        build_idx = self.build_stage_idx if self.build_stage_idx is not None else 0
+        for class_idx, class_name in enumerate(CLASS_NAMES):
+            chunks = self._epoch_cache[class_idx]["ct"][build_idx]
+            counts[class_name] = int(sum(int(t.shape[0]) for t in chunks))
+        return counts
+
+    def epoch_cache_dtype(self) -> Optional[torch.dtype]:
+        for class_idx in range(2):
+            for modality in ("ct", "pet"):
+                for scale_idx in range(self.num_scales):
+                    chunks = self._epoch_cache[class_idx][modality][scale_idx]
+                    if chunks:
+                        return chunks[0].dtype
+        return None
+
     @torch.no_grad()
     def collect(
         self,
@@ -515,10 +580,11 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
         compute_report: bool = False,
     ) -> Dict:
         """
-        Collect real CT/PET slice prototypes BEFORE PET masking.
+        Collect real CT/PET slice prototypes into the epoch candidate cache.
 
-        Full and Missing training batches should both call this method.
-        All cached tensors are detached CPU float16.
+        Intended for clean snapshot extraction (eval / no_grad / FP32).
+        Normal segmentation training forwards must NOT call this.
+        All cached tensors are detached CPU float32.
         """
         self._validate_features(ct_feats, pet_feats)
         if mask.shape[0] != ct_feats[0].shape[0]:
@@ -567,10 +633,10 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
 
                 if valid.any():
                     self._epoch_cache[class_idx]["ct"][scale_idx].append(
-                        ct_proto[valid].detach().to("cpu", dtype=torch.float16)
+                        ct_proto[valid].detach().to("cpu", dtype=torch.float32)
                     )
                     self._epoch_cache[class_idx]["pet"][scale_idx].append(
-                        pet_proto[valid].detach().to("cpu", dtype=torch.float16)
+                        pet_proto[valid].detach().to("cpu", dtype=torch.float32)
                     )
 
                 if need_report:
@@ -602,42 +668,17 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
     # -------------------------- bank finalization --------------------------
 
     @torch.no_grad()
-    def finalize_epoch(
-        self,
-        epoch: Optional[int] = None,
-        save_json: bool = True,
-        save_visualizations: bool = True,
-        print_info: bool = True,
-    ) -> Dict:
+    def _build_candidate_bank_from_cache(self) -> Tuple[
+        List[torch.Tensor],
+        List[torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        Dict,
+    ]:
         """
-        Build the bank from all cached slice prototypes.
-
-        For each class independently:
-          1. Cluster build-stage CT prototypes.
-          2. Reuse those labels to aggregate CT keys and PET values at all scales.
+        Cluster epoch cache into a candidate bank (no EMA / no commit).
         """
-        report = {
-            "epoch": epoch,
-            "config": asdict(self.config),
-            "collect_calls": self._collect_calls,
-            "collected_slices": self._collected_slices,
-            "bank_version_before": int(self.bank_version.item()),
-            "classes": {},
-            "scales": {},
-            "build_mode": (
-                "concatenated_multiscale"
-                if self.build_stage_idx is None
-                else f"single_scale_{self.build_stage_idx + 1}"
-            ),
-            "build_feature_channels": (
-                int(sum(self.channels))
-                if self.build_stage_idx is None
-                else int(self.channels[self.build_stage_idx])
-            ),
-        }
-
-        # Build temporary banks first, so incomplete classes do not corrupt
-        # the previous valid bank.
+        class_reports = {}
         new_keys = [
             torch.zeros_like(getattr(self, f"ct_keys_s{s + 1}"), device="cpu")
             for s in range(self.num_scales)
@@ -679,7 +720,7 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
             }
 
             if build_ct.shape[0] == 0:
-                report["classes"][class_name] = class_report
+                class_reports[class_name] = class_report
                 continue
 
             labels, centers = spherical_kmeans(
@@ -717,8 +758,6 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
                 class_report["cluster_discarded_counts"][cluster_idx] = discarded_count
                 class_report["cluster_counts"][cluster_idx] = after_count
 
-            # Cache lists are appended with the same valid slice ordering at
-            # every scale. Check alignment before aggregating.
             for scale_idx in range(self.num_scales):
                 ct_all = self._concat_cache(class_idx, "ct", scale_idx).float()
                 pet_all = self._concat_cache(class_idx, "pet", scale_idx).float()
@@ -751,10 +790,348 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
                         new_ready[class_idx, cluster_idx] = True
                         new_count[class_idx, cluster_idx] = after_count
 
-            report["classes"][class_name] = class_report
+            class_reports[class_name] = class_report
 
-        if not bool(new_ready.any()):
+        return new_keys, new_values, new_ready, new_count, class_reports
+
+    @torch.no_grad()
+    def _match_candidate_to_existing_bank(
+        self,
+        candidate_keys: List[torch.Tensor],
+        candidate_values: List[torch.Tensor],
+        candidate_ready: torch.Tensor,
+        candidate_count: torch.Tensor,
+    ) -> Tuple[
+        List[torch.Tensor],
+        List[torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        Dict,
+    ]:
+        """
+        Class-wise matching on build-stage CT keys; apply the same permutation
+        to all CT keys and paired PET values.
+        """
+        matched_keys = [k.clone() for k in candidate_keys]
+        matched_values = [v.clone() for v in candidate_values]
+        matched_ready = candidate_ready.clone()
+        matched_count = candidate_count.clone()
+
+        build_idx = (
+            self.build_stage_idx
+            if self.build_stage_idx is not None
+            else 0
+        )
+        match_report = {}
+
+        for class_idx, class_name in enumerate(CLASS_NAMES):
+            old_ready = self.prototype_ready[class_idx].detach().cpu().bool()
+            new_ready = candidate_ready[class_idx].detach().cpu().bool()
+            old_ready_idx = torch.nonzero(old_ready, as_tuple=False).flatten().tolist()
+            new_ready_idx = torch.nonzero(new_ready, as_tuple=False).flatten().tolist()
+
+            class_match = {
+                "matching_permutation": list(range(self.num_clusters)),
+                "matching_mean_cosine": None,
+                "matching_min_cosine": None,
+                "matched_slot_count": 0,
+                "used_identity": True,
+            }
+
+            if len(old_ready_idx) == 0 or len(new_ready_idx) == 0:
+                # First bank for this class, or no new candidates: keep candidate order.
+                match_report[class_name] = class_match
+                continue
+
+            if len(old_ready_idx) != len(new_ready_idx):
+                # Unequal ready counts: keep candidate order; slot merge rules handle gaps.
+                class_match["used_identity"] = True
+                class_match["note"] = (
+                    f"unequal_ready_counts old={len(old_ready_idx)} new={len(new_ready_idx)}; "
+                    "identity order retained for slot-wise merge"
+                )
+                match_report[class_name] = class_match
+                continue
+
+            # Match the ready subsets, then lift to a full-slot permutation.
+            old_build = getattr(self, f"ct_keys_s{build_idx + 1}")[class_idx].detach().cpu().float()
+            new_build = candidate_keys[build_idx][class_idx].detach().cpu().float()
+            old_sub = old_build[old_ready_idx]
+            new_sub = new_build[new_ready_idx]
+            sub_perm, mean_cos, min_cos = match_cluster_slots(old_sub, new_sub)
+
+            # Place matched new clusters into old ready slots.
+            # matched_slot[old_ready_idx[i]] <- candidate_slot[new_ready_idx[sub_perm[i]]]
+            source_slots = [None] * self.num_clusters
+            used_new = set()
+            for i, old_i in enumerate(old_ready_idx):
+                src = new_ready_idx[sub_perm[i]]
+                source_slots[old_i] = src
+                used_new.add(src)
+            # Remaining new-only / unused slots keep relative leftover order.
+            leftover_new = [j for j in range(self.num_clusters) if j not in used_new]
+            leftover_dst = [j for j in range(self.num_clusters) if source_slots[j] is None]
+            for dst, src in zip(leftover_dst, leftover_new):
+                source_slots[dst] = src
+            full_perm = source_slots
+
+            for scale_idx in range(self.num_scales):
+                src_k = candidate_keys[scale_idx][class_idx]
+                src_v = candidate_values[scale_idx][class_idx]
+                reordered_k = torch.stack([src_k[src] for src in full_perm], dim=0)
+                reordered_v = torch.stack([src_v[src] for src in full_perm], dim=0)
+                matched_keys[scale_idx][class_idx].copy_(reordered_k)
+                matched_values[scale_idx][class_idx].copy_(reordered_v)
+
+            matched_ready[class_idx] = candidate_ready[class_idx][full_perm]
+            matched_count[class_idx] = candidate_count[class_idx][full_perm]
+
+            class_match.update({
+                "matching_permutation": list(full_perm),
+                "matching_mean_cosine": float(mean_cos),
+                "matching_min_cosine": float(min_cos),
+                "matched_slot_count": int(len(old_ready_idx)),
+                "used_identity": False,
+                "old_ready_indices": list(old_ready_idx),
+                "new_ready_indices": list(new_ready_idx),
+                "subset_permutation": list(sub_perm),
+            })
+            match_report[class_name] = class_match
+
+        return matched_keys, matched_values, matched_ready, matched_count, match_report
+
+    @torch.no_grad()
+    def _merge_candidate_bank_with_ema(
+        self,
+        matched_keys: List[torch.Tensor],
+        matched_values: List[torch.Tensor],
+        matched_ready: torch.Tensor,
+        matched_count: torch.Tensor,
+        ema_momentum: float,
+    ) -> Tuple[
+        List[torch.Tensor],
+        List[torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        Dict,
+    ]:
+        """
+        Slot-wise EMA after matching. First ready bank bypasses EMA.
+        """
+        if not (0.0 <= float(ema_momentum) < 1.0):
+            raise ValueError(f"ema_momentum must satisfy 0 <= m < 1, got {ema_momentum}")
+        m = float(ema_momentum)
+        build_idx = self.build_stage_idx if self.build_stage_idx is not None else 0
+
+        final_keys = [
+            torch.zeros_like(getattr(self, f"ct_keys_s{s + 1}"), device="cpu")
+            for s in range(self.num_scales)
+        ]
+        final_values = [
+            torch.zeros_like(getattr(self, f"pet_values_s{s + 1}"), device="cpu")
+            for s in range(self.num_scales)
+        ]
+        final_ready = torch.zeros_like(self.prototype_ready, device="cpu")
+        final_count = torch.zeros_like(self.prototype_count, device="cpu")
+
+        before_cos_all = []
+        after_cos_all = []
+        class_diag = {}
+
+        for class_idx, class_name in enumerate(CLASS_NAMES):
+            old_ready = self.prototype_ready[class_idx].detach().cpu().bool()
+            new_ready = matched_ready[class_idx].detach().cpu().bool()
+            class_before = []
+            class_after = []
+
+            # Entire class has no historical bank -> direct copy candidate.
+            class_has_old = bool(old_ready.any())
+
+            for cluster_idx in range(self.num_clusters):
+                o_r = bool(old_ready[cluster_idx].item())
+                n_r = bool(new_ready[cluster_idx].item())
+
+                if (not class_has_old) and n_r:
+                    # First bank: bypass EMA.
+                    for scale_idx in range(self.num_scales):
+                        final_keys[scale_idx][class_idx, cluster_idx] = matched_keys[scale_idx][class_idx, cluster_idx]
+                        final_values[scale_idx][class_idx, cluster_idx] = matched_values[scale_idx][class_idx, cluster_idx]
+                    final_ready[class_idx, cluster_idx] = True
+                    final_count[class_idx, cluster_idx] = matched_count[class_idx, cluster_idx]
+                    continue
+
+                if o_r and n_r:
+                    old_k_build = getattr(self, f"ct_keys_s{build_idx + 1}")[class_idx, cluster_idx].detach().cpu().float()
+                    new_k_build = matched_keys[build_idx][class_idx, cluster_idx].float()
+                    before_cos = float(
+                        F.cosine_similarity(
+                            old_k_build.unsqueeze(0),
+                            new_k_build.unsqueeze(0),
+                            dim=-1,
+                            eps=EPS,
+                        ).item()
+                    )
+                    class_before.append(before_cos)
+                    before_cos_all.append(before_cos)
+
+                    for scale_idx in range(self.num_scales):
+                        old_k = getattr(self, f"ct_keys_s{scale_idx + 1}")[class_idx, cluster_idx].detach().cpu().float()
+                        old_v = getattr(self, f"pet_values_s{scale_idx + 1}")[class_idx, cluster_idx].detach().cpu().float()
+                        new_k = matched_keys[scale_idx][class_idx, cluster_idx].float()
+                        new_v = matched_values[scale_idx][class_idx, cluster_idx].float()
+                        merged_k = F.normalize(m * old_k + (1.0 - m) * new_k, dim=0, eps=EPS)
+                        merged_v = m * old_v + (1.0 - m) * new_v
+                        final_keys[scale_idx][class_idx, cluster_idx] = merged_k
+                        final_values[scale_idx][class_idx, cluster_idx] = merged_v
+
+                    updated_k_build = final_keys[build_idx][class_idx, cluster_idx].float()
+                    after_cos = float(
+                        F.cosine_similarity(
+                            old_k_build.unsqueeze(0),
+                            updated_k_build.unsqueeze(0),
+                            dim=-1,
+                            eps=EPS,
+                        ).item()
+                    )
+                    class_after.append(after_cos)
+                    after_cos_all.append(after_cos)
+
+                    final_ready[class_idx, cluster_idx] = True
+                    final_count[class_idx, cluster_idx] = matched_count[class_idx, cluster_idx]
+                    continue
+
+                if (not o_r) and n_r:
+                    for scale_idx in range(self.num_scales):
+                        final_keys[scale_idx][class_idx, cluster_idx] = matched_keys[scale_idx][class_idx, cluster_idx]
+                        final_values[scale_idx][class_idx, cluster_idx] = matched_values[scale_idx][class_idx, cluster_idx]
+                    final_ready[class_idx, cluster_idx] = True
+                    final_count[class_idx, cluster_idx] = matched_count[class_idx, cluster_idx]
+                    continue
+
+                if o_r and (not n_r):
+                    # Keep historical stable prototype.
+                    for scale_idx in range(self.num_scales):
+                        final_keys[scale_idx][class_idx, cluster_idx] = (
+                            getattr(self, f"ct_keys_s{scale_idx + 1}")[class_idx, cluster_idx].detach().cpu()
+                        )
+                        final_values[scale_idx][class_idx, cluster_idx] = (
+                            getattr(self, f"pet_values_s{scale_idx + 1}")[class_idx, cluster_idx].detach().cpu()
+                        )
+                    final_ready[class_idx, cluster_idx] = True
+                    final_count[class_idx, cluster_idx] = self.prototype_count[class_idx, cluster_idx].detach().cpu()
+                    continue
+
+                # both not ready
+                final_ready[class_idx, cluster_idx] = False
+                final_count[class_idx, cluster_idx] = 0
+
+            class_diag[class_name] = {
+                "candidate_to_old_cosine_before_ema": (
+                    float(sum(class_before) / len(class_before)) if class_before else None
+                ),
+                "updated_to_old_cosine_after_ema": (
+                    float(sum(class_after) / len(class_after)) if class_after else None
+                ),
+            }
+
+        drift_before = (
+            float(1.0 - (sum(before_cos_all) / len(before_cos_all))) if before_cos_all else None
+        )
+        drift_after = (
+            float(1.0 - (sum(after_cos_all) / len(after_cos_all))) if after_cos_all else None
+        )
+        merge_report = {
+            "ema_momentum": m,
+            "cppi_bank_drift_before_ema": drift_before,
+            "cppi_bank_drift_after_ema": drift_after,
+            "classes": class_diag,
+        }
+        return final_keys, final_values, final_ready, final_count, merge_report
+
+    @torch.no_grad()
+    def _commit_bank_buffers(
+        self,
+        final_keys: List[torch.Tensor],
+        final_values: List[torch.Tensor],
+        final_ready: torch.Tensor,
+        final_count: torch.Tensor,
+    ) -> None:
+        for scale_idx in range(self.num_scales):
+            getattr(self, f"ct_keys_s{scale_idx + 1}").copy_(
+                final_keys[scale_idx].to(
+                    device=getattr(self, f"ct_keys_s{scale_idx + 1}").device,
+                    dtype=getattr(self, f"ct_keys_s{scale_idx + 1}").dtype,
+                )
+            )
+            getattr(self, f"pet_values_s{scale_idx + 1}").copy_(
+                final_values[scale_idx].to(
+                    device=getattr(self, f"pet_values_s{scale_idx + 1}").device,
+                    dtype=getattr(self, f"pet_values_s{scale_idx + 1}").dtype,
+                )
+            )
+        self.prototype_ready.copy_(final_ready.to(self.prototype_ready.device))
+        self.prototype_count.copy_(final_count.to(self.prototype_count.device))
+        self.bank_version.add_(1)
+
+    @torch.no_grad()
+    def finalize_epoch(
+        self,
+        epoch: Optional[int] = None,
+        save_json: bool = True,
+        save_visualizations: bool = True,
+        print_info: bool = True,
+        ema_momentum: float = 0.9,
+    ) -> Dict:
+        """
+        Snapshot candidate bank -> class-wise matching -> EMA -> commit.
+
+        For each class independently:
+          1. Cluster build-stage CT prototypes.
+          2. Reuse those labels to aggregate CT keys and PET values at all scales.
+          3. Match candidate CT keys to existing bank CT keys.
+          4. EMA-merge matched CT keys (renormalize) and PET values (no renorm).
+        """
+        report = {
+            "epoch": epoch,
+            "config": asdict(self.config),
+            "collect_calls": self._collect_calls,
+            "collected_slices": self._collected_slices,
+            "bank_version_before": int(self.bank_version.item()),
+            "classes": {},
+            "scales": {},
+            "update_mode": "snapshot_matched_ema",
+            "ema_momentum": float(ema_momentum),
+            "build_mode": (
+                "concatenated_multiscale"
+                if self.build_stage_idx is None
+                else f"single_scale_{self.build_stage_idx + 1}"
+            ),
+            "build_feature_channels": (
+                int(sum(self.channels))
+                if self.build_stage_idx is None
+                else int(self.channels[self.build_stage_idx])
+            ),
+        }
+
+        cand_keys, cand_values, cand_ready, cand_count, class_reports = (
+            self._build_candidate_bank_from_cache()
+        )
+        report["classes"] = class_reports
+        report["cppi_snapshot_candidates_bg"] = int(
+            class_reports.get("background", {}).get("num_candidates", 0)
+        )
+        report["cppi_snapshot_candidates_fg"] = int(
+            class_reports.get("foreground", {}).get("num_candidates", 0)
+        )
+
+        if not bool(cand_ready.any()):
             report["status"] = "bank_not_updated_no_candidates"
+            report["cppi_bg_match_mean_cos"] = None
+            report["cppi_fg_match_mean_cos"] = None
+            report["cppi_bg_match_min_cos"] = None
+            report["cppi_fg_match_min_cos"] = None
+            report["cppi_bank_drift_before_ema"] = None
+            report["cppi_bank_drift_after_ema"] = None
             if print_info:
                 print("[PrototypeFinalize] No valid candidates; bank unchanged.")
             if save_json:
@@ -763,24 +1140,45 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
             self.reset_epoch_cache()
             return report
 
-        # Copy the newly built bank to registered buffers.
-        for scale_idx in range(self.num_scales):
-            getattr(self, f"ct_keys_s{scale_idx + 1}").copy_(
-                new_keys[scale_idx].to(
-                    device=getattr(self, f"ct_keys_s{scale_idx + 1}").device,
-                    dtype=getattr(self, f"ct_keys_s{scale_idx + 1}").dtype,
-                )
+        matched_keys, matched_values, matched_ready, matched_count, match_report = (
+            self._match_candidate_to_existing_bank(
+                cand_keys, cand_values, cand_ready, cand_count
             )
-            getattr(self, f"pet_values_s{scale_idx + 1}").copy_(
-                new_values[scale_idx].to(
-                    device=getattr(self, f"pet_values_s{scale_idx + 1}").device,
-                    dtype=getattr(self, f"pet_values_s{scale_idx + 1}").dtype,
-                )
-            )
+        )
 
-        self.prototype_ready.copy_(new_ready.to(self.prototype_ready.device))
-        self.prototype_count.copy_(new_count.to(self.prototype_count.device))
-        self.bank_version.add_(1)
+        for class_name in CLASS_NAMES:
+            if class_name in report["classes"] and class_name in match_report:
+                report["classes"][class_name].update(match_report[class_name])
+
+        report["cppi_bg_match_mean_cos"] = match_report.get("background", {}).get(
+            "matching_mean_cosine"
+        )
+        report["cppi_fg_match_mean_cos"] = match_report.get("foreground", {}).get(
+            "matching_mean_cosine"
+        )
+        report["cppi_bg_match_min_cos"] = match_report.get("background", {}).get(
+            "matching_min_cosine"
+        )
+        report["cppi_fg_match_min_cos"] = match_report.get("foreground", {}).get(
+            "matching_min_cosine"
+        )
+
+        final_keys, final_values, final_ready, final_count, merge_report = (
+            self._merge_candidate_bank_with_ema(
+                matched_keys,
+                matched_values,
+                matched_ready,
+                matched_count,
+                ema_momentum=ema_momentum,
+            )
+        )
+        report["cppi_bank_drift_before_ema"] = merge_report.get("cppi_bank_drift_before_ema")
+        report["cppi_bank_drift_after_ema"] = merge_report.get("cppi_bank_drift_after_ema")
+        for class_name in CLASS_NAMES:
+            if class_name in report["classes"] and class_name in merge_report.get("classes", {}):
+                report["classes"][class_name].update(merge_report["classes"][class_name])
+
+        self._commit_bank_buffers(final_keys, final_values, final_ready, final_count)
 
         report["status"] = "bank_updated"
         report["bank_version_after"] = int(self.bank_version.item())
@@ -1086,7 +1484,9 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
             f"epoch={report.get('epoch')} "
             f"version={report.get('bank_version_after')} "
             f"ready={report.get('ready_count')}/{report.get('total_slots')} "
-            f"slices={report.get('collected_slices')}"
+            f"slices={report.get('collected_slices')} "
+            f"mode={report.get('update_mode')} "
+            f"ema={report.get('ema_momentum')}"
         )
         for class_name in CLASS_NAMES:
             item = report["classes"][class_name]
@@ -1094,6 +1494,16 @@ class CrossScaleCTPETPrototypeMemory(nn.Module):
             print(f"    before={item['cluster_counts_before_filter']}")
             print(f"    after={item['cluster_counts_after_filter']}")
             print(f"    discarded={item['cluster_discarded_counts']}")
+            if item.get("matching_permutation") is not None:
+                print(
+                    f"    match_perm={item.get('matching_permutation')} "
+                    f"mean_cos={item.get('matching_mean_cosine')} "
+                    f"min_cos={item.get('matching_min_cosine')}"
+                )
+        print(
+            f"  drift_before_ema={report.get('cppi_bank_drift_before_ema')} "
+            f"drift_after_ema={report.get('cppi_bank_drift_after_ema')}"
+        )
         for scale_name, item in report["scales"].items():
             print(
                 f"  {scale_name}: C={item['channels']} "

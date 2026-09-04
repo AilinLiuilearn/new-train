@@ -25,8 +25,8 @@ def _seed(cfg):
 
 
 def _loaders(cfg):
-    from datasets.pclt20k_seg import get_pclt20k_loaders_cipa_aligned
-    return get_pclt20k_loaders_cipa_aligned(
+    from datasets.pclt20k_seg import get_pclt20k_loaders_cipa_aligned, get_pclt20k_prototype_loader
+    train_loader, val_loader, test_loader = get_pclt20k_loaders_cipa_aligned(
         cfg.root,
         cfg.image_size_2d,
         cfg.batch_size,
@@ -40,6 +40,17 @@ def _loaders(cfg):
         cfg.test_split_file,
         checkpoint_dir=cfg.checkpoint_dir,
     )
+    prototype_loader = get_pclt20k_prototype_loader(
+        cfg.root,
+        image_size=cfg.image_size_2d,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+        random_state=cfg.random_state,
+        pin_memory=cfg.pin_memory,
+        norm_mode=cfg.norm_mode,
+        train_split_file=cfg.train_split_file,
+    )
+    return train_loader, val_loader, test_loader, prototype_loader
 
 
 def _assert_baseline(cfg):
@@ -61,6 +72,42 @@ def module_grad_norm(module):
         val = p.grad.detach().float().pow(2).sum()
         total = val if total is None else total + val
     return float(total.sqrt().item()) if total is not None else 0.0
+
+
+@torch.no_grad()
+def rebuild_cppi_bank_from_snapshot(task, prototype_loader, epoch, cfg):
+    """
+    Epoch-end snapshot-consistent CPPI bank rebuild.
+
+    Uses a frozen encoder snapshot (eval + no_grad + FP32, no augmentation).
+    Does not clear the committed retrieval bank; only the candidate cache.
+    """
+    model = task.model
+    was_training = model.training
+    model.prototype_memory.reset_epoch_cache()
+    model.eval()
+    snapshot_start = time.time()
+    for batch in prototype_loader:
+        ct = batch['ct'].to(task.device, non_blocking=True).float()
+        pet = batch['pet'].to(task.device, non_blocking=True).float()
+        mask = batch['mask'].to(task.device, non_blocking=True).float()
+        with torch.cuda.amp.autocast(enabled=False):
+            model.collect_cppi_snapshot(ct=ct, pet=pet, mask=mask)
+    snapshot_time = time.time() - snapshot_start
+    cppi_report = model.finalize_cppi_epoch(
+        epoch=epoch,
+        save_json=True,
+        save_visualizations=(
+            epoch == 1
+            or epoch % 5 == 0
+            or epoch == cfg.epochs
+        ),
+        print_info=True,
+        ema_momentum=float(getattr(cfg, 'cppi_bank_ema', 0.9)),
+    )
+    cppi_report['cppi_snapshot_time'] = float(snapshot_time)
+    model.train(was_training)
+    return cppi_report
 
 
 def _checkpoint_paths(checkpoint_dir):
@@ -99,8 +146,8 @@ def main():
     with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
         json.dump(vars(cfg), f, indent=2, default=str)
 
-    train_loader, val_loader, _ = _loaders(cfg)
-    print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)}', flush=True)
+    train_loader, val_loader, _, prototype_loader = _loaders(cfg)
+    print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)} proto_batches={len(prototype_loader)}', flush=True)
 
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
     if getattr(cfg, 'resume_checkpoint', None):
@@ -125,6 +172,11 @@ def main():
         'grad_full_enc_ct', 'grad_missing_enc_ct', 'grad_full_ct_align', 'grad_missing_ct_align', 'grad_full_decoder', 'grad_missing_decoder',
         'epoch_time',
         'cppi_bank_version', 'cppi_ready_slots', 'cppi_bg_candidates', 'cppi_fg_candidates',
+        'cppi_bg_match_mean_cos', 'cppi_fg_match_mean_cos',
+        'cppi_bg_match_min_cos', 'cppi_fg_match_min_cos',
+        'cppi_bank_drift_before_ema', 'cppi_bank_drift_after_ema',
+        'cppi_snapshot_candidates_bg', 'cppi_snapshot_candidates_fg',
+        'cppi_snapshot_time',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
 
@@ -200,22 +252,29 @@ def main():
                     'mask': batch['mask'][:1].detach().cpu(),
                 }
 
-        cppi_report = task.model.finalize_cppi_epoch(
+        cppi_report = rebuild_cppi_bank_from_snapshot(
+            task=task,
+            prototype_loader=prototype_loader,
             epoch=epoch,
-            save_json=True,
-            save_visualizations=(
-                epoch == 1
-                or epoch % 5 == 0
-                or epoch == cfg.epochs
-            ),
-            print_info=True,
+            cfg=cfg,
         )
+        def _cppi_num(key, default=0.0):
+            val = cppi_report.get(key, default)
+            return float(val) if val is not None else float(default)
+
         print(
             f"[CPPI EPOCH {epoch}]\n"
             f"bank_version={cppi_report.get('bank_version_after', cppi_report.get('bank_version_before', 0))}\n"
             f"ready_slots={cppi_report.get('ready_count', cppi_report.get('ready_slots', 0))}\n"
             f"bg_candidates={cppi_report.get('classes', {}).get('background', {}).get('num_candidates', 0)}\n"
-            f"fg_candidates={cppi_report.get('classes', {}).get('foreground', {}).get('num_candidates', 0)}",
+            f"fg_candidates={cppi_report.get('classes', {}).get('foreground', {}).get('num_candidates', 0)}\n"
+            f"bg_match_mean_cos={cppi_report.get('cppi_bg_match_mean_cos')}\n"
+            f"fg_match_mean_cos={cppi_report.get('cppi_fg_match_mean_cos')}\n"
+            f"bg_match_min_cos={cppi_report.get('cppi_bg_match_min_cos')}\n"
+            f"fg_match_min_cos={cppi_report.get('cppi_fg_match_min_cos')}\n"
+            f"drift_before_ema={cppi_report.get('cppi_bank_drift_before_ema')}\n"
+            f"drift_after_ema={cppi_report.get('cppi_bank_drift_after_ema')}\n"
+            f"snapshot_time={cppi_report.get('cppi_snapshot_time')}",
             flush=True,
         )
         if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is not None and epoch % int(cfg.gradient_diagnostics_interval) == 0:
@@ -287,6 +346,15 @@ def main():
             'cppi_ready_slots': int(cppi_report.get('ready_count', cppi_report.get('ready_slots', 0))),
             'cppi_bg_candidates': int(cppi_report.get('classes', {}).get('background', {}).get('num_candidates', 0)),
             'cppi_fg_candidates': int(cppi_report.get('classes', {}).get('foreground', {}).get('num_candidates', 0)),
+            'cppi_bg_match_mean_cos': _cppi_num('cppi_bg_match_mean_cos'),
+            'cppi_fg_match_mean_cos': _cppi_num('cppi_fg_match_mean_cos'),
+            'cppi_bg_match_min_cos': _cppi_num('cppi_bg_match_min_cos'),
+            'cppi_fg_match_min_cos': _cppi_num('cppi_fg_match_min_cos'),
+            'cppi_bank_drift_before_ema': _cppi_num('cppi_bank_drift_before_ema'),
+            'cppi_bank_drift_after_ema': _cppi_num('cppi_bank_drift_after_ema'),
+            'cppi_snapshot_candidates_bg': int(cppi_report.get('cppi_snapshot_candidates_bg', cppi_report.get('classes', {}).get('background', {}).get('num_candidates', 0))),
+            'cppi_snapshot_candidates_fg': int(cppi_report.get('cppi_snapshot_candidates_fg', cppi_report.get('classes', {}).get('foreground', {}).get('num_candidates', 0))),
+            'cppi_snapshot_time': _cppi_num('cppi_snapshot_time'),
             **{f'diag_{k}': v for k, v in diag_stats.items()},
         }
         append_epoch_log(

@@ -22,7 +22,7 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
-    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=6, cppi_build_stage=3, cppi_output_dir=None):
+    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, cppi_num_clusters=6, cppi_build_stage=4, cppi_output_dir=None):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
@@ -66,6 +66,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return out
 
     def _collect_cppi(self, ct_feats, pet_feats_real, mask):
+        """Legacy online collect kept for API compatibility; training forwards no longer call it."""
         if self.training and mask is not None:
             return self.prototype_memory.collect(
                 ct_feats=ct_feats,
@@ -75,6 +76,22 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 compute_report=False,
             )
         return None
+
+    @torch.no_grad()
+    def collect_cppi_snapshot(self, ct, pet, mask):
+        """
+        Snapshot-only prototype collection: encoders + pooling only.
+        Must be called under model.eval() with autocast disabled.
+        """
+        ct_feats = self._encode_ct(ct)
+        pet_feats_real = self._encode_pet(pet)
+        return self.prototype_memory.collect(
+            ct_feats=ct_feats,
+            pet_feats=pet_feats_real,
+            mask=mask,
+            print_info=False,
+            compute_report=False,
+        )
 
     def _retrieve_cppi(self, ct_feats, compute_report=False, save_diagnostics=False, print_info=False, return_ct_reference=False):
         return self.prototype_memory.retrieve(
@@ -88,7 +105,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
     def _forward_full(self, ct, pet, target_size, mask=None):
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
-        self._collect_cppi(ct_feats, pet_feats_real, mask)
+        # Online CPPI collection disabled: bank is rebuilt from clean snapshot only.
         if self.prototype_memory.bank_ready:
             _, ct_reference_feats, _ = self._retrieve_cppi(
                 ct_feats,
@@ -116,8 +133,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
 
     def _forward_missing(self, ct, pet, target_size, mask=None):
         ct_feats = self._encode_ct(ct)
-        pet_feats_real = self._encode_pet(pet)
-        self._collect_cppi(ct_feats, pet_feats_real, mask)
+        # Preserve PET-encoder train-time BN/stat side effects; features unused after collect removal.
+        self._encode_pet(pet)
         pet_feats_proxy, ct_reference_feats, _ = self._retrieve_cppi(
             ct_feats,
             compute_report=False,
@@ -138,7 +155,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
     def _forward_auto(self, ct, pet, pet_available, target_size, mask=None):
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
-        self._collect_cppi(ct_feats, pet_feats_real, mask)
+        # Online CPPI collection disabled: bank is rebuilt from clean snapshot only.
         pet_feats_proxy, ct_reference_feats, _ = self._retrieve_cppi(
             ct_feats,
             compute_report=False,
@@ -172,12 +189,13 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return self._decode(fused_feats, target_size)
 
     @torch.no_grad()
-    def finalize_cppi_epoch(self, epoch, save_json=True, save_visualizations=False, print_info=True):
+    def finalize_cppi_epoch(self, epoch, save_json=True, save_visualizations=False, print_info=True, ema_momentum=0.9):
         return self.prototype_memory.finalize_epoch(
             epoch=epoch,
             save_json=save_json,
             save_visualizations=save_visualizations,
             print_info=print_info,
+            ema_momentum=ema_momentum,
         )
 
     def forward(self, ct, pet, pet_available=None, target_size=None, forward_mode='auto', mask=None):
