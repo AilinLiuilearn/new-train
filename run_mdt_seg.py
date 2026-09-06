@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 import json
 import os
+
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
 import random
 import time
 
@@ -18,10 +21,21 @@ def _seed(cfg):
     random.seed(cfg.random_state)
     np.random.seed(cfg.random_state)
     torch.manual_seed(cfg.random_state)
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.random_state)
+
+    torch.use_deterministic_algorithms(
+        True,
+        warn_only=False,
+    )
+
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
 
 def _loaders(cfg):
@@ -83,6 +97,9 @@ def main():
     cfg = SegMDTConfig.parse_arguments()
     _assert_baseline(cfg)
     _seed(cfg)
+    print('[REPRO] deterministic_algorithms=True', flush=True)
+    print('[REPRO] CUBLAS_WORKSPACE_CONFIG=:4096:8', flush=True)
+    print('[REPRO] TF32=False', flush=True)
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
         json.dump(vars(cfg), f, indent=2, default=str)
@@ -187,6 +204,20 @@ def main():
 
         if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is not None and epoch % int(cfg.gradient_diagnostics_interval) == 0:
             diag_stats = task.gradient_diagnostics(fixed_diag_batch, max_samples=min(1, int(cfg.gradient_diagnostics_num_samples))) or {}
+
+        # Epoch-wise Module-1 bank finalize: AFTER all train batches, BEFORE validation.
+        module1_report = None
+        if hasattr(task.model, 'finalize_module1_epoch'):
+            module1_report = task.model.finalize_module1_epoch(epoch)
+        if module1_report is not None:
+            print(
+                f"[PSPI][BANK] epoch={module1_report.get('epoch', epoch)} "
+                f"status={module1_report.get('status')} "
+                f"bank_version={module1_report.get('bank_version_after', module1_report.get('bank_version_before', 0))} "
+                f"ready_count={module1_report.get('ready_count', 0)} "
+                f"total_slots={module1_report.get('total_slots', 0)}",
+                flush=True,
+            )
 
         val_full = task.evaluate(val_loader, eval_mode='full', tag='val_full')
         val_missing = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_missing')

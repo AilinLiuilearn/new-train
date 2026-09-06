@@ -351,6 +351,7 @@ class ConvBNAct(nn.Module):
 
 def build_mdt_seg_teacher(config):
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
+    pspi_loss_stages = getattr(config, 'pspi_prototype_loss_stages', None)
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
@@ -360,11 +361,37 @@ def build_mdt_seg_teacher(config):
         out_channels=1,
         decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
         use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
+        pspi_enabled=getattr(config, 'pspi_enabled', True),
+        pspi_num_clusters=getattr(config, 'pspi_num_clusters', 6),
+        pspi_build_stage=getattr(config, 'pspi_build_stage', 4),
+        pspi_cluster_max_iter=getattr(config, 'pspi_cluster_max_iter', 25),
+        pspi_outlier_discard_rate=getattr(config, 'pspi_outlier_discard_rate', 0.05),
+        pspi_bank_update_mode=getattr(config, 'pspi_bank_update_mode', 'direct'),
+        pspi_ema_momentum=getattr(config, 'pspi_ema_momentum', 0.999),
+        pspi_prototype_loss_type=getattr(config, 'pspi_prototype_loss_type', 'pad_kl'),
+        pspi_prototype_loss_weight=getattr(config, 'pspi_prototype_loss_weight', 0.01),
+        pspi_prototype_temperature=getattr(config, 'pspi_prototype_temperature', 0.1),
+        pspi_prototype_loss_stages=pspi_loss_stages,
+        pspi_use_affine_calibration=getattr(config, 'pspi_use_affine_calibration', True),
+        pspi_collect_candidates=getattr(config, 'pspi_collect_candidates', True),
     )
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
         f'fusion=add shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
+    )
+    proto_stages = 'build_stage' if pspi_loss_stages is None else list(pspi_loss_stages)
+    print(
+        f'[PSPI] enabled={getattr(config, "pspi_enabled", True)} '
+        f'K={getattr(config, "pspi_num_clusters", 6)} '
+        f'build_stage=S{getattr(config, "pspi_build_stage", 4)} '
+        f'bank_update={getattr(config, "pspi_bank_update_mode", "direct")} '
+        f'proto_loss={getattr(config, "pspi_prototype_loss_type", "pad_kl")} '
+        f'proto_weight={getattr(config, "pspi_prototype_loss_weight", 0.01)} '
+        f'proto_temperature={getattr(config, "pspi_prototype_temperature", 0.1)} '
+        f'proto_loss_stages={proto_stages} '
+        f'affine={getattr(config, "pspi_use_affine_calibration", True)} '
+        f'fusion=AddFusion'
     )
     return {'model': model}

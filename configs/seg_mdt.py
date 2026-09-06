@@ -35,6 +35,25 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--enable_gradient_diagnostics', type=str2bool, default=False)
         p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
+        # PSPI / Module-1
+        p.add_argument('--pspi_enabled', type=str2bool, default=True)
+        p.add_argument('--pspi_num_clusters', type=int, default=6)
+        p.add_argument('--pspi_build_stage', type=int, default=4)
+        p.add_argument('--pspi_cluster_max_iter', type=int, default=25)
+        p.add_argument('--pspi_outlier_discard_rate', type=float, default=0.05)
+        p.add_argument('--pspi_bank_update_mode', type=str, default='direct', choices=('direct', 'matched_ema'))
+        p.add_argument('--pspi_ema_momentum', type=float, default=0.999)
+        p.add_argument(
+            '--pspi_prototype_loss_type',
+            type=str,
+            default='pad_kl',
+            choices=('none', 'pad_kl', 'pad_js', 'retrieval_cosine'),
+        )
+        p.add_argument('--pspi_prototype_loss_weight', type=float, default=0.01)
+        p.add_argument('--pspi_prototype_temperature', type=float, default=0.1)
+        p.add_argument('--pspi_prototype_loss_stages', type=int, nargs='+', default=None)
+        p.add_argument('--pspi_use_affine_calibration', type=str2bool, default=True)
+        p.add_argument('--pspi_collect_candidates', type=str2bool, default=True)
         return p
 
     @staticmethod

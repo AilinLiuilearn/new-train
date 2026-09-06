@@ -39,15 +39,22 @@ class MDTSegTeacher:
         ct = batch['ct'].to(self.device, non_blocking=True)
         pet = batch['pet'].to(self.device, non_blocking=True)
         mask = batch['mask'].to(self.device, non_blocking=True).float()
-        outputs = self.model(ct, pet=pet, forward_mode=forward_mode)
+        outputs = self.model(ct, pet=pet, forward_mode=forward_mode, mask=mask)
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-        loss, loss_stats = self.criterion(logits, mask)
+        seg_loss, loss_stats = self.criterion(logits, mask)
+        proto_loss_raw = outputs.get('prototype_loss', seg_loss.new_zeros(()))
+        proto_loss_weighted = outputs.get('prototype_loss_weighted', seg_loss.new_zeros(()))
+        total_loss = seg_loss + proto_loss_weighted
         stats = {
-            'loss_total': loss.detach(),
-            'loss_seg': loss_stats.get('loss_dice', loss.detach()),
-            'loss_boundary': torch.tensor(0.0, device=loss.device),
+            'loss_total': total_loss.detach(),
+            'loss_seg': loss_stats.get('loss_dice', seg_loss.detach()),
+            'loss_seg_total': seg_loss.detach(),
+            'loss_proto': proto_loss_raw.detach(),
+            'loss_proto_weighted': proto_loss_weighted.detach(),
+            'prototype_loss_num_terms': outputs.get('prototype_loss_num_terms', 0),
+            'loss_boundary': torch.tensor(0.0, device=total_loss.device),
         }
-        return loss, logits, outputs, stats
+        return total_loss, logits, outputs, stats
 
     @torch.no_grad()
     def evaluate(self, loader, eval_mode='full', tag='val'):
@@ -65,7 +72,7 @@ class MDTSegTeacher:
                 forward_mode = 'full'
                 pet_available = None
             elif eval_mode == 'fixed_missing':
-                pet = batch['pet'].to(self.device, non_blocking=True)
+                pet = None
                 forward_mode = 'missing'
                 pet_available = None
             else:
@@ -74,7 +81,13 @@ class MDTSegTeacher:
                 pet_available = batch.get('pet_available')
                 if pet_available is not None:
                     pet_available = pet_available.to(self.device, non_blocking=True)
-            outputs = self.model(ct, pet=pet, pet_available=pet_available, forward_mode=forward_mode)
+            outputs = self.model(
+                ct,
+                pet=pet,
+                pet_available=pet_available,
+                forward_mode=forward_mode,
+                mask=mask,
+            )
             logits = outputs['logits'] if isinstance(outputs, dict) else outputs
             loss, _ = self.criterion(logits, mask)
             self.metrics.update(logits, mask)
