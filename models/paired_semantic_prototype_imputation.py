@@ -1717,6 +1717,7 @@ class PairedSemanticPrototypeImputation(nn.Module):
             torch.stack([r.float().mean() for r in reliability])
             .mean()
             .item()
+       #这个是为了保存文件，所以故意做出的修改     
         )
         gate_mean = float(
             torch.stack([g.float().mean() for g in gates]).mean().item()
