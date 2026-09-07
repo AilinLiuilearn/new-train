@@ -46,18 +46,26 @@ Missing prediction:
       -> CT prototype keys (K)
       -> paired PET prototype values (V)
       -> population PET prior
+      -> retrieval reliability R (normalized attention entropy, detached)
       -> CT-current vs CT-reference discrepancy
-      -> shared affine calibration
-      -> individualized compensated PET features
+      -> shared affine calibration (gamma / beta)
+      -> PET contribution gate G = 2 * sigmoid(raw_gate) in (0, 2), init 1
+      -> P_out = G * R * calibrated prototype PET
+      -> simple_fused = CT + P_out
 
 Full prediction:
     real PET features
       -> the SAME shared CT-reference-guided affine calibration
-      -> calibrated real PET features
+      -> the SAME PET contribution gate (retrieval reliability NOT applied)
+      -> P_out = G * calibrated real PET
+      -> simple_fused = CT + P_out
 
-This file intentionally does NOT implement the final CT/PET fusion or decoder.
-It returns calibrated PET features so it can be plugged into the reproducible
-baseline without changing the downstream architecture.
+Outputs
+-------
+`pet_output` is the final quality-controlled PET feature (Module-2 input);
+`simple_fused = CT + pet_output` is the Module-1-only decoder input.
+The module implements the simple residual fusion itself, so downstream code
+must NOT apply an external AddFusion on top of `pet_output`.
 
 Recommended first controlled configuration
 ------------------------------------------
@@ -71,6 +79,8 @@ Recommended first controlled configuration
     prototype_temperature=0.1
     prototype_loss_stages=None   # => build_stage only
     use_affine_calibration=True
+    use_pet_contribution_gate=True
+    use_retrieval_reliability=True
 
 Optional ablations exposed as switches
 --------------------------------------
@@ -80,6 +90,8 @@ Optional ablations exposed as switches
 - prototype_loss_stages: any subset of stages, e.g. (4,) or (1,2,3,4)
 - bank_update_mode: direct / matched_ema
 - use_affine_calibration: True / False
+- use_pet_contribution_gate: True / False
+- use_retrieval_reliability: True / False
 
 Notes on reproducibility
 ------------------------
@@ -487,9 +499,9 @@ class SharedPrototypeReferencedAffineCalibration(nn.Module):
             head = nn.Sequential(
                 nn.Linear(c, hidden),
                 nn.GELU(),
-                nn.Linear(hidden, 2 * c),
+                nn.Linear(hidden, 3 * c),
             )
-            # Identity behavior at initialization.
+            # Identity behavior at initialization: gamma=beta=0, gate=1.
             nn.init.zeros_(head[-1].weight)
             nn.init.zeros_(head[-1].bias)
             heads.append(head)
@@ -501,15 +513,22 @@ class SharedPrototypeReferencedAffineCalibration(nn.Module):
         pet_evidence_feats: Sequence[torch.Tensor],
         ct_reference_feats: Optional[Sequence[torch.Tensor]],
         reference_valid: bool,
-    ) -> List[torch.Tensor]:
+        use_pet_contribution_gate: bool = True,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         if len(ct_feats) != len(pet_evidence_feats):
             raise ValueError("CT and PET evidence must have the same scale count")
         if not reference_valid or ct_reference_feats is None:
-            return [_sanitize(pet) for pet in pet_evidence_feats]
+            calibrated = [_sanitize(pet) for pet in pet_evidence_feats]
+            gates = [
+                torch.ones_like(pet[:, :1, :, :])
+                for pet in pet_evidence_feats
+            ]
+            return calibrated, gates
         if len(ct_reference_feats) != len(ct_feats):
             raise ValueError("CT reference scale count mismatch")
 
         calibrated: List[torch.Tensor] = []
+        gates: List[torch.Tensor] = []
         for scale_idx, (ct, pet, ct_ref) in enumerate(
             zip(ct_feats, pet_evidence_feats, ct_reference_feats)
         ):
@@ -551,14 +570,23 @@ class SharedPrototypeReferencedAffineCalibration(nn.Module):
             )
             delta = (ct_tokens - ref_tokens).mean(dim=1)
             affine = self.heads[scale_idx](delta)
-            raw_gamma, raw_beta = affine.chunk(2, dim=-1)
-            gamma = torch.tanh(raw_gamma).view(ct.shape[0], ct.shape[1], 1, 1)
-            beta = torch.tanh(raw_beta).view(ct.shape[0], ct.shape[1], 1, 1)
+            raw_gamma, raw_beta, raw_gate = affine.chunk(3, dim=-1)
+            gamma = torch.tanh(raw_gamma).view(pet.shape[0], pet.shape[1], 1, 1)
+            beta = torch.tanh(raw_beta).view(pet.shape[0], pet.shape[1], 1, 1)
+            # Gate range (0, 2); raw_gate=0 at init gives gate=1 so Full PET is
+            # not scaled down before learning starts.
+            gate = 2.0 * torch.sigmoid(raw_gate).view(
+                pet.shape[0], pet.shape[1], 1, 1
+            )
+            if not use_pet_contribution_gate:
+                gate = torch.ones_like(gate)
 
             pet_centered = pet - pet.mean(dim=(2, 3), keepdim=True)
             pet_cal = pet + gamma * pet_centered + beta
+            _finite_or_raise("pet_gate", gate)
             calibrated.append(_sanitize(pet_cal))
-        return calibrated
+            gates.append(gate)
+        return calibrated, gates
 
 
 # -----------------------------------------------------------------------------
@@ -587,6 +615,8 @@ class Module1Config:
     prototype_loss_stages: Optional[Tuple[int, ...]] = None
 
     use_affine_calibration: bool = True
+    use_pet_contribution_gate: bool = True
+    use_retrieval_reliability: bool = True
     collect_candidates_during_training: bool = True
 
     def validate(self) -> None:
@@ -658,7 +688,8 @@ class PairedSemanticPrototypeImputation(nn.Module):
             mask=mask,
             mode=route,                     # 'full' or 'missing'
         )
-        pet_for_fusion = out['pet_output']
+        fused_feats = out['simple_fused']   # CT + P_out (Module-1 simple fusion)
+        pet_output  = out['pet_output']     # quality-controlled PET for Module-2
         proto_loss = out['prototype_loss_weighted']
 
     End of every epoch:
@@ -666,7 +697,8 @@ class PairedSemanticPrototypeImputation(nn.Module):
 
     Strict Missing inference:
         # No current-patient PET is accepted by this method.
-        pet_comp, aux = module1.recover_missing(ct_feats)
+        pet_output, aux = module1.recover_missing(ct_feats)
+        fused_feats = aux['simple_fused']
     """
 
     def __init__(
@@ -683,6 +715,8 @@ class PairedSemanticPrototypeImputation(nn.Module):
         prototype_temperature: float = 0.1,
         prototype_loss_stages: Optional[Sequence[int]] = None,
         use_affine_calibration: bool = True,
+        use_pet_contribution_gate: bool = True,
+        use_retrieval_reliability: bool = True,
         collect_candidates_during_training: bool = True,
     ):
         super().__init__()
@@ -703,6 +737,8 @@ class PairedSemanticPrototypeImputation(nn.Module):
                 else tuple(int(s) for s in prototype_loss_stages)
             ),
             use_affine_calibration=bool(use_affine_calibration),
+            use_pet_contribution_gate=bool(use_pet_contribution_gate),
+            use_retrieval_reliability=bool(use_retrieval_reliability),
             collect_candidates_during_training=bool(
                 collect_candidates_during_training
             ),
@@ -1277,6 +1313,44 @@ class PairedSemanticPrototypeImputation(nn.Module):
     # Retrieval
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _compute_retrieval_reliability(
+        attention: torch.Tensor,
+        ready: torch.Tensor,
+        ref: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Per-pixel retrieval reliability from the *same* spatial prototype
+        attention used for PET retrieval:
+
+            H(x) = -sum_j A(x,j) log A(x,j)
+            R(x) = 1 - H(x) / log(M),  M = number of ready prototypes
+
+        M is the number of prototypes that actually participate in the softmax
+        (the masked non-ready slots carry zero probability). The reliability
+        branch is detached: it only measures how decisive retrieval already is
+        and must not let segmentation loss push the attention toward a
+        degenerate high-confidence solution.
+        """
+        b, n, _ = attention.shape
+        num_ready = int(ready.sum().item())
+        h, w = ref.shape[-2], ref.shape[-1]
+        if num_ready == 0:
+            return torch.zeros(
+                b, 1, h, w, device=ref.device, dtype=ref.dtype
+            )
+        if num_ready == 1:
+            return torch.ones(
+                b, 1, h, w, device=ref.device, dtype=ref.dtype
+            )
+        attn_fp32 = attention.float()
+        entropy = -(attn_fp32 * attn_fp32.clamp_min(EPS).log()).sum(dim=-1)
+        reliability = 1.0 - entropy / math.log(float(num_ready))
+        reliability = reliability.clamp(0.0, 1.0).detach()
+        reliability = reliability.view(b, 1, h, w).to(dtype=ref.dtype)
+        _finite_or_raise("retrieval_reliability", reliability)
+        return reliability
+
     def retrieve(
         self,
         ct_feats: Sequence[torch.Tensor],
@@ -1288,6 +1362,7 @@ class PairedSemanticPrototypeImputation(nn.Module):
         pet_proxy: List[torch.Tensor] = []
         ct_reference: List[torch.Tensor] = []
         attentions: List[torch.Tensor] = []
+        reliabilities: List[torch.Tensor] = []
 
         for s, ct in enumerate(ct_feats):
             keys = getattr(self, f"ct_keys_s{s + 1}").reshape(
@@ -1304,6 +1379,11 @@ class PairedSemanticPrototypeImputation(nn.Module):
                 ct, keys, values, ready
             )
             pet_proxy.append(retrieved)
+
+            # Reliability comes from the SAME attention; no second attention.
+            reliabilities.append(
+                self._compute_retrieval_reliability(attention, ready, ct)
+            )
 
             if bool(ready.any()):
                 # Use the same attention weights to reconstruct the paired CT
@@ -1325,6 +1405,7 @@ class PairedSemanticPrototypeImputation(nn.Module):
             "pet_proxy": pet_proxy,
             "ct_reference": ct_reference,
             "attention": attentions if return_attention else None,
+            "retrieval_reliability": reliabilities,
             "bank_ready": self.bank_ready,
             "bank_version": int(self.bank_version.item()),
         }
@@ -1498,38 +1579,80 @@ class PairedSemanticPrototypeImputation(nn.Module):
         ct_feats: Sequence[torch.Tensor],
         pet_feats_real: Sequence[torch.Tensor],
     ) -> Dict:
-        """Shared affine calibration of REAL PET for the Full route."""
+        """
+        Full route: shared calibration + contribution gate of REAL PET.
+
+        Flow: retrieve CT reference -> CT-current/reference discrepancy ->
+        shared head (gamma/beta/gate) -> calibrate real PET -> gate real PET ->
+        P_out -> simple_fused = CT + P_out.
+
+        The retrieval reliability is NOT applied to real PET (real PET is not
+        produced by retrieval, so retrieval confidence must not suppress it).
+        When the bank is not ready, calibration is identity, gate = 1, and
+        P_out = real PET, keeping epoch-1 behavior close to the baseline.
+        """
         self._validate_features(ct_feats, pet_feats_real)
         if self.bank_ready:
             retrieval = self.retrieve(ct_feats, return_attention=True)
             ct_ref = retrieval["ct_reference"]
+            reliability = retrieval["retrieval_reliability"]
             reference_valid = True
         else:
             retrieval = {
                 "pet_proxy": None,
                 "ct_reference": None,
                 "attention": None,
+                "retrieval_reliability": None,
                 "bank_ready": False,
                 "bank_version": int(self.bank_version.item()),
             }
             ct_ref = None
+            reliability = None
             reference_valid = False
 
         if self.config.use_affine_calibration:
-            pet_output = self.affine_calibration(
+            calibrated, gates = self.affine_calibration(
                 ct_feats,
                 pet_feats_real,
                 ct_ref,
                 reference_valid=reference_valid,
+                use_pet_contribution_gate=self.config.use_pet_contribution_gate,
             )
         else:
-            pet_output = [_sanitize(p) for p in pet_feats_real]
+            calibrated = [_sanitize(p) for p in pet_feats_real]
+            gates = [
+                torch.ones(
+                    p.shape[0],
+                    p.shape[1],
+                    1,
+                    1,
+                    device=p.device,
+                    dtype=p.dtype,
+                )
+                for p in pet_feats_real
+            ]
+
+        pet_output: List[torch.Tensor] = []
+        simple_fused: List[torch.Tensor] = []
+        for s, (ct, pet_cal, gate) in enumerate(
+            zip(ct_feats, calibrated, gates)
+        ):
+            pet_out = gate * pet_cal
+            _finite_or_raise(f"pet_output_s{s + 1}", pet_out)
+            pet_out = _sanitize(pet_out)
+            fused = ct + pet_out
+            _finite_or_raise(f"simple_fused_s{s + 1}", fused)
+            simple_fused.append(_sanitize(fused))
+            pet_output.append(pet_out)
 
         return {
             "pet_output": pet_output,
+            "simple_fused": simple_fused,
+            "pet_gate": gates,
             "pet_proxy": None,
             "ct_reference": ct_ref,
             "attention": retrieval["attention"],
+            "retrieval_reliability": reliability,
             "bank_ready": self.bank_ready,
             "bank_version": int(self.bank_version.item()),
         }
@@ -1543,25 +1666,70 @@ class PairedSemanticPrototypeImputation(nn.Module):
 
         IMPORTANT: this method accepts NO real PET input. Therefore its output is
         structurally independent of the current patient's PET file.
+
+        Flow: retrieve P_proto / C_ref / R -> shared adaptation -> P_cal_proto
+        -> gate -> P_out = gate * reliability * P_cal_proto ->
+        simple_fused = CT + P_out.
         """
         retrieval = self.retrieve(ct_feats, return_attention=True)
         pet_proxy = retrieval["pet_proxy"]
         ct_ref = retrieval["ct_reference"]
+        reliability = retrieval["retrieval_reliability"]
 
         if self.config.use_affine_calibration:
-            pet_output = self.affine_calibration(
+            calibrated, gates = self.affine_calibration(
                 ct_feats,
                 pet_proxy,
                 ct_ref,
                 reference_valid=self.bank_ready,
+                use_pet_contribution_gate=self.config.use_pet_contribution_gate,
             )
         else:
-            pet_output = [_sanitize(p) for p in pet_proxy]
+            calibrated = [_sanitize(p) for p in pet_proxy]
+            gates = [
+                torch.ones(
+                    p.shape[0],
+                    p.shape[1],
+                    1,
+                    1,
+                    device=p.device,
+                    dtype=p.dtype,
+                )
+                for p in pet_proxy
+            ]
+
+        pet_output: List[torch.Tensor] = []
+        simple_fused: List[torch.Tensor] = []
+        for s, (ct, pet_cal, gate, rel) in enumerate(
+            zip(ct_feats, calibrated, gates, reliability)
+        ):
+            pet_out = gate * pet_cal
+            if self.config.use_retrieval_reliability:
+                pet_out = pet_out * rel
+            _finite_or_raise(f"pet_output_s{s + 1}", pet_out)
+            pet_out = _sanitize(pet_out)
+            fused = ct + pet_out
+            _finite_or_raise(f"simple_fused_s{s + 1}", fused)
+            simple_fused.append(_sanitize(fused))
+            pet_output.append(pet_out)
+
+        reliability_mean = float(
+            torch.stack([r.float().mean() for r in reliability])
+            .mean()
+            .item()
+        )
+        gate_mean = float(
+            torch.stack([g.float().mean() for g in gates]).mean().item()
+        )
 
         aux = {
             "pet_proxy": pet_proxy,
             "ct_reference": ct_ref,
             "attention": retrieval["attention"],
+            "pet_gate": gates,
+            "simple_fused": simple_fused,
+            "retrieval_reliability_mean": reliability_mean,
+            "pet_gate_mean": gate_mean,
             "bank_ready": self.bank_ready,
             "bank_version": int(self.bank_version.item()),
         }
@@ -1642,7 +1810,7 @@ class PairedSemanticPrototypeImputation(nn.Module):
 
 
 def _self_check() -> None:
-    """Small CPU smoke test for shape/API/backward sanity."""
+    """Small CPU smoke test for shape/API/backward/leakage sanity."""
     torch.manual_seed(7)
     channels = (8, 12, 16, 20)
     shapes = ((16, 16), (8, 8), (4, 4), (2, 2))
@@ -1655,6 +1823,8 @@ def _self_check() -> None:
         prototype_temperature=0.1,
         bank_update_mode="direct",
         use_affine_calibration=True,
+        use_pet_contribution_gate=True,
+        use_retrieval_reliability=True,
     )
     module.train()
 
@@ -1673,29 +1843,99 @@ def _self_check() -> None:
         module.collect_candidates(ct, pet, mask)
 
     report = module.finalize_epoch(epoch=1)
-    assert report["status"] == "bank_updated"
-    assert module.bank_ready
+    assert report["status"] == "bank_updated"  # check 1
+    assert module.bank_ready  # check 2
 
+    b = 2
     ct = [
-        torch.randn(2, c, h, w, requires_grad=True)
+        torch.randn(b, c, h, w, requires_grad=True)
         for c, (h, w) in zip(channels, shapes)
     ]
-    pet = [
-        torch.randn(2, c, h, w, requires_grad=True)
+    pet_a = [
+        torch.randn(b, c, h, w, requires_grad=True)
         for c, (h, w) in zip(channels, shapes)
     ]
-    mask = torch.zeros(2, 1, 64, 64)
+    pet_b = [
+        torch.randn(b, c, h, w, requires_grad=True)
+        for c, (h, w) in zip(channels, shapes)
+    ]
+    mask = torch.zeros(b, 1, 64, 64)
     mask[:, :, 16:48, 16:48] = 1.0
 
-    full = module(ct, pet, mask, mode="full", collect_candidates=False)
-    missing = module(ct, pet, mask, mode="missing", collect_candidates=False)
+    full = module(ct, pet_a, mask, mode="full", collect_candidates=False)
+    missing = module(ct, pet_a, mask, mode="missing", collect_candidates=False)
+    missing_alt = module(
+        ct, pet_b, mask, mode="missing",
+        collect_candidates=False, compute_prototype_loss=False,
+    )
 
-    assert len(full["pet_output"]) == 4
-    assert len(missing["pet_output"]) == 4
     for s in range(4):
+        # checks 3-6: pet_output / simple_fused shapes match CT at all scales
         assert full["pet_output"][s].shape == ct[s].shape
         assert missing["pet_output"][s].shape == ct[s].shape
+        assert full["simple_fused"][s].shape == ct[s].shape
+        assert missing["simple_fused"][s].shape == ct[s].shape
+        # check 7: gates finite
+        for out in (full, missing):
+            for gate in out["pet_gate"] if "pet_gate" in out else []:
+                assert bool(torch.isfinite(gate).all())
+        for gate in full["pet_gate"]:
+            assert bool(torch.isfinite(gate).all())  # check 7
+            assert bool((gate > 0.0).all() and (gate < 2.0).all())  # check 10
+        for gate in missing["pet_gate"] + missing_alt["pet_gate"]:
+            assert bool(torch.isfinite(gate).all())
+            assert bool((gate > 0.0).all() and (gate < 2.0).all())
 
+    retrieval = module.retrieve(ct, return_attention=False)
+    for rel in retrieval["retrieval_reliability"]:
+        assert bool(torch.isfinite(rel).all())
+        assert bool((rel >= 0.0).all() and (rel <= 1.0).all())
+
+    # Zero-init identity: gamma=beta=0 and gate=1, so the Full route passes real
+    # PET through unchanged and the Missing route is R * prototype PET.
+    for s in range(4):
+        assert torch.allclose(
+            full["pet_output"][s], pet_a[s].detach(), atol=1e-5
+        )
+        proxy = retrieval["pet_proxy"][s].detach()
+        rel = retrieval["retrieval_reliability"][s].detach()
+        expected = rel * proxy
+        assert torch.allclose(
+            missing["pet_output"][s], expected, atol=1e-5
+        )
+
+    # check 13 (Module-1 level): the missing prediction path is independent of
+    # the real PET that is passed for candidate/teacher purposes only.
+    for s in range(4):
+        assert torch.allclose(
+            missing["pet_output"][s],
+            missing_alt["pet_output"][s],
+            atol=1e-6,
+        )
+        assert torch.allclose(
+            missing["simple_fused"][s],
+            missing_alt["simple_fused"][s],
+            atol=1e-6,
+        )
+    assert missing["retrieval_reliability_mean"] == (
+        missing_alt["retrieval_reliability_mean"]
+    )
+    assert missing["pet_gate_mean"] == missing_alt["pet_gate_mean"]
+
+    # check 12: recover_missing() takes no PET argument at all.
+    pet_out_no_pet, aux_no_pet = module.recover_missing(ct)
+    assert len(pet_out_no_pet) == 4
+    assert "simple_fused" in aux_no_pet
+    for s in range(4):
+        assert torch.allclose(
+            pet_out_no_pet[s], missing["pet_output"][s], atol=1e-6
+        )
+        assert torch.allclose(
+            aux_no_pet["simple_fused"][s], missing["simple_fused"][s],
+            atol=1e-6,
+        )
+
+    # check 11: backward works through both routes and the gate parameters.
     loss = (
         full["prototype_loss_weighted"]
         + missing["prototype_loss_weighted"]
@@ -1703,6 +1943,63 @@ def _self_check() -> None:
         + sum(x.mean() for x in missing["pet_output"])
     )
     loss.backward()
+
+    # Equivalence smoke test: with gate/reliability switches off, Module-1 must
+    # reproduce the previous PSPI behavior exactly:
+    #   pet_output == calibrated PET, simple_fused == CT + calibrated PET.
+    equiv = PairedSemanticPrototypeImputation(
+        channels=channels,
+        num_clusters=3,
+        build_stage=4,
+        prototype_loss_type="pad_kl",
+        prototype_loss_weight=0.01,
+        prototype_temperature=0.1,
+        bank_update_mode="direct",
+        use_affine_calibration=True,
+        use_pet_contribution_gate=False,
+        use_retrieval_reliability=False,
+    )
+    equiv.load_state_dict(module.state_dict())
+    # Non-trivial head weights so identity shortcuts cannot hide a wiring bug.
+    with torch.no_grad():
+        for head in equiv.affine_calibration.heads:
+            nn.init.normal_(head[-1].weight, std=0.02)
+            nn.init.normal_(head[-1].bias, std=0.02)
+    equiv.train()
+
+    full_eq = equiv(ct, pet_a, mask, mode="full", collect_candidates=False)
+    ref_cal_full, _ = equiv.affine_calibration(
+        ct,
+        pet_a,
+        full_eq["ct_reference"],
+        reference_valid=True,
+        use_pet_contribution_gate=False,
+    )
+    for s in range(4):
+        assert torch.allclose(
+            full_eq["pet_output"][s], ref_cal_full[s], atol=1e-5
+        )
+        assert torch.allclose(
+            full_eq["simple_fused"][s], ct[s] + ref_cal_full[s], atol=1e-5
+        )
+
+    miss_eq, miss_eq_aux = equiv.recover_missing(ct)
+    retrieval_eq = equiv.retrieve(ct, return_attention=False)
+    ref_cal_miss, _ = equiv.affine_calibration(
+        ct,
+        retrieval_eq["pet_proxy"],
+        retrieval_eq["ct_reference"],
+        reference_valid=True,
+        use_pet_contribution_gate=False,
+    )
+    for s in range(4):
+        assert torch.allclose(
+            miss_eq[s], ref_cal_miss[s], atol=1e-5
+        )
+        assert torch.allclose(
+            miss_eq_aux["simple_fused"][s], ct[s] + ref_cal_miss[s], atol=1e-5
+        )
+
     print("[SELF-CHECK] passed")
 
 

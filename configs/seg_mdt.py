@@ -53,6 +53,8 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--pspi_prototype_temperature', type=float, default=0.1)
         p.add_argument('--pspi_prototype_loss_stages', type=int, nargs='+', default=None)
         p.add_argument('--pspi_use_affine_calibration', type=str2bool, default=True)
+        p.add_argument('--pspi_use_pet_contribution_gate', type=str2bool, default=True)
+        p.add_argument('--pspi_use_retrieval_reliability', type=str2bool, default=True)
         p.add_argument('--pspi_collect_candidates', type=str2bool, default=True)
         return p
 

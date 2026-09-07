@@ -46,6 +46,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pspi_prototype_temperature=0.1,
         pspi_prototype_loss_stages=None,
         pspi_use_affine_calibration=True,
+        pspi_use_pet_contribution_gate=True,
+        pspi_use_retrieval_reliability=True,
         pspi_collect_candidates=True,
     ):
         super().__init__()
@@ -80,6 +82,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 prototype_temperature=pspi_prototype_temperature,
                 prototype_loss_stages=pspi_prototype_loss_stages,
                 use_affine_calibration=pspi_use_affine_calibration,
+                use_pet_contribution_gate=pspi_use_pet_contribution_gate,
+                use_retrieval_reliability=pspi_use_retrieval_reliability,
                 collect_candidates_during_training=pspi_collect_candidates,
             )
         else:
@@ -140,12 +144,13 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 collect_candidates=None,
                 compute_prototype_loss=True,
             )
-            pet_for_fusion = module1_out['pet_output']
+            # Module-1 owns the simple residual fusion: CT + P_out.
+            fused_feats = module1_out['simple_fused']
         else:
             module1_out = None
             pet_for_fusion = pet_feats_real
+            fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
 
-        fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
         out = self._decode(fused_feats, target_size)
         return self._attach_pspi_stats(out, module1_out=module1_out, ref_tensor=out['logits'])
 
@@ -155,8 +160,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
         if self.pspi_enabled:
             # Strict Missing EVAL / inference: never encode or use current-patient PET.
             if not self.training:
-                pet_for_fusion, module1_aux = self.module1.recover_missing(ct_feats)
-                fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
+                _, module1_aux = self.module1.recover_missing(ct_feats)
+                fused_feats = module1_aux['simple_fused']
                 out = self._decode(fused_feats, target_size)
                 zero = out['logits'].new_zeros(())
                 out['prototype_loss'] = zero
@@ -180,13 +185,13 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 collect_candidates=None,
                 compute_prototype_loss=True,
             )
-            pet_for_fusion = module1_out['pet_output']
+            fused_feats = module1_out['simple_fused']
         else:
             module1_out = None
             pet_feats_real = self._encode_pet(pet)
             pet_for_fusion = [torch.zeros_like(feat) for feat in pet_feats_real]
+            fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
 
-        fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
         out = self._decode(fused_feats, target_size)
         return self._attach_pspi_stats(out, module1_out=module1_out, ref_tensor=out['logits'])
 
@@ -223,11 +228,15 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 collect_candidates=False,
                 compute_prototype_loss=False,
             )
-            pet_for_fusion = []
+            # Simple fusion lives inside Module-1: select per-sample between the
+            # Full and Missing simple_fused features, never re-fuse CT + PET.
+            fused_feats = []
             availability = pet_available.view(-1, 1, 1, 1)
-            for feat_full, feat_miss in zip(full_out['pet_output'], missing_out['pet_output']):
-                avail = availability.to(device=feat_full.device, dtype=feat_full.dtype)
-                pet_for_fusion.append(feat_full * avail + feat_miss * (1.0 - avail))
+            for full_simple, miss_simple in zip(
+                full_out['simple_fused'], missing_out['simple_fused']
+            ):
+                avail = availability.to(device=full_simple.device, dtype=full_simple.dtype)
+                fused_feats.append(full_simple * avail + miss_simple * (1.0 - avail))
             module1_out = full_out
         else:
             module1_out = None
@@ -235,8 +244,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
             for feat in pet_feats_real:
                 availability_mask = pet_available.to(device=feat.device, dtype=feat.dtype).view(-1, 1, 1, 1)
                 pet_for_fusion.append(feat * availability_mask)
+            fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
 
-        fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
         out = self._decode(fused_feats, target_size)
         return self._attach_pspi_stats(out, module1_out=module1_out, ref_tensor=out['logits'])
 

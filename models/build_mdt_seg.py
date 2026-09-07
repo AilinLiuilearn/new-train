@@ -373,17 +373,27 @@ def build_mdt_seg_teacher(config):
         pspi_prototype_temperature=getattr(config, 'pspi_prototype_temperature', 0.1),
         pspi_prototype_loss_stages=pspi_loss_stages,
         pspi_use_affine_calibration=getattr(config, 'pspi_use_affine_calibration', True),
+        pspi_use_pet_contribution_gate=getattr(config, 'pspi_use_pet_contribution_gate', True),
+        pspi_use_retrieval_reliability=getattr(config, 'pspi_use_retrieval_reliability', True),
         pspi_collect_candidates=getattr(config, 'pspi_collect_candidates', True),
     )
+    pspi_enabled = bool(getattr(config, 'pspi_enabled', True))
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion=add shared_decoder=UNetStyleDecoder '
+        f'fusion={"module1_simple_fusion" if pspi_enabled else "AddFusion"} '
+        f'shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
     proto_stages = 'build_stage' if pspi_loss_stages is None else list(pspi_loss_stages)
+    if pspi_enabled:
+        fusion_desc = (
+            'module1_simple_fusion=CT+Pout downstream_fusion=None'
+        )
+    else:
+        fusion_desc = 'baseline_fusion=AddFusion'
     print(
-        f'[PSPI] enabled={getattr(config, "pspi_enabled", True)} '
+        f'[PSPI] enabled={pspi_enabled} '
         f'K={getattr(config, "pspi_num_clusters", 6)} '
         f'build_stage=S{getattr(config, "pspi_build_stage", 4)} '
         f'bank_update={getattr(config, "pspi_bank_update_mode", "direct")} '
@@ -392,6 +402,9 @@ def build_mdt_seg_teacher(config):
         f'proto_temperature={getattr(config, "pspi_prototype_temperature", 0.1)} '
         f'proto_loss_stages={proto_stages} '
         f'affine={getattr(config, "pspi_use_affine_calibration", True)} '
-        f'fusion=AddFusion'
+        f'pet_gate={getattr(config, "pspi_use_pet_contribution_gate", True)} '
+        f'retrieval_reliability={getattr(config, "pspi_use_retrieval_reliability", True)} '
+        f'{fusion_desc} '
+        f'decoder=UNetStyleDecoder'
     )
     return {'model': model}
