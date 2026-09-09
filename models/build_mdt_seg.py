@@ -196,6 +196,116 @@ def load_local_weights_safe(model, path, name='Encoder'):
         print(f'[-] {name}: no compatible tensors were loaded; training this encoder from scratch')
 
 
+def _strict_load_into_module(module, state_dict, name):
+    msg = module.load_state_dict(state_dict, strict=True)
+    if msg.missing_keys or msg.unexpected_keys:
+        raise RuntimeError(
+            f"[STAGE1 INIT] {name}: missing={msg.missing_keys} "
+            f"unexpected={msg.unexpected_keys}"
+        )
+    return len(state_dict)
+
+
+def _extract_legacy_unimodal_state(checkpoint, prefix):
+    model_state = checkpoint.get("model")
+    if not isinstance(model_state, dict):
+        return None
+    return {
+        key[len(prefix):]: value
+        for key, value in model_state.items()
+        if key.startswith(prefix)
+    }
+
+
+def _resolve_stage1_module_state(checkpoint, modality, strict):
+    """Return the module state dict for a Stage-1 unimodal checkpoint.
+
+    New Stage-1 checkpoints store explicit 'encoder' / 'ct_align' entries.
+    Legacy CT-only checkpoints only store the full 'model' state dict; in that
+    case the encoder (and ct_align) tensors are extracted by key prefix.
+    """
+    if modality == "ct":
+        encoder_state = checkpoint.get("encoder")
+        if not isinstance(encoder_state, dict):
+            encoder_state = _extract_legacy_unimodal_state(checkpoint, "enc_ct.")
+            if encoder_state is None:
+                if strict:
+                    raise RuntimeError(
+                        "[STAGE1 INIT] CT checkpoint has no encoder weights"
+                    )
+                return None, None
+        align_state = checkpoint.get("ct_align")
+        if not isinstance(align_state, dict):
+            align_state = _extract_legacy_unimodal_state(checkpoint, "ct_align.")
+            if align_state is None and strict:
+                raise RuntimeError(
+                    "[STAGE1 INIT] CT checkpoint has no ct_align weights"
+                )
+        return encoder_state, align_state
+    encoder_state = checkpoint.get("encoder")
+    if not isinstance(encoder_state, dict):
+        encoder_state = _extract_legacy_unimodal_state(checkpoint, "enc_pet.")
+        if encoder_state is None:
+            if strict:
+                raise RuntimeError(
+                    "[STAGE1 INIT] PET checkpoint has no encoder weights"
+                )
+            return None, None
+    return encoder_state, None
+
+
+def load_stage1_unimodal_initialization(model, ct_checkpoint, pet_checkpoint, strict=True):
+    """Load Stage-1 unimodal expert weights into the Stage-2 joint model.
+
+    Only modality-specific encoders (+ CT align) are loaded. Stage-1 decoders
+    are NEVER loaded: the Stage-2 shared decoder keeps its seed-determined
+    initialization so this experiment isolates encoder pretraining only.
+    """
+    report = {
+        "ct_encoder": False,
+        "ct_align": False,
+        "pet_encoder": False,
+        "shared_decoder": False,
+    }
+    if ct_checkpoint:
+        if not os.path.isfile(ct_checkpoint):
+            raise FileNotFoundError(ct_checkpoint)
+        checkpoint = torch.load(ct_checkpoint, map_location="cpu", weights_only=False)
+        encoder_state, align_state = _resolve_stage1_module_state(
+            checkpoint, "ct", strict
+        )
+        if encoder_state is not None:
+            n = _strict_load_into_module(model.enc_ct, encoder_state, "ct_encoder")
+            report["ct_encoder"] = True
+            print(f"[STAGE1 INIT] ct_encoder loaded_tensors={n}", flush=True)
+        if align_state is not None:
+            n = _strict_load_into_module(model.ct_align, align_state, "ct_align")
+            report["ct_align"] = True
+            print(f"[STAGE1 INIT] ct_align loaded_tensors={n}", flush=True)
+        print(f"[STAGE1 INIT] ct_checkpoint={ct_checkpoint}", flush=True)
+    if pet_checkpoint:
+        if not os.path.isfile(pet_checkpoint):
+            raise FileNotFoundError(pet_checkpoint)
+        checkpoint = torch.load(pet_checkpoint, map_location="cpu", weights_only=False)
+        encoder_state, _ = _resolve_stage1_module_state(checkpoint, "pet", strict)
+        if encoder_state is not None:
+            n = _strict_load_into_module(model.enc_pet, encoder_state, "pet_encoder")
+            report["pet_encoder"] = True
+            print(f"[STAGE1 INIT] pet_encoder loaded_tensors={n}", flush=True)
+        print(f"[STAGE1 INIT] pet_checkpoint={pet_checkpoint}", flush=True)
+
+    print(
+        "[STAGE1 INIT] "
+        f"ct_encoder={report['ct_encoder']} "
+        f"ct_align={report['ct_align']} "
+        f"pet_encoder={report['pet_encoder']} "
+        "shared_decoder_loaded=False "
+        "(Stage-1 decoders are never transferred; encoders remain trainable)",
+        flush=True,
+    )
+    return report
+
+
 def _normalize_backbone_name(backbone):
     backbone = str(backbone).strip().replace('\u200b', '').replace('\ufeff', '')
     aliases = {
@@ -377,6 +487,16 @@ def build_mdt_seg_teacher(config):
         pspi_use_retrieval_reliability=getattr(config, 'pspi_use_retrieval_reliability', True),
         pspi_collect_candidates=getattr(config, 'pspi_collect_candidates', True),
     )
+    if bool(getattr(config, 'stage1_init_enabled', False)):
+        load_stage1_unimodal_initialization(
+            model,
+            getattr(config, 'stage1_ct_checkpoint', None),
+            getattr(config, 'stage1_pet_checkpoint', None),
+            strict=bool(getattr(config, 'stage1_init_strict', True)),
+        )
+        assert all(p.requires_grad for p in model.enc_ct.parameters())
+        assert all(p.requires_grad for p in model.enc_pet.parameters())
+        assert all(p.requires_grad for p in model.ct_align.parameters())
     pspi_enabled = bool(getattr(config, 'pspi_enabled', True))
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '

@@ -110,6 +110,74 @@ def main():
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
     total_params, trainable_params = _count_parameters(task.model)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
+
+    # Stage-1.5: optional clean prototype bank bootstrap BEFORE any training step.
+    if (
+        bool(getattr(cfg, 'pspi_enabled', False))
+        and bool(getattr(cfg, 'pspi_bootstrap_bank', False))
+        and getattr(task.model, 'pspi_enabled', False)
+    ):
+        from datasets.pclt20k_seg import get_pclt20k_pspi_bootstrap_loader
+
+        bootstrap_loader = get_pclt20k_pspi_bootstrap_loader(
+            cfg.root,
+            cfg.image_size_2d,
+            cfg.batch_size,
+            cfg.num_workers,
+            cfg.random_state,
+            cfg.pin_memory,
+            cfg.norm_mode,
+            cfg.train_split_file,
+        )
+        print(
+            '[PSPI][BOOTSTRAP] source=train_only '
+            f'batches={len(bootstrap_loader)} augmentation=none',
+            flush=True,
+        )
+        module1 = task.model.module1
+        before_state = {
+            name: value.detach().cpu().clone()
+            for name, value in module1.state_dict().items()
+            if 'ct_keys' in name or 'pet_values' in name
+        }
+        encoder_names = ('enc_ct', 'enc_pet', 'ct_align')
+        encoder_before = {
+            name: value.detach().cpu().clone()
+            for name, value in task.model.state_dict().items()
+            if any(name.startswith(prefix + '.') for prefix in encoder_names)
+        }
+        was_training = task.model.training
+        task.model.eval()
+        for batch_idx, batch in enumerate(bootstrap_loader):
+            ct = batch['ct'].to(task.device, non_blocking=True)
+            pet = batch['pet'].to(task.device, non_blocking=True)
+            mask = batch['mask'].to(task.device, non_blocking=True).float()
+            with torch.no_grad():
+                task.model.collect_module1_bootstrap_batch(ct, pet, mask)
+            if (batch_idx + 1) % 50 == 0:
+                print(f'[PSPI][BOOTSTRAP] batch={batch_idx + 1}', flush=True)
+        bootstrap_report = module1.finalize_epoch(epoch=0)
+        task.model.train(was_training)
+        for name, value in task.model.state_dict().items():
+            if any(name.startswith(prefix + '.') for prefix in encoder_names):
+                if not torch.equal(encoder_before[name], value.detach().cpu()):
+                    raise RuntimeError(f'[PSPI][BOOTSTRAP] encoder parameter changed: {name}')
+        changed_slots = sum(
+            int((before_state[name] != module1.state_dict()[name].cpu()).any())
+            for name in before_state
+        )
+        print(
+            "[PSPI][BOOTSTRAP] done "
+            f"status={bootstrap_report.get('status')} "
+            f"bank_version={module1.bank_version.item()} "
+            f"ready_count={int(module1.prototype_ready.sum().item())} "
+            f"total_slots={module1.prototype_ready.numel()} "
+            f"bank_buffers_changed={changed_slots > 0} "
+            "encoder_params_unchanged=True",
+            flush=True,
+        )
+        module1.reset_epoch_cache()
+
     task.scheduler = get_cosine_scheduler(
         task.optimizer,
         epochs=cfg.epochs,

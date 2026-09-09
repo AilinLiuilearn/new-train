@@ -9,12 +9,18 @@ Only the model is changed relative to run_mdt_seg.py:
 The PET encoder and AddFusion are not instantiated.  The original data loader,
 BCEDiceLoss, AdamW optimizer, cosine schedule, AMP, gradient clipping, early
 stopping, metrics and checkpoint format are reused.
+
+The CT-only model definition lives in models/unimodal_pretrain.py so it can be
+shared with the Stage-1 unimodal pretraining runner.
 """
 
 import argparse
 import csv
 import json
 import os
+
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
 import random
 import time
 
@@ -29,7 +35,7 @@ from models.baseline_blocks import (
     _check_tensor_list,
 )
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
-from models.dual_shared_add_baseline import StageChannelAlign
+from models.unimodal_pretrain import CTOnlySegmentationModel
 from tasks.mdt_seg import MDTSegTeacher
 from utils.optimization import get_cosine_scheduler
 from utils.train_logger import append_epoch_log, init_train_log
@@ -39,81 +45,6 @@ from utils.train_logger import append_epoch_log, init_train_log
 # enter the shared decoder.  Keeping these values preserves the exact decoder
 # structure and capacity after PET is removed.
 DECODER_INPUT_CHANNELS = (64, 128, 320, 512)
-
-
-class CTOnlySegmentationModel(nn.Module):
-    """ConvNeXtV2-Nano CT encoder plus the baseline's shared decoder."""
-
-    def __init__(
-        self,
-        ct_backbone="convnextv2_nano",
-        ct_pretrained_path=None,
-        in_channels=3,
-        out_channels=1,
-        decoder_channels=(512, 256, 128, 64),
-        use_deep_supervision=False,
-    ):
-        super().__init__()
-        self.use_deep_supervision = bool(use_deep_supervision)
-
-        # CT is the only encoder instantiated in this experiment.
-        self.enc_ct = create_feature_backbone(
-            ct_backbone,
-            in_channels=in_channels,
-        )
-        load_local_weights_safe(
-            self.enc_ct,
-            ct_pretrained_path,
-            name="CT_Encoder",
-        )
-
-        ct_channels = list(self.enc_ct.feature_info.channels())
-        decoder_input_channels = list(DECODER_INPUT_CHANNELS)
-
-        # This is the same StageChannelAlign used by the joint baseline before
-        # SUM fusion.  Here its outputs go directly to the decoder skips.
-        self.ct_align = StageChannelAlign(
-            ct_channels,
-            decoder_input_channels,
-        )
-        self.decoder = UNetStyleDecoder(
-            decoder_input_channels,
-            decoder_channels=decoder_channels,
-            out_channels=out_channels,
-            use_deep_supervision=self.use_deep_supervision,
-        )
-
-    @staticmethod
-    def _to_3ch(x):
-        return x.repeat(1, 3, 1, 1) if x.shape[1] == 1 else x
-
-    def _encode_ct(self, ct):
-        ct_feats = self.enc_ct(self._to_3ch(ct))
-        _check_tensor_list("ct_feats", ct_feats)
-        aligned_ct = self.ct_align(ct_feats)
-        _check_tensor_list("aligned_ct", aligned_ct)
-        return aligned_ct
-
-    def forward(
-        self,
-        ct,
-        pet=None,
-        pet_available=None,
-        target_size=None,
-        forward_mode="missing",
-    ):
-        # These arguments are retained only for compatibility with
-        # MDTSegTeacher.  They never affect this CT-only forward pass.
-        del pet, pet_available, forward_mode
-
-        if target_size is None:
-            target_size = ct.shape[-2:]
-
-        out = self.decoder(self._encode_ct(ct), target_size)
-        _check_tensor("logits", out["logits"])
-        out["pred"] = out["logits"]
-        out["aux"] = {}
-        return out
 
 
 def build_ct_only_model(cfg):
@@ -176,8 +107,12 @@ def _seed(cfg):
     torch.manual_seed(cfg.random_state)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.random_state)
+    torch.use_deterministic_algorithms(True, warn_only=False)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
 
 def _loaders(cfg):

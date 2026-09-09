@@ -56,6 +56,12 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--pspi_use_pet_contribution_gate', type=str2bool, default=True)
         p.add_argument('--pspi_use_retrieval_reliability', type=str2bool, default=True)
         p.add_argument('--pspi_collect_candidates', type=str2bool, default=True)
+        # Stage-1 unimodal pretraining initialization (SimMLM-style two-stage recipe)
+        p.add_argument('--stage1_init_enabled', type=str2bool, default=False)
+        p.add_argument('--stage1_ct_checkpoint', type=str, default=None)
+        p.add_argument('--stage1_pet_checkpoint', type=str, default=None)
+        p.add_argument('--stage1_init_strict', type=str2bool, default=True)
+        p.add_argument('--pspi_bootstrap_bank', type=str2bool, default=False)
         return p
 
     @staticmethod

@@ -250,6 +250,19 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return self._attach_pspi_stats(out, module1_out=module1_out, ref_tensor=out['logits'])
 
     @torch.no_grad()
+    def collect_module1_bootstrap_batch(self, ct, pet, mask):
+        """Extract features with the current encoders and feed Module-1's cache.
+
+        Used only for the pre-epoch-1 prototype bank bootstrap. No segmentation
+        forward, no optimizer, no backward; encoder parameters are untouched.
+        """
+        if not self.pspi_enabled:
+            raise RuntimeError("bootstrap requires pspi_enabled=True")
+        ct_feats = self._encode_ct(ct)
+        pet_feats = self._encode_pet(pet)
+        return self.module1.collect_candidates(ct_feats, pet_feats, mask)
+
+    @torch.no_grad()
     def finalize_module1_epoch(self, epoch):
         if not self.pspi_enabled:
             return None

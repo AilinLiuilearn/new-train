@@ -157,5 +157,51 @@ def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_wor
     return _make_loader(train_ds, batch_size, num_workers, True, True, random_state+11, pin_memory), _make_loader(val_ds, batch_size, num_workers, False, False, random_state+17, pin_memory), _make_loader(test_ds, batch_size, num_workers, False, False, random_state+23, pin_memory)
 
 
+def get_pclt20k_pspi_bootstrap_loader(root, image_size=512, batch_size=8, num_workers=4, random_state=2023, pin_memory=True, norm_mode='cipa', train_split_file='train_original.txt'):
+    """Clean, no-augmentation train-split-only loader for the PSPI bank bootstrap.
+
+    Never touches val/test splits. Uses train=False (no augmentation), the same
+    norm/image-size conventions as the formal training loader, and a dedicated
+    deterministic generator so the formal train loader's RNG is not consumed.
+    """
+    train_ids = _read_list(os.path.join(root, train_split_file))
+    if train_ids is None:
+        raise FileNotFoundError(os.path.join(root, train_split_file))
+    train_records = _records_from_ids(root, train_ids)
+    if not train_records:
+        raise ValueError('bootstrap train split is empty')
+    if any(
+        not (
+            os.path.isfile(r['ct_path'])
+            and os.path.isfile(r['pet_path'])
+            and os.path.isfile(r['mask_path'])
+        )
+        for r in train_records
+    ):
+        raise FileNotFoundError('bootstrap train split contains missing PET/CT/mask files')
+    train_ds = PCLT20KSegDataset(
+        train_records,
+        image_size=image_size,
+        train=False,
+        random_state=random_state,
+        aug_mode='none',
+        norm_mode=norm_mode,
+    )
+    # Independent generator: distinct seed offset from the formal loaders
+    # (which use random_state+11 / +17 / +23).
+    g = torch.Generator()
+    g.manual_seed(int(random_state) + 101)
+    return DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        drop_last=False,
+        pin_memory=pin_memory,
+        worker_init_fn=_seed_worker,
+        generator=g,
+    )
+
+
 def get_pclt20k_loaders(*args, **kwargs):
     return get_pclt20k_loaders_cipa_aligned(*args, **kwargs)
