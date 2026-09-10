@@ -42,16 +42,17 @@ class MDTSegTeacher:
         outputs = self.model(ct, pet=pet, forward_mode=forward_mode, mask=mask)
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
         seg_loss, loss_stats = self.criterion(logits, mask)
-        proto_loss_raw = outputs.get('prototype_loss', seg_loss.new_zeros(()))
-        proto_loss_weighted = outputs.get('prototype_loss_weighted', seg_loss.new_zeros(()))
-        total_loss = seg_loss + proto_loss_weighted
+        semantic_weighted = outputs.get('semantic_loss_weighted', seg_loss.new_zeros(()))
+        if semantic_weighted.dim() > 0:
+            semantic_weighted = semantic_weighted.reshape(())
+        total_loss = seg_loss + semantic_weighted
         stats = {
             'loss_total': total_loss.detach(),
             'loss_seg': loss_stats.get('loss_dice', seg_loss.detach()),
             'loss_seg_total': seg_loss.detach(),
-            'loss_proto': proto_loss_raw.detach(),
-            'loss_proto_weighted': proto_loss_weighted.detach(),
-            'prototype_loss_num_terms': outputs.get('prototype_loss_num_terms', 0),
+            'loss_semantic': outputs.get('semantic_loss', seg_loss.new_zeros(())).detach(),
+            'loss_semantic_weighted': semantic_weighted.detach(),
+            'semantic_loss_num_terms': outputs.get('semantic_loss_num_terms', 0),
             'loss_boundary': torch.tensor(0.0, device=total_loss.device),
         }
         return total_loss, logits, outputs, stats

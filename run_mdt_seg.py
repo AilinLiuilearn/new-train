@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
 import json
 import os
-
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-
 import random
 import time
 
@@ -18,6 +15,12 @@ from utils.train_logger import append_epoch_log, init_train_log
 
 
 def _seed(cfg):
+    # ---------------------------------------------------------
+    # Seeded stochastic training
+    # ---------------------------------------------------------
+    # Keep experiment-level RNG controllable:
+    # weight initialization / shuffle / augmentation / dropout
+    # still remain random, but are reproducible for a given seed.
     random.seed(cfg.random_state)
     np.random.seed(cfg.random_state)
     torch.manual_seed(cfg.random_state)
@@ -25,14 +28,17 @@ def _seed(cfg):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.random_state)
 
-    torch.use_deterministic_algorithms(
-        True,
-        warn_only=False,
-    )
+    # Do NOT force every CUDA/PyTorch operator to use a
+    # deterministic implementation.
+    torch.use_deterministic_algorithms(False)
 
+    # First relaxed setting:
+    # keep cuDNN reasonably reproducible, similar to many papers.
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+    # Keep numerical precision unchanged in the first ablation.
+    # Do not change determinism and TF32 at the same time.
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
@@ -97,8 +103,12 @@ def main():
     cfg = SegMDTConfig.parse_arguments()
     _assert_baseline(cfg)
     _seed(cfg)
-    print('[REPRO] deterministic_algorithms=True', flush=True)
-    print('[REPRO] CUBLAS_WORKSPACE_CONFIG=:4096:8', flush=True)
+    print('[REPRO] mode=seeded_stochastic', flush=True)
+    print('[REPRO] seed={}'.format(cfg.random_state), flush=True)
+    print('[REPRO] deterministic_algorithms=False', flush=True)
+    print('[REPRO] cudnn_deterministic=True', flush=True)
+    print('[REPRO] cudnn_benchmark=False', flush=True)
+    print('[REPRO] CUBLAS_WORKSPACE_CONFIG=unset', flush=True)
     print('[REPRO] TF32=False', flush=True)
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
@@ -190,6 +200,7 @@ def main():
     extra_headers = [
         'train_full_loss', 'train_missing_loss', 'train_overall_loss',
         'full_train_batches', 'missing_train_batches',
+        'train_missing_semantic_loss', 'train_missing_semantic_loss_weighted',
         'val_full_loss', 'val_full_dice', 'val_full_iou', 'val_full_acc', 'val_full_acc_pixel', 'val_full_hd95',
         'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
         'joint_dice', 'best_joint', 'best_joint_epoch',
@@ -212,6 +223,8 @@ def main():
         task.model.train()
         full_n = missing_n = 0
         full_loss = missing_loss = 0.0
+        missing_semantic_loss = 0.0
+        missing_semantic_weighted = 0.0
         grad_norm_accum = 0.0
         grad_norm_steps = 0
         grads = {
@@ -226,7 +239,7 @@ def main():
             route = 'full' if global_batch_step % 2 == 0 else 'missing'
             task.optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
-                loss, _, _, _ = task.train_step(batch, forward_mode=route)
+                loss, _, _, step_stats = task.train_step(batch, forward_mode=route)
             if not torch.isfinite(loss):
                 raise RuntimeError('loss became non-finite')
 
@@ -260,6 +273,8 @@ def main():
             else:
                 missing_n += 1
                 missing_loss += float(loss.detach())
+                missing_semantic_loss += float(step_stats['loss_semantic'].detach())
+                missing_semantic_weighted += float(step_stats['loss_semantic_weighted'].detach())
 
             global_batch_step += 1
             task.global_batch_step = global_batch_step
@@ -334,6 +349,8 @@ def main():
                 'train_overall_loss': train_loss,
                 'full_train_batches': full_n,
                 'missing_train_batches': missing_n,
+                'train_missing_semantic_loss': missing_semantic_loss / max(1, missing_n),
+                'train_missing_semantic_loss_weighted': missing_semantic_weighted / max(1, missing_n),
                 'val_full_loss': val_full['total_loss'],
                 'val_full_dice': val_full['dice'],
                 'val_full_iou': val_full['iou'],

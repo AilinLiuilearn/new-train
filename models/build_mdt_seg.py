@@ -461,7 +461,6 @@ class ConvBNAct(nn.Module):
 
 def build_mdt_seg_teacher(config):
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
-    pspi_loss_stages = getattr(config, 'pspi_prototype_loss_stages', None)
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
@@ -478,13 +477,7 @@ def build_mdt_seg_teacher(config):
         pspi_outlier_discard_rate=getattr(config, 'pspi_outlier_discard_rate', 0.05),
         pspi_bank_update_mode=getattr(config, 'pspi_bank_update_mode', 'direct'),
         pspi_ema_momentum=getattr(config, 'pspi_ema_momentum', 0.999),
-        pspi_prototype_loss_type=getattr(config, 'pspi_prototype_loss_type', 'pad_kl'),
-        pspi_prototype_loss_weight=getattr(config, 'pspi_prototype_loss_weight', 0.01),
-        pspi_prototype_temperature=getattr(config, 'pspi_prototype_temperature', 0.1),
-        pspi_prototype_loss_stages=pspi_loss_stages,
-        pspi_use_affine_calibration=getattr(config, 'pspi_use_affine_calibration', True),
-        pspi_use_pet_contribution_gate=getattr(config, 'pspi_use_pet_contribution_gate', True),
-        pspi_use_retrieval_reliability=getattr(config, 'pspi_use_retrieval_reliability', True),
+        pspi_semantic_loss_weight=getattr(config, 'pspi_semantic_loss_weight', 0.01),
         pspi_collect_candidates=getattr(config, 'pspi_collect_candidates', True),
     )
     if bool(getattr(config, 'stage1_init_enabled', False)):
@@ -501,29 +494,25 @@ def build_mdt_seg_teacher(config):
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion={"module1_simple_fusion" if pspi_enabled else "AddFusion"} '
+        f'fusion=AddFusion '
         f'shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
-    proto_stages = 'build_stage' if pspi_loss_stages is None else list(pspi_loss_stages)
     if pspi_enabled:
-        fusion_desc = (
-            'module1_simple_fusion=CT+Pout downstream_fusion=None'
-        )
+        fusion_desc = 'downstream_fusion=AddFusion'
     else:
         fusion_desc = 'baseline_fusion=AddFusion'
     print(
         f'[PSPI] enabled={pspi_enabled} '
+        f'role=missing_pet_compensation_only '
         f'K={getattr(config, "pspi_num_clusters", 6)} '
         f'build_stage=S{getattr(config, "pspi_build_stage", 4)} '
         f'bank_update={getattr(config, "pspi_bank_update_mode", "direct")} '
-        f'proto_loss={getattr(config, "pspi_prototype_loss_type", "pad_kl")} '
-        f'proto_weight={getattr(config, "pspi_prototype_loss_weight", 0.01)} '
-        f'proto_temperature={getattr(config, "pspi_prototype_temperature", 0.1)} '
-        f'proto_loss_stages={proto_stages} '
-        f'affine={getattr(config, "pspi_use_affine_calibration", True)} '
-        f'pet_gate={getattr(config, "pspi_use_pet_contribution_gate", True)} '
-        f'retrieval_reliability={getattr(config, "pspi_use_retrieval_reliability", True)} '
+        f'personalization=ct_reference_residual_affine '
+        f'semantic_relation_loss=True '
+        f'semantic_weight={getattr(config, "pspi_semantic_loss_weight", 0.01)} '
+        f'full_path=raw_CT_plus_real_PET '
+        f'missing_path=CT_plus_compensated_PET '
         f'{fusion_desc} '
         f'decoder=UNetStyleDecoder'
     )

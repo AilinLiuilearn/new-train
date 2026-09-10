@@ -24,6 +24,16 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
+    """AddFusion baseline with a missing-only Module-1.
+
+    Full route is the raw baseline (CT + real PET via AddFusion). Module-1 is
+    bypassed entirely for Full prediction; real PET on Full batches is only
+    used for detached prototype candidate collection.
+
+    Missing route: CT -> Module-1 (retrieval + personalization) -> P_comp,
+    then the same AddFusion boundary: F = CT + P_comp.
+    """
+
     def __init__(
         self,
         ct_backbone='convnextv2_nano',
@@ -41,13 +51,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pspi_outlier_discard_rate=0.05,
         pspi_bank_update_mode='direct',
         pspi_ema_momentum=0.999,
-        pspi_prototype_loss_type='pad_kl',
-        pspi_prototype_loss_weight=0.01,
-        pspi_prototype_temperature=0.1,
-        pspi_prototype_loss_stages=None,
-        pspi_use_affine_calibration=True,
-        pspi_use_pet_contribution_gate=True,
-        pspi_use_retrieval_reliability=True,
+        pspi_semantic_loss_weight=0.01,
         pspi_collect_candidates=True,
     ):
         super().__init__()
@@ -77,13 +81,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 outlier_discard_rate=pspi_outlier_discard_rate,
                 bank_update_mode=pspi_bank_update_mode,
                 ema_momentum=pspi_ema_momentum,
-                prototype_loss_type=pspi_prototype_loss_type,
-                prototype_loss_weight=pspi_prototype_loss_weight,
-                prototype_temperature=pspi_prototype_temperature,
-                prototype_loss_stages=pspi_prototype_loss_stages,
-                use_affine_calibration=pspi_use_affine_calibration,
-                use_pet_contribution_gate=pspi_use_pet_contribution_gate,
-                use_retrieval_reliability=pspi_use_retrieval_reliability,
+                semantic_loss_weight=pspi_semantic_loss_weight,
                 collect_candidates_during_training=pspi_collect_candidates,
             )
         else:
@@ -100,7 +98,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
 
     def _encode_pet(self, pet):
         if pet is None:
-            raise ValueError('API-style baseline requires PET input before fusion-time masking')
+            raise ValueError('PET encoder requires PET input; Missing inference must not call it')
         pet_feats = self.enc_pet(self._to_3ch(pet))
         _check_tensor_list('pet_feats', pet_feats)
         return pet_feats
@@ -112,64 +110,67 @@ class DualSharedAddPETCTBaseline(nn.Module):
         out['aux'] = {}
         return out
 
-    def _attach_pspi_stats(self, out, module1_out=None, ref_tensor=None):
-        if module1_out is not None:
-            out['prototype_loss'] = module1_out['prototype_loss']
-            out['prototype_loss_weighted'] = module1_out['prototype_loss_weighted']
-            out['prototype_loss_num_terms'] = module1_out['prototype_loss_num_terms']
-            out['module1_bank_ready'] = bool(module1_out['bank_ready'])
-            out['module1_bank_version'] = int(module1_out['bank_version'])
-            return out
-
-        if ref_tensor is None:
-            raise ValueError('ref_tensor is required when module1_out is None')
-        zero = ref_tensor.new_zeros(())
-        out['prototype_loss'] = zero
-        out['prototype_loss_weighted'] = zero
-        out['prototype_loss_num_terms'] = 0
-        out['module1_bank_ready'] = False
-        out['module1_bank_version'] = 0
+    def _attach_pspi_stats(self, out, semantic=None, module1_aux=None, ref_tensor=None):
+        if semantic is not None:
+            out['semantic_loss'] = semantic['loss']
+            out['semantic_loss_weighted'] = semantic['weighted_loss']
+            out['semantic_loss_num_terms'] = semantic['num_terms']
+        elif ref_tensor is not None:
+            zero = ref_tensor.new_zeros(())
+            out['semantic_loss'] = zero
+            out['semantic_loss_weighted'] = zero
+            out['semantic_loss_num_terms'] = 0
+        else:
+            raise ValueError('semantic or ref_tensor is required')
+        if module1_aux is not None:
+            out['module1_bank_ready'] = bool(module1_aux.get('bank_ready', False))
+            out['module1_bank_version'] = int(module1_aux.get('bank_version', 0))
+        else:
+            out['module1_bank_ready'] = False
+            out['module1_bank_version'] = 0
+        # Legacy names kept as aliases so old logging code does not crash.
+        out['prototype_loss'] = out['semantic_loss']
+        out['prototype_loss_weighted'] = out['semantic_loss_weighted']
+        out['prototype_loss_num_terms'] = out['semantic_loss_num_terms']
         return out
+
+    def _maybe_collect(self, ct_feats, pet_feats_real, mask):
+        if not self.pspi_enabled or self.module1 is None:
+            return None
+        if not self.training:
+            return None
+        if not self.module1.config.collect_candidates_during_training:
+            return None
+        if mask is None:
+            return None
+        return self.module1.collect_candidates(ct_feats, pet_feats_real, mask)
 
     def _forward_full(self, ct, pet, target_size, mask=None):
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
 
-        if self.pspi_enabled:
-            module1_out = self.module1(
-                ct_feats=ct_feats,
-                pet_feats_real=pet_feats_real,
-                mask=mask,
-                mode='full',
-                collect_candidates=None,
-                compute_prototype_loss=True,
-            )
-            # Module-1 owns the simple residual fusion: CT + P_out.
-            fused_feats = module1_out['simple_fused']
-        else:
-            module1_out = None
-            pet_for_fusion = pet_feats_real
-            fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
+        # Full candidate collection is detached/no-grad and never affects the
+        # Full prediction path below.
+        self._maybe_collect(ct_feats, pet_feats_real, mask)
 
+        # Full prediction = raw baseline: CT + real PET via AddFusion.
+        # Module-1 is fully bypassed.
+        fused_feats = self.fusion(ct_feats, pet_feats_real, None)
         out = self._decode(fused_feats, target_size)
-        return self._attach_pspi_stats(out, module1_out=module1_out, ref_tensor=out['logits'])
+        return self._attach_pspi_stats(out, ref_tensor=out['logits'])
 
     def _forward_missing(self, ct, pet, target_size, mask=None):
         ct_feats = self._encode_ct(ct)
 
         if self.pspi_enabled:
-            # Strict Missing EVAL / inference: never encode or use current-patient PET.
+            # Strict Missing EVAL / inference: never encode or use PET.
             if not self.training:
-                _, module1_aux = self.module1.recover_missing(ct_feats)
-                fused_feats = module1_aux['simple_fused']
+                pet_comp, module1_aux = self.module1.recover_missing(ct_feats)
+                fused_feats = self.fusion(ct_feats, pet_comp, None)
                 out = self._decode(fused_feats, target_size)
-                zero = out['logits'].new_zeros(())
-                out['prototype_loss'] = zero
-                out['prototype_loss_weighted'] = zero
-                out['prototype_loss_num_terms'] = 0
-                out['module1_bank_ready'] = bool(module1_aux.get('bank_ready', False))
-                out['module1_bank_version'] = int(module1_aux.get('bank_version', 0))
-                return out
+                return self._attach_pspi_stats(
+                    out, module1_aux=module1_aux, ref_tensor=out['logits']
+                )
 
             # Missing TRAIN: real PET is privileged teacher / candidate source only.
             if pet is None:
@@ -177,23 +178,32 @@ class DualSharedAddPETCTBaseline(nn.Module):
             if mask is None:
                 raise ValueError('Missing training requires mask for PSPI candidate/teacher path')
             pet_feats_real = self._encode_pet(pet)
-            module1_out = self.module1(
-                ct_feats=ct_feats,
-                pet_feats_real=pet_feats_real,
-                mask=mask,
-                mode='missing',
-                collect_candidates=None,
-                compute_prototype_loss=True,
-            )
-            fused_feats = module1_out['simple_fused']
-        else:
-            module1_out = None
-            pet_feats_real = self._encode_pet(pet)
-            pet_for_fusion = [torch.zeros_like(feat) for feat in pet_feats_real]
-            fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
+            self._maybe_collect(ct_feats, pet_feats_real, mask)
 
-        out = self._decode(fused_feats, target_size)
-        return self._attach_pspi_stats(out, module1_out=module1_out, ref_tensor=out['logits'])
+            # Prediction path uses NO real PET.
+            pet_comp, module1_aux = self.module1.recover_missing(ct_feats)
+
+            # Semantic supervision (build stage only; teacher detached inside).
+            semantic = self.module1.compute_semantic_relation_loss(
+                pet_comp, pet_feats_real, mask
+            )
+
+            fused_feats = self.fusion(ct_feats, pet_comp, None)
+            out = self._decode(fused_feats, target_size)
+            return self._attach_pspi_stats(
+                out, semantic=semantic, module1_aux=module1_aux,
+                ref_tensor=out['logits'],
+            )
+        else:
+            module1_aux = None
+            if self.training:
+                pet_feats_real = self._encode_pet(pet)
+                pet_for_fusion = [torch.zeros_like(feat) for feat in pet_feats_real]
+            else:
+                pet_for_fusion = [torch.zeros_like(feat) for feat in ct_feats]
+            fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
+            out = self._decode(fused_feats, target_size)
+            return self._attach_pspi_stats(out, module1_aux=module1_aux, ref_tensor=out['logits'])
 
     def _forward_auto(self, ct, pet, pet_available, target_size, mask=None):
         pet_available = pet_available.to(device=ct.device).long().view(-1)
@@ -207,47 +217,27 @@ class DualSharedAddPETCTBaseline(nn.Module):
         if torch.all(pet_available == 0):
             return self._forward_missing(ct, pet, target_size, mask=mask)
 
-        # Mixed batch: keep API compatibility without changing Full/Missing schedule.
+        # Mixed batch: keep API compatibility. Per-sample PET evidence chooses
+        # real PET (available) or compensated PET (missing); fusion is always
+        # the same AddFusion boundary.
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
+        self._maybe_collect(ct_feats, pet_feats_real, mask)
 
         if self.pspi_enabled:
-            full_out = self.module1(
-                ct_feats=ct_feats,
-                pet_feats_real=pet_feats_real,
-                mask=mask,
-                mode='full',
-                collect_candidates=None,
-                compute_prototype_loss=True,
-            )
-            missing_out = self.module1(
-                ct_feats=ct_feats,
-                pet_feats_real=pet_feats_real,
-                mask=mask,
-                mode='missing',
-                collect_candidates=False,
-                compute_prototype_loss=False,
-            )
-            # Simple fusion lives inside Module-1: select per-sample between the
-            # Full and Missing simple_fused features, never re-fuse CT + PET.
-            fused_feats = []
-            availability = pet_available.view(-1, 1, 1, 1)
-            for full_simple, miss_simple in zip(
-                full_out['simple_fused'], missing_out['simple_fused']
-            ):
-                avail = availability.to(device=full_simple.device, dtype=full_simple.dtype)
-                fused_feats.append(full_simple * avail + miss_simple * (1.0 - avail))
-            module1_out = full_out
-        else:
-            module1_out = None
+            pet_comp, module1_aux = self.module1.recover_missing(ct_feats)
+            availability = pet_available.view(-1, 1, 1, 1).to(dtype=pet_feats_real[0].dtype)
             pet_for_fusion = []
-            for feat in pet_feats_real:
-                availability_mask = pet_available.to(device=feat.device, dtype=feat.dtype).view(-1, 1, 1, 1)
-                pet_for_fusion.append(feat * availability_mask)
-            fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
+            for real_feat, comp_feat in zip(pet_feats_real, pet_comp):
+                pet_for_fusion.append(real_feat * availability + comp_feat * (1.0 - availability))
+        else:
+            module1_aux = None
+            availability = pet_available.view(-1, 1, 1, 1).to(dtype=pet_feats_real[0].dtype)
+            pet_for_fusion = [feat * availability for feat in pet_feats_real]
 
+        fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
         out = self._decode(fused_feats, target_size)
-        return self._attach_pspi_stats(out, module1_out=module1_out, ref_tensor=out['logits'])
+        return self._attach_pspi_stats(out, module1_aux=module1_aux, ref_tensor=out['logits'])
 
     @torch.no_grad()
     def collect_module1_bootstrap_batch(self, ct, pet, mask):

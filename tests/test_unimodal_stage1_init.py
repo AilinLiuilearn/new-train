@@ -126,8 +126,7 @@ def test_stage2_strict_missing_with_bootstrap_bank():
         pet_pretrained_path=None,
         pspi_enabled=True,
         pspi_num_clusters=3,
-        pspi_prototype_loss_type="none",
-        pspi_prototype_loss_weight=0.0,
+        pspi_semantic_loss_weight=0.0,
     )
     joint.eval()
     ct = torch.randn(1, 1, 64, 64)
