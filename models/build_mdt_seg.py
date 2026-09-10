@@ -477,7 +477,11 @@ def build_mdt_seg_teacher(config):
         pspi_outlier_discard_rate=getattr(config, 'pspi_outlier_discard_rate', 0.05),
         pspi_bank_update_mode=getattr(config, 'pspi_bank_update_mode', 'direct'),
         pspi_ema_momentum=getattr(config, 'pspi_ema_momentum', 0.999),
-        pspi_semantic_loss_weight=getattr(config, 'pspi_semantic_loss_weight', 0.01),
+        pspi_retrieval_temperature=getattr(config, 'pspi_retrieval_temperature', 0.1),
+        pspi_proto_contrastive_weight=getattr(config, 'pspi_proto_contrastive_weight', 0.01),
+        pspi_proto_temperature=getattr(config, 'pspi_proto_temperature', 0.02),
+        pspi_reconstruction_weight=getattr(config, 'pspi_reconstruction_weight', 0.1),
+        pspi_spatial_affine=getattr(config, 'pspi_spatial_affine', True),
         pspi_collect_candidates=getattr(config, 'pspi_collect_candidates', True),
     )
     if bool(getattr(config, 'stage1_init_enabled', False)):
@@ -504,13 +508,21 @@ def build_mdt_seg_teacher(config):
         fusion_desc = 'baseline_fusion=AddFusion'
     print(
         f'[PSPI] enabled={pspi_enabled} '
-        f'role=missing_pet_compensation_only '
+        f'clustering=spherical_cosine '
+        f'cluster_init=deterministic_mean_farthest '
+        f'outlier_filter=cosine_top5_percent '
+        f'retrieval=cosine_soft '
+        f'retrieval_temperature={getattr(config, "pspi_retrieval_temperature", 0.1)} '
+        f'personalization=api_style_ct_spatial_affine '
+        f'personalization_initialization=xavier '
+        f'personalization_formula=gamma_times_proto_plus_beta '
+        f'proto_temperature={getattr(config, "pspi_proto_temperature", 0.02)} '
+        f'proto_weight={getattr(config, "pspi_proto_contrastive_weight", 0.01)} '
+        f'reconstruction_weight={getattr(config, "pspi_reconstruction_weight", 0.1)} '
+        f'cold_start=epoch1 '
+        f'bank_update={getattr(config, "pspi_bank_update_mode", "direct")} '
         f'K={getattr(config, "pspi_num_clusters", 6)} '
         f'build_stage=S{getattr(config, "pspi_build_stage", 4)} '
-        f'bank_update={getattr(config, "pspi_bank_update_mode", "direct")} '
-        f'personalization=ct_reference_residual_affine '
-        f'semantic_relation_loss=True '
-        f'semantic_weight={getattr(config, "pspi_semantic_loss_weight", 0.01)} '
         f'full_path=raw_CT_plus_real_PET '
         f'missing_path=CT_plus_compensated_PET '
         f'{fusion_desc} '

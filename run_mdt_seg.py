@@ -15,30 +15,14 @@ from utils.train_logger import append_epoch_log, init_train_log
 
 
 def _seed(cfg):
-    # ---------------------------------------------------------
-    # Seeded stochastic training
-    # ---------------------------------------------------------
-    # Keep experiment-level RNG controllable:
-    # weight initialization / shuffle / augmentation / dropout
-    # still remain random, but are reproducible for a given seed.
     random.seed(cfg.random_state)
     np.random.seed(cfg.random_state)
     torch.manual_seed(cfg.random_state)
-
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.random_state)
-
-    # Do NOT force every CUDA/PyTorch operator to use a
-    # deterministic implementation.
     torch.use_deterministic_algorithms(False)
-
-    # First relaxed setting:
-    # keep cuDNN reasonably reproducible, similar to many papers.
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-    # Keep numerical precision unchanged in the first ablation.
-    # Do not change determinism and TF32 at the same time.
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
@@ -120,73 +104,7 @@ def main():
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
     total_params, trainable_params = _count_parameters(task.model)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
-
-    # Stage-1.5: optional clean prototype bank bootstrap BEFORE any training step.
-    if (
-        bool(getattr(cfg, 'pspi_enabled', False))
-        and bool(getattr(cfg, 'pspi_bootstrap_bank', False))
-        and getattr(task.model, 'pspi_enabled', False)
-    ):
-        from datasets.pclt20k_seg import get_pclt20k_pspi_bootstrap_loader
-
-        bootstrap_loader = get_pclt20k_pspi_bootstrap_loader(
-            cfg.root,
-            cfg.image_size_2d,
-            cfg.batch_size,
-            cfg.num_workers,
-            cfg.random_state,
-            cfg.pin_memory,
-            cfg.norm_mode,
-            cfg.train_split_file,
-        )
-        print(
-            '[PSPI][BOOTSTRAP] source=train_only '
-            f'batches={len(bootstrap_loader)} augmentation=none',
-            flush=True,
-        )
-        module1 = task.model.module1
-        before_state = {
-            name: value.detach().cpu().clone()
-            for name, value in module1.state_dict().items()
-            if 'ct_keys' in name or 'pet_values' in name
-        }
-        encoder_names = ('enc_ct', 'enc_pet', 'ct_align')
-        encoder_before = {
-            name: value.detach().cpu().clone()
-            for name, value in task.model.state_dict().items()
-            if any(name.startswith(prefix + '.') for prefix in encoder_names)
-        }
-        was_training = task.model.training
-        task.model.eval()
-        for batch_idx, batch in enumerate(bootstrap_loader):
-            ct = batch['ct'].to(task.device, non_blocking=True)
-            pet = batch['pet'].to(task.device, non_blocking=True)
-            mask = batch['mask'].to(task.device, non_blocking=True).float()
-            with torch.no_grad():
-                task.model.collect_module1_bootstrap_batch(ct, pet, mask)
-            if (batch_idx + 1) % 50 == 0:
-                print(f'[PSPI][BOOTSTRAP] batch={batch_idx + 1}', flush=True)
-        bootstrap_report = module1.finalize_epoch(epoch=0)
-        task.model.train(was_training)
-        for name, value in task.model.state_dict().items():
-            if any(name.startswith(prefix + '.') for prefix in encoder_names):
-                if not torch.equal(encoder_before[name], value.detach().cpu()):
-                    raise RuntimeError(f'[PSPI][BOOTSTRAP] encoder parameter changed: {name}')
-        changed_slots = sum(
-            int((before_state[name] != module1.state_dict()[name].cpu()).any())
-            for name in before_state
-        )
-        print(
-            "[PSPI][BOOTSTRAP] done "
-            f"status={bootstrap_report.get('status')} "
-            f"bank_version={module1.bank_version.item()} "
-            f"ready_count={int(module1.prototype_ready.sum().item())} "
-            f"total_slots={module1.prototype_ready.numel()} "
-            f"bank_buffers_changed={changed_slots > 0} "
-            "encoder_params_unchanged=True",
-            flush=True,
-        )
-        module1.reset_epoch_cache()
+    # No Stage-1.5 bootstrap: epoch-1 cold start, bank_version=0, ready=False
 
     task.scheduler = get_cosine_scheduler(
         task.optimizer,
@@ -200,11 +118,23 @@ def main():
     extra_headers = [
         'train_full_loss', 'train_missing_loss', 'train_overall_loss',
         'full_train_batches', 'missing_train_batches',
-        'train_missing_semantic_loss', 'train_missing_semantic_loss_weighted',
+        'train_full_proto_loss', 'train_missing_proto_loss',
+        'train_full_proto_loss_weighted', 'train_missing_proto_loss_weighted',
+        'train_full_recon_loss', 'train_missing_recon_loss',
+        'train_full_recon_loss_weighted', 'train_missing_recon_loss_weighted',
         'val_full_loss', 'val_full_dice', 'val_full_iou', 'val_full_acc', 'val_full_acc_pixel', 'val_full_hd95',
         'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
         'joint_dice', 'best_joint', 'best_joint_epoch',
-        'grad_full_enc_ct', 'grad_missing_enc_ct', 'grad_full_ct_align', 'grad_missing_ct_align', 'grad_full_decoder', 'grad_missing_decoder',
+        'grad_full_enc_ct', 'grad_missing_enc_ct',
+        'grad_full_enc_pet', 'grad_missing_enc_pet',
+        'grad_full_ct_align', 'grad_missing_ct_align',
+        'grad_full_decoder', 'grad_missing_decoder',
+        'grad_full_module1_retrieval', 'grad_missing_module1_retrieval',
+        'grad_full_module1_personalization', 'grad_missing_module1_personalization',
+        'attention_entropy_s1', 'attention_entropy_s2', 'attention_entropy_s3', 'attention_entropy_s4',
+        'normalized_attention_entropy_s1', 'normalized_attention_entropy_s2', 'normalized_attention_entropy_s3', 'normalized_attention_entropy_s4',
+        'gamma_abs_mean', 'beta_abs_mean', 'pet_proto_norm', 'pet_comp_norm',
+        'bank_ready', 'bank_version',
         'epoch_time',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
@@ -223,23 +153,36 @@ def main():
         task.model.train()
         full_n = missing_n = 0
         full_loss = missing_loss = 0.0
-        missing_semantic_loss = 0.0
-        missing_semantic_weighted = 0.0
+        full_proto = 0.0
+        missing_proto = 0.0
+        full_proto_w = 0.0
+        missing_proto_w = 0.0
+        full_recon = 0.0
+        missing_recon = 0.0
+        full_recon_w = 0.0
+        missing_recon_w = 0.0
         grad_norm_accum = 0.0
         grad_norm_steps = 0
         grads = {
-            'full': {'enc_ct': [], 'ct_align': [], 'decoder': []},
-            'missing': {'enc_ct': [], 'ct_align': [], 'decoder': []},
+            'full': {'enc_ct': [], 'enc_pet': [], 'ct_align': [], 'decoder': [], 'retrieval': [], 'personalization': []},
+            'missing': {'enc_ct': [], 'enc_pet': [], 'ct_align': [], 'decoder': [], 'retrieval': [], 'personalization': []},
         }
         epoch_start = time.time()
         fixed_diag_batch = None
         diag_stats = {}
+        # accum for entropy / gamma stats across epoch
+        attn_ent_accum = {f's{i}': [] for i in range(1, 5)}
+        nattn_ent_accum = {f's{i}': [] for i in range(1, 5)}
+        gamma_abs_vals = []
+        beta_abs_vals = []
+        proto_norm_vals = []
+        comp_norm_vals = []
 
         for batch_idx, batch in enumerate(train_loader):
             route = 'full' if global_batch_step % 2 == 0 else 'missing'
             task.optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
-                loss, _, _, step_stats = task.train_step(batch, forward_mode=route)
+                loss, _, outputs, step_stats = task.train_step(batch, forward_mode=route)
             if not torch.isfinite(loss):
                 raise RuntimeError('loss became non-finite')
 
@@ -249,9 +192,25 @@ def main():
             else:
                 loss.backward()
 
+            # grad norms per module
             grads[route]['enc_ct'].append(module_grad_norm(task.model.enc_ct))
+            grads[route]['enc_pet'].append(module_grad_norm(task.model.enc_pet))
             grads[route]['ct_align'].append(module_grad_norm(task.model.ct_align))
             grads[route]['decoder'].append(module_grad_norm(task.model.decoder))
+            if task.model.pspi_enabled and task.model.module1 is not None:
+                # retrieval = ModuleList attention
+                # personalization = SpatialPrototypePersonalization
+                ret_norm = 0.0
+                for mod in task.model.module1.attention:
+                    ret_norm += sum(p.grad.detach().float().pow(2).sum().item() if p.grad is not None else 0 for p in mod.parameters())
+                ret_norm = float(ret_norm ** 0.5) if ret_norm > 0 else 0.0
+                pers_norm = module_grad_norm(task.model.module1.personalization)
+                grads[route]['retrieval'].append(ret_norm)
+                grads[route]['personalization'].append(pers_norm)
+            else:
+                grads[route]['retrieval'].append(0.0)
+                grads[route]['personalization'].append(0.0)
+
             total_grad_norm = torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip)) if float(cfg.grad_clip) > 0 else 0.0
             grad_norm_accum += float(total_grad_norm)
             grad_norm_steps += 1
@@ -270,11 +229,33 @@ def main():
             if route == 'full':
                 full_n += 1
                 full_loss += float(loss.detach())
+                full_proto += float(step_stats['loss_proto'].detach())
+                full_proto_w += float(step_stats['loss_proto_weighted'].detach())
+                full_recon += float(step_stats['loss_recon'].detach())
+                full_recon_w += float(step_stats['loss_recon_weighted'].detach())
             else:
                 missing_n += 1
                 missing_loss += float(loss.detach())
-                missing_semantic_loss += float(step_stats['loss_semantic'].detach())
-                missing_semantic_weighted += float(step_stats['loss_semantic_weighted'].detach())
+                missing_proto += float(step_stats['loss_proto'].detach())
+                missing_proto_w += float(step_stats['loss_proto_weighted'].detach())
+                missing_recon += float(step_stats['loss_recon'].detach())
+                missing_recon_w += float(step_stats['loss_recon_weighted'].detach())
+
+            # collect per-batch attention / affine stats if available
+            if outputs is not None and isinstance(outputs, dict):
+                for i in range(1, 5):
+                    k = f'attention_entropy_s{i}'
+                    if k in outputs:
+                        attn_ent_accum[f's{i}'].append(float(outputs[k]))
+                    k2 = f'normalized_attention_entropy_s{i}'
+                    if k2 in outputs:
+                        nattn_ent_accum[f's{i}'].append(float(outputs[k2]))
+                # aggregated stats are also in outputs (from _attach_pspi_stats)
+                if 'gamma_abs_mean' in outputs:
+                    gamma_abs_vals.append(float(outputs['gamma_abs_mean']))
+                    beta_abs_vals.append(float(outputs['beta_abs_mean']))
+                    proto_norm_vals.append(float(outputs['pet_proto_norm']))
+                    comp_norm_vals.append(float(outputs['pet_comp_norm']))
 
             global_batch_step += 1
             task.global_batch_step = global_batch_step
@@ -288,7 +269,7 @@ def main():
         if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is not None and epoch % int(cfg.gradient_diagnostics_interval) == 0:
             diag_stats = task.gradient_diagnostics(fixed_diag_batch, max_samples=min(1, int(cfg.gradient_diagnostics_num_samples))) or {}
 
-        # Epoch-wise Module-1 bank finalize: AFTER all train batches, BEFORE validation.
+        # Epoch-wise Module-1 bank finalize
         module1_report = None
         if hasattr(task.model, 'finalize_module1_epoch'):
             module1_report = task.model.finalize_module1_epoch(epoch)
@@ -336,6 +317,12 @@ def main():
         val_acc_pixel = 0.5 * val_full.get('acc_pixel', 0.0) + 0.5 * val_missing.get('acc_pixel', 0.0)
         val_hd95 = 0.5 * val_full['hd95'] + 0.5 * val_missing['hd95']
         avg_grad_norm = grad_norm_accum / max(1, grad_norm_steps)
+        # bank status
+        bank_ready_val = 0
+        bank_version_val = 0
+        if task.model.pspi_enabled and task.model.module1 is not None:
+            bank_ready_val = 1 if task.model.module1.bank_ready else 0
+            bank_version_val = int(task.model.module1.bank_version.item())
         append_epoch_log(
             os.path.join(cfg.checkpoint_dir, 'train_log.csv'),
             epoch,
@@ -349,8 +336,14 @@ def main():
                 'train_overall_loss': train_loss,
                 'full_train_batches': full_n,
                 'missing_train_batches': missing_n,
-                'train_missing_semantic_loss': missing_semantic_loss / max(1, missing_n),
-                'train_missing_semantic_loss_weighted': missing_semantic_weighted / max(1, missing_n),
+                'train_full_proto_loss': full_proto / max(1, full_n),
+                'train_missing_proto_loss': missing_proto / max(1, missing_n),
+                'train_full_proto_loss_weighted': full_proto_w / max(1, full_n),
+                'train_missing_proto_loss_weighted': missing_proto_w / max(1, missing_n),
+                'train_full_recon_loss': full_recon / max(1, full_n),
+                'train_missing_recon_loss': missing_recon / max(1, missing_n),
+                'train_full_recon_loss_weighted': full_recon_w / max(1, full_n),
+                'train_missing_recon_loss_weighted': missing_recon_w / max(1, missing_n),
                 'val_full_loss': val_full['total_loss'],
                 'val_full_dice': val_full['dice'],
                 'val_full_iou': val_full['iou'],
@@ -368,10 +361,30 @@ def main():
                 'best_joint_epoch': best_joint_epoch,
                 'grad_full_enc_ct': float(np.mean(grads['full']['enc_ct'])) if grads['full']['enc_ct'] else 0.0,
                 'grad_missing_enc_ct': float(np.mean(grads['missing']['enc_ct'])) if grads['missing']['enc_ct'] else 0.0,
+                'grad_full_enc_pet': float(np.mean(grads['full']['enc_pet'])) if grads['full']['enc_pet'] else 0.0,
+                'grad_missing_enc_pet': float(np.mean(grads['missing']['enc_pet'])) if grads['missing']['enc_pet'] else 0.0,
                 'grad_full_ct_align': float(np.mean(grads['full']['ct_align'])) if grads['full']['ct_align'] else 0.0,
                 'grad_missing_ct_align': float(np.mean(grads['missing']['ct_align'])) if grads['missing']['ct_align'] else 0.0,
                 'grad_full_decoder': float(np.mean(grads['full']['decoder'])) if grads['full']['decoder'] else 0.0,
                 'grad_missing_decoder': float(np.mean(grads['missing']['decoder'])) if grads['missing']['decoder'] else 0.0,
+                'grad_full_module1_retrieval': float(np.mean(grads['full']['retrieval'])) if grads['full']['retrieval'] else 0.0,
+                'grad_missing_module1_retrieval': float(np.mean(grads['missing']['retrieval'])) if grads['missing']['retrieval'] else 0.0,
+                'grad_full_module1_personalization': float(np.mean(grads['full']['personalization'])) if grads['full']['personalization'] else 0.0,
+                'grad_missing_module1_personalization': float(np.mean(grads['missing']['personalization'])) if grads['missing']['personalization'] else 0.0,
+                'attention_entropy_s1': float(np.mean(attn_ent_accum['s1'])) if attn_ent_accum['s1'] else 0.0,
+                'attention_entropy_s2': float(np.mean(attn_ent_accum['s2'])) if attn_ent_accum['s2'] else 0.0,
+                'attention_entropy_s3': float(np.mean(attn_ent_accum['s3'])) if attn_ent_accum['s3'] else 0.0,
+                'attention_entropy_s4': float(np.mean(attn_ent_accum['s4'])) if attn_ent_accum['s4'] else 0.0,
+                'normalized_attention_entropy_s1': float(np.mean(nattn_ent_accum['s1'])) if nattn_ent_accum['s1'] else 0.0,
+                'normalized_attention_entropy_s2': float(np.mean(nattn_ent_accum['s2'])) if nattn_ent_accum['s2'] else 0.0,
+                'normalized_attention_entropy_s3': float(np.mean(nattn_ent_accum['s3'])) if nattn_ent_accum['s3'] else 0.0,
+                'normalized_attention_entropy_s4': float(np.mean(nattn_ent_accum['s4'])) if nattn_ent_accum['s4'] else 0.0,
+                'gamma_abs_mean': float(np.mean(gamma_abs_vals)) if gamma_abs_vals else 0.0,
+                'beta_abs_mean': float(np.mean(beta_abs_vals)) if beta_abs_vals else 0.0,
+                'pet_proto_norm': float(np.mean(proto_norm_vals)) if proto_norm_vals else 0.0,
+                'pet_comp_norm': float(np.mean(comp_norm_vals)) if comp_norm_vals else 0.0,
+                'bank_ready': bank_ready_val,
+                'bank_version': bank_version_val,
                 'epoch_time': time.time() - epoch_start,
                 **{f'diag_{k}': v for k, v in diag_stats.items()},
             },

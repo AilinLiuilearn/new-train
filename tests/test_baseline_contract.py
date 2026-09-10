@@ -35,7 +35,9 @@ def test_forward_full_missing_shapes():
     ct = torch.randn(2, 1, 64, 64)
     pet = torch.randn(2, 1, 64, 64)
     out_full = model(ct, pet, forward_mode='full')
+    model.eval()
     out_missing = model(ct, None, forward_mode='missing')
+    model.train()
     assert out_full['logits'].shape == out_missing['logits'].shape
 
 
@@ -99,6 +101,8 @@ def test_missing_path_pet_encoder_not_called(monkeypatch):
 
     monkeypatch.setattr(model.enc_pet, 'forward', wrapped)
     ct = torch.randn(1, 1, 64, 64)
+    # Training path REQUIRES pet as privileged teacher; eval path must not call enc_pet.
+    model.eval()
     out = model(ct, None, forward_mode='missing')
     assert 'logits' in out
     assert calls['n'] == 0

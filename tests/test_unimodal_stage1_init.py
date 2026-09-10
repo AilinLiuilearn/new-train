@@ -6,10 +6,9 @@ Run:  python tests/test_unimodal_stage1_init.py
 
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import tempfile
 
 import torch
 
@@ -118,38 +117,27 @@ def test_checkpoint_roundtrip():
     print("[TEST C/D/E] checkpoint load, decoder untouched, trainability passed")
 
 
-def test_stage2_strict_missing_with_bootstrap_bank():
-    ct_model = _ct_model()
-    pet_model = _pet_model()
+def test_stage2_strict_missing_inference():
+    """Stage-2 joint model: strict Missing inference with pet=None.
+
+    Stage-1.5 bootstrap was removed; the bank starts empty (epoch-1 cold
+    start) and compensated PET is strictly zero until epoch-1 finalize.
+    """
     joint = DualSharedAddPETCTBaseline(
         ct_pretrained_path=None,
         pet_pretrained_path=None,
         pspi_enabled=True,
         pspi_num_clusters=3,
-        pspi_semantic_loss_weight=0.0,
     )
     joint.eval()
+    assert joint.module1.bank_ready is False
+    assert int(joint.module1.bank_version.item()) == 0
     ct = torch.randn(1, 1, 64, 64)
-    pet = torch.randn(1, 1, 64, 64)
-    mask = torch.zeros(1, 1, 64, 64)
-    mask[:, :, 20:44, 24:40] = 1.0
-
-    # Bootstrap bank from a few clean batches (no optimizer/backward).
-    encoder_before = {
-        k: v.clone() for k, v in joint.enc_ct.state_dict().items()
-    }
-    for _ in range(3):
-        joint.collect_module1_bootstrap_batch(ct, pet, mask)
-    joint.module1.finalize_epoch(epoch=0)
-    assert joint.module1.bank_ready
-    assert int(joint.module1.bank_version.item()) == 1
-    for key, value in joint.enc_ct.state_dict().items():
-        assert torch.equal(encoder_before[key], value), "encoder changed during bootstrap"
-
     with torch.no_grad():
         out = joint(ct, pet=None, pet_available=None, forward_mode="missing")
     assert out["logits"].shape == (1, 1, 64, 64)
-    print("[TEST F/G] bootstrap bank v1 + strict missing pet=None passed")
+    assert out["module1_bank_ready"] is False
+    print("[TEST F/G] epoch-1 cold start + strict missing pet=None passed")
 
 
 def main():
@@ -157,7 +145,7 @@ def main():
     test_ct_only_structure()
     test_pet_only_structure()
     test_checkpoint_roundtrip()
-    test_stage2_strict_missing_with_bootstrap_bank()
+    test_stage2_strict_missing_inference()
     print("[SELF-CHECK] passed")
 
 

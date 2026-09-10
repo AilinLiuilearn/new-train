@@ -43,14 +43,17 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--pspi_outlier_discard_rate', type=float, default=0.05)
         p.add_argument('--pspi_bank_update_mode', type=str, default='direct', choices=('direct', 'matched_ema'))
         p.add_argument('--pspi_ema_momentum', type=float, default=0.999)
-        p.add_argument('--pspi_semantic_loss_weight', type=float, default=0.01)
+        p.add_argument('--pspi_retrieval_temperature', type=float, default=0.1)
+        p.add_argument('--pspi_proto_contrastive_weight', type=float, default=0.01)
+        p.add_argument('--pspi_proto_temperature', type=float, default=0.02)
+        p.add_argument('--pspi_reconstruction_weight', type=float, default=0.1)
+        p.add_argument('--pspi_spatial_affine', type=str2bool, default=True)
         p.add_argument('--pspi_collect_candidates', type=str2bool, default=True)
-        # Stage-1 unimodal pretraining initialization (SimMLM-style two-stage recipe)
+        # Stage-1 unimodal pretraining initialization
         p.add_argument('--stage1_init_enabled', type=str2bool, default=False)
         p.add_argument('--stage1_ct_checkpoint', type=str, default=None)
         p.add_argument('--stage1_pet_checkpoint', type=str, default=None)
         p.add_argument('--stage1_init_strict', type=str2bool, default=True)
-        p.add_argument('--pspi_bootstrap_bank', type=str2bool, default=False)
         return p
 
     @staticmethod
