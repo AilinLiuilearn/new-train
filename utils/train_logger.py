@@ -50,7 +50,11 @@ def append_epoch_log(log_path, epoch, train_loss_avg, val_metrics, lr=None, grad
         f"{row['lr']:.8f}",
         f"{row['grad_norm']:.6f}",
     ]
-    csv_values.extend(f"{float(v):.6f}" for v in extra_metrics.values())
+    for v in extra_metrics.values():
+        try:
+            csv_values.append(f"{float(v):.6f}")
+        except (TypeError, ValueError):
+            csv_values.append(str(v))
 
     with open(log_path, 'a', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
@@ -68,7 +72,10 @@ def append_epoch_log(log_path, epoch, train_loss_avg, val_metrics, lr=None, grad
         f.write(f"  lr            : {row['lr']:.8f}\n")
         f.write(f"  grad_norm     : {row['grad_norm']:.6f}\n")
         for key, value in extra_metrics.items():
-            f.write(f"  {key:<13}: {float(value):.6f}\n")
+            try:
+                f.write(f"  {key:<13}: {float(value):.6f}\n")
+            except (TypeError, ValueError):
+                f.write(f"  {key:<13}: {value}\n")
         f.write('-' * 64 + '\n')
 
 
