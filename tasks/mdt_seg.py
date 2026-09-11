@@ -42,23 +42,21 @@ class MDTSegTeacher:
         outputs = self.model(ct, pet=pet, forward_mode=forward_mode, mask=mask)
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
         seg_loss, loss_stats = self.criterion(logits, mask)
-        proto_weighted = outputs.get('prototype_contrastive_loss_weighted', seg_loss.new_zeros(()))
-        if proto_weighted.dim() > 0:
-            proto_weighted = proto_weighted.reshape(())
-        recon_weighted = outputs.get('reconstruction_loss_weighted', seg_loss.new_zeros(()))
-        if recon_weighted.dim() > 0:
-            recon_weighted = recon_weighted.reshape(())
-        total_loss = seg_loss + proto_weighted + recon_weighted
+        # Clean Module-1: loss_total = seg + lambda_p * PET-proto (raw).
+        # First round (bank not ready) yields exactly 0.
+        proto_raw = outputs.get('prototype_contrastive_loss', seg_loss.new_zeros(()))
+        if proto_raw.dim() > 0:
+            proto_raw = proto_raw.reshape(())
+        proto_weight = float(getattr(self.config, 'pspi_proto_contrastive_weight', 0.01))
+        proto_weighted = proto_weight * proto_raw
+        total_loss = seg_loss + proto_weighted
         stats = {
             'loss_total': total_loss.detach(),
             'loss_seg': loss_stats.get('loss_dice', seg_loss.detach()),
             'loss_seg_total': seg_loss.detach(),
-            'loss_proto': outputs.get('prototype_contrastive_loss', seg_loss.new_zeros(())).detach(),
+            'loss_proto': proto_raw.detach(),
             'loss_proto_weighted': proto_weighted.detach(),
             'proto_num_terms': outputs.get('prototype_contrastive_num_terms', 0),
-            'loss_recon': outputs.get('reconstruction_loss', seg_loss.new_zeros(())).detach(),
-            'loss_recon_weighted': recon_weighted.detach(),
-            'recon_num_terms': outputs.get('reconstruction_num_terms', 0),
             'loss_boundary': torch.tensor(0.0, device=total_loss.device),
         }
         return total_loss, logits, outputs, stats

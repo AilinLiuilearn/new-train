@@ -120,8 +120,6 @@ def main():
         'full_train_batches', 'missing_train_batches',
         'train_full_proto_loss', 'train_missing_proto_loss',
         'train_full_proto_loss_weighted', 'train_missing_proto_loss_weighted',
-        'train_full_recon_loss', 'train_missing_recon_loss',
-        'train_full_recon_loss_weighted', 'train_missing_recon_loss_weighted',
         'val_full_loss', 'val_full_dice', 'val_full_iou', 'val_full_acc', 'val_full_acc_pixel', 'val_full_hd95',
         'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
         'joint_dice', 'best_joint', 'best_joint_epoch',
@@ -130,17 +128,16 @@ def main():
         'grad_full_ct_align', 'grad_missing_ct_align',
         'grad_full_decoder', 'grad_missing_decoder',
         'grad_full_module1_retrieval', 'grad_missing_module1_retrieval',
-        'grad_full_module1_personalization', 'grad_missing_module1_personalization',
+        'grad_full_prior_scale', 'grad_missing_prior_scale',
         'attention_entropy_s1', 'attention_entropy_s2', 'attention_entropy_s3', 'attention_entropy_s4',
         'normalized_attention_entropy_s1', 'normalized_attention_entropy_s2', 'normalized_attention_entropy_s3', 'normalized_attention_entropy_s4',
-        'gamma_abs_mean', 'beta_abs_mean', 'pet_proto_norm', 'pet_comp_norm',
+        'pet_prior_norm',
         'bank_ready', 'bank_version',
         'prototype_diversity_background', 'prototype_diversity_foreground',
         'mean_matching_cosine_distance', 'max_matching_cosine_distance',
         'duplicate_current_match_count', 'ct_key_update_norm', 'pet_value_update_norm',
         'bank_update_mode', 'bank_update_detail_mode',
-        'missing_pet_alpha_mean_s1', 'missing_pet_alpha_mean_s2', 'missing_pet_alpha_mean_s3', 'missing_pet_alpha_mean_s4',
-        'missing_pet_alpha_min', 'missing_pet_alpha_max', 'missing_pet_alpha_std',
+        'missing_prior_alpha_s1', 'missing_prior_alpha_s2', 'missing_prior_alpha_s3', 'missing_prior_alpha_s4',
         'epoch_time',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
@@ -163,30 +160,20 @@ def main():
         missing_proto = 0.0
         full_proto_w = 0.0
         missing_proto_w = 0.0
-        full_recon = 0.0
-        missing_recon = 0.0
-        full_recon_w = 0.0
-        missing_recon_w = 0.0
         grad_norm_accum = 0.0
         grad_norm_steps = 0
         grads = {
-            'full': {'enc_ct': [], 'enc_pet': [], 'ct_align': [], 'decoder': [], 'retrieval': [], 'personalization': []},
-            'missing': {'enc_ct': [], 'enc_pet': [], 'ct_align': [], 'decoder': [], 'retrieval': [], 'personalization': []},
+            'full': {'enc_ct': [], 'enc_pet': [], 'ct_align': [], 'decoder': [], 'retrieval': [], 'prior_scale': []},
+            'missing': {'enc_ct': [], 'enc_pet': [], 'ct_align': [], 'decoder': [], 'retrieval': [], 'prior_scale': []},
         }
         epoch_start = time.time()
         fixed_diag_batch = None
         diag_stats = {}
-        # accum for entropy / gamma stats across epoch
+        # accum for entropy / prior stats across epoch
         attn_ent_accum = {f's{i}': [] for i in range(1, 5)}
         nattn_ent_accum = {f's{i}': [] for i in range(1, 5)}
-        gamma_abs_vals = []
-        beta_abs_vals = []
-        proto_norm_vals = []
-        comp_norm_vals = []
-        alpha_s_accum = {f's{i}': [] for i in range(1, 5)}
-        alpha_min_vals = []
-        alpha_max_vals = []
-        alpha_std_vals = []
+        prior_norm_vals = []
+        prior_alpha_accum = {f's{i}': [] for i in range(1, 5)}
 
         for batch_idx, batch in enumerate(train_loader):
             route = 'full' if global_batch_step % 2 == 0 else 'missing'
@@ -208,18 +195,21 @@ def main():
             grads[route]['ct_align'].append(module_grad_norm(task.model.ct_align))
             grads[route]['decoder'].append(module_grad_norm(task.model.decoder))
             if task.model.pspi_enabled and task.model.module1 is not None:
-                # retrieval = ModuleList attention
-                # personalization = SpatialPrototypePersonalization
+                # retrieval = ModuleList attention (PrototypeCrossAttention)
                 ret_norm = 0.0
                 for mod in task.model.module1.attention:
                     ret_norm += sum(p.grad.detach().float().pow(2).sum().item() if p.grad is not None else 0 for p in mod.parameters())
                 ret_norm = float(ret_norm ** 0.5) if ret_norm > 0 else 0.0
-                pers_norm = module_grad_norm(task.model.module1.personalization)
                 grads[route]['retrieval'].append(ret_norm)
-                grads[route]['personalization'].append(pers_norm)
+                if getattr(task.model, 'missing_prior_logits', None) is not None:
+                    g = task.model.missing_prior_logits.grad
+                    ps_norm = float(g.detach().float().pow(2).sum().sqrt().item()) if g is not None else 0.0
+                else:
+                    ps_norm = 0.0
+                grads[route]['prior_scale'].append(ps_norm)
             else:
                 grads[route]['retrieval'].append(0.0)
-                grads[route]['personalization'].append(0.0)
+                grads[route]['prior_scale'].append(0.0)
 
             total_grad_norm = torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip)) if float(cfg.grad_clip) > 0 else 0.0
             grad_norm_accum += float(total_grad_norm)
@@ -241,15 +231,11 @@ def main():
                 full_loss += float(loss.detach())
                 full_proto += float(step_stats['loss_proto'].detach())
                 full_proto_w += float(step_stats['loss_proto_weighted'].detach())
-                full_recon += float(step_stats['loss_recon'].detach())
-                full_recon_w += float(step_stats['loss_recon_weighted'].detach())
             else:
                 missing_n += 1
                 missing_loss += float(loss.detach())
                 missing_proto += float(step_stats['loss_proto'].detach())
                 missing_proto_w += float(step_stats['loss_proto_weighted'].detach())
-                missing_recon += float(step_stats['loss_recon'].detach())
-                missing_recon_w += float(step_stats['loss_recon_weighted'].detach())
 
             # collect per-batch attention / affine / alpha stats if available
             if outputs is not None and isinstance(outputs, dict):
@@ -260,20 +246,12 @@ def main():
                     k2 = f'normalized_attention_entropy_s{i}'
                     if k2 in outputs:
                         nattn_ent_accum[f's{i}'].append(float(outputs[k2]))
-                # aggregated stats are also in outputs (from _attach_pspi_stats)
-                if 'gamma_abs_mean' in outputs:
-                    gamma_abs_vals.append(float(outputs['gamma_abs_mean']))
-                    beta_abs_vals.append(float(outputs['beta_abs_mean']))
-                    proto_norm_vals.append(float(outputs['pet_proto_norm']))
-                    comp_norm_vals.append(float(outputs['pet_comp_norm']))
+                if 'pet_prior_norm' in outputs:
+                    prior_norm_vals.append(float(outputs['pet_prior_norm']))
                 for i in range(1, 5):
-                    k = f'missing_pet_alpha_mean_s{i}'
+                    k = f'missing_prior_alpha_s{i}'
                     if k in outputs:
-                        alpha_s_accum[f's{i}'].append(float(outputs[k]))
-                if 'missing_pet_alpha_min' in outputs:
-                    alpha_min_vals.append(float(outputs['missing_pet_alpha_min']))
-                    alpha_max_vals.append(float(outputs['missing_pet_alpha_max']))
-                    alpha_std_vals.append(float(outputs['missing_pet_alpha_std']))
+                        prior_alpha_accum[f's{i}'].append(float(outputs[k]))
 
             global_batch_step += 1
             task.global_batch_step = global_batch_step
@@ -319,6 +297,11 @@ def main():
                     f" ct_norm={ct_key_update_norm:.6f}"
                     f" pet_norm={pet_value_update_norm:.6f}"
                 )
+            # Per-scale prior contribution alpha_l = sigmoid(logit), printed every epoch.
+            if getattr(task.model, 'missing_prior_logits', None) is not None:
+                _alphas = [float(torch.sigmoid(v).item()) for v in task.model.missing_prior_logits.detach()]
+            else:
+                _alphas = [1.0, 1.0, 1.0, 1.0]
             print(
                 f"[PSPI][BANK] epoch={module1_report.get('epoch', epoch)} "
                 f"status={module1_report.get('status')} "
@@ -326,7 +309,8 @@ def main():
                 f"bank_version={module1_report.get('bank_version_after', module1_report.get('bank_version_before', 0))} "
                 f"ready_count={module1_report.get('ready_count', 0)} "
                 f"total_slots={module1_report.get('total_slots', 0)}"
-                f"{extra}",
+                f"{extra} "
+                f"alpha=[{', '.join(f'{a:.4f}' for a in _alphas)}]",
                 flush=True,
             )
 
@@ -383,10 +367,6 @@ def main():
                 'train_missing_proto_loss': missing_proto / max(1, missing_n),
                 'train_full_proto_loss_weighted': full_proto_w / max(1, full_n),
                 'train_missing_proto_loss_weighted': missing_proto_w / max(1, missing_n),
-                'train_full_recon_loss': full_recon / max(1, full_n),
-                'train_missing_recon_loss': missing_recon / max(1, missing_n),
-                'train_full_recon_loss_weighted': full_recon_w / max(1, full_n),
-                'train_missing_recon_loss_weighted': missing_recon_w / max(1, missing_n),
                 'val_full_loss': val_full['total_loss'],
                 'val_full_dice': val_full['dice'],
                 'val_full_iou': val_full['iou'],
@@ -412,8 +392,8 @@ def main():
                 'grad_missing_decoder': float(np.mean(grads['missing']['decoder'])) if grads['missing']['decoder'] else 0.0,
                 'grad_full_module1_retrieval': float(np.mean(grads['full']['retrieval'])) if grads['full']['retrieval'] else 0.0,
                 'grad_missing_module1_retrieval': float(np.mean(grads['missing']['retrieval'])) if grads['missing']['retrieval'] else 0.0,
-                'grad_full_module1_personalization': float(np.mean(grads['full']['personalization'])) if grads['full']['personalization'] else 0.0,
-                'grad_missing_module1_personalization': float(np.mean(grads['missing']['personalization'])) if grads['missing']['personalization'] else 0.0,
+                'grad_full_prior_scale': float(np.mean(grads['full']['prior_scale'])) if grads['full']['prior_scale'] else 0.0,
+                'grad_missing_prior_scale': float(np.mean(grads['missing']['prior_scale'])) if grads['missing']['prior_scale'] else 0.0,
                 'attention_entropy_s1': float(np.mean(attn_ent_accum['s1'])) if attn_ent_accum['s1'] else 0.0,
                 'attention_entropy_s2': float(np.mean(attn_ent_accum['s2'])) if attn_ent_accum['s2'] else 0.0,
                 'attention_entropy_s3': float(np.mean(attn_ent_accum['s3'])) if attn_ent_accum['s3'] else 0.0,
@@ -422,10 +402,7 @@ def main():
                 'normalized_attention_entropy_s2': float(np.mean(nattn_ent_accum['s2'])) if nattn_ent_accum['s2'] else 0.0,
                 'normalized_attention_entropy_s3': float(np.mean(nattn_ent_accum['s3'])) if nattn_ent_accum['s3'] else 0.0,
                 'normalized_attention_entropy_s4': float(np.mean(nattn_ent_accum['s4'])) if nattn_ent_accum['s4'] else 0.0,
-                'gamma_abs_mean': float(np.mean(gamma_abs_vals)) if gamma_abs_vals else 0.0,
-                'beta_abs_mean': float(np.mean(beta_abs_vals)) if beta_abs_vals else 0.0,
-                'pet_proto_norm': float(np.mean(proto_norm_vals)) if proto_norm_vals else 0.0,
-                'pet_comp_norm': float(np.mean(comp_norm_vals)) if comp_norm_vals else 0.0,
+                'pet_prior_norm': float(np.mean(prior_norm_vals)) if prior_norm_vals else 0.0,
                 'bank_ready': bank_ready_val,
                 'bank_version': bank_version_val,
                 'prototype_diversity_background': prototype_diversity_background,
@@ -437,13 +414,10 @@ def main():
                 'pet_value_update_norm': pet_value_update_norm,
                 'bank_update_mode': getattr(cfg, 'pspi_bank_update_mode', 'direct'),
                 'bank_update_detail_mode': bank_update_detail_mode,
-                'missing_pet_alpha_mean_s1': float(np.mean(alpha_s_accum['s1'])) if alpha_s_accum['s1'] else 0.0,
-                'missing_pet_alpha_mean_s2': float(np.mean(alpha_s_accum['s2'])) if alpha_s_accum['s2'] else 0.0,
-                'missing_pet_alpha_mean_s3': float(np.mean(alpha_s_accum['s3'])) if alpha_s_accum['s3'] else 0.0,
-                'missing_pet_alpha_mean_s4': float(np.mean(alpha_s_accum['s4'])) if alpha_s_accum['s4'] else 0.0,
-                'missing_pet_alpha_min': float(np.mean(alpha_min_vals)) if alpha_min_vals else 0.0,
-                'missing_pet_alpha_max': float(np.mean(alpha_max_vals)) if alpha_max_vals else 0.0,
-                'missing_pet_alpha_std': float(np.mean(alpha_std_vals)) if alpha_std_vals else 0.0,
+                'missing_prior_alpha_s1': float(np.mean(prior_alpha_accum['s1'])) if prior_alpha_accum['s1'] else 0.0,
+                'missing_prior_alpha_s2': float(np.mean(prior_alpha_accum['s2'])) if prior_alpha_accum['s2'] else 0.0,
+                'missing_prior_alpha_s3': float(np.mean(prior_alpha_accum['s3'])) if prior_alpha_accum['s3'] else 0.0,
+                'missing_prior_alpha_s4': float(np.mean(prior_alpha_accum['s4'])) if prior_alpha_accum['s4'] else 0.0,
                 'epoch_time': time.time() - epoch_start,
                 **{f'diag_{k}': v for k, v in diag_stats.items()},
             },

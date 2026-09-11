@@ -476,13 +476,12 @@ def build_mdt_seg_teacher(config):
         pspi_cluster_max_iter=getattr(config, 'pspi_cluster_max_iter', 25),
         pspi_outlier_discard_rate=getattr(config, 'pspi_outlier_discard_rate', 0.05),
         pspi_bank_update_mode=getattr(config, 'pspi_bank_update_mode', 'direct'),
-        pspi_ema_momentum=getattr(config, 'pspi_ema_momentum', 0.999),
+        pspi_ema_momentum=getattr(config, 'pspi_ema_momentum', 0.95),
         pspi_retrieval_temperature=getattr(config, 'pspi_retrieval_temperature', 0.1),
-        pspi_proto_contrastive_weight=getattr(config, 'pspi_proto_contrastive_weight', 0.01),
         pspi_proto_temperature=getattr(config, 'pspi_proto_temperature', 0.02),
-        pspi_reconstruction_weight=getattr(config, 'pspi_reconstruction_weight', 0.1),
-        pspi_spatial_affine=getattr(config, 'pspi_spatial_affine', True),
         pspi_collect_candidates=getattr(config, 'pspi_collect_candidates', True),
+        pspi_prior_scale_enabled=getattr(config, 'pspi_prior_scale_enabled', True),
+        pspi_prior_scale_init=getattr(config, 'pspi_prior_scale_init', 0.1),
     )
     if bool(getattr(config, 'stage1_init_enabled', False)):
         load_stage1_unimodal_initialization(
@@ -508,24 +507,29 @@ def build_mdt_seg_teacher(config):
         fusion_desc = 'baseline_fusion=AddFusion'
     print(
         f'[PSPI] enabled={pspi_enabled} '
+        f'module1=paired_ct_pet_prototype_prior_retrieval '
         f'clustering=spherical_cosine '
         f'cluster_init=deterministic_mean_farthest '
         f'outlier_filter=cosine_top5_percent '
         f'retrieval=cosine_soft '
         f'retrieval_temperature={getattr(config, "pspi_retrieval_temperature", 0.1)} '
-        f'personalization=api_style_ct_spatial_affine '
-        f'personalization_initialization=xavier '
-        f'personalization_formula=gamma_times_proto_plus_beta '
+        f'personalization=none '
+        f'prototype_loss=pet_multi_positive_contrastive '
         f'proto_temperature={getattr(config, "pspi_proto_temperature", 0.02)} '
         f'proto_weight={getattr(config, "pspi_proto_contrastive_weight", 0.01)} '
-        f'reconstruction_weight={getattr(config, "pspi_reconstruction_weight", 0.1)} '
+        f'reconstruction_loss=none '
         f'cold_start=epoch1 '
         f'bank_update={getattr(config, "pspi_bank_update_mode", "direct")} '
+        f'ema_momentum={getattr(config, "pspi_ema_momentum", 0.95)} '
         f'K={getattr(config, "pspi_num_clusters", 6)} '
         f'build_stage=S{getattr(config, "pspi_build_stage", 4)} '
         f'full_path=raw_CT_plus_real_PET '
-        f'missing_path=CT_plus_compensated_PET '
+        f'missing_boundary=CT_plus_scale_weighted_PET_prior '
+        f'prior_scale_type=per_scale_scalar '
+        f'prior_scale_init={getattr(config, "pspi_prior_scale_init", 0.1)} '
+        f'prior_scale_enabled={bool(getattr(config, "pspi_prior_scale_enabled", True))} '
         f'{fusion_desc} '
+        f'downstream_fusion=AddFusion '
         f'decoder=UNetStyleDecoder'
     )
     return {'model': model}

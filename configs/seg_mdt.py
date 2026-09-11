@@ -35,19 +35,19 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--enable_gradient_diagnostics', type=str2bool, default=False)
         p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
-        # PSPI / Module-1
+        # PSPI / Module-1: paired CT-PET prototype prior retrieval
         p.add_argument('--pspi_enabled', type=str2bool, default=True)
         p.add_argument('--pspi_num_clusters', type=int, default=6)
         p.add_argument('--pspi_build_stage', type=int, default=4)
         p.add_argument('--pspi_cluster_max_iter', type=int, default=25)
         p.add_argument('--pspi_outlier_discard_rate', type=float, default=0.05)
         p.add_argument('--pspi_bank_update_mode', type=str, default='direct', choices=('direct', 'matched_ema', 'fedmepd_ema'))
-        p.add_argument('--pspi_ema_momentum', type=float, default=0.999)
+        p.add_argument('--pspi_ema_momentum', type=float, default=0.95)
         p.add_argument('--pspi_retrieval_temperature', type=float, default=0.1)
         p.add_argument('--pspi_proto_contrastive_weight', type=float, default=0.01)
         p.add_argument('--pspi_proto_temperature', type=float, default=0.02)
-        p.add_argument('--pspi_reconstruction_weight', type=float, default=0.1)
-        p.add_argument('--pspi_spatial_affine', type=str2bool, default=True)
+        p.add_argument('--pspi_prior_scale_enabled', type=str2bool, default=True)
+        p.add_argument('--pspi_prior_scale_init', type=float, default=0.1)
         p.add_argument('--pspi_collect_candidates', type=str2bool, default=True)
         # Stage-1 unimodal pretraining initialization
         p.add_argument('--stage1_init_enabled', type=str2bool, default=False)
