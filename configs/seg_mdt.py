@@ -41,7 +41,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--pspi_build_stage', type=int, default=4)
         p.add_argument('--pspi_cluster_max_iter', type=int, default=25)
         p.add_argument('--pspi_outlier_discard_rate', type=float, default=0.05)
-        p.add_argument('--pspi_bank_update_mode', type=str, default='direct', choices=('direct', 'matched_ema'))
+        p.add_argument('--pspi_bank_update_mode', type=str, default='direct', choices=('direct', 'matched_ema', 'fedmepd_ema'))
         p.add_argument('--pspi_ema_momentum', type=float, default=0.999)
         p.add_argument('--pspi_retrieval_temperature', type=float, default=0.1)
         p.add_argument('--pspi_proto_contrastive_weight', type=float, default=0.01)

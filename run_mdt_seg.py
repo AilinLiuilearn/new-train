@@ -135,6 +135,10 @@ def main():
         'normalized_attention_entropy_s1', 'normalized_attention_entropy_s2', 'normalized_attention_entropy_s3', 'normalized_attention_entropy_s4',
         'gamma_abs_mean', 'beta_abs_mean', 'pet_proto_norm', 'pet_comp_norm',
         'bank_ready', 'bank_version',
+        'prototype_diversity_background', 'prototype_diversity_foreground',
+        'mean_matching_cosine_distance', 'max_matching_cosine_distance',
+        'duplicate_current_match_count', 'ct_key_update_norm', 'pet_value_update_norm',
+        'bank_update_mode', 'bank_update_detail_mode',
         'epoch_time',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
@@ -271,15 +275,44 @@ def main():
 
         # Epoch-wise Module-1 bank finalize
         module1_report = None
+        bank_update_detail_mode = ""
+        prototype_diversity_background = 0.0
+        prototype_diversity_foreground = 0.0
+        mean_matching_cosine_distance = 0.0
+        max_matching_cosine_distance = 0.0
+        duplicate_current_match_count = 0
+        ct_key_update_norm = 0.0
+        pet_value_update_norm = 0.0
         if hasattr(task.model, 'finalize_module1_epoch'):
             module1_report = task.model.finalize_module1_epoch(epoch)
         if module1_report is not None:
+            update = module1_report.get("update") or {}
+            bank_update_detail_mode = str(update.get("mode", ""))
+            prototype_diversity_background = float(module1_report.get("prototype_diversity_background", update.get("prototype_diversity_background", 0.0)))
+            prototype_diversity_foreground = float(module1_report.get("prototype_diversity_foreground", update.get("prototype_diversity_foreground", 0.0)))
+            mean_matching_cosine_distance = float(module1_report.get("mean_matching_cosine_distance", update.get("mean_matching_cosine_distance", 0.0)))
+            max_matching_cosine_distance = float(module1_report.get("max_matching_cosine_distance", update.get("max_matching_cosine_distance", 0.0)))
+            duplicate_current_match_count = int(module1_report.get("duplicate_current_match_count", update.get("duplicate_current_match_count", 0)))
+            ct_key_update_norm = float(module1_report.get("ct_key_update_norm", update.get("ct_key_update_norm", 0.0)))
+            pet_value_update_norm = float(module1_report.get("pet_value_update_norm", update.get("pet_value_update_norm", 0.0)))
+            extra = ""
+            if bank_update_detail_mode in ("fedmepd_ema", "fedmepd_ema_init"):
+                extra = (
+                    f" diversity_bg={prototype_diversity_background:.4f}"
+                    f" diversity_fg={prototype_diversity_foreground:.4f}"
+                    f" mean_dist={mean_matching_cosine_distance:.4f}"
+                    f" dup={duplicate_current_match_count}"
+                    f" ct_norm={ct_key_update_norm:.6f}"
+                    f" pet_norm={pet_value_update_norm:.6f}"
+                )
             print(
                 f"[PSPI][BANK] epoch={module1_report.get('epoch', epoch)} "
                 f"status={module1_report.get('status')} "
+                f"mode={bank_update_detail_mode or getattr(cfg, 'pspi_bank_update_mode', '')} "
                 f"bank_version={module1_report.get('bank_version_after', module1_report.get('bank_version_before', 0))} "
                 f"ready_count={module1_report.get('ready_count', 0)} "
-                f"total_slots={module1_report.get('total_slots', 0)}",
+                f"total_slots={module1_report.get('total_slots', 0)}"
+                f"{extra}",
                 flush=True,
             )
 
@@ -385,6 +418,15 @@ def main():
                 'pet_comp_norm': float(np.mean(comp_norm_vals)) if comp_norm_vals else 0.0,
                 'bank_ready': bank_ready_val,
                 'bank_version': bank_version_val,
+                'prototype_diversity_background': prototype_diversity_background,
+                'prototype_diversity_foreground': prototype_diversity_foreground,
+                'mean_matching_cosine_distance': mean_matching_cosine_distance,
+                'max_matching_cosine_distance': max_matching_cosine_distance,
+                'duplicate_current_match_count': duplicate_current_match_count,
+                'ct_key_update_norm': ct_key_update_norm,
+                'pet_value_update_norm': pet_value_update_norm,
+                'bank_update_mode': getattr(cfg, 'pspi_bank_update_mode', 'direct'),
+                'bank_update_detail_mode': bank_update_detail_mode,
                 'epoch_time': time.time() - epoch_start,
                 **{f'diag_{k}': v for k, v in diag_stats.items()},
             },

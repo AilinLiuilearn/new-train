@@ -480,8 +480,9 @@ class Module1Config:
             raise ValueError("cluster_max_iter must be >= 1")
         if not 0.0 <= self.outlier_discard_rate < 1.0:
             raise ValueError("outlier_discard_rate must be in [0,1)")
-        if self.bank_update_mode not in {"direct", "matched_ema"}:
-            raise ValueError("bank_update_mode must be 'direct' or 'matched_ema'")
+        valid_modes = {"direct", "matched_ema", "fedmepd_ema"}
+        if self.bank_update_mode not in valid_modes:
+            raise ValueError(f"bank_update_mode must be one of {valid_modes}, got {self.bank_update_mode!r}")
         if not 0.0 <= self.ema_momentum < 1.0:
             raise ValueError("ema_momentum must be in [0,1)")
         if float(self.retrieval_temperature) <= 0:
@@ -838,6 +839,182 @@ class PairedSemanticPrototypeImputation(nn.Module):
         self.prototype_count.copy_(out_count.to(self.prototype_count.device))
         return report
 
+    @torch.no_grad()
+    def _apply_fedmepd_ema_update(self, new_keys, new_values, new_ready, new_count) -> Dict:
+        momentum = float(self.config.ema_momentum)
+        # First-time bank init: no persistent ready slot -> direct init, never 0.999*0+0.001*current
+        if not self.prototype_ready.any():
+            # direct copy, but report as fedmepd_ema_init
+            for s in range(self.num_scales):
+                key_buf = getattr(self, f"ct_keys_s{s + 1}")
+                val_buf = getattr(self, f"pet_values_s{s + 1}")
+                key_buf.copy_(new_keys[s].to(key_buf.device, dtype=key_buf.dtype))
+                val_buf.copy_(new_values[s].to(val_buf.device, dtype=val_buf.dtype))
+            self.prototype_ready.copy_(new_ready.to(self.prototype_ready.device))
+            self.prototype_count.copy_(new_count.to(self.prototype_count.device))
+            # compute diversities after init
+            diversities = {}
+            for class_idx, class_name in enumerate(CLASS_NAMES):
+                s4_keys = getattr(self, f"ct_keys_s{self.build_stage_idx + 1}")[class_idx]  # [K,C]
+                ready = self.prototype_ready[class_idx]
+                n_ready = int(ready.sum().item())
+                if n_ready < 2:
+                    div = 0.0
+                else:
+                    keys_ready = s4_keys[ready].float()
+                    # already L2 normalized, but re-normalize for safety
+                    keys_ready = F.normalize(keys_ready, p=2, dim=1, eps=EPS)
+                    cos_mat = keys_ready @ keys_ready.t()
+                    dist_mat = 1.0 - cos_mat
+                    # sum upper triangle
+                    triu = torch.triu(dist_mat, diagonal=1)
+                    div = float(triu.sum().item() / (n_ready * (n_ready - 1) / 2))
+                diversities[class_name] = div
+            return {
+                "mode": "fedmepd_ema_init",
+                "momentum": momentum,
+                "matches": {"background": [], "foreground": []},
+                "mean_matching_cosine_distance": 0.0,
+                "max_matching_cosine_distance": 0.0,
+                "duplicate_current_match_count": 0,
+                "ct_key_update_norm": 0.0,
+                "pet_value_update_norm": 0.0,
+                "prototype_diversity_background": diversities.get("background", 0.0),
+                "prototype_diversity_foreground": diversities.get("foreground", 0.0),
+            }
+
+        out_keys = [getattr(self, f"ct_keys_s{s + 1}").detach().float().cpu().clone() for s in range(self.num_scales)]
+        out_values = [getattr(self, f"pet_values_s{s + 1}").detach().float().cpu().clone() for s in range(self.num_scales)]
+        out_ready = self.prototype_ready.detach().cpu().clone()
+        out_count = self.prototype_count.detach().cpu().clone()
+        old_build = out_keys[self.build_stage_idx]
+        new_build = new_keys[self.build_stage_idx]
+
+        report_matches: Dict[str, List[Dict]] = {"background": [], "foreground": []}
+        all_distances: List[float] = []
+        ct_update_norms: List[float] = []
+        pet_update_norms: List[float] = []
+        duplicate_current_match_count = 0
+
+        for class_idx, class_name in enumerate(CLASS_NAMES):
+            old_slots = torch.nonzero(out_ready[class_idx], as_tuple=False).flatten().long()
+            new_slots = torch.nonzero(new_ready[class_idx], as_tuple=False).flatten().long()
+            if new_slots.numel() == 0:
+                report_matches[class_name] = []
+                # keep optional flag for no_current logging
+                continue
+            if old_slots.numel() == 0:
+                # No old anchor for this class yet -> direct init empty slots from current centroids
+                free_slots = [int(s) for s in range(self.num_clusters) if not bool(out_ready[class_idx, s])]
+                # use current centroids in order
+                for idx, new_slot in enumerate([int(v.item()) for v in new_slots]):
+                    if idx >= len(free_slots):
+                        break
+                    target = free_slots[idx]
+                    for s in range(self.num_scales):
+                        out_keys[s][class_idx, target] = new_keys[s][class_idx, new_slot]
+                        out_values[s][class_idx, target] = new_values[s][class_idx, new_slot]
+                    out_ready[class_idx, target] = True
+                    out_count[class_idx, target] = new_count[class_idx, new_slot]
+                report_matches[class_name] = []
+                continue
+
+            # S4 cosine distance matrix old x current
+            old_keys = old_build[class_idx, old_slots]  # [n_old, C]
+            cur_keys = new_build[class_idx, new_slots]  # [n_new, C]
+            cost = _pairwise_cosine_distance(old_keys, cur_keys)  # [n_old, n_new]
+            nearest_local = cost.argmin(dim=1)  # [n_old]
+            # track chosen current slot values for duplicate count and for free-slot reuse
+            chosen_current_slots: List[int] = []
+            for i in range(old_slots.numel()):
+                old_slot = int(old_slots[i].item())
+                new_local = int(nearest_local[i].item())
+                new_slot = int(new_slots[new_local].item())
+                dist = float(cost[i, new_local].item())
+                chosen_current_slots.append(new_slot)
+                all_distances.append(dist)
+                # snapshot old for norm computation
+                old_key_norms_before = [out_keys[s][class_idx, old_slot].clone() for s in range(self.num_scales)]
+                old_val_before = [out_values[s][class_idx, old_slot].clone() for s in range(self.num_scales)]
+                # Paired EMA across all 4 scales with same mapping
+                for s in range(self.num_scales):
+                    mixed_key = momentum * out_keys[s][class_idx, old_slot] + (1.0 - momentum) * new_keys[s][class_idx, new_slot]
+                    out_keys[s][class_idx, old_slot] = F.normalize(mixed_key, dim=0, eps=EPS)
+                    out_values[s][class_idx, old_slot] = momentum * out_values[s][class_idx, old_slot] + (1.0 - momentum) * new_values[s][class_idx, new_slot]
+                out_count[class_idx, old_slot] = new_count[class_idx, new_slot]
+                # update norms (use S4 as representative, but compute per scale mean)
+                # CT
+                for s in range(self.num_scales):
+                    ct_delta = float((out_keys[s][class_idx, old_slot] - old_key_norms_before[s]).norm().item())
+                    pet_delta = float((out_values[s][class_idx, old_slot] - old_val_before[s]).norm().item())
+                    ct_update_norms.append(ct_delta)
+                    pet_update_norms.append(pet_delta)
+                report_matches[class_name].append({
+                    "old_slot": old_slot,
+                    "current_slot": new_slot,
+                    "cosine_distance": dist,
+                })
+
+            # duplicate count: number of extra matches beyond unique current
+            unique_chosen = len(set(chosen_current_slots))
+            duplicate_current_match_count += len(chosen_current_slots) - unique_chosen
+
+            # Fill remaining empty slots with still-unused current centroids (no EMA, direct init)
+            free_slots = [int(s) for s in range(self.num_clusters) if not bool(out_ready[class_idx, s])]
+            # unused = new_slots not in chosen_current_slots
+            chosen_set = set(chosen_current_slots)
+            unused_new = [int(v.item()) for v in new_slots if int(v.item()) not in chosen_set]
+            for target, new_slot in zip(free_slots, unused_new):
+                for s in range(self.num_scales):
+                    out_keys[s][class_idx, target] = new_keys[s][class_idx, new_slot]
+                    out_values[s][class_idx, target] = new_values[s][class_idx, new_slot]
+                out_ready[class_idx, target] = True
+                out_count[class_idx, target] = new_count[class_idx, new_slot]
+
+        # commit buffers
+        for s in range(self.num_scales):
+            key_buf = getattr(self, f"ct_keys_s{s + 1}")
+            val_buf = getattr(self, f"pet_values_s{s + 1}")
+            key_buf.copy_(out_keys[s].to(key_buf.device, dtype=key_buf.dtype))
+            val_buf.copy_(out_values[s].to(val_buf.device, dtype=val_buf.dtype))
+        self.prototype_ready.copy_(out_ready.to(self.prototype_ready.device))
+        self.prototype_count.copy_(out_count.to(self.prototype_count.device))
+
+        # diversity after update
+        diversities = {}
+        for class_idx, class_name in enumerate(CLASS_NAMES):
+            s4_keys = getattr(self, f"ct_keys_s{self.build_stage_idx + 1}")[class_idx]
+            ready = self.prototype_ready[class_idx]
+            n_ready = int(ready.sum().item())
+            if n_ready < 2:
+                div = 0.0
+            else:
+                keys_ready = s4_keys[ready].float()
+                keys_ready = F.normalize(keys_ready, p=2, dim=1, eps=EPS)
+                cos_mat = keys_ready @ keys_ready.t()
+                dist_mat = 1.0 - cos_mat
+                triu = torch.triu(dist_mat, diagonal=1)
+                div = float(triu.sum().item() / (n_ready * (n_ready - 1) / 2))
+            diversities[class_name] = div
+
+        mean_dist = float(sum(all_distances) / len(all_distances)) if all_distances else 0.0
+        max_dist = float(max(all_distances)) if all_distances else 0.0
+        ct_norm = float(sum(ct_update_norms) / len(ct_update_norms)) if ct_update_norms else 0.0
+        pet_norm = float(sum(pet_update_norms) / len(pet_update_norms)) if pet_update_norms else 0.0
+
+        return {
+            "mode": "fedmepd_ema",
+            "momentum": momentum,
+            "matches": report_matches,
+            "mean_matching_cosine_distance": mean_dist,
+            "max_matching_cosine_distance": max_dist,
+            "duplicate_current_match_count": int(duplicate_current_match_count),
+            "ct_key_update_norm": ct_norm,
+            "pet_value_update_norm": pet_norm,
+            "prototype_diversity_background": diversities.get("background", 0.0),
+            "prototype_diversity_foreground": diversities.get("foreground", 0.0),
+        }
+
     # ------------------------------------------------------------------
     # Epoch bank finalization
     # ------------------------------------------------------------------
@@ -941,8 +1118,12 @@ class PairedSemanticPrototypeImputation(nn.Module):
             return report
         if self.config.bank_update_mode == "direct":
             update_report = self._apply_direct_update(new_keys, new_values, new_ready, new_count)
-        else:
+        elif self.config.bank_update_mode == "matched_ema":
             update_report = self._apply_matched_ema_update(new_keys, new_values, new_ready, new_count)
+        elif self.config.bank_update_mode == "fedmepd_ema":
+            update_report = self._apply_fedmepd_ema_update(new_keys, new_values, new_ready, new_count)
+        else:
+            raise RuntimeError(f"Unsupported bank_update_mode={self.config.bank_update_mode!r}")
         self.bank_version.add_(1)
         report["status"] = "bank_updated"
         report["update"] = update_report
@@ -950,6 +1131,19 @@ class PairedSemanticPrototypeImputation(nn.Module):
         report["ready_count"] = int(self.prototype_ready.sum().item())
         report["total_slots"] = int(self.prototype_ready.numel())
         report["prototype_count"] = self.prototype_count.detach().cpu().tolist()
+        # Expose FedMEPD monitoring fields at top level when present
+        if isinstance(update_report, dict):
+            for extra_key in (
+                "prototype_diversity_background",
+                "prototype_diversity_foreground",
+                "mean_matching_cosine_distance",
+                "max_matching_cosine_distance",
+                "duplicate_current_match_count",
+                "ct_key_update_norm",
+                "pet_value_update_norm",
+            ):
+                if extra_key in update_report:
+                    report[extra_key] = update_report[extra_key]
         self.reset_epoch_cache()
         return report
 
