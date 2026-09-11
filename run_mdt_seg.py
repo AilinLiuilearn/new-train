@@ -350,11 +350,7 @@ def main():
 
         if joint_improved:
             task.save_checkpoint(paths['best_joint'], epoch, best_joint, best_full, best_missing, best_joint_epoch, val_full, val_missing, joint_dice)
-        if full_improved:
-            task.save_checkpoint(paths['best_full'], epoch, best_joint, best_full, best_missing, best_joint_epoch, val_full, val_missing, joint_dice)
-        if missing_improved:
-            task.save_checkpoint(paths['best_missing'], epoch, best_joint, best_full, best_missing, best_joint_epoch, val_full, val_missing, joint_dice)
-        task.save_checkpoint(paths['last'], epoch, best_joint, best_full, best_missing, best_joint_epoch, val_full, val_missing, joint_dice)
+        # NOTE: only best_joint is persisted to save disk; best_full/best_missing/last are skipped.
 
         train_loss = (full_loss + missing_loss) / max(1, full_n + missing_n)
         val_loss = 0.5 * val_full['total_loss'] + 0.5 * val_missing['total_loss']
