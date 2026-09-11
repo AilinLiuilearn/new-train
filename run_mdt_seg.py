@@ -139,6 +139,8 @@ def main():
         'mean_matching_cosine_distance', 'max_matching_cosine_distance',
         'duplicate_current_match_count', 'ct_key_update_norm', 'pet_value_update_norm',
         'bank_update_mode', 'bank_update_detail_mode',
+        'missing_pet_alpha_mean_s1', 'missing_pet_alpha_mean_s2', 'missing_pet_alpha_mean_s3', 'missing_pet_alpha_mean_s4',
+        'missing_pet_alpha_min', 'missing_pet_alpha_max', 'missing_pet_alpha_std',
         'epoch_time',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
@@ -181,6 +183,10 @@ def main():
         beta_abs_vals = []
         proto_norm_vals = []
         comp_norm_vals = []
+        alpha_s_accum = {f's{i}': [] for i in range(1, 5)}
+        alpha_min_vals = []
+        alpha_max_vals = []
+        alpha_std_vals = []
 
         for batch_idx, batch in enumerate(train_loader):
             route = 'full' if global_batch_step % 2 == 0 else 'missing'
@@ -245,7 +251,7 @@ def main():
                 missing_recon += float(step_stats['loss_recon'].detach())
                 missing_recon_w += float(step_stats['loss_recon_weighted'].detach())
 
-            # collect per-batch attention / affine stats if available
+            # collect per-batch attention / affine / alpha stats if available
             if outputs is not None and isinstance(outputs, dict):
                 for i in range(1, 5):
                     k = f'attention_entropy_s{i}'
@@ -260,6 +266,14 @@ def main():
                     beta_abs_vals.append(float(outputs['beta_abs_mean']))
                     proto_norm_vals.append(float(outputs['pet_proto_norm']))
                     comp_norm_vals.append(float(outputs['pet_comp_norm']))
+                for i in range(1, 5):
+                    k = f'missing_pet_alpha_mean_s{i}'
+                    if k in outputs:
+                        alpha_s_accum[f's{i}'].append(float(outputs[k]))
+                if 'missing_pet_alpha_min' in outputs:
+                    alpha_min_vals.append(float(outputs['missing_pet_alpha_min']))
+                    alpha_max_vals.append(float(outputs['missing_pet_alpha_max']))
+                    alpha_std_vals.append(float(outputs['missing_pet_alpha_std']))
 
             global_batch_step += 1
             task.global_batch_step = global_batch_step
@@ -427,6 +441,13 @@ def main():
                 'pet_value_update_norm': pet_value_update_norm,
                 'bank_update_mode': getattr(cfg, 'pspi_bank_update_mode', 'direct'),
                 'bank_update_detail_mode': bank_update_detail_mode,
+                'missing_pet_alpha_mean_s1': float(np.mean(alpha_s_accum['s1'])) if alpha_s_accum['s1'] else 0.0,
+                'missing_pet_alpha_mean_s2': float(np.mean(alpha_s_accum['s2'])) if alpha_s_accum['s2'] else 0.0,
+                'missing_pet_alpha_mean_s3': float(np.mean(alpha_s_accum['s3'])) if alpha_s_accum['s3'] else 0.0,
+                'missing_pet_alpha_mean_s4': float(np.mean(alpha_s_accum['s4'])) if alpha_s_accum['s4'] else 0.0,
+                'missing_pet_alpha_min': float(np.mean(alpha_min_vals)) if alpha_min_vals else 0.0,
+                'missing_pet_alpha_max': float(np.mean(alpha_max_vals)) if alpha_max_vals else 0.0,
+                'missing_pet_alpha_std': float(np.mean(alpha_std_vals)) if alpha_std_vals else 0.0,
                 'epoch_time': time.time() - epoch_start,
                 **{f'diag_{k}': v for k, v in diag_stats.items()},
             },

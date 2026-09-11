@@ -1375,6 +1375,181 @@ def test_57_modes_independent():
     print("[57] direct/matched_ema/fedmepd_ema semantics independent: PASS")
 
 
+# =============================================================================
+# Missing PET channel-wise scale alpha=2*sigmoid(a) (tests 58-64)
+# =============================================================================
+
+def test_58_alpha_init_all_one():
+    """missing_pet_scale 0-init => alpha=2*sigmoid(0)=1 at every channel."""
+    model = _joint_model(pspi_enabled=True)
+    for idx, p in enumerate(model.missing_pet_scale):
+        assert torch.all(p == 0), f"scale[{idx}] not zero-init"
+        alpha = 2.0 * torch.sigmoid(p)
+        assert torch.allclose(alpha, torch.ones_like(alpha)), f"alpha s{idx+1} !=1 at init"
+        assert float(alpha.min()) == 1.0 and float(alpha.max()) == 1.0
+    # also detached helper
+    alphas = model.missing_pet_alpha_vals()
+    for a in alphas:
+        assert torch.allclose(a, torch.ones_like(a))
+    print("[58] missing_pet_scale zero-init => alpha=1: PASS")
+
+
+def test_59_initial_missing_logits_identical_before_after():
+    """At init alpha=1 so Missing logits = ct+pet_comp exactly (no change vs old)."""
+    torch.manual_seed(40)
+    model = _joint_model(pspi_enabled=True)
+    # ensure bank ready so pet_comp != 0
+    ct = torch.randn(1, 1, 64, 64)
+    pet = torch.randn(1, 1, 64, 64)
+    mask = _mask(1)
+    model.eval()
+    with torch.no_grad():
+        ct_feats = model._encode_ct(ct)
+        pet_comp, _ = model.module1.recover_missing(ct_feats)
+        # manual old fusion
+        fused_old = [c + p for c, p in zip(ct_feats, pet_comp)]
+        out_old = model.decoder(fused_old, ct.shape[-2:])
+        # new path via forward (alpha=1)
+        out_new = model(ct, pet=pet, forward_mode="missing", mask=mask)
+    assert torch.allclose(out_old["logits"], out_new["logits"], atol=1e-6), \
+        "alpha=1 must keep Missing output identical"
+    # also check every scale alpha*pet_comp == pet_comp
+    for a, comp in zip(model.missing_pet_scale, pet_comp):
+        alpha = 2.0 * torch.sigmoid(a)
+        assert torch.allclose(alpha * comp, comp, atol=1e-6)
+    print("[59] initial Missing logits identical before/after alpha: PASS")
+
+
+def test_60_full_logits_unaffected_by_alpha():
+    """Full path must not use missing_pet_scale; changing it cannot affect Full."""
+    torch.manual_seed(41)
+    model = _joint_model(pspi_enabled=True)
+    ct = torch.randn(1, 1, 64, 64)
+    pet = torch.randn(1, 1, 64, 64)
+    mask = _mask(1)
+    model.eval()
+    with torch.no_grad():
+        out_before = model(ct, pet=pet, forward_mode="full", mask=mask)
+        # push alpha far from 1
+        for p in model.missing_pet_scale:
+            p.data.fill_(3.0)  # alpha≈1.905
+        out_after = model(ct, pet=pet, forward_mode="full", mask=mask)
+        # reset
+        for p in model.missing_pet_scale:
+            p.data.zero_()
+    assert torch.allclose(out_before["logits"], out_after["logits"], atol=1e-6), \
+        "Full logits must be independent of missing_pet_scale"
+    print("[60] Full logits unaffected by missing_pet_scale: PASS")
+
+
+def test_61_missing_seg_loss_grad_positive_for_alpha():
+    """Missing segmentation loss must backprop to missing_pet_scale (via alpha*pet_comp)."""
+    torch.manual_seed(42)
+    model = _joint_model(pspi_enabled=True)
+    # make bank produce non-zero pet_comp
+    model.train()
+    ct = torch.randn(2, 1, 64, 64)
+    pet = torch.randn(2, 1, 64, 64)
+    mask = _mask(2)
+    out = model(ct, pet=pet, forward_mode="missing", mask=mask)
+    from utils.seg_losses import BCEDiceLoss as _BCEDice
+    criterion = _BCEDice()
+    seg_loss, _ = criterion(out["logits"], mask)
+    model.zero_grad(set_to_none=True)
+    seg_loss.backward()
+    total = 0.0
+    for p in model.missing_pet_scale:
+        assert p.grad is not None, "missing_pet_scale must receive grad from Missing seg loss"
+        total += float(p.grad.abs().sum().item())
+    assert total > 0, "Missing seg loss grad for missing_pet_scale must be >0"
+    print("[61] Missing seg loss grad for missing_pet_scale >0: PASS")
+
+
+def test_62_recon_loss_grad_strictly_zero_for_alpha():
+    """Reconstruction loss supervises raw pet_comp; alpha must get 0 grad."""
+    torch.manual_seed(43)
+    model = _joint_model(pspi_enabled=True)
+    model.train()
+    ct = torch.randn(2, 1, 64, 64)
+    pet = torch.randn(2, 1, 64, 64)
+    mask = _mask(2)
+    ct_feats = model._encode_ct(ct)
+    pet_feats = model._encode_pet(pet)
+    pet_comp, _ = model.module1.recover_missing(ct_feats)
+    result = model.module1.compute_balanced_reconstruction_loss(pet_comp, pet_feats, mask)
+    assert result["num_terms"] > 0
+    model.zero_grad(set_to_none=True)
+    result["loss"].backward()
+    for p in model.missing_pet_scale:
+        if p.grad is not None:
+            assert float(p.grad.abs().sum().item()) == 0.0, "recon loss must not reach missing_pet_scale"
+        else:
+            # None is also acceptable (strictly zero)
+            pass
+    print("[62] recon loss grad for missing_pet_scale strictly 0: PASS")
+
+
+def test_63_alpha_always_in_0_2():
+    """alpha=2*sigmoid(a) in (0,2) for any finite a, including extremes."""
+    model = _joint_model(pspi_enabled=True)
+    for p in model.missing_pet_scale:
+        alpha = 2.0 * torch.sigmoid(p.detach())
+        assert float(alpha.min().item()) > 0 and float(alpha.max().item()) < 2
+    # push to extremes
+    with torch.no_grad():
+        for p in model.missing_pet_scale:
+            p.fill_(10.0)
+    for p in model.missing_pet_scale:
+        alpha = 2.0 * torch.sigmoid(p.detach())
+        assert float(alpha.min().item()) > 1.9 and float(alpha.min().item()) < 2.0
+    with torch.no_grad():
+        for p in model.missing_pet_scale:
+            p.fill_(-10.0)
+    for p in model.missing_pet_scale:
+        alpha = 2.0 * torch.sigmoid(p.detach())
+        assert float(alpha.min().item()) > 0 and float(alpha.max().item()) < 0.1
+    # restore
+    with torch.no_grad():
+        for p in model.missing_pet_scale:
+            p.zero_()
+    print("[63] alpha in (0,2) for any finite a: PASS")
+
+
+def test_64_checkpoint_strict_recovery_alpha():
+    """state_dict save/restore must recover missing_pet_scale exactly."""
+    import tempfile, os
+    torch.manual_seed(44)
+    model = _joint_model(pspi_enabled=True)
+    # set non-trivial values
+    with torch.no_grad():
+        for idx, p in enumerate(model.missing_pet_scale):
+            p.fill_(float(idx) * 0.5 - 0.7)
+    before = [p.detach().clone() for p in model.missing_pet_scale]
+    sd = model.state_dict()
+    assert any("missing_pet_scale" in k for k in sd), "missing_pet_scale must be in state_dict"
+    # check shapes are [1,C,1,1] per spec
+    for k, v in sd.items():
+        if "missing_pet_scale" in k:
+            assert v.shape[1] in (64, 128, 320, 512) and v.shape[0] == 1
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "ckpt.pth")
+        torch.save({"model": sd}, path)
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        fresh = _joint_model(pspi_enabled=True)
+        # fresh is zero-init; strict load must succeed
+        fresh.load_state_dict(ckpt["model"], strict=True)
+        for b, f in zip(before, fresh.missing_pet_scale):
+            assert torch.equal(b, f.detach().cpu()), "checkpoint must restore alpha exactly"
+        # also functional equivalence: same Missing logits after restore
+        ct = torch.randn(1, 1, 64, 64); pet = torch.randn(1, 1, 64, 64); mask = _mask(1)
+        fresh.eval(); model.eval()
+        with torch.no_grad():
+            out_fresh = fresh(ct, pet=pet, forward_mode="missing", mask=mask)
+            out_orig = model(ct, pet=pet, forward_mode="missing", mask=mask)
+        assert torch.allclose(out_fresh["logits"], out_orig["logits"], atol=1e-6)
+    print("[64] checkpoint strict recovery of missing_pet_scale: PASS")
+
+
 def main():
     tests = [
         test_01_kmeans_determinism,
@@ -1432,6 +1607,13 @@ def main():
         test_55_no_current_centroid_keeps_old,
         test_56_checkpoint_roundtrip_fedmepd,
         test_57_modes_independent,
+        test_58_alpha_init_all_one,
+        test_59_initial_missing_logits_identical_before_after,
+        test_60_full_logits_unaffected_by_alpha,
+        test_61_missing_seg_loss_grad_positive_for_alpha,
+        test_62_recon_loss_grad_strictly_zero_for_alpha,
+        test_63_alpha_always_in_0_2,
+        test_64_checkpoint_strict_recovery_alpha,
     ]
     failed = []
     for t in tests:

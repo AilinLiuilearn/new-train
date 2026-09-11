@@ -86,6 +86,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
             )
         else:
             self.module1 = None
+        # 4-scale Missing PET channel-wise weight: alpha^l = 2*sigmoid(a^l), a init 0 => alpha=1
+        self.missing_pet_scale = nn.ParameterList([
+            nn.Parameter(torch.zeros(1, c, 1, 1))
+            for c in pet_channels
+        ])
 
     @staticmethod
     def _to_3ch(x):
@@ -109,6 +114,13 @@ class DualSharedAddPETCTBaseline(nn.Module):
         out['pred'] = out['logits']
         out['aux'] = {}
         return out
+
+    def missing_pet_alpha_vals(self):
+        """Return alpha^l = 2*sigmoid(a^l) per scale, plus aggregates."""
+        alphas = []
+        for a in self.missing_pet_scale:
+            alphas.append(2.0 * torch.sigmoid(a).detach().float())
+        return alphas
 
     def _attach_pspi_stats(self, out, proto_result=None, recon_result=None, module1_aux=None, ref_tensor=None):
         # proto/recon results may be None or dict with loss/weighted_loss/num_terms
@@ -160,6 +172,14 @@ class DualSharedAddPETCTBaseline(nn.Module):
             out['normalized_attention_entropy'] = 0.0
             for k in ('gamma_mean','gamma_std','gamma_abs_mean','beta_mean','beta_std','beta_abs_mean','pet_proto_norm','pet_comp_norm'):
                 out[k] = 0.0
+        # 4-scale alpha stats (on top of PSPI stats for logging)
+        alphas = self.missing_pet_alpha_vals()
+        for i, a in enumerate(alphas):
+            out[f'missing_pet_alpha_mean_s{i+1}'] = float(a.mean().item())
+        flat = torch.cat([a.flatten() for a in alphas]) if alphas else torch.zeros(1)
+        out['missing_pet_alpha_min'] = float(flat.min().item())
+        out['missing_pet_alpha_max'] = float(flat.max().item())
+        out['missing_pet_alpha_std'] = float(flat.std().item()) if flat.numel() > 1 else 0.0
         return out
 
     def _maybe_collect(self, ct_feats, pet_feats_real, mask):
@@ -209,7 +229,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
         if self.pspi_enabled:
             if not self.training:
                 pet_comp, module1_aux = self.module1.recover_missing(ct_feats, return_attention=False)
-                fused_feats = self.fusion(ct_feats, pet_comp, None)
+                pet_for_fusion = [2.0 * torch.sigmoid(a) * comp for a, comp in zip(self.missing_pet_scale, pet_comp)]
+                fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
                 out = self._decode(fused_feats, target_size)
                 return self._attach_pspi_stats(out, proto_result=None, recon_result=None, module1_aux=module1_aux, ref_tensor=out['logits'])
             # training
@@ -221,8 +242,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
             self._maybe_collect(ct_feats, pet_real_feats, mask)
             proto_result = self.module1.compute_pet_prototype_contrastive_loss(pet_real_feats, mask)
             pet_comp, module1_aux = self.module1.recover_missing(ct_feats, return_attention=False)
+            # Reconstruction loss supervises RAW pet_comp; alpha only enters
+            # the Missing segmentation path below.
             recon_result = self.module1.compute_balanced_reconstruction_loss(pet_comp, pet_real_feats, mask)
-            fused_feats = self.fusion(ct_feats, pet_comp, None)
+            pet_for_fusion = [2.0 * torch.sigmoid(a) * comp for a, comp in zip(self.missing_pet_scale, pet_comp)]
+            fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
             out = self._decode(fused_feats, target_size)
             return self._attach_pspi_stats(out, proto_result=proto_result, recon_result=recon_result, module1_aux=module1_aux, ref_tensor=out['logits'])
         else:
@@ -253,8 +277,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
             pet_comp, module1_aux = self.module1.recover_missing(ct_feats, return_attention=False)
             availability = pet_available.view(-1, 1, 1, 1).to(dtype=pet_feats_real[0].dtype)
             pet_for_fusion = []
-            for real_feat, comp_feat in zip(pet_feats_real, pet_comp):
-                pet_for_fusion.append(real_feat * availability + comp_feat * (1.0 - availability))
+            for scale_idx, (real_feat, comp_feat) in enumerate(zip(pet_feats_real, pet_comp)):
+                alpha = 2.0 * torch.sigmoid(self.missing_pet_scale[scale_idx])
+                comp_weighted = alpha * comp_feat
+                pet_for_fusion.append(real_feat * availability + comp_weighted * (1.0 - availability))
             # For mixed batch, proto/recon not well-defined; return zeros but keep bank info
             proto_result = None
             recon_result = None
