@@ -199,7 +199,6 @@ def main():
         prior_norm_vals = []
         prior_alpha_accum = {f's{i}': [] for i in range(1, 5)}
         module2_on = getattr(task.model, 'module2', None) is not None
-        n_groups = len(getattr(getattr(task.model, 'module2', None), 'experts', {}).get('ct', [])) if module2_on else 0
         route_accum = {'full': [], 'missing': []}
         counts_accum = {'full': [[] for _ in range(4)], 'missing': [[] for _ in range(4)]}
 
