@@ -49,6 +49,12 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--pspi_prior_scale_enabled', type=str2bool, default=True)
         p.add_argument('--pspi_prior_scale_init', type=float, default=0.1)
         p.add_argument('--pspi_collect_candidates', type=str2bool, default=True)
+        # Module-2: state-guided CT/PET expert fusion (default OFF).
+        # experts_per_group is independent of pspi_num_clusters; do not mix them.
+        p.add_argument('--module2_enabled', type=str2bool, default=False)
+        p.add_argument('--module2_use_text', type=str2bool, default=True)
+        p.add_argument('--module2_experts_per_group', type=int, default=2)
+        p.add_argument('--module2_text_cache', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/module2_text_cache.pt')
         # Stage-1 unimodal pretraining initialization
         p.add_argument('--stage1_init_enabled', type=str2bool, default=False)
         p.add_argument('--stage1_ct_checkpoint', type=str, default=None)

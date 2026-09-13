@@ -459,8 +459,90 @@ class ConvBNAct(nn.Module):
         return self.block(x)
 
 
-def build_mdt_seg_teacher(config):
+def build_mdt_seg_teacher(config, model_state_dict=None):
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
+    from models.state_guided_expert_fusion import FORMAT_VERSION as MODULE2_FORMAT_VERSION
+    from models.state_guided_expert_fusion import PROMPTS as MODULE2_PROMPTS
+    from models.state_guided_expert_fusion import load_text_cache
+    module2_enabled = bool(getattr(config, 'module2_enabled', False))
+    pspi_enabled = bool(getattr(config, 'pspi_enabled', True))
+    if module2_enabled and not pspi_enabled:
+        raise ValueError('module2_enabled=True requires pspi_enabled=True')
+    module2_experts = getattr(config, 'module2_experts_per_group', 2)
+    if module2_enabled:
+        if type(module2_experts) is not int or module2_experts < 1:
+            raise ValueError('module2_experts_per_group must be a positive integer')
+    module2_kwargs = None
+    module2_from_checkpoint = False
+    if module2_enabled:
+        # Full-checkpoint recovery: reuse archived text vectors/metadata so
+        # evaluation never depends on the external text cache file.
+        ckpt_module2_prefix = 'module2.'
+        ckpt_text_key = ckpt_module2_prefix + 'text_embeddings'
+        ckpt_extra_key = ckpt_module2_prefix + '_extra_state'
+        has_ckpt_module2 = (
+            isinstance(model_state_dict, dict)
+            and ckpt_text_key in model_state_dict
+            and ckpt_extra_key in model_state_dict
+        )
+        if has_ckpt_module2:
+            extra = model_state_dict[ckpt_extra_key]
+            if not isinstance(extra, dict):
+                raise ValueError('module2 _extra_state in checkpoint must be a dict')
+            if extra.get('version') != MODULE2_FORMAT_VERSION:
+                raise ValueError('module2 checkpoint version mismatch')
+            if list(extra.get('prompts', [])) != list(MODULE2_PROMPTS):
+                raise ValueError('module2 checkpoint prompt content/order mismatch; rebuild cache')
+            ckpt_cfg = dict(extra.get('config', {}))
+            if int(ckpt_cfg.get('experts_per_group', -1)) != int(module2_experts):
+                raise ValueError(
+                    f"module2 experts_per_group mismatch: config={module2_experts} "
+                    f"checkpoint={ckpt_cfg.get('experts_per_group')}"
+                )
+            use_text = bool(ckpt_cfg.get('use_text', False))
+            if use_text != bool(getattr(config, 'module2_use_text', True)):
+                raise ValueError(
+                    f"module2 text-mode mismatch: config={bool(getattr(config, 'module2_use_text', True))} "
+                    f"checkpoint={use_text}"
+                )
+            archived = model_state_dict[ckpt_text_key]
+            if not torch.is_tensor(archived):
+                raise ValueError('module2 text_embeddings in checkpoint must be a Tensor')
+            module2_kwargs = dict(ckpt_cfg)
+            module2_kwargs['text_embeddings'] = archived.detach().float().cpu().clone() if use_text else None
+            module2_kwargs['text_metadata'] = dict(extra.get('text_metadata', {}))
+            module2_from_checkpoint = True
+            print('[Module2] text vectors restored from checkpoint state_dict (no cache file needed)')
+        elif bool(getattr(config, 'module2_use_text', True)):
+            cache_path = getattr(config, 'module2_text_cache', None)
+            if not cache_path:
+                raise ValueError(
+                    'module2_use_text=True requires module2_text_cache; generate with: '
+                    'python models/state_guided_expert_fusion.py --cache-text pretrained/module2_text_cache.pt '
+                    '--backend biomedclip --text-tower-path pretrained/biomedbert_text_tower '
+                    '--biomedclip-path pretrained/biomedclip_model --device cpu'
+                )
+            if not os.path.isfile(cache_path):
+                raise FileNotFoundError(
+                    f'Module-2 text cache not found: {cache_path}. Generate with: '
+                    'python models/state_guided_expert_fusion.py --cache-text pretrained/module2_text_cache.pt '
+                    '--backend biomedclip --text-tower-path pretrained/biomedbert_text_tower '
+                    '--biomedclip-path pretrained/biomedclip_model --device cpu'
+                )
+            embeddings, metadata = load_text_cache(cache_path)
+            module2_kwargs = {
+                'use_text': True,
+                'text_embeddings': embeddings,
+                'text_metadata': metadata,
+                'experts_per_group': int(module2_experts),
+            }
+            print(f'[Module2] text cache loaded: {cache_path} dim={embeddings.shape[1]}')
+        else:
+            module2_kwargs = {
+                'use_text': False,
+                'experts_per_group': int(module2_experts),
+            }
+            print('[Module2] text disabled; no cache file accessed')
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
@@ -482,6 +564,8 @@ def build_mdt_seg_teacher(config):
         pspi_collect_candidates=getattr(config, 'pspi_collect_candidates', True),
         pspi_prior_scale_enabled=getattr(config, 'pspi_prior_scale_enabled', True),
         pspi_prior_scale_init=getattr(config, 'pspi_prior_scale_init', 0.1),
+        module2_enabled=module2_enabled,
+        module2_kwargs=module2_kwargs,
     )
     if bool(getattr(config, 'stage1_init_enabled', False)):
         load_stage1_unimodal_initialization(
@@ -494,17 +578,51 @@ def build_mdt_seg_teacher(config):
         assert all(p.requires_grad for p in model.enc_pet.parameters())
         assert all(p.requires_grad for p in model.ct_align.parameters())
     pspi_enabled = bool(getattr(config, 'pspi_enabled', True))
+    module2_enabled = bool(getattr(config, 'module2_enabled', False))
+    module2_params = sum(p.numel() for p in model.module2.parameters()) if model.module2 is not None else 0
+    module2_trainable = sum(p.numel() for p in model.module2.parameters() if p.requires_grad) if model.module2 is not None else 0
+    if model.module2 is not None:
+        fusion_name = type(model.module2).__name__
+    else:
+        fusion_name = 'AddFusion'
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion=AddFusion '
+        f'fusion={fusion_name} '
         f'shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
+    print(
+        f'[Module2] enabled={module2_enabled} '
+        f'use_text={bool(getattr(config, "module2_use_text", True))} '
+        f'experts_per_group={getattr(config, "module2_experts_per_group", 2)} '
+        f'params={module2_params} trainable={module2_trainable} '
+        f'anatomical_personalization={"module2_spatial_gamma_beta" if model.module2 is not None and model.module2.personalization else ("none" if model.module2 is None else "disabled")} '
+        f'from_checkpoint={module2_from_checkpoint}'
+    )
+    if model.module2 is not None:
+        print(
+            f'[Module2][PriorScale] requested_enabled={model.requested_prior_scale_enabled} '
+            f'effective_enabled={model.effective_prior_scale_enabled} '
+            f'missing_prior_logits=None (replaced by Module-2 fusion)'
+        )
     if pspi_enabled:
-        fusion_desc = 'downstream_fusion=AddFusion'
+        fusion_desc = 'downstream_fusion=AddFusion' if model.module2 is None else 'downstream_fusion=StateGuidedExpertFusion'
     else:
         fusion_desc = 'baseline_fusion=AddFusion'
+    if model.module2 is not None:
+        prior_scale_desc = (
+            f'prior_scale_type=module2_replaced '
+            f'prior_scale_requested={model.requested_prior_scale_enabled} '
+            f'prior_scale_effective=False '
+            f'missing_prior_alpha=disabled_by_module2'
+        )
+    else:
+        prior_scale_desc = (
+            f'prior_scale_type=per_scale_scalar '
+            f'prior_scale_init={getattr(config, "pspi_prior_scale_init", 0.1)} '
+            f'prior_scale_enabled={bool(getattr(config, "pspi_prior_scale_enabled", True))}'
+        )
     print(
         f'[PSPI] enabled={pspi_enabled} '
         f'module1=paired_ct_pet_prototype_prior_retrieval '
@@ -514,6 +632,7 @@ def build_mdt_seg_teacher(config):
         f'retrieval=cosine_soft '
         f'retrieval_temperature={getattr(config, "pspi_retrieval_temperature", 0.1)} '
         f'personalization=none '
+        f'(module1_personalization=none; Module-2 anatomical personalization logged separately) '
         f'prototype_loss=pet_multi_positive_contrastive '
         f'proto_temperature={getattr(config, "pspi_proto_temperature", 0.02)} '
         f'proto_weight={getattr(config, "pspi_proto_contrastive_weight", 0.01)} '
@@ -523,13 +642,10 @@ def build_mdt_seg_teacher(config):
         f'ema_momentum={getattr(config, "pspi_ema_momentum", 0.95)} '
         f'K={getattr(config, "pspi_num_clusters", 6)} '
         f'build_stage=S{getattr(config, "pspi_build_stage", 4)} '
-        f'full_path=raw_CT_plus_real_PET '
-        f'missing_boundary=CT_plus_scale_weighted_PET_prior '
-        f'prior_scale_type=per_scale_scalar '
-        f'prior_scale_init={getattr(config, "pspi_prior_scale_init", 0.1)} '
-        f'prior_scale_enabled={bool(getattr(config, "pspi_prior_scale_enabled", True))} '
+        f'full_path={"module2_state_guided_expert_full" if model.module2 is not None else "raw_CT_plus_real_PET"} '
+        f'missing_boundary={"module2_state_guided_expert_missing" if model.module2 is not None else "CT_plus_scale_weighted_PET_prior"} '
+        f'{prior_scale_desc} '
         f'{fusion_desc} '
-        f'downstream_fusion=AddFusion '
         f'decoder=UNetStyleDecoder'
     )
     return {'model': model}

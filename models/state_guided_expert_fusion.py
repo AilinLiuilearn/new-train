@@ -107,12 +107,24 @@ def encode_local_text_prompts(text_tower_path, biomedclip_path=None,
             pooler_type=text_cfg['hf_pooler_type'],
             proj_type=text_cfg['hf_proj_type'], pretrained=False,
         )
-        # OpenCLIP 2.24's explicit-config constructor creates a BERT pooler
-        # even for CLS-last-hidden-state pooling. Its normal pretrained=False
-        # path (and official BiomedCLIP weights) omit this UNUSED HF pooler.
+        # Pooler compatibility across OpenCLIP 2.x + Transformers 4.x:
+        # with pooler_type != 'cls_pooler' (BiomedCLIP uses
+        # cls_last_hidden_state_pooler), the official text.* checkpoint and
+        # OpenCLIP's config-less pretrained=False path omit the UNUSED HF
+        # transformer.pooler, but Transformers 4.38 BertModel.forward checks
+        # `self.pooler is not None` and crashes if the attribute is deleted.
+        # Keep an UNREGISTERED empty BertPooler for attribute presence only:
+        # it is never called by the CLS pooling path and never enters
+        # strict state_dict (registered keys match the checkpoint exactly).
         if text_cfg['hf_pooler_type'] != 'cls_pooler' and config.model_type in ('bert','roberta','xlm-roberta'):
             if hasattr(encoder.transformer,'pooler'):
-                encoder.transformer.pooler = None
+                from transformers.models.bert.modeling_bert import BertPooler
+                empty_pooler = BertPooler(config)
+                with torch.no_grad():
+                    empty_pooler.dense.weight.zero_()
+                    empty_pooler.dense.bias.zero_()
+                encoder.transformer._modules.pop('pooler', None)
+                object.__setattr__(encoder.transformer, 'pooler', empty_pooler)
         checkpoint_path = model_path / 'open_clip_pytorch_model.bin'
         if checkpoint_path.is_file():
             state = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
@@ -127,6 +139,12 @@ def encode_local_text_prompts(text_tower_path, biomedclip_path=None,
         text_state = {k[len('text.'):]: v for k,v in state.items() if k.startswith('text.')}
         if not text_state:
             raise ValueError('Official full BiomedCLIP checkpoint must contain text.* weights')
+        # Official checkpoints carry a registered position_ids buffer that the
+        # current HFTextEncoder/transformers layer does not register as a
+        # parameter or persistent buffer. Drop ONLY this exact buffer key;
+        # every other text.* weight must match the encoder exactly.
+        text_state = {k: v for k, v in text_state.items()
+                      if k != 'transformer.embeddings.position_ids'}
         try:
             encoder.load_state_dict(text_state, strict=True)
         except RuntimeError as error:

@@ -104,6 +104,26 @@ def main():
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
     total_params, trainable_params = _count_parameters(task.model)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
+    module2_on = bool(getattr(cfg, 'module2_enabled', False)) and getattr(task.model, 'module2', None) is not None
+    print(
+        f"[Module2] enabled={module2_on} "
+        f"use_text={bool(getattr(cfg, 'module2_use_text', True))} "
+        f"experts_per_group={getattr(cfg, 'module2_experts_per_group', 2)} "
+        f"fusion={type(getattr(task.model, 'module2', None)).__name__ if module2_on else 'AddFusion'} "
+        f"module1_personalization=none "
+        f"module2_personalization={'spatial_gamma_beta' if (module2_on and task.model.module2.personalization) else ('disabled' if module2_on else 'n/a')}",
+        flush=True,
+    )
+    if module2_on:
+        m2p = sum(p.numel() for p in task.model.module2.parameters())
+        m2t = sum(p.numel() for p in task.model.module2.parameters() if p.requires_grad)
+        print(f'[Module2] params={m2p} trainable={m2t}', flush=True)
+        print(
+            f"[Module2][PriorScale] requested_enabled={task.model.requested_prior_scale_enabled} "
+            f"effective_enabled={task.model.effective_prior_scale_enabled} "
+            f"missing_prior_alpha=disabled_by_module2",
+            flush=True,
+        )
     # No Stage-1.5 bootstrap: epoch-1 cold start, bank_version=0, ready=False
 
     task.scheduler = get_cosine_scheduler(
@@ -138,6 +158,10 @@ def main():
         'duplicate_current_match_count', 'ct_key_update_norm', 'pet_value_update_norm',
         'bank_update_mode', 'bank_update_detail_mode',
         'missing_prior_alpha_s1', 'missing_prior_alpha_s2', 'missing_prior_alpha_s3', 'missing_prior_alpha_s4',
+        'module2_route_full_ct', 'module2_route_full_pet', 'module2_route_missing_ct', 'module2_route_missing_pet',
+        'module2_counts_full_s1', 'module2_counts_full_s2', 'module2_counts_full_s3', 'module2_counts_full_s4',
+        'module2_counts_missing_s1', 'module2_counts_missing_s2', 'module2_counts_missing_s3', 'module2_counts_missing_s4',
+        'grad_missing_personalizers', 'grad_missing_routers', 'grad_missing_experts', 'grad_missing_output_proj',
         'epoch_time',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
@@ -174,6 +198,10 @@ def main():
         nattn_ent_accum = {f's{i}': [] for i in range(1, 5)}
         prior_norm_vals = []
         prior_alpha_accum = {f's{i}': [] for i in range(1, 5)}
+        module2_on = getattr(task.model, 'module2', None) is not None
+        n_groups = len(getattr(getattr(task.model, 'module2', None), 'experts', {}).get('ct', [])) if module2_on else 0
+        route_accum = {'full': [], 'missing': []}
+        counts_accum = {'full': [[] for _ in range(4)], 'missing': [[] for _ in range(4)]}
 
         for batch_idx, batch in enumerate(train_loader):
             route = 'full' if global_batch_step % 2 == 0 else 'missing'
@@ -221,6 +249,19 @@ def main():
             else:
                 task.optimizer.step()
 
+            # Module-2 gradient norms read AFTER unscale, without modifying grads.
+            if module2_on:
+                with torch.no_grad():
+                    m2 = task.model.module2
+                    g_person = module_grad_norm(m2.personalizers) if len(m2.personalizers) else 0.0
+                    g_routers = module_grad_norm(m2.routers)
+                    g_experts = module_grad_norm(m2.experts)
+                    g_outproj = module_grad_norm(m2.output_projections)
+                grads[route].setdefault('m2_person', []).append(g_person)
+                grads[route].setdefault('m2_routers', []).append(g_routers)
+                grads[route].setdefault('m2_experts', []).append(g_experts)
+                grads[route].setdefault('m2_outproj', []).append(g_outproj)
+
             task.scheduler.step()
 
             if (batch_idx + 1) % 100 == 0:
@@ -251,7 +292,30 @@ def main():
                 for i in range(1, 5):
                     k = f'missing_prior_alpha_s{i}'
                     if k in outputs:
-                        prior_alpha_accum[f's{i}'].append(float(outputs[k]))
+                        v = outputs[k]
+                        # NaN marks disabled-by-Module2; do not average NaN.
+                        if isinstance(v, float) and v != v:
+                            continue
+                        prior_alpha_accum[f's{i}'].append(float(v))
+                # Module-2 diagnostics: small detached tensors only.
+                aux2 = (outputs.get('aux') or {}).get('module2') if isinstance(outputs.get('aux'), dict) else None
+                if module2_on and isinstance(aux2, dict):
+                    rw = aux2.get('route_weights')
+                    active = aux2.get('active')
+                    counts = aux2.get('expert_counts')
+                    sel = aux2.get('selected_experts')
+                    if torch.is_tensor(rw) and torch.is_tensor(active) and rw.dim() == 3:
+                        on = active.detach()
+                        if on.dtype != torch.bool:
+                            on = on.bool()
+                        for b in range(rw.shape[0]):
+                            for s in range(4):
+                                if bool(on[b, s].item()):
+                                    route_accum[route].append(rw.detach()[b, s].float().cpu())
+                    if torch.is_tensor(counts) and counts.dim() == 2 and counts.shape[0] == 4:
+                        for s in range(4):
+                            counts_accum[route][s].append(counts.detach()[s].float().cpu())
+                    del rw, active, counts, sel
 
             global_batch_step += 1
             task.global_batch_step = global_batch_step
@@ -350,6 +414,32 @@ def main():
         if task.model.pspi_enabled and task.model.module1 is not None:
             bank_ready_val = 1 if task.model.module1.bank_ready else 0
             bank_version_val = int(task.model.module1.bank_version.item())
+        module2_metrics = {}
+        if module2_on:
+            for route in ('full', 'missing'):
+                stacked = torch.stack(route_accum[route]).mean(dim=0).tolist() if route_accum[route] else [0.0, 0.0]
+                module2_metrics[f'module2_route_{route}_ct'] = float(stacked[0])
+                module2_metrics[f'module2_route_{route}_pet'] = float(stacked[1])
+                for s in range(4):
+                    if counts_accum[route][s]:
+                        summed = torch.stack(counts_accum[route][s]).sum(dim=0)
+                        module2_metrics[f'module2_counts_{route}_s{s+1}'] = ','.join(str(int(v)) for v in summed.tolist())
+                    else:
+                        module2_metrics[f'module2_counts_{route}_s{s+1}'] = ''
+            module2_metrics['grad_missing_personalizers'] = float(np.mean(grads['missing'].get('m2_person', [0.0]))) if grads['missing'].get('m2_person') else 0.0
+            module2_metrics['grad_missing_routers'] = float(np.mean(grads['missing'].get('m2_routers', [0.0]))) if grads['missing'].get('m2_routers', [0.0]) else 0.0
+            module2_metrics['grad_missing_experts'] = float(np.mean(grads['missing'].get('m2_experts', [0.0]))) if grads['missing'].get('m2_experts', [0.0]) else 0.0
+            module2_metrics['grad_missing_output_proj'] = float(np.mean(grads['missing'].get('m2_outproj', [0.0]))) if grads['missing'].get('m2_outproj', [0.0]) else 0.0
+            if module2_metrics['module2_route_full_ct'] or module2_metrics['module2_route_missing_ct']:
+                print(
+                    f"[Module2] route_full=[ct={module2_metrics['module2_route_full_ct']:.4f},pet={module2_metrics['module2_route_full_pet']:.4f}] "
+                    f"route_missing=[ct={module2_metrics['module2_route_missing_ct']:.4f},pet={module2_metrics['module2_route_missing_pet']:.4f}] "
+                    f"grad_person={module2_metrics['grad_missing_personalizers']:.6f} "
+                    f"grad_routers={module2_metrics['grad_missing_routers']:.6f} "
+                    f"grad_experts={module2_metrics['grad_missing_experts']:.6f} "
+                    f"grad_outproj={module2_metrics['grad_missing_output_proj']:.6f}",
+                    flush=True,
+                )
         append_epoch_log(
             os.path.join(cfg.checkpoint_dir, 'train_log.csv'),
             epoch,
@@ -418,6 +508,7 @@ def main():
                 'missing_prior_alpha_s2': float(np.mean(prior_alpha_accum['s2'])) if prior_alpha_accum['s2'] else 0.0,
                 'missing_prior_alpha_s3': float(np.mean(prior_alpha_accum['s3'])) if prior_alpha_accum['s3'] else 0.0,
                 'missing_prior_alpha_s4': float(np.mean(prior_alpha_accum['s4'])) if prior_alpha_accum['s4'] else 0.0,
+                **module2_metrics,
                 'epoch_time': time.time() - epoch_start,
                 **{f'diag_{k}': v for k, v in diag_stats.items()},
             },
