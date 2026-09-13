@@ -136,7 +136,7 @@ def main():
             f"[Module2][PriorScale] requested_enabled={task.model.requested_prior_scale_enabled} "
             f"effective_enabled={task.model.effective_prior_scale_enabled} "
             f"missing_prior_logits=None (replaced by routing weight a_P) "
-            f"fusion=weighted_CT_plus_raw_prior_plus_expert_residual",
+            f"fusion=weighted_CT_plus_Pimp_plus_expert_residual",
             flush=True,
         )
     # No Stage-1.5 bootstrap: epoch-1 cold start, bank_version=0, ready=False

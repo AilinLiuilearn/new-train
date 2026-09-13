@@ -623,7 +623,8 @@ def test_real_scale_shapes_s1_s4():
 
 
 def test_balanced_weights_restore_addition():
-    # Force router -> [0.5,0.5], zero expert proj: must equal ct+pet / ct+raw_prior.
+    # Force router -> [0.5,0.5], zero expert proj: Full must equal ct+pet;
+    # Missing must equal ct+P_imp (personalized prior on the main path).
     _, on = _model_pair(use_text=False, experts_per_group=1)
     batch = _tiny_batch()
     _warm_bank(on, batch)
@@ -642,10 +643,14 @@ def test_balanced_weights_restore_addition():
             assert torch.allclose(o, c + r, atol=1e-6, rtol=1e-5), \
                 (o - (c + r)).abs().max().item()
         prior, _ = on.module1.retrieve_pet_prior(ct_feats, return_attention=False)
-        out_m, _ = on.module2(ct_feats, prior, base_pet_feats=prior, mode='missing', bank_ready=True)
-        for o, c, r in zip(out_m, ct_feats, prior):
-            assert torch.allclose(o, c + r, atol=1e-6, rtol=1e-5), \
-                (o - (c + r)).abs().max().item()
+        pimp = [on.module2.personalizers[s](c, p).detach()
+                for s, (c, p) in enumerate(zip(ct_feats, prior))]
+        out_m, aux_m = on.module2(ct_feats, prior, mode='missing', bank_ready=True)
+        assert torch.allclose(aux_m['modality_scales'],
+                              torch.ones_like(aux_m['modality_scales']), atol=1e-6)
+        for o, c, q in zip(out_m, ct_feats, pimp):
+            assert torch.allclose(o, c + q, atol=1e-6, rtol=1e-5), \
+                (o - (c + q)).abs().max().item()
 
 
 def test_unbalanced_weights_scale_both_paths():
@@ -677,19 +682,26 @@ def test_unbalanced_weights_scale_both_paths():
 
 
 def test_personalization_boundary():
-    # personalizer sees RAW prior; main path sees RAW prior base, never P_imp.
+    # personalizer input = RAW prior; P_imp feeds BOTH the main path (P_base)
+    # and the PET-expert input. Balanced routing + zero expert projection
+    # pins output == ct + P_imp exactly.
     _, on = _model_pair(use_text=False, experts_per_group=2)
     batch = _tiny_batch()
     _warm_bank(on, batch)
     on.eval()
-    seen_person_in, seen_expert_in, seen_base = {}, {}, {}
+    for router in on.module2.routers:
+        router.readout[-1].weight.data.zero_()
+        router.readout[-1].bias.data.zero_()
+    seen_person_in, seen_person_out, seen_expert_in = {}, {}, {}
 
     for s, pers in enumerate(on.module2.personalizers):
         orig = pers.forward
         def make_orig(o, ss):
             def w(ct, prior):
                 seen_person_in[ss] = prior.clone().detach()
-                return o(ct, prior)
+                out = o(ct, prior)
+                seen_person_out[ss] = out.clone().detach()
+                return out
             return w
         pers.forward = make_orig(orig, s)
     orig_disp = on.module2._dispatch
@@ -702,21 +714,22 @@ def test_personalization_boundary():
         ct_feats = on._encode_ct(batch['ct'])
         prior, _ = on.module1.retrieve_pet_prior(ct_feats, return_attention=False)
         with torch.no_grad():
-            on.module2(ct_feats, prior, base_pet_feats=prior, mode='missing', bank_ready=True)
+            out_m, _ = on.module2(ct_feats, prior, mode='missing', bank_ready=True)
         for s in range(4):
-            assert torch.equal(seen_person_in[s], prior[s]), s
-            assert not torch.equal(seen_expert_in[s], prior[s]), s  # P_imp != raw
-            for b in seen_base.values():
-                pass
+            assert torch.equal(seen_person_in[s], prior[s]), s  # raw in
+            with torch.no_grad():
+                expect_adapted = on.module2.pet_adapters[s](seen_person_out[s])
+            assert torch.equal(seen_expert_in[s], expect_adapted), s  # expert in == adapter(P_imp)
+            assert torch.allclose(out_m[s], ct_feats[s] + seen_person_out[s],
+                                  atol=1e-6, rtol=1e-5), s  # main base == P_imp
     finally:
         on.module2._dispatch = orig_disp
-    # Base-path isolation under perturbation is covered by
-    # test_personalizer_perturb_keeps_main_path.
 
 
-def test_personalizer_perturb_keeps_main_path():
-    # With zero expert projection, main path = a_ct*CT + a_pet*raw_prior
-    # regardless of personalizer output magnitude.
+def test_personalizer_perturb_moves_main_path():
+    # With zero expert projection and balanced routing, the main path is
+    # exactly ct + P_imp, so replacing the personalizer moves the output to
+    # ct + (100*prior + 50) while the router/expert path is unchanged.
     _, on = _model_pair(use_text=False, experts_per_group=1)
     batch = _tiny_batch()
     _warm_bank(on, batch)
@@ -727,15 +740,18 @@ def test_personalizer_perturb_keeps_main_path():
     ct_feats = on._encode_ct(batch['ct'])
     prior, _ = on.module1.retrieve_pet_prior(ct_feats, return_attention=False)
     with torch.no_grad():
-        ref, _ = on.module2(ct_feats, prior, base_pet_feats=prior, mode='missing', bank_ready=True)
+        ref, _ = on.module2(ct_feats, prior, mode='missing', bank_ready=True)
     class BigPersonalizer(torch.nn.Module):
         def forward(self, ct, prior):
             return prior * 100.0 + 50.0
     on.module2.personalizers = torch.nn.ModuleList(BigPersonalizer() for _ in range(4))
     with torch.no_grad():
-        got, _ = on.module2(ct_feats, prior, base_pet_feats=prior, mode='missing', bank_ready=True)
+        got, aux = on.module2(ct_feats, prior, mode='missing', bank_ready=True)
         for r, g in zip(ref, got):
-            assert torch.equal(r, g)
+            assert not torch.equal(r, g)
+            assert (r - g).abs().max().item() > 1e-3
+        for g, c, p in zip(got, ct_feats, prior):
+            assert torch.allclose(g, c + (p * 100.0 + 50.0), atol=1e-4, rtol=1e-3)
 
 
 def test_prior_logits_absent_routing_grad_present():
@@ -802,8 +818,8 @@ def test_weighted_checkpoint_roundtrip(tmp_path):
 
 
 def test_feature_rms_magnitudes_logged():
-    # RMS smoke: detached magnitudes for CT / raw prior (= base, no alpha) /
-    # personalized PET. No scaled-prior RMS exists under Module-2.
+    # RMS smoke: detached magnitudes for CT / raw prior / personalized PET
+    # (= P_base on Missing). No scaled-prior RMS exists under Module-2.
     _, on = _model_pair(use_text=False, experts_per_group=1)
     batch = _tiny_batch()
     _warm_bank(on, batch)
@@ -813,14 +829,15 @@ def test_feature_rms_magnitudes_logged():
     personalized = [on.module2.personalizers[s](c, p).detach()
                     for s, (c, p) in enumerate(zip(ct_feats, prior))]
     with torch.no_grad():
-        out, aux = on.module2(ct_feats, prior, base_pet_feats=prior,
+        out, aux = on.module2(ct_feats, prior,
                               mode='missing', bank_ready=True)
     rep = {}
     for s in range(4):
         rep[f'module2_rms_ct_s{s+1}'] = _rms(ct_feats[s])
         rep[f'module2_rms_raw_prior_s{s+1}'] = _rms(prior[s])
         rep[f'module2_rms_personalized_pet_s{s+1}'] = _rms(personalized[s])
-        rep[f'module2_rms_pet_base_s{s+1}'] = _rms(prior[s])
+        # P_base = P_imp on Missing: base RMS equals personalized RMS.
+        rep[f'module2_rms_pet_base_s{s+1}'] = _rms(personalized[s])
     for k, v in rep.items():
         assert v > 0 and v < 1e6, (k, v)
     print('\n[RMS] ' + ' '.join(f'{k}={v:.4f}' for k, v in rep.items()))

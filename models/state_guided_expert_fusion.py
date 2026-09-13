@@ -352,9 +352,13 @@ class StateGuidedExpertFusion(nn.Module):
                        base_pet_feats=None):
         # Weighted fusion: F^l = a_C^l C^l + a_P^l P_base^l + O_l(a_C^l E_C + a_P^l E_P),
         # with a_* = 2 * softmax weights so [0.5,0.5] restores plain addition.
-        # pet_feats feeds router + PET expert (Missing: RAW prior, personalized
-        # inside); base_pet_feats feeds ONLY the main fusion path (Missing:
-        # alpha-scaled RAW prior). base_pet NEVER enters the personalizer.
+        # Full: P_base = real PET. Missing with personalization:
+        #   P_imp = personalizer(C_det, P_prior_raw);
+        #   P_base = P_imp (main path), PET-expert input = P_imp.
+        # Missing without personalization: P_base = raw prior.
+        # The personalizer detaches CT internally, so no CT gradient leaks
+        # through the P_imp main-path term. base_pet_feats is a legacy
+        # override, ignored on Missing when personalization is on.
         batch = ct_feats[0].shape[0]
         if state == 1 and not ready:
             return list(ct_feats), {
@@ -377,11 +381,12 @@ class StateGuidedExpertFusion(nn.Module):
         state_text = self.text_embeddings[3+state] if self.use_text else None
         for scale, (ct, pet) in enumerate(zip(ct_feats, pet_feats)):
             raw_pet = pet
-            base_pet = base_pet_feats[scale]
             if state == 1 and self.personalization:
                 expert_pet = self.personalizers[scale](ct, raw_pet)
+                base_pet = expert_pet
             else:
                 expert_pet = raw_pet
+                base_pet = base_pet_feats[scale]
             c, p = self.ct_adapters[scale](ct), self.pet_adapters[scale](expert_pet)
             ct_id, pet_id, weights = self.routers[scale](c,p,state,state_text)
             ce, pe = self._dispatch('ct',c,ct_id), self._dispatch(group,p,pet_id)
@@ -461,12 +466,12 @@ class StateGuidedExpertFusion(nn.Module):
             for state,selected in ((0,available),(1,~available)):
                 indices=selected.nonzero(as_tuple=False).flatten()
                 c=[x.index_select(0,indices) for x in ct_feats]
-                p=[x.index_select(0,indices) for x in pet_feats]
+                p_list=[x.index_select(0,indices) for x in pet_feats]
                 if base_pet_feats is None:
-                    base=[x.index_select(0,indices) for x in p]
+                    base=list(p_list)
                 else:
                     base=[x.index_select(0,indices) for x in base_pet_feats]
-                values,diagnostics=self._forward_state(c,p,state,bank_ready,base_pet_feats=base)
+                values,diagnostics=self._forward_state(c,p_list,state,bank_ready,base_pet_feats=base)
                 out=[dst.index_copy(0,indices,v.to(dst.dtype)) for dst,v in zip(out,values)]
                 for key,value in diagnostics.items():
                     if key not in aux: aux[key]=value.new_zeros((ref.shape[0],*value.shape[1:]))

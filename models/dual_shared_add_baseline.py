@@ -300,12 +300,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 module1_aux = dict(module1_aux)
                 module1_aux['pet_prior'] = pet_prior
                 if self.module2 is not None:
-                    # RAW prior feeds BOTH the main fusion path (as P_base)
-                    # and the personalizer/router/PET-expert branch. No alpha.
+                    # RAW prior enters the personalizer; P_imp feeds the main
+                    # path, router and PET-expert branch. No alpha.
                     fused_feats, module2_aux = self.module2(
                         ct_feats,
                         pet_prior,
-                        base_pet_feats=pet_prior,
                         mode='missing',
                         bank_ready=self.module1.bank_ready,
                     )
@@ -327,10 +326,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
             module1_aux = dict(module1_aux)
             module1_aux['pet_prior'] = pet_prior
             if self.module2 is not None:
+                # Same as inference: P_base = P_imp derived inside Module-2.
                 fused_feats, module2_aux = self.module2(
                     ct_feats,
                     pet_prior,
-                    base_pet_feats=pet_prior,
                     mode='missing',
                     bank_ready=self.module1.bank_ready,
                 )
@@ -384,19 +383,15 @@ class DualSharedAddPETCTBaseline(nn.Module):
             if self.module2 is not None:
                 availability = pet_available.bool().view(-1, 1, 1, 1)
                 # Full rows use real PET; Missing rows use RAW retrieved prior
-                # for BOTH the expert/router input and the main-fusion base.
+                # as personalizer input (P_imp derived inside Module-2 feeds
+                # the main path, router and PET-expert branch).
                 pet_for_module2 = [
-                    torch.where(availability, real_feat, prior_feat)
-                    for real_feat, prior_feat in zip(pet_feats_real, pet_prior)
-                ]
-                base_pet_for_module2 = [
                     torch.where(availability, real_feat, prior_feat)
                     for real_feat, prior_feat in zip(pet_feats_real, pet_prior)
                 ]
                 fused_feats, module2_aux = self.module2(
                     ct_feats,
                     pet_for_module2,
-                    base_pet_feats=base_pet_for_module2,
                     mode='auto',
                     pet_available=pet_available,
                     bank_ready=self.module1.bank_ready,

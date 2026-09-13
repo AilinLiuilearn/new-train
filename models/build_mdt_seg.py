@@ -616,7 +616,7 @@ def build_mdt_seg_teacher(config, model_state_dict=None):
             f'prior_scale_requested={model.requested_prior_scale_enabled} '
             f'prior_scale_effective=False '
             f'missing_prior_alpha=disabled_by_module2 '
-            f'module2_base_pet=raw_prior'
+            f'module2_base_pet=personalized_Pimp'
         )
     else:
         prior_scale_desc = (
