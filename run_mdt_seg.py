@@ -132,12 +132,11 @@ def main():
         m2p = sum(p.numel() for p in task.model.module2.parameters())
         m2t = sum(p.numel() for p in task.model.module2.parameters() if p.requires_grad)
         print(f'[Module2] params={m2p} trainable={m2t}', flush=True)
-        has_logits = getattr(task.model, 'missing_prior_logits', None) is not None
         print(
             f"[Module2][PriorScale] requested_enabled={task.model.requested_prior_scale_enabled} "
             f"effective_enabled={task.model.effective_prior_scale_enabled} "
-            f"missing_prior_logits_present={has_logits} (reused for base PET) "
-            f"fusion=weighted_CT_plus_alpha_prior_plus_expert_residual",
+            f"missing_prior_logits=None (replaced by routing weight a_P) "
+            f"fusion=weighted_CT_plus_raw_prior_plus_expert_residual",
             flush=True,
         )
     # No Stage-1.5 bootstrap: epoch-1 cold start, bank_version=0, ready=False
@@ -364,9 +363,11 @@ def main():
                 for i in range(1, 5):
                     k = f'missing_prior_alpha_s{i}'
                     if k in outputs:
-                        # Real sigmoid(logits); 1.0 means prior scale disabled
-                        # by config (pspi_prior_scale_enabled=false).
-                        prior_alpha_accum[f's{i}'].append(float(outputs[k]))
+                        v = outputs[k]
+                        # NaN marks disabled-by-Module2; do not average NaN.
+                        if isinstance(v, float) and v != v:
+                            continue
+                        prior_alpha_accum[f's{i}'].append(float(v))
                 # Module-2 diagnostics: small detached tensors only, per scale.
                 aux2 = (outputs.get('aux') or {}).get('module2') if isinstance(outputs.get('aux'), dict) else None
                 if module2_on and isinstance(aux2, dict):

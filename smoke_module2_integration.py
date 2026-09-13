@@ -101,14 +101,13 @@ def main():
         assert torch.allclose(ms, 2.0 * aux['route_weights'], atol=1e-6), 'a=2w contract'
         scales_ct = ms[..., 0].mean(dim=0).tolist()
         scales_pet = ms[..., 1].mean(dim=0).tolist()
-        alpha = [float(torch.sigmoid(v).item()) for v in model.missing_prior_logits.detach()]
         print(f"[SMOKE] round2 mode={mode} loss={float(loss):.4f} "
               f"route_mean={aux['route_weights'].mean(dim=(0,1)).tolist()} "
               f"scales_ct={[round(v,4) for v in scales_ct]} "
               f"scales_pet={[round(v,4) for v in scales_pet]} "
-              f"alpha={[round(v,4) for v in alpha]}")
+              f"alpha=disabled_by_module2")
         assert bool(aux['active'].any())
-        assert model.missing_prior_logits is not None, 'alpha reused under Module-2'
+        assert model.missing_prior_logits is None, 'no alpha under Module-2'
     # Missing inference with pet=None must not touch the PET encoder.
     model.eval()
     with torch.no_grad():

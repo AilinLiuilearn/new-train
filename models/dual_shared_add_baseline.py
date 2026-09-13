@@ -100,10 +100,15 @@ class DualSharedAddPETCTBaseline(nn.Module):
         else:
             self.module1 = None
 
-        # Prior scale contract: missing_prior_logits is registered whenever
-        # PSPI + prior-scale are enabled, INCLUDING Module-2 mode. Module-2
-        # reuses alpha for its main-path base PET (no second PET weight).
-        self.effective_prior_scale_enabled = bool(pspi_prior_scale_enabled)
+        # Prior scale contract: when Module-2 is enabled, the old per-scale
+        # scalar (missing_prior_logits) is disabled and Module-2's routing
+        # weight a_P alone controls the PET main-path contribution
+        # (F = a_C*C + a_P*P_base + O(R), P_base = raw prior on Missing).
+        # module2_enabled=false keeps the Module-1-clean scalar untouched.
+        if self.module2_enabled and self.pspi_enabled:
+            self.effective_prior_scale_enabled = False
+        else:
+            self.effective_prior_scale_enabled = bool(pspi_prior_scale_enabled)
         self.pspi_prior_scale_enabled = self.effective_prior_scale_enabled
         self.pspi_prior_scale_init = float(pspi_prior_scale_init)
         if not 0.0 < self.pspi_prior_scale_init < 1.0:
@@ -118,7 +123,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 torch.full((4,), initial_logit)
             )
         else:
-            # No dangling trainable parameter when PSPI is off or scale is off.
+            # No dangling trainable parameter when PSPI is off, scale is off,
+            # or Module-2 replaces the old scalar fusion.
             self.register_parameter("missing_prior_logits", None)
 
         # Module-2 is constructed AFTER all shared components so common
@@ -211,14 +217,15 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 out[f'normalized_attention_entropy_s{i+1}'] = 0.0
             out['attention_entropy'] = 0.0
             out['normalized_attention_entropy'] = 0.0
-        # Prior contribution alpha_l = sigmoid(logit); always the real
-        # Module-1 boundary scalar, never route weights. If the config
-        # disables prior scale, 1.0 is reported (self.pspi_prior_scale_enabled
-        # records the disabled state).
+        # Prior contribution alpha_l = sigmoid(logit) on the Module-1-clean
+        # path only, never route weights. In Module-2 mode the old scalar is
+        # disabled (NaN); if the config disables prior scale, 1.0 is reported.
         self.module1_is_module1_personalization_none = True
         if self.missing_prior_logits is not None:
             with torch.no_grad():
                 alphas = [float(torch.sigmoid(v).item()) for v in self.missing_prior_logits]
+        elif self.module2_enabled:
+            alphas = [float("nan"), float("nan"), float("nan"), float("nan")]
         else:
             alphas = [1.0, 1.0, 1.0, 1.0]
         for i, a in enumerate(alphas):
@@ -293,13 +300,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 module1_aux = dict(module1_aux)
                 module1_aux['pet_prior'] = pet_prior
                 if self.module2 is not None:
-                    # pet_prior (RAW) feeds personalizer/router/PET-expert;
-                    # alpha-scaled prior feeds ONLY the main fusion path.
-                    scaled_pet_prior = self._scaled_prior(pet_prior)
+                    # RAW prior feeds BOTH the main fusion path (as P_base)
+                    # and the personalizer/router/PET-expert branch. No alpha.
                     fused_feats, module2_aux = self.module2(
                         ct_feats,
                         pet_prior,
-                        base_pet_feats=scaled_pet_prior,
+                        base_pet_feats=pet_prior,
                         mode='missing',
                         bank_ready=self.module1.bank_ready,
                     )
@@ -321,11 +327,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
             module1_aux = dict(module1_aux)
             module1_aux['pet_prior'] = pet_prior
             if self.module2 is not None:
-                scaled_pet_prior = self._scaled_prior(pet_prior)
                 fused_feats, module2_aux = self.module2(
                     ct_feats,
                     pet_prior,
-                    base_pet_feats=scaled_pet_prior,
+                    base_pet_feats=pet_prior,
                     mode='missing',
                     bank_ready=self.module1.bank_ready,
                 )
@@ -378,16 +383,15 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 proto_result = self.module1.compute_pet_prototype_contrastive_loss(pet_feats_real, mask)
             if self.module2 is not None:
                 availability = pet_available.bool().view(-1, 1, 1, 1)
-                scaled_prior = self._scaled_prior(pet_prior)
-                # Expert/router input: Full rows real PET, Missing rows RAW prior.
+                # Full rows use real PET; Missing rows use RAW retrieved prior
+                # for BOTH the expert/router input and the main-fusion base.
                 pet_for_module2 = [
                     torch.where(availability, real_feat, prior_feat)
                     for real_feat, prior_feat in zip(pet_feats_real, pet_prior)
                 ]
-                # Main-fusion input: Full rows real PET, Missing rows alpha*prior.
                 base_pet_for_module2 = [
-                    torch.where(availability, real_feat, scaled_feat)
-                    for real_feat, scaled_feat in zip(pet_feats_real, scaled_prior)
+                    torch.where(availability, real_feat, prior_feat)
+                    for real_feat, prior_feat in zip(pet_feats_real, pet_prior)
                 ]
                 fused_feats, module2_aux = self.module2(
                     ct_feats,
