@@ -97,9 +97,25 @@ def main():
         loss.backward()
         task.optimizer.step()
         aux = outputs['aux']['module2']
+        ms = aux['modality_scales']
+        assert torch.allclose(ms, 2.0 * aux['route_weights'], atol=1e-6), 'a=2w contract'
+        scales_ct = ms[..., 0].mean(dim=0).tolist()
+        scales_pet = ms[..., 1].mean(dim=0).tolist()
+        alpha = [float(torch.sigmoid(v).item()) for v in model.missing_prior_logits.detach()]
         print(f"[SMOKE] round2 mode={mode} loss={float(loss):.4f} "
-              f"route_mean={aux['route_weights'].mean(dim=(0,1)).tolist()}")
+              f"route_mean={aux['route_weights'].mean(dim=(0,1)).tolist()} "
+              f"scales_ct={[round(v,4) for v in scales_ct]} "
+              f"scales_pet={[round(v,4) for v in scales_pet]} "
+              f"alpha={[round(v,4) for v in alpha]}")
         assert bool(aux['active'].any())
+        assert model.missing_prior_logits is not None, 'alpha reused under Module-2'
+    # Missing inference with pet=None must not touch the PET encoder.
+    model.eval()
+    with torch.no_grad():
+        out_m = model(b['ct'], pet=None, forward_mode='missing')
+    assert torch.isfinite(out_m['logits']).all()
+    print('[SMOKE] missing inference pet=None OK, '
+          f'route_missing={out_m["aux"]["module2"]["route_weights"].mean(dim=(0,1)).tolist()}')
 
     # Optimizer/scheduler/scaler state round-trip.
     opt_state = copy.deepcopy(task.optimizer.state_dict())

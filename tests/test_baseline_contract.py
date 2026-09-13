@@ -83,9 +83,10 @@ def test_module_grad_norm_preserves_grad_and_value():
     y = lin(x).sum()
     y.backward()
     before = [p.grad.clone() for p in lin.parameters()]
-    norm = module_grad_norm(lin)
+    norm, nonfinite = module_grad_norm(lin)
     after = [p.grad for p in lin.parameters()]
     assert norm >= 0
+    assert nonfinite == 0
     for b, a in zip(before, after):
         assert torch.allclose(b, a)
 

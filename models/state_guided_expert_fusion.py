@@ -348,33 +348,64 @@ class StateGuidedExpertFusion(nn.Module):
                 result = result.index_copy(0,indices,values.to(result.dtype))
         return result
 
-    def _forward_state(self, ct_feats, pet_feats, state: int, ready: bool):
+    def _forward_state(self, ct_feats, pet_feats, state: int, ready: bool,
+                       base_pet_feats=None):
+        # Weighted fusion: F^l = a_C^l C^l + a_P^l P_base^l + O_l(a_C^l E_C + a_P^l E_P),
+        # with a_* = 2 * softmax weights so [0.5,0.5] restores plain addition.
+        # pet_feats feeds router + PET expert (Missing: RAW prior, personalized
+        # inside); base_pet_feats feeds ONLY the main fusion path (Missing:
+        # alpha-scaled RAW prior). base_pet NEVER enters the personalizer.
         batch = ct_feats[0].shape[0]
         if state == 1 and not ready:
             return list(ct_feats), {
                 'selected_experts': torch.full((batch,4,2),-1,device=ct_feats[0].device,dtype=torch.long),
                 'route_weights': ct_feats[0].new_zeros((batch,4,2)),
+                'modality_scales': ct_feats[0].new_zeros((batch,4,2)),
                 'active': torch.zeros(batch,4,device=ct_feats[0].device,dtype=torch.bool),
             }
-        outputs, ids, all_weights = [], [], []
+        if base_pet_feats is None:
+            base_pet_feats = pet_feats
+        if len(base_pet_feats) != 4:
+            raise ValueError('Expected four base PET scales')
+        for base, ct, channels in zip(base_pet_feats, ct_feats, self.channels):
+            if (base.ndim != 4 or base.shape[:2] != (batch, channels)
+                    or base.shape[2:] != ct.shape[2:] or base.device != ct.device
+                    or not base.is_floating_point()):
+                raise ValueError('base PET shape/channel/device/dtype must match CT')
+        outputs, ids, all_weights, all_scales = [], [], [], []
         group = 'real' if state == 0 else 'imputed'
         state_text = self.text_embeddings[3+state] if self.use_text else None
-        for scale, (ct,pet) in enumerate(zip(ct_feats,pet_feats)):
+        for scale, (ct, pet) in enumerate(zip(ct_feats, pet_feats)):
+            raw_pet = pet
+            base_pet = base_pet_feats[scale]
             if state == 1 and self.personalization:
-                pet = self.personalizers[scale](ct,pet)
-            c, p = self.ct_adapters[scale](ct), self.pet_adapters[scale](pet)
+                expert_pet = self.personalizers[scale](ct, raw_pet)
+            else:
+                expert_pet = raw_pet
+            c, p = self.ct_adapters[scale](ct), self.pet_adapters[scale](expert_pet)
             ct_id, pet_id, weights = self.routers[scale](c,p,state,state_text)
             ce, pe = self._dispatch('ct',c,ct_id), self._dispatch(group,p,pet_id)
-            w = weights.to(ce.dtype)
-            residual = w[:,0,None,None,None]*ce + w[:,1,None,None,None]*pe
-            outputs.append(ct+pet+self.output_projections[scale](residual))
+            w = weights.to(dtype=ce.dtype)
+            w_ct = w[:,0,None,None,None]
+            w_pet = w[:,1,None,None,None]
+            a_ct = 2.0 * w_ct
+            a_pet = 2.0 * w_pet
+            expert_residual = a_ct * ce + a_pet * pe
+            base_dtype = torch.promote_types(ct.dtype, base_pet.dtype)
+            weighted_base = (a_ct.to(dtype=base_dtype) * ct.to(dtype=base_dtype)
+                             + a_pet.to(dtype=base_dtype) * base_pet.to(dtype=base_dtype))
+            projected_residual = self.output_projections[scale](expert_residual).to(dtype=base_dtype)
+            outputs.append(weighted_base + projected_residual)
             ids.append(torch.stack((ct_id,pet_id+(1 if state==0 else 2)*self.n),dim=-1))
             all_weights.append(weights.detach())
+            all_scales.append((2.0 * weights).detach())
         return outputs, {'selected_experts':torch.stack(ids,dim=1).detach(),
             'route_weights':torch.stack(all_weights,dim=1),
+            'modality_scales':torch.stack(all_scales,dim=1),
             'active':torch.ones(batch,4,device=ct_feats[0].device,dtype=torch.bool)}
 
-    def forward(self, ct_feats, pet_feats=None, *, mode='full',
+    def forward(self, ct_feats, pet_feats=None, *,
+                base_pet_feats=None, mode='full',
                 bank_ready=False, pet_available=None):
         if mode not in ('full','missing','auto'):
             raise ValueError('mode must be full, missing or auto')
@@ -410,10 +441,17 @@ class StateGuidedExpertFusion(nn.Module):
             for c,p in zip(ct_feats,pet_feats):
                 if p.shape!=c.shape or p.device!=c.device or not p.is_floating_point():
                     raise ValueError('PET must match already-aligned CT shape/device and be floating point')
+        if base_pet_feats is not None:
+            if len(base_pet_feats)!=4: raise ValueError('Expected four base PET scales')
+            for refbase,c in zip(base_pet_feats,ct_feats):
+                if refbase.shape!=c.shape or refbase.device!=c.device or not refbase.is_floating_point():
+                    raise ValueError('base PET must match CT shape/device and be floating point')
         if mode!='auto':
-            out,aux=self._forward_state(ct_feats,pet_feats,0 if mode=='full' else 1,bank_ready)
+            out,aux=self._forward_state(ct_feats,pet_feats,0 if mode=='full' else 1,
+                                        bank_ready,base_pet_feats=base_pet_feats)
         elif bool(available.all()) or not bool(available.any()):
-            out,aux=self._forward_state(ct_feats,pet_feats,0 if bool(available.all()) else 1,bank_ready)
+            out,aux=self._forward_state(ct_feats,pet_feats,0 if bool(available.all()) else 1,
+                                        bank_ready,base_pet_feats=base_pet_feats)
         else:
             # Encoders may emit different floating dtypes under autocast.
             # Match normal CT+PET type promotion without downcasting real PET.
@@ -424,7 +462,11 @@ class StateGuidedExpertFusion(nn.Module):
                 indices=selected.nonzero(as_tuple=False).flatten()
                 c=[x.index_select(0,indices) for x in ct_feats]
                 p=[x.index_select(0,indices) for x in pet_feats]
-                values,diagnostics=self._forward_state(c,p,state,bank_ready)
+                if base_pet_feats is None:
+                    base=[x.index_select(0,indices) for x in p]
+                else:
+                    base=[x.index_select(0,indices) for x in base_pet_feats]
+                values,diagnostics=self._forward_state(c,p,state,bank_ready,base_pet_feats=base)
                 out=[dst.index_copy(0,indices,v.to(dst.dtype)) for dst,v in zip(out,values)]
                 for key,value in diagnostics.items():
                     if key not in aux: aux[key]=value.new_zeros((ref.shape[0],*value.shape[1:]))

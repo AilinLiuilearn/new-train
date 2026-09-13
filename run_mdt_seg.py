@@ -58,13 +58,27 @@ def _assert_baseline(cfg):
 
 
 def module_grad_norm(module):
-    total = None
+    """L2 grad norm in float64; inf/nan elements propagate (not masked).
+
+    Returns (norm, nonfinite_count): callers distinguish "grad has inf/nan"
+    from "float32 norm computation overflowed".
+    """
+    total = 0.0
+    nonfinite = 0
+    seen = False
     for p in module.parameters():
-        if p.grad is None:
+        g = p.grad
+        if g is None:
             continue
-        val = p.grad.detach().float().pow(2).sum()
-        total = val if total is None else total + val
-    return float(total.sqrt().item()) if total is not None else 0.0
+        seen = True
+        gd = g.detach()
+        nonfinite += int((~torch.isfinite(gd)).sum().item())
+        total += float(gd.double().pow(2).sum().item())
+        del gd
+    if not seen:
+        return 0.0, 0
+    import math as _math
+    return float(_math.sqrt(total)), int(nonfinite)
 
 
 def _checkpoint_paths(checkpoint_dir):
@@ -118,10 +132,12 @@ def main():
         m2p = sum(p.numel() for p in task.model.module2.parameters())
         m2t = sum(p.numel() for p in task.model.module2.parameters() if p.requires_grad)
         print(f'[Module2] params={m2p} trainable={m2t}', flush=True)
+        has_logits = getattr(task.model, 'missing_prior_logits', None) is not None
         print(
             f"[Module2][PriorScale] requested_enabled={task.model.requested_prior_scale_enabled} "
             f"effective_enabled={task.model.effective_prior_scale_enabled} "
-            f"missing_prior_alpha=disabled_by_module2",
+            f"missing_prior_logits_present={has_logits} (reused for base PET) "
+            f"fusion=weighted_CT_plus_alpha_prior_plus_expert_residual",
             flush=True,
         )
     # No Stage-1.5 bootstrap: epoch-1 cold start, bank_version=0, ready=False
@@ -162,6 +178,28 @@ def main():
         'module2_counts_full_s1', 'module2_counts_full_s2', 'module2_counts_full_s3', 'module2_counts_full_s4',
         'module2_counts_missing_s1', 'module2_counts_missing_s2', 'module2_counts_missing_s3', 'module2_counts_missing_s4',
         'grad_missing_personalizers', 'grad_missing_routers', 'grad_missing_experts', 'grad_missing_output_proj',
+        'nonfinite_grad_steps_full', 'nonfinite_grad_steps_missing',
+        'optimizer_steps_full', 'optimizer_steps_missing',
+        'skipped_steps_full', 'skipped_steps_missing',
+        'amp_scale',
+        'module2_scale_full_ct_s1', 'module2_scale_full_ct_s2', 'module2_scale_full_ct_s3', 'module2_scale_full_ct_s4',
+        'module2_scale_full_pet_s1', 'module2_scale_full_pet_s2', 'module2_scale_full_pet_s3', 'module2_scale_full_pet_s4',
+        'module2_scale_missing_ct_s1', 'module2_scale_missing_ct_s2', 'module2_scale_missing_ct_s3', 'module2_scale_missing_ct_s4',
+        'module2_scale_missing_pet_s1', 'module2_scale_missing_pet_s2', 'module2_scale_missing_pet_s3', 'module2_scale_missing_pet_s4',
+        'module2_rms_ct_s1', 'module2_rms_ct_s2', 'module2_rms_ct_s3', 'module2_rms_ct_s4',
+        'module2_rms_pet_base_s1', 'module2_rms_pet_base_s2', 'module2_rms_pet_base_s3', 'module2_rms_pet_base_s4',
+        'module2_rms_pet_expert_input_s1', 'module2_rms_pet_expert_input_s2',
+        'module2_rms_pet_expert_input_s3', 'module2_rms_pet_expert_input_s4',
+        'module2_rms_expert_residual_s1', 'module2_rms_expert_residual_s2',
+        'module2_rms_expert_residual_s3', 'module2_rms_expert_residual_s4',
+        'module2_rms_projected_residual_s1', 'module2_rms_projected_residual_s2',
+        'module2_rms_projected_residual_s3', 'module2_rms_projected_residual_s4',
+        'module2_rms_raw_prior_s1', 'module2_rms_raw_prior_s2',
+        'module2_rms_raw_prior_s3', 'module2_rms_raw_prior_s4',
+        'module2_rms_scaled_prior_s1', 'module2_rms_scaled_prior_s2',
+        'module2_rms_scaled_prior_s3', 'module2_rms_scaled_prior_s4',
+        'module2_rms_personalized_pet_s1', 'module2_rms_personalized_pet_s2',
+        'module2_rms_personalized_pet_s3', 'module2_rms_personalized_pet_s4',
         'epoch_time',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
@@ -199,8 +237,16 @@ def main():
         prior_norm_vals = []
         prior_alpha_accum = {f's{i}': [] for i in range(1, 5)}
         module2_on = getattr(task.model, 'module2', None) is not None
-        route_accum = {'full': [], 'missing': []}
+        route_accum = {'full': [[] for _ in range(4)], 'missing': [[] for _ in range(4)]}
         counts_accum = {'full': [[] for _ in range(4)], 'missing': [[] for _ in range(4)]}
+        scales_accum = {'full': [[] for _ in range(4)], 'missing': [[] for _ in range(4)]}
+        rms_accum = {'ct': [[] for _ in range(4)], 'pet_base': [[] for _ in range(4)],
+                     'pet_expert': [[] for _ in range(4)], 'expert_res': [[] for _ in range(4)],
+                     'proj_res': [[] for _ in range(4)], 'raw_prior': [[] for _ in range(4)],
+                     'scaled_prior': [[] for _ in range(4)], 'personalized': [[] for _ in range(4)]}
+        nonfinite_steps = {'full': 0, 'missing': 0}
+        optimizer_steps = {'full': 0, 'missing': 0}
+        skipped_steps = {'full': 0, 'missing': 0}
 
         for batch_idx, batch in enumerate(train_loader):
             route = 'full' if global_batch_step % 2 == 0 else 'missing'
@@ -208,7 +254,7 @@ def main():
             with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
                 loss, _, outputs, step_stats = task.train_step(batch, forward_mode=route)
             if not torch.isfinite(loss):
-                raise RuntimeError('loss became non-finite')
+                raise RuntimeError(f'loss became non-finite (route={route} batch={batch_idx})')
 
             if task.scaler.is_enabled():
                 task.scaler.scale(loss).backward()
@@ -216,27 +262,66 @@ def main():
             else:
                 loss.backward()
 
-            # grad norms per module
-            grads[route]['enc_ct'].append(module_grad_norm(task.model.enc_ct))
-            grads[route]['enc_pet'].append(module_grad_norm(task.model.enc_pet))
-            grads[route]['ct_align'].append(module_grad_norm(task.model.ct_align))
-            grads[route]['decoder'].append(module_grad_norm(task.model.decoder))
+            # Unified grad diagnostics AFTER unscale, BEFORE clip. Never masks grads.
+            nonfinite_mods = []
+            for _mod_name, _mod in (('enc_ct', task.model.enc_ct),
+                                    ('enc_pet', task.model.enc_pet),
+                                    ('ct_align', task.model.ct_align),
+                                    ('decoder', task.model.decoder)):
+                _norm, _nf = module_grad_norm(_mod)
+                grads[route][{'enc_ct': 'enc_ct', 'enc_pet': 'enc_pet',
+                              'ct_align': 'ct_align', 'decoder': 'decoder'}[_mod_name]].append(_norm)
+                if _nf:
+                    nonfinite_mods.append(f'{_mod_name}:{_nf}')
             if task.model.pspi_enabled and task.model.module1 is not None:
-                # retrieval = ModuleList attention (PrototypeCrossAttention)
-                ret_norm = 0.0
-                for mod in task.model.module1.attention:
-                    ret_norm += sum(p.grad.detach().float().pow(2).sum().item() if p.grad is not None else 0 for p in mod.parameters())
-                ret_norm = float(ret_norm ** 0.5) if ret_norm > 0 else 0.0
-                grads[route]['retrieval'].append(ret_norm)
+                _rnorm, _rnf = module_grad_norm(task.model.module1.attention)
+                grads[route]['retrieval'].append(_rnorm)
+                if _rnf:
+                    nonfinite_mods.append(f'module1_retrieval:{_rnf}')
                 if getattr(task.model, 'missing_prior_logits', None) is not None:
                     g = task.model.missing_prior_logits.grad
-                    ps_norm = float(g.detach().float().pow(2).sum().sqrt().item()) if g is not None else 0.0
+                    if g is None:
+                        ps_norm, ps_nf = 0.0, 0
+                    else:
+                        import math as _math
+                        ps_nf = int((~torch.isfinite(g.detach())).sum().item())
+                        ps_norm = float(_math.sqrt(float(g.detach().double().pow(2).sum().item())))
+                    if ps_nf:
+                        nonfinite_mods.append(f'prior_scale:{ps_nf}')
                 else:
                     ps_norm = 0.0
                 grads[route]['prior_scale'].append(ps_norm)
             else:
                 grads[route]['retrieval'].append(0.0)
                 grads[route]['prior_scale'].append(0.0)
+            if module2_on:
+                with torch.no_grad():
+                    m2 = task.model.module2
+                    _pn, _pnf = module_grad_norm(m2.personalizers) if len(m2.personalizers) else (0.0, 0)
+                    _rn2, _rnf2 = module_grad_norm(m2.routers)
+                    _en, _enf = module_grad_norm(m2.experts)
+                    _on, _onf = module_grad_norm(m2.output_projections)
+                for _k, _v, _nf in (('m2_person', _pn, _pnf), ('m2_routers', _rn2, _rnf2),
+                                    ('m2_experts', _en, _enf), ('m2_outproj', _on, _onf)):
+                    grads[route].setdefault(_k, []).append(_v)
+                    if _nf:
+                        nonfinite_mods.append(f'module2_{_k}:{_nf}')
+
+            if nonfinite_mods:
+                nonfinite_steps[route] += 1
+                if task.scaler.is_enabled():
+                    # AMP: let GradScaler skip the optimizer update; count it.
+                    skipped_steps[route] += 1
+                    task.scaler.step(task.optimizer)
+                    task.scaler.update()
+                    print(f'[NONFINITE-GRAD] route={route} batch={batch_idx} mods={nonfinite_mods} (scaler skipped step)', flush=True)
+                    global_batch_step += 1
+                    task.global_batch_step = global_batch_step
+                    continue
+                raise RuntimeError(
+                    f'non-finite gradient without AMP (route={route} batch={batch_idx} '
+                    f'mods={nonfinite_mods}); refusing to mask with nan_to_num'
+                )
 
             total_grad_norm = torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip)) if float(cfg.grad_clip) > 0 else 0.0
             grad_norm_accum += float(total_grad_norm)
@@ -247,19 +332,7 @@ def main():
                 task.scaler.update()
             else:
                 task.optimizer.step()
-
-            # Module-2 gradient norms read AFTER unscale, without modifying grads.
-            if module2_on:
-                with torch.no_grad():
-                    m2 = task.model.module2
-                    g_person = module_grad_norm(m2.personalizers) if len(m2.personalizers) else 0.0
-                    g_routers = module_grad_norm(m2.routers)
-                    g_experts = module_grad_norm(m2.experts)
-                    g_outproj = module_grad_norm(m2.output_projections)
-                grads[route].setdefault('m2_person', []).append(g_person)
-                grads[route].setdefault('m2_routers', []).append(g_routers)
-                grads[route].setdefault('m2_experts', []).append(g_experts)
-                grads[route].setdefault('m2_outproj', []).append(g_outproj)
+            optimizer_steps[route] += 1
 
             task.scheduler.step()
 
@@ -291,15 +364,14 @@ def main():
                 for i in range(1, 5):
                     k = f'missing_prior_alpha_s{i}'
                     if k in outputs:
-                        v = outputs[k]
-                        # NaN marks disabled-by-Module2; do not average NaN.
-                        if isinstance(v, float) and v != v:
-                            continue
-                        prior_alpha_accum[f's{i}'].append(float(v))
-                # Module-2 diagnostics: small detached tensors only.
+                        # Real sigmoid(logits); 1.0 means prior scale disabled
+                        # by config (pspi_prior_scale_enabled=false).
+                        prior_alpha_accum[f's{i}'].append(float(outputs[k]))
+                # Module-2 diagnostics: small detached tensors only, per scale.
                 aux2 = (outputs.get('aux') or {}).get('module2') if isinstance(outputs.get('aux'), dict) else None
                 if module2_on and isinstance(aux2, dict):
                     rw = aux2.get('route_weights')
+                    mscales = aux2.get('modality_scales')
                     active = aux2.get('active')
                     counts = aux2.get('expert_counts')
                     sel = aux2.get('selected_experts')
@@ -307,14 +379,20 @@ def main():
                         on = active.detach()
                         if on.dtype != torch.bool:
                             on = on.bool()
+                        ms = mscales.detach() if torch.is_tensor(mscales) else None
                         for b in range(rw.shape[0]):
                             for s in range(4):
                                 if bool(on[b, s].item()):
-                                    route_accum[route].append(rw.detach()[b, s].float().cpu())
+                                    route_accum[route][s].append(rw.detach()[b, s].float().cpu())
+                                    if ms is not None:
+                                        scales_accum[route][s].append(ms[b, s].float().cpu())
                     if torch.is_tensor(counts) and counts.dim() == 2 and counts.shape[0] == 4:
                         for s in range(4):
                             counts_accum[route][s].append(counts.detach()[s].float().cpu())
-                    del rw, active, counts, sel
+                    # RMS magnitudes from fused-level features are not stored;
+                    # per-scale RMS of CT/base/expert inputs is recomputed in
+                    # the smoke/test harness from detached module2_aux tensors.
+                    del rw, mscales, active, counts, sel
 
             global_batch_step += 1
             task.global_batch_step = global_batch_step
@@ -416,29 +494,75 @@ def main():
         module2_metrics = {}
         if module2_on:
             for route in ('full', 'missing'):
-                stacked = torch.stack(route_accum[route]).mean(dim=0).tolist() if route_accum[route] else [0.0, 0.0]
-                module2_metrics[f'module2_route_{route}_ct'] = float(stacked[0])
-                module2_metrics[f'module2_route_{route}_pet'] = float(stacked[1])
+                # Per-scale route means (no cross-scale collapse).
+                for s in range(4):
+                    vals = scales_accum[route][s]
+                    mean_scales = torch.stack(vals).mean(dim=0).tolist() if vals else [0.0, 0.0]
+                    module2_metrics[f'module2_scale_{route}_ct_s{s+1}'] = float(mean_scales[0])
+                    module2_metrics[f'module2_scale_{route}_pet_s{s+1}'] = float(mean_scales[1])
+                # Legacy epoch-average route pair kept for continuity.
+                flat = [v for s in range(4) for v in route_accum[route][s]]
+                stacked = torch.stack(flat).mean(dim=0).tolist() if flat else [0.0, 0.0]
+                module2_metrics[f'module2_route_{route}_ct'] = float(stacked[0]) / 2.0
+                module2_metrics[f'module2_route_{route}_pet'] = float(stacked[1]) / 2.0
                 for s in range(4):
                     if counts_accum[route][s]:
                         summed = torch.stack(counts_accum[route][s]).sum(dim=0)
                         module2_metrics[f'module2_counts_{route}_s{s+1}'] = ','.join(str(int(v)) for v in summed.tolist())
                     else:
                         module2_metrics[f'module2_counts_{route}_s{s+1}'] = ''
+                # RMS accumulators are filled by the smoke/test harness path;
+                # training fills zeros here to keep the CSV schema stable.
+                for key, prefix in (('ct', 'module2_rms_ct'), ('pet_base', 'module2_rms_pet_base'),
+                                    ('pet_expert', 'module2_rms_pet_expert_input'),
+                                    ('expert_res', 'module2_rms_expert_residual'),
+                                    ('proj_res', 'module2_rms_projected_residual'),
+                                    ('raw_prior', 'module2_rms_raw_prior'),
+                                    ('scaled_prior', 'module2_rms_scaled_prior'),
+                                    ('personalized', 'module2_rms_personalized_pet')):
+                    for s in range(4):
+                        vals = rms_accum[key][s]
+                        module2_metrics[f'{prefix}_s{s+1}'] = float(torch.stack(vals).mean().item()) if vals else 0.0
             module2_metrics['grad_missing_personalizers'] = float(np.mean(grads['missing'].get('m2_person', [0.0]))) if grads['missing'].get('m2_person') else 0.0
             module2_metrics['grad_missing_routers'] = float(np.mean(grads['missing'].get('m2_routers', [0.0]))) if grads['missing'].get('m2_routers', [0.0]) else 0.0
             module2_metrics['grad_missing_experts'] = float(np.mean(grads['missing'].get('m2_experts', [0.0]))) if grads['missing'].get('m2_experts', [0.0]) else 0.0
             module2_metrics['grad_missing_output_proj'] = float(np.mean(grads['missing'].get('m2_outproj', [0.0]))) if grads['missing'].get('m2_outproj', [0.0]) else 0.0
+            module2_metrics['nonfinite_grad_steps_full'] = int(nonfinite_steps['full'])
+            module2_metrics['nonfinite_grad_steps_missing'] = int(nonfinite_steps['missing'])
+            module2_metrics['optimizer_steps_full'] = int(optimizer_steps['full'])
+            module2_metrics['optimizer_steps_missing'] = int(optimizer_steps['missing'])
+            module2_metrics['skipped_steps_full'] = int(skipped_steps['full'])
+            module2_metrics['skipped_steps_missing'] = int(skipped_steps['missing'])
+            try:
+                module2_metrics['amp_scale'] = float(task.scaler.get_scale())
+            except Exception:
+                module2_metrics['amp_scale'] = 0.0
             if module2_metrics['module2_route_full_ct'] or module2_metrics['module2_route_missing_ct']:
                 print(
                     f"[Module2] route_full=[ct={module2_metrics['module2_route_full_ct']:.4f},pet={module2_metrics['module2_route_full_pet']:.4f}] "
                     f"route_missing=[ct={module2_metrics['module2_route_missing_ct']:.4f},pet={module2_metrics['module2_route_missing_pet']:.4f}] "
+                    f"scales_full_ct={[round(module2_metrics[f'module2_scale_full_ct_s{s+1}'],4) for s in range(4)]} "
+                    f"scales_missing_ct={[round(module2_metrics[f'module2_scale_missing_ct_s{s+1}'],4) for s in range(4)]} "
                     f"grad_person={module2_metrics['grad_missing_personalizers']:.6f} "
                     f"grad_routers={module2_metrics['grad_missing_routers']:.6f} "
                     f"grad_experts={module2_metrics['grad_missing_experts']:.6f} "
-                    f"grad_outproj={module2_metrics['grad_missing_output_proj']:.6f}",
+                    f"grad_outproj={module2_metrics['grad_missing_output_proj']:.6f} "
+                    f"nonfinite=[{module2_metrics['nonfinite_grad_steps_full']},{module2_metrics['nonfinite_grad_steps_missing']}] "
+                    f"opt_steps=[{module2_metrics['optimizer_steps_full']},{module2_metrics['optimizer_steps_missing']}] "
+                    f"skipped=[{module2_metrics['skipped_steps_full']},{module2_metrics['skipped_steps_missing']}] "
+                    f"amp_scale={module2_metrics['amp_scale']:.1f}",
                     flush=True,
                 )
+        else:
+            module2_metrics = {
+                'nonfinite_grad_steps_full': int(nonfinite_steps['full']),
+                'nonfinite_grad_steps_missing': int(nonfinite_steps['missing']),
+                'optimizer_steps_full': int(optimizer_steps['full']),
+                'optimizer_steps_missing': int(optimizer_steps['missing']),
+                'skipped_steps_full': int(skipped_steps['full']),
+                'skipped_steps_missing': int(skipped_steps['missing']),
+                'amp_scale': float(task.scaler.get_scale()) if task.scaler.is_enabled() else 0.0,
+            }
         append_epoch_log(
             os.path.join(cfg.checkpoint_dir, 'train_log.csv'),
             epoch,

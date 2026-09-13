@@ -28,10 +28,15 @@ class StageChannelAlign(nn.Module):
 class DualSharedAddPETCTBaseline(nn.Module):
     """AddFusion baseline with clean Module-1 (paired PET prior retrieval).
 
-    Missing boundary: F_missing^l = C^l + alpha_l * P_prior^l with a
-    per-scale scalar alpha_l = sigmoid(a_l), a_l init at logit(0.1).
-    The scalar lives on the model boundary (NOT inside Module-1) and only
-    controls the overall strength of the retrieved prior into AddFusion.
+    OFF path (module2_enabled=False): Missing boundary is
+    F_missing^l = C^l + alpha_l * P_prior^l with per-scale
+    alpha_l = sigmoid(a_l), a_l init at logit(0.1). The scalar lives on the
+    model boundary (NOT inside Module-1).
+
+    ON path (Module-2 weighted fusion): F^l = a_C^l C^l + a_P^l P_base^l
+    + O_l(a_C^l E_C + a_P^l E_P) with a_* = 2*softmax weights; Missing uses
+    P_base^l = alpha_l * P_prior^l and keeps the same alpha parameters
+    (no second PET weight is created).
     """
 
     def __init__(
@@ -95,14 +100,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
         else:
             self.module1 = None
 
-        # Prior scale contract: when Module-2 is enabled, the old per-scale
-        # scalar (missing_prior_logits) is replaced by Module-2 fusion.
-        # effective_prior_scale_enabled=False, logits registered as None,
-        # and _scaled_prior is never called on the Module-2 path.
-        if self.module2_enabled and self.pspi_enabled:
-            self.effective_prior_scale_enabled = False
-        else:
-            self.effective_prior_scale_enabled = bool(pspi_prior_scale_enabled)
+        # Prior scale contract: missing_prior_logits is registered whenever
+        # PSPI + prior-scale are enabled, INCLUDING Module-2 mode. Module-2
+        # reuses alpha for its main-path base PET (no second PET weight).
+        self.effective_prior_scale_enabled = bool(pspi_prior_scale_enabled)
         self.pspi_prior_scale_enabled = self.effective_prior_scale_enabled
         self.pspi_prior_scale_init = float(pspi_prior_scale_init)
         if not 0.0 < self.pspi_prior_scale_init < 1.0:
@@ -117,8 +118,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 torch.full((4,), initial_logit)
             )
         else:
-            # No dangling trainable parameter when PSPI is off, scale is off,
-            # or Module-2 replaces the old scalar fusion.
+            # No dangling trainable parameter when PSPI is off or scale is off.
             self.register_parameter("missing_prior_logits", None)
 
         # Module-2 is constructed AFTER all shared components so common
@@ -211,15 +211,14 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 out[f'normalized_attention_entropy_s{i+1}'] = 0.0
             out['attention_entropy'] = 0.0
             out['normalized_attention_entropy'] = 0.0
-        # Prior contribution scale + retrieved prior norm.
-        # In Module-2 mode the old scalar is disabled; report it as such and
-        # never present route weights as prior alpha.
+        # Prior contribution alpha_l = sigmoid(logit); always the real
+        # Module-1 boundary scalar, never route weights. If the config
+        # disables prior scale, 1.0 is reported (self.pspi_prior_scale_enabled
+        # records the disabled state).
         self.module1_is_module1_personalization_none = True
         if self.missing_prior_logits is not None:
             with torch.no_grad():
                 alphas = [float(torch.sigmoid(v).item()) for v in self.missing_prior_logits]
-        elif self.module2_enabled:
-            alphas = [float("nan"), float("nan"), float("nan"), float("nan")]
         else:
             alphas = [1.0, 1.0, 1.0, 1.0]
         for i, a in enumerate(alphas):
@@ -264,12 +263,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 "normalized_attention_entropy": [0.0, 0.0, 0.0, 0.0],
             }
 
-        # Full prediction: CT + real PET. Full NEVER calls retrieve_pet_prior
-        # or missing_prior_logits. With Module-2 the raw AddFusion call is
-        # replaced by the state-guided expert fusion (mode='full'); the
-        # zero-initialized expert residual keeps the first forward identical
-        # to the baseline. _decode rebuilds out['aux'], so module2_aux is
-        # attached AFTER _decode.
+        # Full prediction: weighted fusion over CT + real PET.
+        # Full NEVER calls retrieve_pet_prior or _scaled_prior. With Module-2
+        # the raw AddFusion call is replaced by the state-guided expert
+        # fusion (mode='full'); [0.5,0.5] routing + zero-initialized expert
+        # residual keeps the first forward identical to the baseline.
+        # _decode rebuilds out['aux'], so module2_aux is attached AFTER _decode.
         if self.module2 is not None:
             fused_feats, module2_aux = self.module2(
                 ct_feats,
@@ -294,13 +293,13 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 module1_aux = dict(module1_aux)
                 module1_aux['pet_prior'] = pet_prior
                 if self.module2 is not None:
-                    # pet_prior is RAW (no _scaled_prior); its retrieval
-                    # projection keeps the segmentation gradient. CT keeps its
-                    # main-path gradient; only Module-2's internal
-                    # personalization detaches CT.
+                    # pet_prior (RAW) feeds personalizer/router/PET-expert;
+                    # alpha-scaled prior feeds ONLY the main fusion path.
+                    scaled_pet_prior = self._scaled_prior(pet_prior)
                     fused_feats, module2_aux = self.module2(
                         ct_feats,
                         pet_prior,
+                        base_pet_feats=scaled_pet_prior,
                         mode='missing',
                         bank_ready=self.module1.bank_ready,
                     )
@@ -322,9 +321,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
             module1_aux = dict(module1_aux)
             module1_aux['pet_prior'] = pet_prior
             if self.module2 is not None:
+                scaled_pet_prior = self._scaled_prior(pet_prior)
                 fused_feats, module2_aux = self.module2(
                     ct_feats,
                     pet_prior,
+                    base_pet_feats=scaled_pet_prior,
                     mode='missing',
                     bank_ready=self.module1.bank_ready,
                 )
@@ -377,14 +378,21 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 proto_result = self.module1.compute_pet_prototype_contrastive_loss(pet_feats_real, mask)
             if self.module2 is not None:
                 availability = pet_available.bool().view(-1, 1, 1, 1)
-                # Full rows use real PET; Missing rows use RAW retrieved prior.
+                scaled_prior = self._scaled_prior(pet_prior)
+                # Expert/router input: Full rows real PET, Missing rows RAW prior.
                 pet_for_module2 = [
                     torch.where(availability, real_feat, prior_feat)
                     for real_feat, prior_feat in zip(pet_feats_real, pet_prior)
                 ]
+                # Main-fusion input: Full rows real PET, Missing rows alpha*prior.
+                base_pet_for_module2 = [
+                    torch.where(availability, real_feat, scaled_feat)
+                    for real_feat, scaled_feat in zip(pet_feats_real, scaled_prior)
+                ]
                 fused_feats, module2_aux = self.module2(
                     ct_feats,
                     pet_for_module2,
+                    base_pet_feats=base_pet_for_module2,
                     mode='auto',
                     pet_available=pet_available,
                     bank_ready=self.module1.bank_ready,

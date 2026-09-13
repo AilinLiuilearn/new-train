@@ -601,28 +601,24 @@ def build_mdt_seg_teacher(config, model_state_dict=None):
         f'from_checkpoint={module2_from_checkpoint}'
     )
     if model.module2 is not None:
+        has_logits = getattr(model, 'missing_prior_logits', None) is not None
         print(
             f'[Module2][PriorScale] requested_enabled={model.requested_prior_scale_enabled} '
             f'effective_enabled={model.effective_prior_scale_enabled} '
-            f'missing_prior_logits=None (replaced by Module-2 fusion)'
+            f'missing_prior_logits_present={has_logits} (reused for base PET)'
         )
     if pspi_enabled:
         fusion_desc = 'downstream_fusion=AddFusion' if model.module2 is None else 'downstream_fusion=StateGuidedExpertFusion'
     else:
         fusion_desc = 'baseline_fusion=AddFusion'
+    prior_scale_desc = (
+        f'prior_scale_type=per_scale_scalar '
+        f'prior_scale_init={getattr(config, "pspi_prior_scale_init", 0.1)} '
+        f'prior_scale_enabled={bool(getattr(config, "pspi_prior_scale_enabled", True))} '
+        f'missing_prior_alpha=sigmoid_logits'
+    )
     if model.module2 is not None:
-        prior_scale_desc = (
-            f'prior_scale_type=module2_replaced '
-            f'prior_scale_requested={model.requested_prior_scale_enabled} '
-            f'prior_scale_effective=False '
-            f'missing_prior_alpha=disabled_by_module2'
-        )
-    else:
-        prior_scale_desc = (
-            f'prior_scale_type=per_scale_scalar '
-            f'prior_scale_init={getattr(config, "pspi_prior_scale_init", 0.1)} '
-            f'prior_scale_enabled={bool(getattr(config, "pspi_prior_scale_enabled", True))}'
-        )
+        prior_scale_desc += ' module2_base_pet=alpha_scaled_prior' 
     print(
         f'[PSPI] enabled={pspi_enabled} '
         f'module1=paired_ct_pet_prototype_prior_retrieval '
@@ -642,8 +638,8 @@ def build_mdt_seg_teacher(config, model_state_dict=None):
         f'ema_momentum={getattr(config, "pspi_ema_momentum", 0.95)} '
         f'K={getattr(config, "pspi_num_clusters", 6)} '
         f'build_stage=S{getattr(config, "pspi_build_stage", 4)} '
-        f'full_path={"module2_state_guided_expert_full" if model.module2 is not None else "raw_CT_plus_real_PET"} '
-        f'missing_boundary={"module2_state_guided_expert_missing" if model.module2 is not None else "CT_plus_scale_weighted_PET_prior"} '
+        f'full_path={"module2_weighted_CT_plus_real_PET" if model.module2 is not None else "raw_CT_plus_real_PET"} '
+        f'missing_boundary={"module2_weighted_CT_plus_alpha_prior" if model.module2 is not None else "CT_plus_scale_weighted_PET_prior"} '
         f'{prior_scale_desc} '
         f'{fusion_desc} '
         f'decoder=UNetStyleDecoder'
