@@ -73,7 +73,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
     def _forward_auto(self, ct, pet, pet_available, target_size):
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
-        pet_available = pet_available.to(device=ct.device).long().view(-1)
+        pet_available = torch.as_tensor(pet_available, device=ct.device).long().view(-1)
         if pet_available.numel() != ct.shape[0]:
             raise ValueError('pet_available must contain one state per sample')
         if not torch.all((pet_available == 0) | (pet_available == 1)):
@@ -83,7 +83,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
             availability_mask = pet_available.to(device=feat.device, dtype=feat.dtype).view(-1, 1, 1, 1)
             pet_feats_masked.append(feat * availability_mask)
         fused_feats = self.fusion(ct_feats, pet_feats_masked, None)
-        return self._decode(fused_feats, target_size)
+        out = self._decode(fused_feats, target_size)
+        out['pet_available'] = pet_available.detach().cpu()
+        out['num_full'] = int(pet_available.eq(1).sum())
+        out['num_missing'] = int(pet_available.eq(0).sum())
+        return out
 
     def forward(self, ct, pet, pet_available=None, target_size=None, forward_mode='auto'):
         if target_size is None:

@@ -35,7 +35,7 @@ def test_forward_full_missing_shapes():
     ct = torch.randn(2, 1, 64, 64)
     pet = torch.randn(2, 1, 64, 64)
     out_full = model(ct, pet, forward_mode='full')
-    out_missing = model(ct, None, forward_mode='missing')
+    out_missing = model(ct, pet, forward_mode='missing')
     assert out_full['logits'].shape == out_missing['logits'].shape
 
 
@@ -88,7 +88,7 @@ def test_module_grad_norm_preserves_grad_and_value():
         assert torch.allclose(b, a)
 
 
-def test_missing_path_pet_encoder_not_called(monkeypatch):
+def test_missing_path_encodes_pet_then_zeroes_features(monkeypatch):
     model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
     calls = {'n': 0}
     orig = model.enc_pet.forward
@@ -99,9 +99,22 @@ def test_missing_path_pet_encoder_not_called(monkeypatch):
 
     monkeypatch.setattr(model.enc_pet, 'forward', wrapped)
     ct = torch.randn(1, 1, 64, 64)
-    out = model(ct, None, forward_mode='missing')
+    pet = torch.randn(1, 1, 64, 64)
+    model.eval()
+    with torch.no_grad():
+        out = model(ct, pet, forward_mode='missing')
     assert 'logits' in out
-    assert calls['n'] == 0
+    assert calls['n'] == 1, 'API-style contract requires PET encoding before fusion-time masking'
+
+
+def test_missing_logits_independent_of_pet_content():
+    model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
+    model.eval()
+    ct = torch.randn(1, 1, 64, 64)
+    with torch.no_grad():
+        logits_a = model(ct, torch.randn(1, 1, 64, 64), forward_mode='missing')['logits']
+        logits_b = model(ct, torch.randn(1, 1, 64, 64), forward_mode='missing')['logits']
+    assert torch.allclose(logits_a, logits_b, atol=1e-5)
 
 
 def test_checkpoint_save_and_eval_config_contract(tmp_path):

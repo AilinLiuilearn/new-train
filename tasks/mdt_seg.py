@@ -49,6 +49,49 @@ class MDTSegTeacher:
         }
         return loss, logits, outputs, stats
 
+    def train_step_mixed(self, batch, pet_available, missing_loss_weight=1.0):
+        ct = batch['ct'].to(self.device, non_blocking=True)
+        pet = batch['pet'].to(self.device, non_blocking=True)
+        mask = batch['mask'].to(self.device, non_blocking=True).float()
+        state = torch.as_tensor(pet_available, device=ct.device, dtype=torch.long).view(-1)
+        if state.numel() != ct.shape[0]:
+            raise ValueError(
+                f'pet_available must contain one state per sample: got {state.numel()} for batch {ct.shape[0]}'
+            )
+        if not torch.all((state == 0) | (state == 1)):
+            raise ValueError('pet_available values must be 0 or 1')
+        full_index = state.eq(1)
+        missing_index = state.eq(0)
+        num_full = int(full_index.sum())
+        num_missing = int(missing_index.sum())
+        if num_full == 0 or num_missing == 0:
+            raise ValueError(
+                f'mixed batch requires non-empty full and missing subsets: got full={num_full} missing={num_missing}'
+            )
+        outputs = self.model(ct, pet=pet, pet_available=state, forward_mode='auto')
+        logits = outputs['logits'] if isinstance(outputs, dict) else outputs
+        full_loss, full_stats = self.criterion(logits[full_index], mask[full_index])
+        missing_loss, missing_stats = self.criterion(logits[missing_index], mask[missing_index])
+        missing_loss_weight = float(missing_loss_weight)
+        denom = 1.0 + missing_loss_weight
+        full_weight = 1.0 / denom
+        missing_weight = missing_loss_weight / denom
+        total_loss = full_weight * full_loss + missing_weight * missing_loss
+        stats = {
+            'loss_total': total_loss.detach(),
+            'loss_full': full_loss.detach(),
+            'loss_missing': missing_loss.detach(),
+            'num_full': num_full,
+            'num_missing': num_missing,
+            'full_weight': full_weight,
+            'missing_weight': missing_weight,
+            'full_bce': full_stats.get('loss_bce', full_loss.detach()).detach(),
+            'full_dice': full_stats.get('loss_dice', full_loss.detach()).detach(),
+            'missing_bce': missing_stats.get('loss_bce', missing_loss.detach()).detach(),
+            'missing_dice': missing_stats.get('loss_dice', missing_loss.detach()).detach(),
+        }
+        return total_loss, logits, outputs, stats
+
     @torch.no_grad()
     def evaluate(self, loader, eval_mode='full', tag='val'):
         was_training = self.model.training
@@ -148,6 +191,7 @@ class MDTSegTeacher:
         payload = {
             'epoch': epoch,
             'global_batch_step': self.global_batch_step,
+            'train_batch_mode': getattr(self.config, 'train_batch_mode', 'alternating'),
             'model': self.model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'scheduler': None if self.scheduler is None else self.scheduler.state_dict(),

@@ -53,6 +53,30 @@ def _assert_baseline(cfg):
     assert float(cfg.boundary_loss_weight) == 0.0
 
 
+def _assert_mixed(cfg, train_loader):
+    batch_size = int(cfg.batch_size)
+    if batch_size < 2 or batch_size % 2 != 0:
+        raise ValueError(f'mixed mode requires an even batch_size >= 2, got {batch_size}')
+    if not bool(getattr(train_loader, 'drop_last', False)):
+        raise ValueError('mixed mode requires DataLoader drop_last=True')
+    if float(cfg.train_pet_drop_prob) != 0.0:
+        raise ValueError('mixed mode requires train_pet_drop_prob == 0')
+
+
+def build_balanced_pet_available(batch_size, global_batch_step, random_state, device):
+    batch_size = int(batch_size)
+    if batch_size < 2 or batch_size % 2 != 0:
+        raise ValueError(f'mixed mode requires an even batch_size >= 2, got {batch_size}')
+    state = torch.cat([
+        torch.ones(batch_size // 2, dtype=torch.long),
+        torch.zeros(batch_size // 2, dtype=torch.long),
+    ])
+    generator = torch.Generator(device='cpu')
+    generator.manual_seed(int(random_state) + int(global_batch_step) * 1000003)
+    state = state[torch.randperm(batch_size, generator=generator)]
+    return state.to(device)
+
+
 def module_grad_norm(module):
     total = None
     for p in module.parameters():
@@ -82,6 +106,10 @@ def main():
     print('[INFO] starting baseline training', flush=True)
     cfg = SegMDTConfig.parse_arguments()
     _assert_baseline(cfg)
+    train_batch_mode = str(getattr(cfg, 'train_batch_mode', 'alternating'))
+    if train_batch_mode not in ('alternating', 'mixed'):
+        raise ValueError(f'unsupported train_batch_mode={train_batch_mode!r}')
+    print(f'[INFO] train_batch_mode={train_batch_mode}', flush=True)
     _seed(cfg)
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
@@ -89,6 +117,8 @@ def main():
 
     train_loader, val_loader, _ = _loaders(cfg)
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)}', flush=True)
+    if train_batch_mode == 'mixed':
+        _assert_mixed(cfg, train_loader)
 
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
     total_params, trainable_params = _count_parameters(task.model)
@@ -102,15 +132,28 @@ def main():
         flat_ratio=cfg.lr_flat_ratio,
     )
 
-    extra_headers = [
-        'train_full_loss', 'train_missing_loss', 'train_overall_loss',
-        'full_train_batches', 'missing_train_batches',
-        'val_full_loss', 'val_full_dice', 'val_full_iou', 'val_full_acc', 'val_full_acc_pixel', 'val_full_hd95',
-        'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
-        'joint_dice', 'best_joint', 'best_joint_epoch',
-        'grad_full_enc_ct', 'grad_missing_enc_ct', 'grad_full_ct_align', 'grad_missing_ct_align', 'grad_full_decoder', 'grad_missing_decoder',
-        'epoch_time',
-    ]
+    if train_batch_mode == 'mixed':
+        extra_headers = [
+            'train_batch_mode',
+            'train_full_loss', 'train_missing_loss', 'train_mixed_loss',
+            'train_full_samples', 'train_missing_samples', 'mixed_train_batches',
+            'mixed_full_weight', 'mixed_missing_weight',
+            'val_full_loss', 'val_full_dice', 'val_full_iou', 'val_full_acc', 'val_full_acc_pixel', 'val_full_hd95',
+            'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
+            'joint_dice', 'best_joint', 'best_joint_epoch',
+            'grad_mixed_enc_ct', 'grad_mixed_ct_align', 'grad_mixed_decoder',
+            'epoch_time',
+        ]
+    else:
+        extra_headers = [
+            'train_full_loss', 'train_missing_loss', 'train_overall_loss',
+            'full_train_batches', 'missing_train_batches',
+            'val_full_loss', 'val_full_dice', 'val_full_iou', 'val_full_acc', 'val_full_acc_pixel', 'val_full_hd95',
+            'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
+            'joint_dice', 'best_joint', 'best_joint_epoch',
+            'grad_full_enc_ct', 'grad_missing_enc_ct', 'grad_full_ct_align', 'grad_missing_ct_align', 'grad_full_decoder', 'grad_missing_decoder',
+            'epoch_time',
+        ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
 
     best_joint = -1.0
@@ -125,65 +168,135 @@ def main():
 
     for epoch in range(1, cfg.epochs + 1):
         task.model.train()
-        full_n = missing_n = 0
-        full_loss = missing_loss = 0.0
         grad_norm_accum = 0.0
         grad_norm_steps = 0
-        grads = {
-            'full': {'enc_ct': [], 'ct_align': [], 'decoder': []},
-            'missing': {'enc_ct': [], 'ct_align': [], 'decoder': []},
-        }
         epoch_start = time.time()
         fixed_diag_batch = None
         diag_stats = {}
+        if train_batch_mode == 'mixed':
+            full_loss_sum = missing_loss_sum = mixed_loss_sum = 0.0
+            full_sample_count = missing_sample_count = 0
+            mixed_n = 0
+            grads = {'enc_ct': [], 'ct_align': [], 'decoder': []}
+            last_full_weight = last_missing_weight = 0.0
 
-        for batch_idx, batch in enumerate(train_loader):
-            route = 'full' if global_batch_step % 2 == 0 else 'missing'
-            task.optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
-                loss, _, _, _ = task.train_step(batch, forward_mode=route)
-            if not torch.isfinite(loss):
-                raise RuntimeError('loss became non-finite')
+            for batch_idx, batch in enumerate(train_loader):
+                actual_batch_size = batch['ct'].shape[0]
+                if actual_batch_size != int(cfg.batch_size):
+                    raise ValueError(
+                        f'mixed mode requires fixed batch size {int(cfg.batch_size)} (drop_last=True), got {actual_batch_size}'
+                    )
+                pet_available = build_balanced_pet_available(
+                    int(cfg.batch_size), global_batch_step, cfg.random_state, task.device,
+                )
+                task.optimizer.zero_grad(set_to_none=True)
+                with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
+                    loss, _, _, train_stats = task.train_step_mixed(
+                        batch,
+                        pet_available=pet_available,
+                        missing_loss_weight=cfg.missing_loss_weight,
+                    )
+                if not torch.isfinite(loss):
+                    raise RuntimeError('loss became non-finite')
 
-            if task.scaler.is_enabled():
-                task.scaler.scale(loss).backward()
-                task.scaler.unscale_(task.optimizer)
-            else:
-                loss.backward()
+                if task.scaler.is_enabled():
+                    task.scaler.scale(loss).backward()
+                    task.scaler.unscale_(task.optimizer)
+                else:
+                    loss.backward()
 
-            grads[route]['enc_ct'].append(module_grad_norm(task.model.enc_ct))
-            grads[route]['ct_align'].append(module_grad_norm(task.model.ct_align))
-            grads[route]['decoder'].append(module_grad_norm(task.model.decoder))
-            total_grad_norm = torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip)) if float(cfg.grad_clip) > 0 else 0.0
-            grad_norm_accum += float(total_grad_norm)
-            grad_norm_steps += 1
+                grads['enc_ct'].append(module_grad_norm(task.model.enc_ct))
+                grads['ct_align'].append(module_grad_norm(task.model.ct_align))
+                grads['decoder'].append(module_grad_norm(task.model.decoder))
+                total_grad_norm = torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip)) if float(cfg.grad_clip) > 0 else 0.0
+                grad_norm_accum += float(total_grad_norm)
+                grad_norm_steps += 1
 
-            if task.scaler.is_enabled():
-                task.scaler.step(task.optimizer)
-                task.scaler.update()
-            else:
-                task.optimizer.step()
+                if task.scaler.is_enabled():
+                    task.scaler.step(task.optimizer)
+                    task.scaler.update()
+                else:
+                    task.optimizer.step()
 
-            task.scheduler.step()
+                task.scheduler.step()
 
-            if (batch_idx + 1) % 100 == 0:
-                print(f'[BATCH {batch_idx + 1}] route={route} loss={float(loss.detach()):.6f}', flush=True)
+                num_full = int(train_stats['num_full'])
+                num_missing = int(train_stats['num_missing'])
+                if (batch_idx + 1) % 100 == 0:
+                    print(f'[BATCH {batch_idx + 1}] mode=mixed num_full={num_full} num_missing={num_missing} loss={float(loss.detach()):.6f}', flush=True)
 
-            if route == 'full':
-                full_n += 1
-                full_loss += float(loss.detach())
-            else:
-                missing_n += 1
-                missing_loss += float(loss.detach())
+                full_loss_sum += float(train_stats['loss_full']) * num_full
+                missing_loss_sum += float(train_stats['loss_missing']) * num_missing
+                full_sample_count += num_full
+                missing_sample_count += num_missing
+                mixed_loss_sum += float(loss.detach())
+                mixed_n += 1
+                last_full_weight = float(train_stats['full_weight'])
+                last_missing_weight = float(train_stats['missing_weight'])
 
-            global_batch_step += 1
-            task.global_batch_step = global_batch_step
-            if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is None:
-                fixed_diag_batch = {
-                    'ct': batch['ct'][:1].detach().cpu(),
-                    'pet': batch['pet'][:1].detach().cpu(),
-                    'mask': batch['mask'][:1].detach().cpu(),
-                }
+                global_batch_step += 1
+                task.global_batch_step = global_batch_step
+                if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is None:
+                    fixed_diag_batch = {
+                        'ct': batch['ct'][:1].detach().cpu(),
+                        'pet': batch['pet'][:1].detach().cpu(),
+                        'mask': batch['mask'][:1].detach().cpu(),
+                    }
+        else:
+            full_n = missing_n = 0
+            full_loss = missing_loss = 0.0
+            grads = {
+                'full': {'enc_ct': [], 'ct_align': [], 'decoder': []},
+                'missing': {'enc_ct': [], 'ct_align': [], 'decoder': []},
+            }
+
+            for batch_idx, batch in enumerate(train_loader):
+                route = 'full' if global_batch_step % 2 == 0 else 'missing'
+                task.optimizer.zero_grad(set_to_none=True)
+                with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
+                    loss, _, _, _ = task.train_step(batch, forward_mode=route)
+                if not torch.isfinite(loss):
+                    raise RuntimeError('loss became non-finite')
+
+                if task.scaler.is_enabled():
+                    task.scaler.scale(loss).backward()
+                    task.scaler.unscale_(task.optimizer)
+                else:
+                    loss.backward()
+
+                grads[route]['enc_ct'].append(module_grad_norm(task.model.enc_ct))
+                grads[route]['ct_align'].append(module_grad_norm(task.model.ct_align))
+                grads[route]['decoder'].append(module_grad_norm(task.model.decoder))
+                total_grad_norm = torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip)) if float(cfg.grad_clip) > 0 else 0.0
+                grad_norm_accum += float(total_grad_norm)
+                grad_norm_steps += 1
+
+                if task.scaler.is_enabled():
+                    task.scaler.step(task.optimizer)
+                    task.scaler.update()
+                else:
+                    task.optimizer.step()
+
+                task.scheduler.step()
+
+                if (batch_idx + 1) % 100 == 0:
+                    print(f'[BATCH {batch_idx + 1}] route={route} loss={float(loss.detach()):.6f}', flush=True)
+
+                if route == 'full':
+                    full_n += 1
+                    full_loss += float(loss.detach())
+                else:
+                    missing_n += 1
+                    missing_loss += float(loss.detach())
+
+                global_batch_step += 1
+                task.global_batch_step = global_batch_step
+                if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is None:
+                    fixed_diag_batch = {
+                        'ct': batch['ct'][:1].detach().cpu(),
+                        'pet': batch['pet'][:1].detach().cpu(),
+                        'mask': batch['mask'][:1].detach().cpu(),
+                    }
 
         if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is not None and epoch % int(cfg.gradient_diagnostics_interval) == 0:
             diag_stats = task.gradient_diagnostics(fixed_diag_batch, max_samples=min(1, int(cfg.gradient_diagnostics_num_samples))) or {}
@@ -214,7 +327,13 @@ def main():
             task.save_checkpoint(paths['best_missing'], epoch, best_joint, best_full, best_missing, best_joint_epoch, val_full, val_missing, joint_dice)
         task.save_checkpoint(paths['last'], epoch, best_joint, best_full, best_missing, best_joint_epoch, val_full, val_missing, joint_dice)
 
-        train_loss = (full_loss + missing_loss) / max(1, full_n + missing_n)
+        if train_batch_mode == 'mixed':
+            epoch_full_loss = full_loss_sum / max(1, full_sample_count)
+            epoch_missing_loss = missing_loss_sum / max(1, missing_sample_count)
+            train_mixed_loss = mixed_loss_sum / max(1, mixed_n)
+            train_loss = train_mixed_loss
+        else:
+            train_loss = (full_loss + missing_loss) / max(1, full_n + missing_n)
         val_loss = 0.5 * val_full['total_loss'] + 0.5 * val_missing['total_loss']
         val_dice = joint_dice
         val_iou = 0.5 * val_full['iou'] + 0.5 * val_missing['iou']
@@ -222,6 +341,39 @@ def main():
         val_acc_pixel = 0.5 * val_full.get('acc_pixel', 0.0) + 0.5 * val_missing.get('acc_pixel', 0.0)
         val_hd95 = 0.5 * val_full['hd95'] + 0.5 * val_missing['hd95']
         avg_grad_norm = grad_norm_accum / max(1, grad_norm_steps)
+        if train_batch_mode == 'mixed':
+            extra = {
+                'train_batch_mode': train_batch_mode,
+                'train_full_loss': epoch_full_loss,
+                'train_missing_loss': epoch_missing_loss,
+                'train_mixed_loss': train_mixed_loss,
+                'train_full_samples': float(full_sample_count),
+                'train_missing_samples': float(missing_sample_count),
+                'mixed_train_batches': float(mixed_n),
+                'mixed_full_weight': last_full_weight,
+                'mixed_missing_weight': last_missing_weight,
+                'grad_mixed_enc_ct': float(np.mean(grads['enc_ct'])) if grads['enc_ct'] else 0.0,
+                'grad_mixed_ct_align': float(np.mean(grads['ct_align'])) if grads['ct_align'] else 0.0,
+                'grad_mixed_decoder': float(np.mean(grads['decoder'])) if grads['decoder'] else 0.0,
+                'epoch_time': time.time() - epoch_start,
+                **{f'diag_{k}': v for k, v in diag_stats.items()},
+            }
+        else:
+            extra = {
+                'train_full_loss': full_loss / max(1, full_n),
+                'train_missing_loss': missing_loss / max(1, missing_n),
+                'train_overall_loss': train_loss,
+                'full_train_batches': full_n,
+                'missing_train_batches': missing_n,
+                'grad_full_enc_ct': float(np.mean(grads['full']['enc_ct'])) if grads['full']['enc_ct'] else 0.0,
+                'grad_missing_enc_ct': float(np.mean(grads['missing']['enc_ct'])) if grads['missing']['enc_ct'] else 0.0,
+                'grad_full_ct_align': float(np.mean(grads['full']['ct_align'])) if grads['full']['ct_align'] else 0.0,
+                'grad_missing_ct_align': float(np.mean(grads['missing']['ct_align'])) if grads['missing']['ct_align'] else 0.0,
+                'grad_full_decoder': float(np.mean(grads['full']['decoder'])) if grads['full']['decoder'] else 0.0,
+                'grad_missing_decoder': float(np.mean(grads['missing']['decoder'])) if grads['missing']['decoder'] else 0.0,
+                'epoch_time': time.time() - epoch_start,
+                **{f'diag_{k}': v for k, v in diag_stats.items()},
+            }
         append_epoch_log(
             os.path.join(cfg.checkpoint_dir, 'train_log.csv'),
             epoch,
@@ -230,11 +382,7 @@ def main():
             lr=task.optimizer.param_groups[0]['lr'],
             grad_norm=avg_grad_norm,
             extra_metrics={
-                'train_full_loss': full_loss / max(1, full_n),
-                'train_missing_loss': missing_loss / max(1, missing_n),
-                'train_overall_loss': train_loss,
-                'full_train_batches': full_n,
-                'missing_train_batches': missing_n,
+                **extra,
                 'val_full_loss': val_full['total_loss'],
                 'val_full_dice': val_full['dice'],
                 'val_full_iou': val_full['iou'],
@@ -250,14 +398,6 @@ def main():
                 'joint_dice': joint_dice,
                 'best_joint': best_joint,
                 'best_joint_epoch': best_joint_epoch,
-                'grad_full_enc_ct': float(np.mean(grads['full']['enc_ct'])) if grads['full']['enc_ct'] else 0.0,
-                'grad_missing_enc_ct': float(np.mean(grads['missing']['enc_ct'])) if grads['missing']['enc_ct'] else 0.0,
-                'grad_full_ct_align': float(np.mean(grads['full']['ct_align'])) if grads['full']['ct_align'] else 0.0,
-                'grad_missing_ct_align': float(np.mean(grads['missing']['ct_align'])) if grads['missing']['ct_align'] else 0.0,
-                'grad_full_decoder': float(np.mean(grads['full']['decoder'])) if grads['full']['decoder'] else 0.0,
-                'grad_missing_decoder': float(np.mean(grads['missing']['decoder'])) if grads['missing']['decoder'] else 0.0,
-                'epoch_time': time.time() - epoch_start,
-                **{f'diag_{k}': v for k, v in diag_stats.items()},
             },
         )
 
