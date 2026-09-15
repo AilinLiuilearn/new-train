@@ -67,118 +67,71 @@ class MDTSegTeacher:
         }
         return total_loss, logits, outputs, stats
 
-    def train_batch_full_missing(self, batch, full_weight=0.5, missing_weight=0.5):
-        """Within-batch alternating step: Full + Missing forwards, one update.
+    def train_step_mixed(self, batch, pet_available, missing_loss_weight=1.0):
+        """Mixed Full/Missing training step, same mechanism as the
+        `e1-api-masked-baseline-mix-full-missing` baseline:
 
-        Both branches share the same batch and are evaluated at the same
-        parameter state theta_t. Gradients of `full_weight * L_full` and
-        `missing_weight * L_missing` are accumulated into .grad, then a single
-        optimizer update is applied. The scheduler is NOT stepped here.
+        - ONE model forward per batch (forward_mode='auto', per-sample
+          pet_available states); real PET is still supplied for every sample
+          so PSPI candidate collection and the PET prototype contrastive loss
+          keep their original per-batch semantics.
+        - criterion is applied separately to the Full and Missing subsets.
+        - total = full_weight * L_full + missing_weight * L_missing
+          (+ lambda_p * PSPI prototype loss on the batch).
+        - caller performs the single backward / unscale / clip / step.
         """
-        full_weight = float(full_weight)
-        missing_weight = float(missing_weight)
-        if full_weight <= 0.0 or missing_weight <= 0.0:
-            raise ValueError('within-batch weights must be > 0')
-        if abs(full_weight + missing_weight - 1.0) > 1e-6:
+        ct = batch['ct'].to(self.device, non_blocking=True)
+        pet = batch['pet'].to(self.device, non_blocking=True)
+        mask = batch['mask'].to(self.device, non_blocking=True).float()
+        state = torch.as_tensor(pet_available, device=ct.device, dtype=torch.long).view(-1)
+        if state.numel() != ct.shape[0]:
             raise ValueError(
-                f'within-batch weights must sum to 1.0, got {full_weight} + {missing_weight}'
+                f'pet_available must contain one state per sample: got {state.numel()} for batch {ct.shape[0]}'
             )
-
-        if task_module1_ref := getattr(self.model, 'module1', None):
-            task_module1_ref.training_collection_calls = 0
-
-        self.optimizer.zero_grad(set_to_none=True)
-        amp_enabled = bool(getattr(self.config, 'mixed_precision', False)) and self.device.type == 'cuda'
-
-        def _branch_backward(loss):
-            # Run forward -> backward immediately for each branch so that the
-            # two full-resolution autograd graphs never coexist (memory).
-            # Both weighted grads accumulate into .grad before one unscale/step.
-            if self.scaler.is_enabled():
-                self.scaler.scale(loss).backward()
-            else:
-                loss.backward()
-
-        with torch.cuda.amp.autocast(enabled=amp_enabled):
-            full_loss, full_logits, full_outputs, full_stats = self.train_step(
-                batch,
-                forward_mode='full',
-                collect_module1_candidates=True,
+        if not torch.all((state == 0) | (state == 1)):
+            raise ValueError('pet_available values must be 0 or 1')
+        full_index = state.eq(1)
+        missing_index = state.eq(0)
+        num_full = int(full_index.sum())
+        num_missing = int(missing_index.sum())
+        if num_full == 0 or num_missing == 0:
+            raise ValueError(
+                f'mixed batch requires non-empty full and missing subsets: got full={num_full} missing={num_missing}'
             )
-        if not torch.isfinite(full_loss):
-            raise RuntimeError('full loss became non-finite')
-        _branch_backward(full_weight * full_loss)
-
-        with torch.cuda.amp.autocast(enabled=amp_enabled):
-            missing_loss, missing_logits, missing_outputs, missing_stats = self.train_step(
-                batch,
-                forward_mode='missing',
-                collect_module1_candidates=False,
-            )
-        if not torch.isfinite(missing_loss):
-            raise RuntimeError('missing loss became non-finite')
-        _branch_backward(missing_weight * missing_loss)
-
-        if self.scaler.is_enabled():
-            self.scaler.unscale_(self.optimizer)
-
-        combined_stats = self._within_batch_grad_norms()
-        grad_clip = float(getattr(self.config, 'grad_clip', 0.0))
-        total_grad_norm = (
-            torch.nn.utils.clip_grad_norm_(self.trainable_parameters(), grad_clip)
-            if grad_clip > 0 else torch.tensor(0.0)
-        )
-
-        if self.scaler.is_enabled():
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            self.optimizer.step()
-
-        combined_loss = full_weight * full_loss.detach() + missing_weight * missing_loss.detach()
+        outputs = self.model(ct, pet=pet, pet_available=state, forward_mode='auto', mask=mask)
+        logits = outputs['logits'] if isinstance(outputs, dict) else outputs
+        full_loss, full_stats = self.criterion(logits[full_index], mask[full_index])
+        missing_loss, missing_stats = self.criterion(logits[missing_index], mask[missing_index])
+        missing_loss_weight = float(missing_loss_weight)
+        denom = 1.0 + missing_loss_weight
+        full_weight = 1.0 / denom
+        missing_weight = missing_loss_weight / denom
+        seg_total = full_weight * full_loss + missing_weight * missing_loss
+        proto_raw = outputs.get('prototype_contrastive_loss', seg_total.new_zeros(())) if isinstance(outputs, dict) else seg_total.new_zeros(())
+        if torch.is_tensor(proto_raw) and proto_raw.dim() > 0:
+            proto_raw = proto_raw.reshape(())
+        proto_weight = float(getattr(self.config, 'pspi_proto_contrastive_weight', 0.01))
+        proto_weighted = proto_weight * proto_raw
+        total_loss = seg_total + proto_weighted
         stats = {
-            'full_loss': full_loss.detach(),
-            'missing_loss': missing_loss.detach(),
-            'combined_loss': combined_loss,
-            'full_seg_loss': full_stats['loss_seg_total'],
-            'missing_seg_loss': missing_stats['loss_seg_total'],
-            'full_proto_loss': full_stats['loss_proto'],
-            'missing_proto_loss': missing_stats['loss_proto'],
-            'full_proto_loss_weighted': full_stats['loss_proto_weighted'],
-            'missing_proto_loss_weighted': missing_stats['loss_proto_weighted'],
-            'total_grad_norm': float(total_grad_norm) if torch.is_tensor(total_grad_norm) else float(total_grad_norm),
-            'full_outputs': full_outputs,
-            'missing_outputs': missing_outputs,
-            **combined_stats,
+            'loss_total': total_loss.detach(),
+            'loss_seg_total': seg_total.detach(),
+            'loss_full': full_loss.detach(),
+            'loss_missing': missing_loss.detach(),
+            'loss_proto': proto_raw.detach() if torch.is_tensor(proto_raw) else torch.tensor(float(proto_raw)),
+            'loss_proto_weighted': proto_weighted.detach(),
+            'proto_num_terms': outputs.get('prototype_contrastive_num_terms', 0) if isinstance(outputs, dict) else 0,
+            'num_full': num_full,
+            'num_missing': num_missing,
+            'full_weight': full_weight,
+            'missing_weight': missing_weight,
+            'full_bce': full_stats.get('loss_bce', full_loss.detach()).detach(),
+            'full_dice': full_stats.get('loss_dice', full_loss.detach()).detach(),
+            'missing_bce': missing_stats.get('loss_bce', missing_loss.detach()).detach(),
+            'missing_dice': missing_stats.get('loss_dice', missing_loss.detach()).detach(),
+            'loss_boundary': torch.tensor(0.0, device=total_loss.device),
         }
-        return combined_loss, full_logits, missing_logits, stats
-
-    def _within_batch_grad_norms(self):
-        def module_norm(module):
-            if module is None:
-                return 0.0
-            total = None
-            for p in module.parameters():
-                if p.requires_grad and p.grad is not None:
-                    val = p.grad.detach().float().pow(2).sum()
-                    total = val if total is None else total + val
-            return float(total.sqrt().item()) if total is not None else 0.0
-
-        def scalar_norm(param):
-            if param is None or param.grad is None:
-                return 0.0
-            return float(param.grad.detach().float().pow(2).sum().sqrt().item())
-
-        module1 = getattr(self.model, 'module1', None)
-        attention = getattr(module1, 'attention', None) if module1 is not None else None
-        return {
-            'grad_combined_enc_ct': module_norm(self.model.enc_ct),
-            'grad_combined_enc_pet': module_norm(self.model.enc_pet),
-            'grad_combined_ct_align': module_norm(self.model.ct_align),
-            'grad_combined_decoder': module_norm(self.model.decoder),
-            'grad_combined_module1_retrieval': module_norm(attention),
-            'grad_combined_prior_scale': scalar_norm(getattr(self.model, 'missing_prior_logits', None)),
-        }
+        return total_loss, logits, outputs, stats
 
     @torch.no_grad()
     def evaluate(self, loader, eval_mode='full', tag='val'):
@@ -285,9 +238,7 @@ class MDTSegTeacher:
         payload = {
             'epoch': epoch,
             'global_batch_step': self.global_batch_step,
-            'train_mode': str(getattr(self.config, 'train_mode', 'within_batch_alternating')),
-            'within_batch_full_weight': float(getattr(self.config, 'within_batch_full_weight', 0.5)),
-            'within_batch_missing_weight': float(getattr(self.config, 'within_batch_missing_weight', 0.5)),
+            'train_batch_mode': str(getattr(self.config, 'train_batch_mode', 'mixed')),
             'model': self.model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'scheduler': None if self.scheduler is None else self.scheduler.state_dict(),
