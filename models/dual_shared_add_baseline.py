@@ -201,7 +201,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
             out['pet_prior_norm'] = 0.0
         return out
 
-    def _maybe_collect(self, ct_feats, pet_feats_real, mask):
+    def _maybe_collect(self, ct_feats, pet_feats_real, mask, collect_module1_candidates=True):
+        if not collect_module1_candidates:
+            return None
         if not self.pspi_enabled or self.module1 is None:
             return None
         if not self.training:
@@ -212,11 +214,16 @@ class DualSharedAddPETCTBaseline(nn.Module):
             return None
         return self.module1.collect_candidates(ct_feats, pet_feats_real, mask)
 
-    def _forward_full(self, ct, pet, target_size, mask=None):
+    def _forward_full(self, ct, pet, target_size, mask=None, collect_module1_candidates=True):
         ct_feats = self._encode_ct(ct)
         pet_real_feats = self._encode_pet(pet)
         # Detached candidate collection never affects the Full prediction path.
-        self._maybe_collect(ct_feats, pet_real_feats, mask)
+        self._maybe_collect(
+            ct_feats,
+            pet_real_feats,
+            mask,
+            collect_module1_candidates=collect_module1_candidates,
+        )
 
         proto_result = None
         module1_aux = None
@@ -237,7 +244,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         out = self._decode(fused_feats, target_size)
         return self._attach_pspi_stats(out, proto_result=proto_result, module1_aux=module1_aux, ref_tensor=out['logits'])
 
-    def _forward_missing(self, ct, pet, target_size, mask=None):
+    def _forward_missing(self, ct, pet, target_size, mask=None, collect_module1_candidates=True):
         ct_feats = self._encode_ct(ct)
         if self.pspi_enabled:
             if not self.training:
@@ -254,7 +261,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
             if mask is None:
                 raise ValueError('Missing training requires mask')
             pet_real_feats = self._encode_pet(pet)
-            self._maybe_collect(ct_feats, pet_real_feats, mask)
+            self._maybe_collect(
+                ct_feats,
+                pet_real_feats,
+                mask,
+                collect_module1_candidates=collect_module1_candidates,
+            )
             proto_result = self.module1.compute_pet_prototype_contrastive_loss(pet_real_feats, mask)
             pet_prior, module1_aux = self.module1.retrieve_pet_prior(ct_feats, return_attention=False)
             module1_aux = dict(module1_aux)
@@ -273,19 +285,19 @@ class DualSharedAddPETCTBaseline(nn.Module):
             out = self._decode(fused_feats, target_size)
             return self._attach_pspi_stats(out, proto_result=None, module1_aux=module1_aux, ref_tensor=out['logits'])
 
-    def _forward_auto(self, ct, pet, pet_available, target_size, mask=None):
+    def _forward_auto(self, ct, pet, pet_available, target_size, mask=None, collect_module1_candidates=True):
         pet_available = pet_available.to(device=ct.device).long().view(-1)
         if pet_available.numel() != ct.shape[0]:
             raise ValueError('pet_available must contain one state per sample')
         if not torch.all((pet_available == 0) | (pet_available == 1)):
             raise ValueError('pet_available values must be 0 or 1')
         if torch.all(pet_available == 1):
-            return self._forward_full(ct, pet, target_size, mask=mask)
+            return self._forward_full(ct, pet, target_size, mask=mask, collect_module1_candidates=collect_module1_candidates)
         if torch.all(pet_available == 0):
-            return self._forward_missing(ct, pet, target_size, mask=mask)
+            return self._forward_missing(ct, pet, target_size, mask=mask, collect_module1_candidates=collect_module1_candidates)
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
-        self._maybe_collect(ct_feats, pet_feats_real, mask)
+        self._maybe_collect(ct_feats, pet_feats_real, mask, collect_module1_candidates=collect_module1_candidates)
         if self.pspi_enabled:
             pet_prior, module1_aux = self.module1.retrieve_pet_prior(ct_feats, return_attention=False)
             module1_aux = dict(module1_aux)
@@ -323,15 +335,16 @@ class DualSharedAddPETCTBaseline(nn.Module):
         target_size=None,
         forward_mode='auto',
         mask=None,
+        collect_module1_candidates=True,
     ):
         if target_size is None:
             target_size = ct.shape[-2:]
         if forward_mode == 'full':
-            return self._forward_full(ct, pet, target_size, mask=mask)
+            return self._forward_full(ct, pet, target_size, mask=mask, collect_module1_candidates=collect_module1_candidates)
         if forward_mode == 'missing':
-            return self._forward_missing(ct, pet, target_size, mask=mask)
+            return self._forward_missing(ct, pet, target_size, mask=mask, collect_module1_candidates=collect_module1_candidates)
         if forward_mode == 'auto':
             if pet_available is None:
                 pet_available = torch.ones(ct.shape[0], device=ct.device, dtype=torch.long)
-            return self._forward_auto(ct, pet, pet_available, target_size, mask=mask)
+            return self._forward_auto(ct, pet, pet_available, target_size, mask=mask, collect_module1_candidates=collect_module1_candidates)
         raise ValueError(f'Unsupported forward_mode={forward_mode!r}')

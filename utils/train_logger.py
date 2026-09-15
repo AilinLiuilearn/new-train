@@ -25,6 +25,7 @@ def init_train_log(log_path, extra_headers=None):
 
 def append_epoch_log(log_path, epoch, train_loss_avg, val_metrics, lr=None, grad_norm=None, extra_metrics=None):
     extra_metrics = extra_metrics or {}
+    headers = _read_headers(log_path)
     row = {
         'epoch': int(epoch),
         'train_loss': float(train_loss_avg),
@@ -38,6 +39,10 @@ def append_epoch_log(log_path, epoch, train_loss_avg, val_metrics, lr=None, grad
         'grad_norm': float(grad_norm) if grad_norm is not None else 0.0,
     }
 
+    unknown = set(extra_metrics.keys()) - set(headers[len(CSV_HEADER):])
+    if unknown:
+        raise ValueError(f'extra_metrics contains undeclared headers: {sorted(unknown)}')
+
     csv_values = [
         row['epoch'],
         f"{row['train_loss']:.4f}",
@@ -50,11 +55,20 @@ def append_epoch_log(log_path, epoch, train_loss_avg, val_metrics, lr=None, grad
         f"{row['lr']:.8f}",
         f"{row['grad_norm']:.6f}",
     ]
-    for v in extra_metrics.values():
-        try:
-            csv_values.append(f"{float(v):.6f}")
-        except (TypeError, ValueError):
-            csv_values.append(str(v))
+    for header_name in headers[len(CSV_HEADER):]:
+        if header_name.startswith('diag_'):
+            value = extra_metrics.get(header_name, 0.0)
+        elif header_name not in extra_metrics:
+            raise ValueError(f'extra_metrics missing declared header: {header_name}')
+        else:
+            value = extra_metrics[header_name]
+        if isinstance(value, str):
+            csv_values.append(value)
+        else:
+            try:
+                csv_values.append(f"{float(value):.6f}")
+            except (TypeError, ValueError):
+                csv_values.append(str(value))
 
     with open(log_path, 'a', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
@@ -77,6 +91,14 @@ def append_epoch_log(log_path, epoch, train_loss_avg, val_metrics, lr=None, grad
             except (TypeError, ValueError):
                 f.write(f"  {key:<13}: {value}\n")
         f.write('-' * 64 + '\n')
+
+
+def _read_headers(log_path):
+    with open(log_path, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        for header in reader:
+            return list(header)
+    raise ValueError(f'train log is empty: {log_path}')
 
 
 def _readable_path(log_path):
