@@ -44,7 +44,6 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--pspi_bank_update_mode', type=str, default='direct', choices=('direct', 'matched_ema', 'fedmepd_ema'))
         p.add_argument('--pspi_ema_momentum', type=float, default=0.95)
         p.add_argument('--pspi_retrieval_temperature', type=float, default=0.1)
-        p.add_argument('--pspi_proto_contrastive_weight', type=float, default=0.01)
         p.add_argument('--pspi_proto_temperature', type=float, default=0.02)
         p.add_argument('--pspi_prior_scale_enabled', type=str2bool, default=False)
         p.add_argument('--pspi_prior_scale_init', type=float, default=0.1)
