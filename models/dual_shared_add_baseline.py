@@ -6,6 +6,7 @@ import torch.nn as nn
 from models.baseline_blocks import AddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.ct_conditioned_pet_affine import CTConditionedPETAffine
+from models.probabilistic_pet_fusion import ProbabilisticPETFusion
 from models.paired_semantic_prototype_imputation import (
     PairedSemanticPrototypeImputation,
 )
@@ -64,6 +65,14 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pspi_affine_enabled=False,
         pspi_reconstruction_weight=0.0,
         pspi_proto_contrastive_weight=0.01,
+        fusion2_enabled=False,
+        fusion2_text_enabled=False,
+        fusion2_text_cache=None,
+        fusion2_text_width=32,
+        fusion2_text_strength=0.5,
+        fusion2_reliability_min=0.2,
+        fusion2_sigma_init=1.5,
+        fusion2_logvar_bounds=(-10.0, 10.0),
     ):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
@@ -75,6 +84,35 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pet_channels = list(self.enc_pet.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
         self.fusion = AddFusion()
+        # Module-2 (downstream probabilistic fusion) replaces the AddFusion
+        # boundary when enabled; Module-1 still supplies pet_comp upstream.
+        self.fusion2_enabled = bool(fusion2_enabled)
+        if self.fusion2_enabled:
+            fusion2_kwargs = dict(
+                channels=list(pet_channels),
+                text_width=int(fusion2_text_width),
+                text_strength=float(fusion2_text_strength),
+                reliability_min=float(fusion2_reliability_min),
+                sigma_init=float(fusion2_sigma_init),
+                logvar_bounds=tuple(fusion2_logvar_bounds),
+            )
+            if bool(fusion2_text_enabled):
+                if not fusion2_text_cache:
+                    raise ValueError(
+                        "fusion2_text_enabled=True requires fusion2_text_cache "
+                        "(offline two-prompt text cache path)"
+                    )
+                self.fusion2 = ProbabilisticPETFusion.from_text_cache(
+                    fusion2_text_cache, **fusion2_kwargs
+                )
+            else:
+                self.fusion2 = ProbabilisticPETFusion(**fusion2_kwargs)
+            self.fusion2_config = dict(fusion2_kwargs)
+            self.fusion2_config['text_enabled'] = bool(fusion2_text_enabled)
+            self.fusion2_config['text_cache'] = fusion2_text_cache
+        else:
+            self.fusion2 = None
+            self.fusion2_config = None
         self.decoder = UNetStyleDecoder(
             pet_channels,
             decoder_channels=decoder_channels,
@@ -177,6 +215,24 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pet_feats = self.enc_pet(self._to_3ch(pet))
         _check_tensor_list('pet_feats', pet_feats)
         return pet_feats
+
+    def _fuse(self, ct_feats, pet_feats, pet_available=None, bank_ready=None):
+        """Single downstream fusion boundary (AddFusion or Module-2)."""
+        if self.fusion2 is None:
+            return self.fusion(ct_feats, pet_feats, None)
+        if pet_available is None:
+            raise ValueError(
+                'fusion2 requires pet_available; internal Full/Missing paths '
+                'must supply their actual source state'
+            )
+        return self.fusion2(
+            ct_feats, pet_feats, pet_available, bank_ready=bank_ready
+        )
+
+    def _bank_ready_flag(self):
+        if not self.pspi_enabled or self.module1 is None:
+            return True
+        return bool(self.module1.bank_ready)
 
     def _decode(self, fused_feats, target_size):
         out = self.decoder(fused_feats, target_size)
@@ -410,10 +466,14 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 "normalized_attention_entropy": [0.0, 0.0, 0.0, 0.0],
             }
 
-        # Full prediction = raw baseline: CT + real PET via AddFusion.
+        # Full prediction = raw baseline: CT + real PET.
         # Full path NEVER calls retrieve_pet_prior, the CT affine, or
         # missing_prior_logits; reconstruction is strictly 0.
-        fused_feats = self.fusion(ct_feats, pet_real_feats, None)
+        fused_feats = self._fuse(
+            ct_feats, pet_real_feats,
+            pet_available=torch.ones(ct.shape[0], device=ct.device, dtype=torch.long),
+            bank_ready=self._bank_ready_flag(),
+        )
         out = self._decode(fused_feats, target_size)
         return self._attach_pspi_stats(out, proto_result=proto_result, module1_aux=module1_aux, ref_tensor=out['logits'])
 
@@ -431,7 +491,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
                         affine_stats = self._affine_stats(gammas, betas, pet_comp, pet_comp[0])
                         module1_aux = dict(module1_aux)
                         module1_aux['pet_prior'] = pet_prior
-                        fused_feats = self.fusion(ct_feats, pet_comp, None)
+                        fused_feats = self._fuse(
+                            ct_feats, pet_comp,
+                            pet_available=torch.zeros(ct.shape[0], device=ct.device, dtype=torch.long),
+                            bank_ready=True,
+                        )
                     else:
                         module1_aux = {
                             "bank_ready": False,
@@ -440,7 +504,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
                             "normalized_attention_entropy": [0.0, 0.0, 0.0, 0.0],
                         }
                         zeros = [torch.zeros_like(f) for f in ct_feats]
-                        fused_feats = self.fusion(ct_feats, zeros, None)
+                        fused_feats = self._fuse(
+                            ct_feats, zeros,
+                            pet_available=torch.zeros(ct.shape[0], device=ct.device, dtype=torch.long),
+                            bank_ready=False,
+                        )
                         affine_stats = self._zero_affine_stats()
                     out = self._decode(fused_feats, target_size)
                     return self._attach_pspi_stats(
@@ -451,7 +519,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 pet_prior, module1_aux = self.module1.retrieve_pet_prior(ct_feats, return_attention=False)
                 module1_aux = dict(module1_aux)
                 module1_aux['pet_prior'] = pet_prior
-                fused_feats = self.fusion(ct_feats, self._scaled_prior(pet_prior), None)
+                fused_feats = self._fuse(
+                    ct_feats, self._scaled_prior(pet_prior),
+                    pet_available=torch.zeros(ct.shape[0], device=ct.device, dtype=torch.long),
+                    bank_ready=self._bank_ready_flag(),
+                )
                 out = self._decode(fused_feats, target_size)
                 return self._attach_pspi_stats(out, proto_result=None, module1_aux=module1_aux, ref_tensor=out['logits'])
             # Missing training: real PET is privileged supervision only, never enters logits.
@@ -476,7 +548,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 )
                 module1_aux = dict(comp['module1_aux'])
                 module1_aux['pet_prior'] = comp['pet_prior']
-                fused_feats = self.fusion(ct_feats, comp['pet_comp'], None)
+                fused_feats = self._fuse(
+                    ct_feats, comp['pet_comp'],
+                    pet_available=torch.zeros(ct.shape[0], device=ct.device, dtype=torch.long),
+                    bank_ready=self._bank_ready_flag(),
+                )
                 out = self._decode(fused_feats, target_size)
                 return self._attach_pspi_stats(
                     out, proto_result=proto_result, module1_aux=module1_aux,
@@ -486,7 +562,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
             pet_prior, module1_aux = self.module1.retrieve_pet_prior(ct_feats, return_attention=False)
             module1_aux = dict(module1_aux)
             module1_aux['pet_prior'] = pet_prior
-            fused_feats = self.fusion(ct_feats, self._scaled_prior(pet_prior), None)
+            fused_feats = self._fuse(
+                ct_feats, self._scaled_prior(pet_prior),
+                pet_available=torch.zeros(ct.shape[0], device=ct.device, dtype=torch.long),
+                bank_ready=self._bank_ready_flag(),
+            )
             out = self._decode(fused_feats, target_size)
             return self._attach_pspi_stats(out, proto_result=proto_result, module1_aux=module1_aux, ref_tensor=out['logits'])
         else:
@@ -496,7 +576,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 pet_for_fusion = [torch.zeros_like(feat) for feat in pet_feats_real]
             else:
                 pet_for_fusion = [torch.zeros_like(feat) for feat in ct_feats]
-            fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
+            fused_feats = self._fuse(
+                ct_feats, pet_for_fusion,
+                pet_available=torch.zeros(ct.shape[0], device=ct.device, dtype=torch.long),
+                bank_ready=True,
+            )
             out = self._decode(fused_feats, target_size)
             return self._attach_pspi_stats(out, proto_result=None, module1_aux=module1_aux, ref_tensor=out['logits'])
 
@@ -623,7 +707,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 "attention_entropy": [0.0, 0.0, 0.0, 0.0],
                 "normalized_attention_entropy": [0.0, 0.0, 0.0, 0.0],
             }
-            fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
+            fused_feats = self._fuse(
+                ct_feats, pet_for_fusion, pet_available=pet_available,
+                bank_ready=self._bank_ready_flag(),
+            )
             out = self._decode(fused_feats, target_size)
             out = self._attach_pspi_stats(
                 out, proto_result=proto_result, module1_aux=module1_aux,
@@ -651,7 +738,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
             proto_result = None
             availability = pet_available.view(-1, 1, 1, 1).to(dtype=pet_feats_real[0].dtype)
             pet_for_fusion = [feat * availability for feat in pet_feats_real]
-        fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
+        fused_feats = self._fuse(
+            ct_feats, pet_for_fusion, pet_available=pet_available,
+            bank_ready=self._bank_ready_flag(),
+        )
         out = self._decode(fused_feats, target_size)
         return self._attach_pspi_stats(out, proto_result=proto_result, module1_aux=module1_aux, ref_tensor=out['logits'])
 

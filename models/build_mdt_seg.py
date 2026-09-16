@@ -527,6 +527,14 @@ def build_mdt_seg_teacher(config):
         pspi_affine_enabled=affine_enabled,
         pspi_reconstruction_weight=recon_weight,
         pspi_proto_contrastive_weight=proto_weight,
+        fusion2_enabled=bool(getattr(config, 'fusion2_enabled', False)),
+        fusion2_text_enabled=bool(getattr(config, 'fusion2_text_enabled', False)),
+        fusion2_text_cache=getattr(config, 'fusion2_text_cache', None),
+        fusion2_text_width=int(getattr(config, 'fusion2_text_width', 32)),
+        fusion2_text_strength=float(getattr(config, 'fusion2_text_strength', 0.5)),
+        fusion2_reliability_min=float(getattr(config, 'fusion2_reliability_min', 0.2)),
+        fusion2_sigma_init=float(getattr(config, 'fusion2_sigma_init', 1.5)),
+        fusion2_logvar_bounds=tuple(getattr(config, 'fusion2_logvar_bounds', (-10.0, 10.0))),
     )
     if bool(getattr(config, 'stage1_init_enabled', False)):
         load_stage1_unimodal_initialization(
@@ -539,15 +547,19 @@ def build_mdt_seg_teacher(config):
         assert all(p.requires_grad for p in model.enc_pet.parameters())
         assert all(p.requires_grad for p in model.ct_align.parameters())
     pspi_enabled = bool(getattr(config, 'pspi_enabled', True))
+    fusion2_enabled = bool(getattr(config, 'fusion2_enabled', False))
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion=AddFusion '
+        f'fusion={"ProbabilisticPETFusion" if fusion2_enabled else "AddFusion"} '
         f'shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
     if pspi_enabled:
-        fusion_desc = 'downstream_fusion=AddFusion'
+        fusion_desc = (
+            'downstream_fusion=ProbabilisticPETFusion'
+            if fusion2_enabled else 'downstream_fusion=AddFusion'
+        )
     else:
         fusion_desc = 'baseline_fusion=AddFusion'
     print(
@@ -581,7 +593,8 @@ def build_mdt_seg_teacher(config):
         f'prior_scale_init={prior_scale_init} '
         f'prior_scale_enabled={prior_scale_enabled} '
         f'{fusion_desc} '
-        f'downstream_fusion=AddFusion '
+        f'fusion2_enabled={fusion2_enabled} '
+        f'fusion2_text_enabled={getattr(config, "fusion2_text_enabled", False)} '
         f'decoder=UNetStyleDecoder'
     )
     return {'model': model}
