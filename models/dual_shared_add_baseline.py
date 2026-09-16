@@ -5,8 +5,12 @@ import torch.nn as nn
 
 from models.baseline_blocks import AddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
+from models.ct_conditioned_pet_affine import CTConditionedPETAffine
 from models.paired_semantic_prototype_imputation import (
     PairedSemanticPrototypeImputation,
+)
+from utils.pet_feature_reconstruction import (
+    balanced_multi_scale_smooth_l1_reconstruction,
 )
 
 
@@ -28,10 +32,11 @@ class StageChannelAlign(nn.Module):
 class DualSharedAddPETCTBaseline(nn.Module):
     """AddFusion baseline with clean Module-1 (paired PET prior retrieval).
 
-    Missing boundary: F_missing^l = C^l + alpha_l * P_prior^l with a
-    per-scale scalar alpha_l = sigmoid(a_l), a_l init at logit(0.1).
-    The scalar lives on the model boundary (NOT inside Module-1) and only
-    controls the overall strength of the retrieved prior into AddFusion.
+    Missing boundary (new scheme): F_missing^l = C^l + pet_comp^l with
+    pet_comp^l = gamma^l(C.detach()) * P_prior^l + beta^l(C.detach()),
+    where P_prior is the existing Module-1 retrieval output. The fusion stays
+    the original AddFusion (direct add), unchanged for the Full route:
+    F_full^l = C^l + P_real^l.
     """
 
     def __init__(
@@ -56,6 +61,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pspi_collect_candidates=True,
         pspi_prior_scale_enabled=True,
         pspi_prior_scale_init=0.1,
+        pspi_affine_enabled=False,
+        pspi_reconstruction_weight=0.0,
+        pspi_proto_contrastive_weight=0.01,
     ):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
@@ -91,6 +99,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
         else:
             self.module1 = None
 
+        # Legacy per-scale scalar prior scale (compatibility only; the new
+        # experiment disables it and must not allocate trainable alpha).
         self.pspi_prior_scale_enabled = bool(pspi_prior_scale_enabled)
         self.pspi_prior_scale_init = float(pspi_prior_scale_init)
         if not 0.0 < self.pspi_prior_scale_init < 1.0:
@@ -108,8 +118,42 @@ class DualSharedAddPETCTBaseline(nn.Module):
             # No dangling trainable parameter when PSPI is off or scale is off.
             self.register_parameter("missing_prior_logits", None)
 
+        # New scheme: CT-conditioned direct affine on Missing rows only.
+        self.pspi_affine_enabled = bool(pspi_affine_enabled)
+        if self.pspi_affine_enabled and self.pspi_prior_scale_enabled:
+            raise ValueError(
+                "pspi_affine_enabled=True is incompatible with "
+                "pspi_prior_scale_enabled=True: the new scheme removes the "
+                "learnable per-scale alpha; disable prior scale explicitly."
+            )
+        recon_w = float(pspi_reconstruction_weight)
+        if not math.isfinite(recon_w) or recon_w < 0.0:
+            raise ValueError(
+                f"pspi_reconstruction_weight must be finite and >= 0, got {pspi_reconstruction_weight!r}"
+            )
+        if recon_w > 0.0 and not (self.pspi_enabled and self.pspi_affine_enabled):
+            raise ValueError(
+                "pspi_reconstruction_weight > 0 requires pspi_enabled=True "
+                "and pspi_affine_enabled=True"
+            )
+        self.pspi_reconstruction_weight = recon_w
+        proto_w = float(pspi_proto_contrastive_weight)
+        if not math.isfinite(proto_w) or proto_w < 0.0:
+            raise ValueError(
+                f"pspi_proto_contrastive_weight must be finite and >= 0, got {pspi_proto_contrastive_weight!r}"
+            )
+        self.pspi_proto_contrastive_weight = proto_w
+        if self.pspi_affine_enabled and self.pspi_enabled:
+            self.pet_affine = CTConditionedPETAffine(pet_channels)
+        else:
+            self.pet_affine = None
+
     def missing_prior_alpha_vals(self):
-        """Return per-scale alpha_l = sigmoid(a_l) detached tensors."""
+        """Return per-scale alpha_l = sigmoid(a_l) detached tensors (legacy).
+
+        The new CT-affine scheme reports constant 1.0 here for old logs; the
+        constant must not be described as a learned fusion weight.
+        """
         if self.missing_prior_logits is None:
             return [torch.ones(()) for _ in range(4)]
         with torch.no_grad():
@@ -142,7 +186,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return out
 
     def _scaled_prior(self, pet_prior):
-        """Apply per-scale scalar alpha_l to the retrieved PET prior."""
+        """Apply legacy per-scale scalar alpha_l to the retrieved PET prior."""
         pet_for_fusion = []
         for scale_idx, prior_scale in enumerate(pet_prior):
             if self.missing_prior_logits is not None:
@@ -152,7 +196,105 @@ class DualSharedAddPETCTBaseline(nn.Module):
             pet_for_fusion.append(alpha * prior_scale)
         return pet_for_fusion
 
-    def _attach_pspi_stats(self, out, proto_result=None, module1_aux=None, ref_tensor=None):
+    def _affine_stats(self, gammas, betas, pet_comp, ref_tensor):
+        """Detached per-scale affine/reconstruction monitoring stats."""
+        stats = {}
+        for s, (g, b, c) in enumerate(zip(gammas, betas, pet_comp)):
+            with torch.no_grad():
+                stats[f'affine_gamma_mean_s{s + 1}'] = float(g.detach().float().mean().item())
+                stats[f'affine_gamma_std_s{s + 1}'] = float(g.detach().float().std().item())
+                stats[f'affine_beta_rms_s{s + 1}'] = float(b.detach().float().pow(2).mean().sqrt().item())
+                stats[f'compensated_pet_rms_s{s + 1}'] = float(c.detach().float().pow(2).mean().sqrt().item())
+        return stats
+
+    def _zero_reconstruction(self, ref_tensor):
+        zero = ref_tensor.new_zeros((), dtype=torch.float32)
+        return {
+            'reconstruction_loss': zero,
+            'reconstruction_active': False,
+            'reconstruction_missing_samples': 0,
+            'reconstruction_per_scale': {},
+            'reconstruction_target_note': 'detached_same_sample_pet_real',
+        }
+
+    def _zero_affine_stats(self):
+        stats = {}
+        for s in range(1, 5):
+            stats[f'affine_gamma_mean_s{s}'] = 0.0
+            stats[f'affine_gamma_std_s{s}'] = 0.0
+            stats[f'affine_beta_rms_s{s}'] = 0.0
+            stats[f'compensated_pet_rms_s{s}'] = 0.0
+        return stats
+
+    def _compensate_missing_rows(
+        self,
+        ct_feats_missing,
+        pet_real_missing,
+        mask_missing,
+        compute_reconstruction=True,
+    ):
+        """Central Missing compensation helper shared by train/infer paths.
+
+        Returns dict with keys:
+          pet_comp:      post-affine Missing PET actually fused (grad kept)
+          pet_prior:     raw retrieved prior (for diagnostics only)
+          gammas/betas:  CT-only affine parameters
+          reconstruction: raw reconstruction dict from the loss helper
+          module1_aux:   bank/entropy stats from retrieval
+        Cold start (bank not ready): compensation is strictly zero (the whole
+        affine is skipped before beta can leak), and reconstruction is zero.
+        """
+        if not self.pspi_enabled or self.module1 is None:
+            raise RuntimeError('_compensate_missing_rows requires pspi_enabled=True')
+        if not self.pspi_affine_enabled or self.pet_affine is None:
+            raise RuntimeError('_compensate_missing_rows requires pspi_affine_enabled=True')
+        pet_prior, aux = self.module1.retrieve_pet_prior(
+            ct_feats_missing, return_attention=False
+        )
+        if not bool(aux.get('bank_ready', False)):
+            # Cold start bypass: skip the entire affine so that even a
+            # manually non-zero beta bias cannot produce output.
+            zeros = [torch.zeros_like(p) for p in pet_prior]
+            ref = ct_feats_missing[0]
+            recon = self._zero_reconstruction(ref)
+            return {
+                'pet_comp': zeros,
+                'pet_prior': pet_prior,
+                'gammas': None,
+                'betas': None,
+                'reconstruction': recon,
+                'module1_aux': aux,
+                'affine_stats': self._zero_affine_stats(),
+                'active': False,
+            }
+        pet_comp, gammas, betas = self.pet_affine(ct_feats_missing, pet_prior)
+        if compute_reconstruction and self.training:
+            recon = balanced_multi_scale_smooth_l1_reconstruction(
+                pet_comp, pet_real_missing, mask_missing
+            )
+        else:
+            ref = pet_comp[0]
+            zero = ref.new_zeros((), dtype=torch.float32)
+            recon = {
+                'loss': zero,
+                'active': False,
+                'num_samples': 0,
+                'per_scale': {},
+            }
+        stats = self._affine_stats(gammas, betas, pet_comp, pet_comp[0])
+        return {
+            'pet_comp': pet_comp,
+            'pet_prior': pet_prior,
+            'gammas': gammas,
+            'betas': betas,
+            'reconstruction': recon,
+            'module1_aux': aux,
+            'affine_stats': stats,
+            'active': True,
+        }
+
+    def _attach_pspi_stats(self, out, proto_result=None, module1_aux=None, ref_tensor=None,
+                           recon_result=None, affine_stats=None):
         def _zero(ref):
             return ref.new_zeros(()) if ref is not None else torch.tensor(0.0)
         ref = ref_tensor if ref_tensor is not None else out.get('logits')
@@ -165,6 +307,36 @@ class DualSharedAddPETCTBaseline(nn.Module):
             z = _zero(ref)
             out['prototype_contrastive_loss'] = z
             out['prototype_contrastive_num_terms'] = 0
+        if recon_result is not None:
+            out['reconstruction_loss'] = recon_result.get(
+                'loss', _zero(ref).to(dtype=torch.float32)
+            )
+            out['reconstruction_active'] = bool(recon_result.get('active', False))
+            out['reconstruction_missing_samples'] = int(
+                recon_result.get('num_samples', recon_result.get('num_missing', 0))
+            )
+            per_scale = recon_result.get('per_scale', {}) or {}
+            for s in range(1, 5):
+                out[f'reconstruction_fg_s{s}'] = float(per_scale.get(f's{s}_fg', 0.0))
+                out[f'reconstruction_bg_s{s}'] = float(per_scale.get(f's{s}_bg', 0.0))
+                out[f'reconstruction_rms_s{s}'] = float(per_scale.get(f's{s}_rms', 0.0))
+        else:
+            out['reconstruction_loss'] = _zero(ref).to(dtype=torch.float32)
+            out['reconstruction_active'] = False
+            out['reconstruction_missing_samples'] = 0
+            for s in range(1, 5):
+                out[f'reconstruction_fg_s{s}'] = 0.0
+                out[f'reconstruction_bg_s{s}'] = 0.0
+                out[f'reconstruction_rms_s{s}'] = 0.0
+        if affine_stats is not None:
+            for k, v in affine_stats.items():
+                out[k] = float(v)
+        else:
+            for s in range(1, 5):
+                out[f'affine_gamma_mean_s{s}'] = 0.0
+                out[f'affine_gamma_std_s{s}'] = 0.0
+                out[f'affine_beta_rms_s{s}'] = 0.0
+                out[f'compensated_pet_rms_s{s}'] = 0.0
         if module1_aux is not None:
             out['module1_bank_ready'] = bool(module1_aux.get('bank_ready', False))
             out['module1_bank_version'] = int(module1_aux.get('bank_version', 0))
@@ -228,7 +400,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         proto_result = None
         module1_aux = None
         if self.pspi_enabled:
-            if self.training and mask is not None:
+            if self.training and mask is not None and self.pspi_proto_contrastive_weight > 0.0:
                 # PET prototype contrastive supervision (grad -> PET encoder).
                 proto_result = self.module1.compute_pet_prototype_contrastive_loss(pet_real_feats, mask)
             module1_aux = {
@@ -239,7 +411,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
             }
 
         # Full prediction = raw baseline: CT + real PET via AddFusion.
-        # Full path NEVER calls retrieve_pet_prior or missing_prior_logits.
+        # Full path NEVER calls retrieve_pet_prior, the CT affine, or
+        # missing_prior_logits; reconstruction is strictly 0.
         fused_feats = self.fusion(ct_feats, pet_real_feats, None)
         out = self._decode(fused_feats, target_size)
         return self._attach_pspi_stats(out, proto_result=proto_result, module1_aux=module1_aux, ref_tensor=out['logits'])
@@ -248,7 +421,33 @@ class DualSharedAddPETCTBaseline(nn.Module):
         ct_feats = self._encode_ct(ct)
         if self.pspi_enabled:
             if not self.training:
-                # Missing inference: CT encoder/align + retrieval + scale + fusion + decoder only.
+                # Missing inference: CT + bank + affine path only; no PET.
+                if self.pspi_affine_enabled and self.pet_affine is not None:
+                    if self.module1.bank_ready:
+                        pet_prior, module1_aux = self.module1.retrieve_pet_prior(
+                            ct_feats, return_attention=False
+                        )
+                        pet_comp, gammas, betas = self.pet_affine(ct_feats, pet_prior)
+                        affine_stats = self._affine_stats(gammas, betas, pet_comp, pet_comp[0])
+                        module1_aux = dict(module1_aux)
+                        module1_aux['pet_prior'] = pet_prior
+                        fused_feats = self.fusion(ct_feats, pet_comp, None)
+                    else:
+                        module1_aux = {
+                            "bank_ready": False,
+                            "bank_version": int(self.module1.bank_version.item()),
+                            "attention_entropy": [0.0, 0.0, 0.0, 0.0],
+                            "normalized_attention_entropy": [0.0, 0.0, 0.0, 0.0],
+                        }
+                        zeros = [torch.zeros_like(f) for f in ct_feats]
+                        fused_feats = self.fusion(ct_feats, zeros, None)
+                        affine_stats = self._zero_affine_stats()
+                    out = self._decode(fused_feats, target_size)
+                    return self._attach_pspi_stats(
+                        out, proto_result=None, module1_aux=module1_aux,
+                        ref_tensor=out['logits'], affine_stats=affine_stats,
+                    )
+                # Legacy path: scaled prior with availability preserved.
                 pet_prior, module1_aux = self.module1.retrieve_pet_prior(ct_feats, return_attention=False)
                 module1_aux = dict(module1_aux)
                 module1_aux['pet_prior'] = pet_prior
@@ -267,7 +466,23 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 mask,
                 collect_module1_candidates=collect_module1_candidates,
             )
-            proto_result = self.module1.compute_pet_prototype_contrastive_loss(pet_real_feats, mask)
+            proto_result = None
+            if self.pspi_proto_contrastive_weight > 0.0:
+                proto_result = self.module1.compute_pet_prototype_contrastive_loss(pet_real_feats, mask)
+            if self.pspi_affine_enabled and self.pet_affine is not None:
+                comp = self._compensate_missing_rows(
+                    ct_feats, pet_real_feats, mask.float(),
+                    compute_reconstruction=True,
+                )
+                module1_aux = dict(comp['module1_aux'])
+                module1_aux['pet_prior'] = comp['pet_prior']
+                fused_feats = self.fusion(ct_feats, comp['pet_comp'], None)
+                out = self._decode(fused_feats, target_size)
+                return self._attach_pspi_stats(
+                    out, proto_result=proto_result, module1_aux=module1_aux,
+                    ref_tensor=out['logits'], recon_result=comp['reconstruction'],
+                    affine_stats=comp['affine_stats'],
+                )
             pet_prior, module1_aux = self.module1.retrieve_pet_prior(ct_feats, return_attention=False)
             module1_aux = dict(module1_aux)
             module1_aux['pet_prior'] = pet_prior
@@ -285,6 +500,58 @@ class DualSharedAddPETCTBaseline(nn.Module):
             out = self._decode(fused_feats, target_size)
             return self._attach_pspi_stats(out, proto_result=None, module1_aux=module1_aux, ref_tensor=out['logits'])
 
+    def _expand_missing_to_full_batch(
+        self, pet_comp_missing, missing_index, full_batch_size, ref_feats,
+    ):
+        """Scatter Missing-row compensation into a full-batch tensor.
+
+        The affine only sees Missing rows (B_m); Full rows receive exact-zero
+        placeholders so that torch.where assembly keeps the Full PET input
+        untouched. Zero placeholders carry no grad_fn; the affine graph flows
+        only through the Missing rows.
+        """
+        missing_idx = missing_index.to(dtype=torch.bool)
+        device = ref_feats[0].device
+        expanded = []
+        for s, comp_m in enumerate(pet_comp_missing):
+            like = ref_feats[s]
+            full = like.new_zeros(like.shape)
+            rows = torch.nonzero(missing_idx.to(device=device), as_tuple=False).flatten().long()
+            if int(comp_m.shape[0]) != int(rows.numel()):
+                raise ValueError(
+                    f"[Mixed][S{s + 1}] compensation rows {int(comp_m.shape[0])} != "
+                    f"missing count {int(rows.numel())}"
+                )
+            full = full.index_copy(0, rows, comp_m.to(dtype=like.dtype))
+            expanded.append(full)
+        return expanded
+
+    def _assemble_mixed_pet_fusion(
+        self, pet_real_feats, pet_comp_missing, missing_index, ref_tensor,
+    ):
+        """Out-of-place per-row assembly: Full rows keep P_real, Missing rows take pet_comp."""
+        missing_idx = missing_index.to(dtype=torch.bool)
+        device = pet_real_feats[0].device
+        missing_rows = missing_idx.to(device=device).view(-1, 1, 1, 1)
+        pet_for_fusion = []
+        for s, (real_feat, comp_feat) in enumerate(zip(pet_real_feats, pet_comp_missing)):
+            # comp_feat is already scattered to the full batch (Full rows = 0).
+            if tuple(comp_feat.shape) != tuple(real_feat.shape):
+                raise ValueError(
+                    f"[Mixed][S{s + 1}] compensation shape {tuple(comp_feat.shape)} != "
+                    f"real shape {tuple(real_feat.shape)}"
+                )
+            # Out-of-place selection: Full rows keep P_real, Missing rows use
+            # pet_comp. torch.where preserves autograd through comp_feat.
+            assembled = torch.where(missing_rows, comp_feat.to(real_feat.dtype), real_feat)
+            if tuple(assembled.shape) != tuple(real_feat.shape):
+                raise ValueError(
+                    f"[Mixed][S{s + 1}] assembled shape mismatch: {tuple(assembled.shape)} "
+                    f"vs {tuple(real_feat.shape)}"
+                )
+            pet_for_fusion.append(assembled)
+        return pet_for_fusion
+
     def _forward_auto(self, ct, pet, pet_available, target_size, mask=None, collect_module1_candidates=True):
         pet_available = pet_available.to(device=ct.device).long().view(-1)
         if pet_available.numel() != ct.shape[0]:
@@ -298,6 +565,73 @@ class DualSharedAddPETCTBaseline(nn.Module):
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
         self._maybe_collect(ct_feats, pet_feats_real, mask, collect_module1_candidates=collect_module1_candidates)
+        if self.pspi_enabled and self.pspi_affine_enabled and self.pet_affine is not None:
+            missing_index = pet_available.eq(0)
+            num_missing = int(missing_index.sum().item())
+            if num_missing == 0:
+                raise RuntimeError('mixed affine path requires a non-empty Missing subset')
+            ct_missing = [f[missing_index] for f in ct_feats]
+            pet_real_missing = [f[missing_index] for f in pet_feats_real]
+            mask_missing = mask[missing_index].float() if mask is not None else None
+            if mask_missing is None and self.training:
+                raise ValueError('mixed affine training requires mask for the Missing subset')
+            if self.module1.bank_ready:
+                pet_prior_m, _ = self.module1.retrieve_pet_prior(ct_missing, return_attention=False)
+                pet_comp_m, gammas_m, betas_m = self.pet_affine(ct_missing, pet_prior_m)
+                recon = None
+                if self.training:
+                    recon = balanced_multi_scale_smooth_l1_reconstruction(
+                        pet_comp_m, pet_real_missing, mask_missing
+                    )
+                    recon_dict = recon
+                else:
+                    ref = pet_comp_m[0]
+                    recon_dict = {
+                        'loss': ref.new_zeros((), dtype=torch.float32),
+                        'active': False,
+                        'num_samples': 0,
+                        'per_scale': {},
+                    }
+                affine_stats = self._affine_stats(gammas_m, betas_m, pet_comp_m, pet_comp_m[0])
+                active = True
+            else:
+                # Cold start: Missing compensation strictly zero; skip affine.
+                pet_comp_m = [torch.zeros_like(f[missing_index]) for f in pet_feats_real]
+                ref = pet_comp_m[0]
+                recon_dict = {
+                    'loss': ref.new_zeros((), dtype=torch.float32),
+                    'active': False,
+                    'num_samples': 0,
+                    'per_scale': {},
+                }
+                affine_stats = self._zero_affine_stats()
+                active = False
+            # Scatter the B_m-row compensation to full-batch tensors so the
+            # assembly keeps Full rows on P_real and Missing rows on pet_comp.
+            pet_comp_full = self._expand_missing_to_full_batch(
+                pet_comp_m, missing_index, ct.shape[0], pet_feats_real
+            )
+            pet_for_fusion = self._assemble_mixed_pet_fusion(
+                pet_feats_real, pet_comp_full, missing_index, pet_feats_real[0],
+            )
+            proto_result = None
+            if self.training and mask is not None and self.pspi_proto_contrastive_weight > 0.0:
+                proto_result = self.module1.compute_pet_prototype_contrastive_loss(pet_feats_real, mask)
+            module1_aux = {
+                "bank_ready": self.module1.bank_ready,
+                "bank_version": int(self.module1.bank_version.item()),
+                "attention_entropy": [0.0, 0.0, 0.0, 0.0],
+                "normalized_attention_entropy": [0.0, 0.0, 0.0, 0.0],
+            }
+            fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
+            out = self._decode(fused_feats, target_size)
+            out = self._attach_pspi_stats(
+                out, proto_result=proto_result, module1_aux=module1_aux,
+                ref_tensor=out['logits'], recon_result=recon_dict,
+                affine_stats=affine_stats,
+            )
+            out['reconstruction_missing_active'] = bool(active)
+            return out
         if self.pspi_enabled:
             pet_prior, module1_aux = self.module1.retrieve_pet_prior(ct_feats, return_attention=False)
             module1_aux = dict(module1_aux)
@@ -310,7 +644,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 for real_feat, prior_feat in zip(pet_feats_real, prior_for_fusion)
             ]
             proto_result = None
-            if self.training and mask is not None:
+            if self.training and mask is not None and self.pspi_proto_contrastive_weight > 0.0:
                 proto_result = self.module1.compute_pet_prototype_contrastive_loss(pet_feats_real, mask)
         else:
             module1_aux = None

@@ -123,8 +123,8 @@ def _pspi_batch_stats(outputs, attn_ent_accum, nattn_ent_accum, prior_norm_vals,
         prior_norm_vals.append(float(outputs['pet_prior_norm']))
 
 
-def _pspi_grad_stats(task):
-    stats = {'enc_pet': 0.0, 'retrieval': 0.0, 'prior_scale': 0.0}
+def _pspi_grad_summaries(task):
+    stats = {'enc_pet': 0.0, 'retrieval': 0.0, 'prior_scale': 0.0, 'pet_affine': 0.0}
     stats['enc_pet'] = module_grad_norm(task.model.enc_pet)
     if getattr(task.model, 'pspi_enabled', False) and getattr(task.model, 'module1', None) is not None:
         ret_norm = 0.0
@@ -134,6 +134,13 @@ def _pspi_grad_stats(task):
         g = getattr(task.model, 'missing_prior_logits', None)
         if g is not None and g.grad is not None:
             stats['prior_scale'] = float(g.grad.detach().float().pow(2).sum().sqrt().item())
+    affine = getattr(task.model, 'pet_affine', None)
+    if affine is not None:
+        aff_norm = 0.0
+        for p in affine.parameters():
+            if p.grad is not None:
+                aff_norm += float(p.grad.detach().float().pow(2).sum().item())
+        stats['pet_affine'] = float(aff_norm ** 0.5) if aff_norm > 0 else 0.0
     return stats
 
 
@@ -236,7 +243,7 @@ def main():
         'train_full_proto_loss_weighted', 'train_missing_proto_loss_weighted',
         'grad_full_enc_pet', 'grad_missing_enc_pet',
         'grad_full_module1_retrieval', 'grad_missing_module1_retrieval',
-        'grad_full_prior_scale', 'grad_missing_prior_scale',
+        'grad_full_prior_scale', 'grad_missing_prior_scale', 'grad_full_pet_affine', 'grad_missing_pet_affine',
     ]
     if train_batch_mode == 'mixed':
         extra_headers = [
@@ -250,8 +257,18 @@ def main():
             'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
             'joint_dice', 'best_joint', 'best_joint_epoch',
             'grad_mixed_enc_ct', 'grad_mixed_enc_pet', 'grad_mixed_ct_align', 'grad_mixed_decoder',
-            'grad_mixed_module1_retrieval', 'grad_mixed_prior_scale',
-            'mixed_optimizer_steps', 'mixed_scheduler_steps', 'mixed_forward_count', 'module1_collection_calls',
+            'grad_mixed_module1_retrieval', 'grad_mixed_prior_scale', 'grad_mixed_pet_affine',
+            'grad_module1_retrieval', 'grad_pet_affine',
+            'train_reconstruction_loss', 'train_reconstruction_loss_weighted',
+            'reconstruction_active', 'reconstruction_missing_samples',
+            'reconstruction_fg_s1', 'reconstruction_fg_s2', 'reconstruction_fg_s3', 'reconstruction_fg_s4',
+            'reconstruction_bg_s1', 'reconstruction_bg_s2', 'reconstruction_bg_s3', 'reconstruction_bg_s4',
+            'reconstruction_rms_s1', 'reconstruction_rms_s2', 'reconstruction_rms_s3', 'reconstruction_rms_s4',
+            'affine_gamma_mean_s1', 'affine_gamma_mean_s2', 'affine_gamma_mean_s3', 'affine_gamma_mean_s4',
+            'affine_gamma_std_s1', 'affine_gamma_std_s2', 'affine_gamma_std_s3', 'affine_gamma_std_s4',
+            'affine_beta_rms_s1', 'affine_beta_rms_s2', 'affine_beta_rms_s3', 'affine_beta_rms_s4',
+            'compensated_pet_rms_s1', 'compensated_pet_rms_s2', 'compensated_pet_rms_s3', 'compensated_pet_rms_s4',
+            'mixed_optimizer_steps', 'mixed_scheduler_steps', 'mixed_forward_count', 'module1_collection_calls', 'skipped_updates',
         ] + pspi_shared_headers + ['epoch_time']
     else:
         extra_headers = [
@@ -264,6 +281,7 @@ def main():
             'grad_full_enc_ct', 'grad_missing_enc_ct',
             'grad_full_ct_align', 'grad_missing_ct_align',
             'grad_full_decoder', 'grad_missing_decoder',
+            'skipped_updates',
         ] + pspi_shared_headers + ['epoch_time']
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
 
@@ -296,10 +314,20 @@ def main():
             full_loss_sum = missing_loss_sum = mixed_loss_sum = 0.0
             full_proto_sum = missing_proto_sum = 0.0
             full_proto_w_sum = missing_proto_w_sum = 0.0
+            recon_loss_sum = recon_w_sum = 0.0
+            recon_active_count = recon_missing_samples = 0
+            recon_fg_accum = {f's{i}': [] for i in range(1, 5)}
+            recon_bg_accum = {f's{i}': [] for i in range(1, 5)}
+            recon_rms_accum = {f's{i}': [] for i in range(1, 5)}
+            affine_gamma_mean_accum = {f's{i}': [] for i in range(1, 5)}
+            affine_gamma_std_accum = {f's{i}': [] for i in range(1, 5)}
+            affine_beta_rms_accum = {f's{i}': [] for i in range(1, 5)}
+            comp_pet_rms_accum = {f's{i}': [] for i in range(1, 5)}
             full_sample_count = missing_sample_count = 0
             mixed_n = 0
             opt_steps = sched_steps = fwd_count = 0
-            grads = {'enc_ct': [], 'enc_pet': [], 'ct_align': [], 'decoder': [], 'retrieval': [], 'prior_scale': []}
+            skipped_updates = 0
+            grads = {'enc_ct': [], 'enc_pet': [], 'ct_align': [], 'decoder': [], 'retrieval': [], 'prior_scale': [], 'pet_affine': []}
             last_full_weight = last_missing_weight = 0.0
             epoch_first_batch = True
 
@@ -336,15 +364,25 @@ def main():
                 grads['enc_ct'].append(module_grad_norm(task.model.enc_ct))
                 grads['ct_align'].append(module_grad_norm(task.model.ct_align))
                 grads['decoder'].append(module_grad_norm(task.model.decoder))
-                _pg = _pspi_grad_stats(task)
+                _pg = _pspi_grad_summaries(task)
                 grads['enc_pet'].append(_pg['enc_pet'])
                 grads['retrieval'].append(_pg['retrieval'])
                 grads['prior_scale'].append(_pg['prior_scale'])
+                grads['pet_affine'].append(_pg['pet_affine'])
                 total_grad_norm = torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip)) if float(cfg.grad_clip) > 0 else 0.0
                 grad_norm_accum += float(total_grad_norm)
                 grad_norm_steps += 1
 
                 if task.scaler.is_enabled():
+                    inf_per_device = task.scaler._check_inf_per_device(task.optimizer)
+                    overflow = any(
+                        torch.is_tensor(v) and bool(v.any().item())
+                        for v in (inf_per_device or {}).values()
+                    )
+                    if overflow:
+                        task.scaler.update()
+                        skipped_updates += 1
+                        continue
                     task.scaler.step(task.optimizer)
                     task.scaler.update()
                 else:
@@ -378,6 +416,36 @@ def main():
 
                 _pspi_batch_stats(outputs, attn_ent_accum, nattn_ent_accum, prior_norm_vals, prior_alpha_accum)
 
+                recon_raw_v = float(train_stats['loss_reconstruction']) if torch.is_tensor(train_stats['loss_reconstruction']) else float(train_stats['loss_reconstruction'])
+                recon_w_v = float(train_stats['loss_reconstruction_weighted']) if torch.is_tensor(train_stats['loss_reconstruction_weighted']) else float(train_stats['loss_reconstruction_weighted'])
+                recon_loss_sum += recon_raw_v
+                recon_w_sum += recon_w_v
+                if bool(train_stats.get('reconstruction_active', False)):
+                    recon_active_count += 1
+                    recon_missing_samples += int(train_stats.get('reconstruction_missing_samples', 0))
+                for i in range(1, 5):
+                    v = outputs.get(f'reconstruction_fg_s{i}')
+                    if v is not None and (train_stats.get('reconstruction_active', False) or v != 0.0):
+                        recon_fg_accum[f's{i}'].append(float(v))
+                    v = outputs.get(f'reconstruction_bg_s{i}')
+                    if v is not None and (train_stats.get('reconstruction_active', False) or v != 0.0):
+                        recon_bg_accum[f's{i}'].append(float(v))
+                    v = outputs.get(f'reconstruction_rms_s{i}')
+                    if v is not None and (train_stats.get('reconstruction_active', False) or v != 0.0):
+                        recon_rms_accum[f's{i}'].append(float(v))
+                    v = outputs.get(f'affine_gamma_mean_s{i}')
+                    if v is not None and train_stats.get('reconstruction_missing_active', train_stats.get('reconstruction_active', False)):
+                        affine_gamma_mean_accum[f's{i}'].append(float(v))
+                    v = outputs.get(f'affine_gamma_std_s{i}')
+                    if v is not None and train_stats.get('reconstruction_missing_active', train_stats.get('reconstruction_active', False)):
+                        affine_gamma_std_accum[f's{i}'].append(float(v))
+                    v = outputs.get(f'affine_beta_rms_s{i}')
+                    if v is not None and train_stats.get('reconstruction_missing_active', train_stats.get('reconstruction_active', False)):
+                        affine_beta_rms_accum[f's{i}'].append(float(v))
+                    v = outputs.get(f'compensated_pet_rms_s{i}')
+                    if v is not None and train_stats.get('reconstruction_missing_active', train_stats.get('reconstruction_active', False)):
+                        comp_pet_rms_accum[f's{i}'].append(float(v))
+
                 global_batch_step += 1
                 task.global_batch_step = global_batch_step
                 if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is None:
@@ -389,7 +457,7 @@ def main():
 
             if getattr(task.model, 'module1', None) is not None:
                 module1_collection_calls = int(task.model.module1._collect_calls) - module1_collection_calls
-            if not (mixed_n == opt_steps == sched_steps == fwd_count == len(train_loader)):
+            if not (mixed_n == fwd_count == len(train_loader)) or opt_steps + skipped_updates != mixed_n or sched_steps + skipped_updates != mixed_n:
                 raise RuntimeError(
                     f'mixed sanity failed: batches={mixed_n} opt={opt_steps} sched={sched_steps} fwd={fwd_count} loader={len(train_loader)}'
                 )
@@ -409,10 +477,12 @@ def main():
             full_proto = missing_proto = 0.0
             full_proto_w = missing_proto_w = 0.0
             grads = {
-                'full': {'enc_ct': [], 'enc_pet': [], 'ct_align': [], 'decoder': [], 'retrieval': [], 'prior_scale': []},
-                'missing': {'enc_ct': [], 'enc_pet': [], 'ct_align': [], 'decoder': [], 'retrieval': [], 'prior_scale': []},
+                'full': {'enc_ct': [], 'enc_pet': [], 'ct_align': [], 'decoder': [], 'retrieval': [], 'prior_scale': [], 'pet_affine': []},
+                'missing': {'enc_ct': [], 'enc_pet': [], 'ct_align': [], 'decoder': [], 'retrieval': [], 'prior_scale': [], 'pet_affine': []},
             }
 
+            skipped_updates = 0
+            opt_steps = sched_steps = 0
             for batch_idx, batch in enumerate(train_loader):
                 route = 'full' if global_batch_step % 2 == 0 else 'missing'
                 task.optimizer.zero_grad(set_to_none=True)
@@ -430,21 +500,35 @@ def main():
                 grads[route]['enc_ct'].append(module_grad_norm(task.model.enc_ct))
                 grads[route]['ct_align'].append(module_grad_norm(task.model.ct_align))
                 grads[route]['decoder'].append(module_grad_norm(task.model.decoder))
-                _pg = _pspi_grad_stats(task)
+                _pg = _pspi_grad_summaries(task)
                 grads[route]['enc_pet'].append(_pg['enc_pet'])
                 grads[route]['retrieval'].append(_pg['retrieval'])
                 grads[route]['prior_scale'].append(_pg['prior_scale'])
+                grads[route]['pet_affine'].append(_pg['pet_affine'])
                 total_grad_norm = torch.nn.utils.clip_grad_norm_(task.trainable_parameters(), float(cfg.grad_clip)) if float(cfg.grad_clip) > 0 else 0.0
                 grad_norm_accum += float(total_grad_norm)
                 grad_norm_steps += 1
 
                 if task.scaler.is_enabled():
-                    task.scaler.step(task.optimizer)
-                    task.scaler.update()
+                    inf_per_device = task.scaler._check_inf_per_device(task.optimizer)
+                    overflow = any(
+                        torch.is_tensor(v) and bool(v.any().item())
+                        for v in (inf_per_device or {}).values()
+                    )
+                    if overflow:
+                        task.scaler.update()
+                        skipped_updates += 1
+                    else:
+                        task.scaler.step(task.optimizer)
+                        task.scaler.update()
+                        opt_steps += 1
+                        task.scheduler.step()
+                        sched_steps += 1
                 else:
                     task.optimizer.step()
-
-                task.scheduler.step()
+                    opt_steps += 1
+                    task.scheduler.step()
+                    sched_steps += 1
 
                 if (batch_idx + 1) % 100 == 0:
                     print(f'[BATCH {batch_idx + 1}] route={route} loss={float(loss.detach()):.6f}', flush=True)
@@ -590,8 +674,44 @@ def main():
                 'grad_mixed_decoder': float(np.mean(grads['decoder'])) if grads['decoder'] else 0.0,
                 'grad_mixed_module1_retrieval': float(np.mean(grads['retrieval'])) if grads['retrieval'] else 0.0,
                 'grad_mixed_prior_scale': float(np.mean(grads['prior_scale'])) if grads['prior_scale'] else 0.0,
+                'grad_mixed_pet_affine': float(np.mean(grads['pet_affine'])) if grads['pet_affine'] else 0.0,
+                'grad_module1_retrieval': float(np.mean(grads['retrieval'])) if grads['retrieval'] else 0.0,
+                'grad_pet_affine': float(np.mean(grads['pet_affine'])) if grads['pet_affine'] else 0.0,
+                'train_reconstruction_loss': recon_loss_sum / max(1, mixed_n),
+                'train_reconstruction_loss_weighted': recon_w_sum / max(1, mixed_n),
+                'reconstruction_active': float(recon_active_count),
+                'reconstruction_missing_samples': float(recon_missing_samples),
+                'reconstruction_fg_s1': float(np.mean(recon_fg_accum['s1'])) if recon_fg_accum['s1'] else 0.0,
+                'reconstruction_fg_s2': float(np.mean(recon_fg_accum['s2'])) if recon_fg_accum['s2'] else 0.0,
+                'reconstruction_fg_s3': float(np.mean(recon_fg_accum['s3'])) if recon_fg_accum['s3'] else 0.0,
+                'reconstruction_fg_s4': float(np.mean(recon_fg_accum['s4'])) if recon_fg_accum['s4'] else 0.0,
+                'reconstruction_bg_s1': float(np.mean(recon_bg_accum['s1'])) if recon_bg_accum['s1'] else 0.0,
+                'reconstruction_bg_s2': float(np.mean(recon_bg_accum['s2'])) if recon_bg_accum['s2'] else 0.0,
+                'reconstruction_bg_s3': float(np.mean(recon_bg_accum['s3'])) if recon_bg_accum['s3'] else 0.0,
+                'reconstruction_bg_s4': float(np.mean(recon_bg_accum['s4'])) if recon_bg_accum['s4'] else 0.0,
+                'reconstruction_rms_s1': float(np.mean(recon_rms_accum['s1'])) if recon_rms_accum['s1'] else 0.0,
+                'reconstruction_rms_s2': float(np.mean(recon_rms_accum['s2'])) if recon_rms_accum['s2'] else 0.0,
+                'reconstruction_rms_s3': float(np.mean(recon_rms_accum['s3'])) if recon_rms_accum['s3'] else 0.0,
+                'reconstruction_rms_s4': float(np.mean(recon_rms_accum['s4'])) if recon_rms_accum['s4'] else 0.0,
+                'affine_gamma_mean_s1': float(np.mean(affine_gamma_mean_accum['s1'])) if affine_gamma_mean_accum['s1'] else 0.0,
+                'affine_gamma_mean_s2': float(np.mean(affine_gamma_mean_accum['s2'])) if affine_gamma_mean_accum['s2'] else 0.0,
+                'affine_gamma_mean_s3': float(np.mean(affine_gamma_mean_accum['s3'])) if affine_gamma_mean_accum['s3'] else 0.0,
+                'affine_gamma_mean_s4': float(np.mean(affine_gamma_mean_accum['s4'])) if affine_gamma_mean_accum['s4'] else 0.0,
+                'affine_gamma_std_s1': float(np.mean(affine_gamma_std_accum['s1'])) if affine_gamma_std_accum['s1'] else 0.0,
+                'affine_gamma_std_s2': float(np.mean(affine_gamma_std_accum['s2'])) if affine_gamma_std_accum['s2'] else 0.0,
+                'affine_gamma_std_s3': float(np.mean(affine_gamma_std_accum['s3'])) if affine_gamma_std_accum['s3'] else 0.0,
+                'affine_gamma_std_s4': float(np.mean(affine_gamma_std_accum['s4'])) if affine_gamma_std_accum['s4'] else 0.0,
+                'affine_beta_rms_s1': float(np.mean(affine_beta_rms_accum['s1'])) if affine_beta_rms_accum['s1'] else 0.0,
+                'affine_beta_rms_s2': float(np.mean(affine_beta_rms_accum['s2'])) if affine_beta_rms_accum['s2'] else 0.0,
+                'affine_beta_rms_s3': float(np.mean(affine_beta_rms_accum['s3'])) if affine_beta_rms_accum['s3'] else 0.0,
+                'affine_beta_rms_s4': float(np.mean(affine_beta_rms_accum['s4'])) if affine_beta_rms_accum['s4'] else 0.0,
+                'compensated_pet_rms_s1': float(np.mean(comp_pet_rms_accum['s1'])) if comp_pet_rms_accum['s1'] else 0.0,
+                'compensated_pet_rms_s2': float(np.mean(comp_pet_rms_accum['s2'])) if comp_pet_rms_accum['s2'] else 0.0,
+                'compensated_pet_rms_s3': float(np.mean(comp_pet_rms_accum['s3'])) if comp_pet_rms_accum['s3'] else 0.0,
+                'compensated_pet_rms_s4': float(np.mean(comp_pet_rms_accum['s4'])) if comp_pet_rms_accum['s4'] else 0.0,
                 'mixed_optimizer_steps': float(opt_steps),
                 'mixed_scheduler_steps': float(sched_steps),
+                'skipped_updates': float(skipped_updates),
                 'mixed_forward_count': float(fwd_count),
                 'module1_collection_calls': float(module1_collection_calls),
                 'train_full_proto_loss': full_proto_sum / max(1, full_sample_count),
@@ -619,6 +739,8 @@ def main():
                 'grad_missing_module1_retrieval': float(np.mean(grads['missing']['retrieval'])) if grads['missing']['retrieval'] else 0.0,
                 'grad_full_prior_scale': float(np.mean(grads['full']['prior_scale'])) if grads['full']['prior_scale'] else 0.0,
                 'grad_missing_prior_scale': float(np.mean(grads['missing']['prior_scale'])) if grads['missing']['prior_scale'] else 0.0,
+                'grad_full_pet_affine': float(np.mean(grads['full']['pet_affine'])) if grads['full']['pet_affine'] else 0.0,
+                'grad_missing_pet_affine': float(np.mean(grads['missing']['pet_affine'])) if grads['missing']['pet_affine'] else 0.0,
                 'val_full_loss': val_full['total_loss'],
                 'val_full_dice': val_full['dice'],
                 'val_full_iou': val_full['iou'],
@@ -640,6 +762,9 @@ def main():
                 'grad_missing_ct_align': float(np.mean(grads['missing']['ct_align'])) if grads['missing']['ct_align'] else 0.0,
                 'grad_full_decoder': float(np.mean(grads['full']['decoder'])) if grads['full']['decoder'] else 0.0,
                 'grad_missing_decoder': float(np.mean(grads['missing']['decoder'])) if grads['missing']['decoder'] else 0.0,
+                'skipped_updates': float(skipped_updates),
+                'mixed_optimizer_steps': float(opt_steps),
+                'mixed_scheduler_steps': float(sched_steps),
                 **common_pspi,
                 'epoch_time': time.time() - epoch_start,
                 **{f'diag_{k}': v for k, v in diag_stats.items()},

@@ -461,6 +461,48 @@ class ConvBNAct(nn.Module):
 
 def build_mdt_seg_teacher(config):
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
+    pspi_enabled = bool(getattr(config, 'pspi_enabled', True))
+    # Legacy checkpoints have no affine/reconstruction fields: fall back to
+    # the old path (affine=False, reconstruction=0, prior_scale=True default)
+    # WITHOUT changing the new CLI defaults.
+    has_affine_field = hasattr(config, 'pspi_affine_enabled')
+    has_recon_field = hasattr(config, 'pspi_reconstruction_weight')
+    has_proto_field = hasattr(config, 'pspi_proto_contrastive_weight')
+    if has_affine_field:
+        affine_enabled = bool(getattr(config, 'pspi_affine_enabled'))
+    else:
+        affine_enabled = False
+    if has_proto_field:
+        proto_weight = float(getattr(config, 'pspi_proto_contrastive_weight', 0.0))
+    else:
+        # Old configs only carry pspi_proto_contrastive_weight's predecessor?
+        # Baseline used pspi_proto_contrastive_weight=0.01 default.
+        proto_weight = float(getattr(config, 'pspi_proto_contrastive_weight', 0.01))
+    if has_recon_field:
+        recon_weight = float(getattr(config, 'pspi_reconstruction_weight', 0.0))
+    else:
+        recon_weight = 0.0
+    if not has_affine_field and not hasattr(config, 'pspi_prior_scale_enabled'):
+        prior_scale_enabled = True
+        prior_scale_init = float(getattr(config, 'pspi_prior_scale_init', 0.1))
+    else:
+        prior_scale_enabled = bool(getattr(config, 'pspi_prior_scale_enabled', True if not has_affine_field else False))
+        prior_scale_init = float(getattr(config, 'pspi_prior_scale_init', 0.1))
+    if affine_enabled and prior_scale_enabled:
+        raise ValueError(
+            "pspi_affine_enabled=True is incompatible with "
+            "pspi_prior_scale_enabled=True: disable prior scale for the "
+            "CT-affine experiment."
+        )
+    if not (recon_weight >= 0.0) or recon_weight != recon_weight:  # NaN check
+        raise ValueError(
+            f"pspi_reconstruction_weight must be finite and >= 0, got {recon_weight!r}"
+        )
+    if recon_weight > 0.0 and not (pspi_enabled and affine_enabled):
+        raise ValueError(
+            "pspi_reconstruction_weight > 0 requires pspi_enabled=True "
+            "and pspi_affine_enabled=True"
+        )
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
@@ -480,8 +522,11 @@ def build_mdt_seg_teacher(config):
         pspi_retrieval_temperature=getattr(config, 'pspi_retrieval_temperature', 0.1),
         pspi_proto_temperature=getattr(config, 'pspi_proto_temperature', 0.02),
         pspi_collect_candidates=getattr(config, 'pspi_collect_candidates', True),
-        pspi_prior_scale_enabled=getattr(config, 'pspi_prior_scale_enabled', True),
-        pspi_prior_scale_init=getattr(config, 'pspi_prior_scale_init', 0.1),
+        pspi_prior_scale_enabled=prior_scale_enabled,
+        pspi_prior_scale_init=prior_scale_init,
+        pspi_affine_enabled=affine_enabled,
+        pspi_reconstruction_weight=recon_weight,
+        pspi_proto_contrastive_weight=proto_weight,
     )
     if bool(getattr(config, 'stage1_init_enabled', False)):
         load_stage1_unimodal_initialization(
@@ -513,21 +558,28 @@ def build_mdt_seg_teacher(config):
         f'outlier_filter=cosine_top5_percent '
         f'retrieval=cosine_soft '
         f'retrieval_temperature={getattr(config, "pspi_retrieval_temperature", 0.1)} '
-        f'personalization=none '
+        f'personalization={"ct_only_direct_affine" if affine_enabled else "none"} '
         f'prototype_loss=pet_multi_positive_contrastive '
         f'proto_temperature={getattr(config, "pspi_proto_temperature", 0.02)} '
-        f'proto_weight={getattr(config, "pspi_proto_contrastive_weight", 0.01)} '
-        f'reconstruction_loss=none '
+        f'proto_weight={proto_weight} '
+        f'proto_loss_disabled={proto_weight == 0.0} '
+        f'ct_only_direct_affine={affine_enabled} '
+        f'reconstruction_weight={recon_weight} '
+        f'reconstruction_loss={"balanced_multiscale_smoothl1" if affine_enabled and recon_weight > 0.0 else "none"} '
+        f'reconstruction_target_detached=True '
+        f'direct_add=True '
         f'cold_start=epoch1 '
+        f'S4_K_per_class={getattr(config, "pspi_num_clusters", 6)} '
+        f'mixed_50_50 '
         f'bank_update={getattr(config, "pspi_bank_update_mode", "direct")} '
         f'ema_momentum={getattr(config, "pspi_ema_momentum", 0.95)} '
         f'K={getattr(config, "pspi_num_clusters", 6)} '
         f'build_stage=S{getattr(config, "pspi_build_stage", 4)} '
         f'full_path=raw_CT_plus_real_PET '
-        f'missing_boundary=CT_plus_scale_weighted_PET_prior '
-        f'prior_scale_type=per_scale_scalar '
-        f'prior_scale_init={getattr(config, "pspi_prior_scale_init", 0.1)} '
-        f'prior_scale_enabled={bool(getattr(config, "pspi_prior_scale_enabled", True))} '
+        f'missing_boundary={"CT_plus_ct_affine_prior" if affine_enabled else "CT_plus_scale_weighted_PET_prior"} '
+        f'prior_scale_type={"none_ct_affine_direct" if affine_enabled else "per_scale_scalar"} '
+        f'prior_scale_init={prior_scale_init} '
+        f'prior_scale_enabled={prior_scale_enabled} '
         f'{fusion_desc} '
         f'downstream_fusion=AddFusion '
         f'decoder=UNetStyleDecoder'

@@ -920,7 +920,8 @@ def test_58_task_applies_proto_weight():
     cfg = types.SimpleNamespace(
         learning_rate=1e-4, weight_decay=0.0, mixed_precision=False,
         loss_smooth=1.0, bce_weight=1.0, dice_weight=1.0,
-        pspi_proto_contrastive_weight=0.01, random_state=2023,
+        pspi_proto_contrastive_weight=0.01, pspi_reconstruction_weight=0.0,
+        random_state=2023,
     )
     task = MDTSegTeacher({"model": model}, cfg)
     task.model.train()
@@ -928,8 +929,9 @@ def test_58_task_applies_proto_weight():
     total, _, outputs, stats = task.train_step(batch, forward_mode="missing")
     raw = outputs["prototype_contrastive_loss"]
     assert abs(float(stats["loss_proto_weighted"]) - 0.01 * float(raw)) < 1e-6
-    assert "reconstruction_loss" not in outputs
-    print("[58] task applies proto weight, no recon key: PASS")
+    assert "reconstruction_loss" in outputs  # new contract always exposes it
+    assert float(outputs["reconstruction_loss"]) == 0.0  # legacy model has no affine
+    print("[58] task applies proto weight, recon exposed as 0: PASS")
 
 
 def main():
