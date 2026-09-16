@@ -380,17 +380,22 @@ def main():
                         for v in (inf_per_device or {}).values()
                     )
                     if overflow:
+                        # AMP overflow: GradScaler.step would be a no-op. Do not
+                        # advance the optimizer/scheduler counters but keep the
+                        # per-batch accounting (forward + collection did happen).
                         task.scaler.update()
                         skipped_updates += 1
-                        continue
-                    task.scaler.step(task.optimizer)
-                    task.scaler.update()
+                    else:
+                        task.scaler.step(task.optimizer)
+                        task.scaler.update()
+                        opt_steps += 1
+                        task.scheduler.step()
+                        sched_steps += 1
                 else:
                     task.optimizer.step()
-                opt_steps += 1
-
-                task.scheduler.step()
-                sched_steps += 1
+                    opt_steps += 1
+                    task.scheduler.step()
+                    sched_steps += 1
 
                 num_full = int(train_stats['num_full'])
                 num_missing = int(train_stats['num_missing'])
@@ -459,14 +464,22 @@ def main():
                 module1_collection_calls = int(task.model.module1._collect_calls) - module1_collection_calls
             if not (mixed_n == fwd_count == len(train_loader)) or opt_steps + skipped_updates != mixed_n or sched_steps + skipped_updates != mixed_n:
                 raise RuntimeError(
-                    f'mixed sanity failed: batches={mixed_n} opt={opt_steps} sched={sched_steps} fwd={fwd_count} loader={len(train_loader)}'
+                    f'mixed sanity failed: batches={mixed_n} opt={opt_steps} sched={sched_steps} '
+                    f'skipped={skipped_updates} fwd={fwd_count} loader={len(train_loader)}'
                 )
             if full_sample_count != missing_sample_count:
                 raise RuntimeError(
                     f'mixed sample count mismatch: full={full_sample_count} missing={missing_sample_count}'
                 )
+            if skipped_updates > 0:
+                print(
+                    f'[WARN] epoch={epoch} amp_overflow_skipped_updates={skipped_updates} '
+                    f'(optimizer/scheduler did not advance on those batches)',
+                    flush=True,
+                )
             print(
                 f'[TRAIN] epoch={epoch} optimizer_steps={opt_steps} scheduler_steps={sched_steps} '
+                f'skipped_updates={skipped_updates} '
                 f'forward_count={fwd_count} full_samples={full_sample_count} missing_samples={missing_sample_count} '
                 f'module1_collections={module1_collection_calls}',
                 flush=True,

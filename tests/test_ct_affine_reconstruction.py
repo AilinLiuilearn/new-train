@@ -475,6 +475,62 @@ def test_mixed_single_forward_and_optimizer_once():
     print("[A16] mixed single-forward, loss weights, affine step: PASS")
 
 
+# ------------------------------------------------------------------
+# 9. Regression: AMP-overflow skip must still count forward/collection
+#    (run_mdt_seg mixed loop accounting; see epoch-1 crash:
+#     "mixed sanity failed: batches=1088 opt=1086 sched=1086 fwd=1088").
+# ------------------------------------------------------------------
+
+def _run_mixed_loop_accounting_pattern(batch_count, overflow_batches):
+    """Replicates run_mdt_seg.py's mixed-loop counter discipline."""
+    fwd_count = opt_steps = sched_steps = skipped_updates = mixed_n = collections = 0
+    for b in range(batch_count):
+        fwd_count += 1
+        collections += 1
+        mixed_n += 1
+        overflow = b in overflow_batches
+        if overflow:
+            skipped_updates += 1
+        else:
+            opt_steps += 1
+            sched_steps += 1
+    ok = (
+        mixed_n == fwd_count == collections == batch_count
+        and opt_steps + skipped_updates == mixed_n
+        and sched_steps + skipped_updates == mixed_n
+    )
+    if not ok:
+        raise RuntimeError(
+            f'accounting invariant broken: fwd={fwd_count} opt={opt_steps} '
+            f'sched={sched_steps} skipped={skipped_updates} batches={batch_count}'
+        )
+    return opt_steps, skipped_updates
+
+
+def test_overflow_skipped_update_accounting_invariant():
+    opt, skipped = _run_mixed_loop_accounting_pattern(1088, {1086, 1087})
+    assert opt == 1086 and skipped == 2
+    # The buggy `continue` pattern (skip before accounting) must fail.
+    raised = False
+    try:
+        fwd = coll = mixed = opt_ok = 0
+        for b in range(1088):
+            fwd += 1
+            coll += 1
+            mixed += 1
+            if b in {1086, 1087}:
+                mixed -= 1
+                coll -= 1
+                continue
+            opt_ok += 1
+        if not (mixed == fwd and opt_ok + 2 == mixed):
+            raise AssertionError
+    except AssertionError:
+        raised = True
+    assert raised, "continue-before-accounting must violate the invariant"
+    print("[A17] overflow-skip accounting invariant: PASS")
+
+
 def main():
     tests = [
         test_affine_four_scale_shapes,
@@ -493,6 +549,7 @@ def main():
         test_recon_helper_hand_values_and_edges,
         test_recon_helper_empty_missing_and_fp32,
         test_mixed_single_forward_and_optimizer_once,
+        test_overflow_skipped_update_accounting_invariant,
     ]
     failed = []
     for t in tests:
