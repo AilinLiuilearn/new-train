@@ -225,6 +225,23 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 'fusion2 requires pet_available; internal Full/Missing paths '
                 'must supply their actual source state'
             )
+        # Module-2 enforces a strict shared device/dtype contract, but under
+        # CUDA AMP the two streams legitimately differ: ct_align ends with
+        # BatchNorm (autocast fp32 op) while the PET backbone outputs stay in
+        # the autocast dtype. AddFusion never cared (add promotes); here the
+        # integration boundary must unify before delegating. Casts are
+        # differentiable and keep the higher-precision CT dtype.
+        ref = ct_feats[0]
+        ct_feats = [
+            c.to(device=ref.device, dtype=ref.dtype)
+            if (c.device != ref.device or c.dtype != ref.dtype) else c
+            for c in ct_feats
+        ]
+        pet_feats = [
+            p.to(device=ref.device, dtype=ref.dtype)
+            if (p.device != ref.device or p.dtype != ref.dtype) else p
+            for p in pet_feats
+        ]
         return self.fusion2(
             ct_feats, pet_feats, pet_available, bank_ready=bank_ready
         )

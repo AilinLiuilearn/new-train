@@ -177,6 +177,37 @@ def test_f2_checkpoint_strict_roundtrip():
     print("[F2-05] fusion2 checkpoint strict round-trip identical: PASS")
 
 
+def test_f2_amp_dtype_unification():
+    """CUDA AMP gives CT (fp32 via BN) and PET streams different dtypes.
+
+    _fuse must unify to the CT dtype before delegating to Module-2's
+    strict shared-dtype contract; the cast must preserve gradients.
+    Module weights stay fp32 on CPU (no .to(dtype) in this test), so run
+    the fusion under autocast like real training does.
+    """
+    model = _banked_model(fusion2_enabled=True)
+    model.train()
+    ct = torch.randn(2, 1, 64, 64)
+    pet = torch.randn(2, 1, 64, 64)
+    ct_feats = [f.to(torch.bfloat16) for f in model._encode_ct(ct)]
+    pet_feats = model._encode_pet(pet)
+    assert ct_feats[0].dtype != pet_feats[0].dtype
+    with torch.autocast(device_type="cpu", enabled=True, dtype=torch.bfloat16):
+        fused = model._fuse(
+            ct_feats, pet_feats,
+            pet_available=torch.tensor([1, 0]), bank_ready=True,
+        )
+    assert all(f.dtype == ct_feats[0].dtype for f in fused)
+    model.zero_grad(set_to_none=True)
+    sum(f.float().mean() for f in fused).backward()
+    f2g = sum(
+        float(p.grad.abs().sum())
+        for p in model.fusion2.parameters() if p.grad is not None
+    )
+    assert f2g > 0
+    print("[F2-07] AMP dtype unification at _fuse keeps grad flow: PASS")
+
+
 def test_f2_text_without_cache_rejected():
     try:
         _plain_model(
@@ -197,6 +228,7 @@ def main():
         test_f2_mixed_routes_states,
         test_f2_grad_flows_to_fusion2_and_affine,
         test_f2_checkpoint_strict_roundtrip,
+        test_f2_amp_dtype_unification,
         test_f2_text_without_cache_rejected,
     ]
     failed = []
