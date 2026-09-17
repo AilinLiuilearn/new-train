@@ -65,16 +65,21 @@ def main():
     p.add_argument('--random_state', type=int, default=2023)
     args = p.parse_args()
 
-    ckpt = torch.load(os.path.join(args.checkpoint_dir, 'ckpt.best_joint.pth.tar'), map_location='cpu')
+    ckpt = torch.load(os.path.join(args.checkpoint_dir, 'ckpt.best_joint.pth.tar'), map_location='cpu', weights_only=False)
     saved_config = dict(ckpt['config'])
     saved_config.pop('checkpoint_dir', None)
     saved_config['root'] = args.root
     saved_config['random_state'] = args.random_state
     saved_config['ct_pretrained_path'] = None
     saved_config['pet_pretrained_path'] = None
+    # Joint-model restore: encoders are inside the checkpoint; never reload
+    # Stage-1 files that may not exist at eval time.
+    saved_config['stage1_init_enabled'] = False
     cfg = SegMDTConfig(args=saved_config)
 
-    task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
+    task = MDTSegTeacher(
+        build_mdt_seg_teacher(cfg, module2_checkpoint_state=ckpt['model']), cfg
+    )
     task.model.load_state_dict(ckpt['model'], strict=True)
     task.model.eval()
 
