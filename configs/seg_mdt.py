@@ -51,11 +51,11 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--pspi_proto_contrastive_weight', type=float, default=0.0)
         p.add_argument('--pspi_reconstruction_weight', type=float, default=0.05)
         p.add_argument('--pspi_collect_candidates', type=str2bool, default=True)
-        # Module-2: StateTextDetailRegionFusion downstream fusion (replaces AddFusion).
+        # Module-2: StateTextDetailFrequencyFusion downstream fusion (replaces AddFusion).
         p.add_argument('--module2_enabled', type=str2bool, default=False)
         p.add_argument('--module2_use_text', type=str2bool, default=True)
         p.add_argument('--module2_use_state', type=str2bool, default=True)
-        p.add_argument('--module2_region_pool_size', type=int, default=4)
+        p.add_argument('--module2_frequency_sigma', type=float, default=0.15)
         p.add_argument('--module2_diag_enabled', type=str2bool, default=False)
         p.add_argument('--module2_diag_interval', type=int, default=50)
         p.add_argument('--module2_text_model_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/clip-vit-base-patch32')

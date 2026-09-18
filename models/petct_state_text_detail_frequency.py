@@ -1,31 +1,31 @@
-"""PET/CT 模块二：双文本细节/区域残差融合（2D 多尺度，detail-region-v1）。
+"""PET/CT 模块二：CT解剖细节 + PET傅里叶频带调制 + 单次输出残差。
 
-放置位置: models/petct_state_text_detail_region.py；仅依赖 torch，导出文本另需 transformers。
-建议 Python>=3.10、PyTorch>=2.0。
+放置位置: models/petct_state_text_detail_frequency.py；仅依赖 torch，
+导出文本另需 transformers。建议 Python>=3.10、PyTorch>=2.0。
 
-从 models/petct_state_text_competitive.py 迁移了文本编码、双文本缓存、
-输入校验、有效样本筛选与诊断接口；旧竞争类及旧文件已删除。
+从 models/petct_state_text_detail_region.py 迁移了文本编码、双文本缓存、
+输入校验、有效行筛选与诊断接口；旧区域分支文件已删除。
 
-每尺度同结构、参数独立；Full/Missing 共用同一个融合实例。
+每尺度同结构、参数独立；Full/Missing 共用同一套参数。
 C, P: [B,d,H,W]，进入 fusion 的原始特征（P 的来源由上游决定）。
 
-  q_ct  = GELU(LayerNorm(Linear_ct(t_ct)))      # [1,d,1,1]，固定CT文本
-  q_pet = GELU(LayerNorm(Linear_pet(t_pet)))    # [1,d,1,1]，固定PET文本
-  q_pet_cond = q_pet + missing * E_missing      # missing=1-pet_available
-  A_ct  = sigmoid(gate_ct(GMP(C) + q_ct))       # [B,d,1,1]，只调制辅助分支
-  A_pet = sigmoid(gate_pet(GMP(P) + q_pet_cond))
-  D = C - avg_pool3x3(C)
-  B_raw = detail_pw(GELU(detail_dw(D)))         # 深度可分离细节，C->C
-  E_B = A_ct * B_raw
-  Q,K,V = q/k/v_proj(P)                         # C->d，d=max(C//4,1)
-  Qp/Kp/Vp: 网格池化到 [B,N,d]，N<=pool_size^2
-  M = softmax(Qp @ Kp^T / sqrt(d));  Z = M @ Vp
-  R_raw = region_out(upsample(Z))               # d->C
-  E_R = A_pet * R_raw
-  delta = out_proj(cat([E_B, E_R]))             # 2C->C，零初始化
-  F = (C + P) + delta                           # 唯一特征残差
+  q_ct  = GELU(LayerNorm(Linear_ct(t_ct)))      # [1,d,1,1]
+  q_pet = GELU(LayerNorm(Linear_pet(t_pet)))    # [1,d,1,1]
+  q_pet_cond = q_pet + missing * E_missing      # 只进PET频带门控条件
+  A_ct = sigmoid(gate_ct(GMP(C) + q_ct))        # [B,d,1,1]
+  D_ct = C - avgpool3x3(C)
+  E_ct = A_ct * detail_pw(GELU(detail_dw(D_ct)))
+  P_hat = rfft2(P); M_low = exp(-rho^2/(2 sigma^2))  # cycles/pixel坐标
+  P_low = irfft2(P_hat * M_low); P_high = P - P_low
+  A_low = sigmoid(gate_low(GMP(P_low) + q_pet_cond))
+  A_high = sigmoid(gate_high(GMP(P_high) + q_pet_cond))
+  P_band = A_low * P_low + A_high * P_high
+  E_pet = pet_pw(GELU(P_band))
+  delta = out_proj(cat([E_ct, E_pet]))          # 2C->C，零初始化
+  F = (C + P) + delta                           # 唯一输出残差
 
 无效行（pet_valid=False）直接返回 C，不运行内部计算。
+sigma 是频率标准差（cycles/pixel），配置常量而非 Parameter。
 """
 from __future__ import annotations
 
@@ -43,8 +43,8 @@ DEFAULT_CT_PROMPT = 'A CT image showing anatomical structures and tumor boundari
 DEFAULT_PET_PROMPT = 'A PET image showing metabolically active tumor regions in the lungs.'
 DEFAULT_CHANNELS = (64, 128, 320, 512)
 TEXT_CACHE_FORMAT_VERSION = 2
-EXTRA_STATE_VERSION = 5
-EXTRA_STATE_ARCHITECTURE = 'state_text_detail_region_v1'
+EXTRA_STATE_VERSION = 6
+EXTRA_STATE_ARCHITECTURE = 'state_text_detail_frequency_v1'
 
 
 def _sentence_vector(value: Tensor) -> Tensor:
@@ -159,14 +159,24 @@ def _binary_rows(value: Any, batch: int, device: torch.device, name: str) -> Ten
     return result.bool()
 
 
-class _ScaleDetailRegionFusion(nn.Module):
-    def __init__(self, channels: int, text_dim: int, reduction: int, region_pool_size: int):
+def band_masks(height: int, width: int, sigma: float, device: torch.device) -> Tensor:
+    """固定高斯低通掩码 [1,1,H,W//2+1]，cycles/pixel 坐标，不做归一化。"""
+    if not math.isfinite(sigma) or not 0.0 < sigma <= 0.5:
+        raise ValueError(f'frequency sigma must be finite in (0, 0.5], got {sigma!r}')
+    fy = torch.fft.fftfreq(height, d=1.0)
+    fx = torch.fft.rfftfreq(width, d=1.0)
+    rho2 = fy[:, None] ** 2 + fx[None, :] ** 2
+    mask = torch.exp(-rho2 / (2.0 * sigma * sigma))
+    return mask.unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.float32)
+
+
+class _ScaleDetailFrequencyFusion(nn.Module):
+    def __init__(self, channels: int, text_dim: int, reduction: int, frequency_sigma: float):
         super().__init__()
-        if not isinstance(region_pool_size, int) or region_pool_size < 1:
-            raise ValueError('region_pool_size must be an integer >= 1')
+        if not math.isfinite(frequency_sigma) or not 0.0 < frequency_sigma <= 0.5:
+            raise ValueError(f'frequency_sigma must be finite in (0, 0.5], got {frequency_sigma!r}')
         hidden = max(channels // reduction, 1)
-        region_dim = max(channels // 4, 1)
-        self.region_pool_size = region_pool_size
+        self.frequency_sigma = float(frequency_sigma)
         self.missing_prompt = nn.Parameter(torch.zeros(1, channels, 1, 1))
         self.proj_ct = nn.Sequential(nn.Linear(text_dim, channels),
                                      nn.LayerNorm(channels), nn.GELU())
@@ -175,27 +185,37 @@ class _ScaleDetailRegionFusion(nn.Module):
         self.gate_ct = nn.Sequential(nn.Conv2d(channels, hidden, 1),
                                      nn.GELU(),
                                      nn.Conv2d(hidden, channels, 1))
-        self.gate_pet = nn.Sequential(nn.Conv2d(channels, hidden, 1),
+        self.gate_low = nn.Sequential(nn.Conv2d(channels, hidden, 1),
                                       nn.GELU(),
                                       nn.Conv2d(hidden, channels, 1))
+        self.gate_high = nn.Sequential(nn.Conv2d(channels, hidden, 1),
+                                       nn.GELU(),
+                                       nn.Conv2d(hidden, channels, 1))
         self.detail_dw = nn.Conv2d(channels, channels, 3, padding=1,
                                    groups=channels, bias=False)
         self.detail_pw = nn.Conv2d(channels, channels, 1, bias=False)
-        self.q_proj = nn.Conv2d(channels, region_dim, 1)
-        self.k_proj = nn.Conv2d(channels, region_dim, 1)
-        self.v_proj = nn.Conv2d(channels, region_dim, 1)
-        self.region_out = nn.Conv2d(region_dim, channels, 1)
+        self.pet_pw = nn.Conv2d(channels, channels, 1, bias=False)
         self.out_proj = nn.Conv2d(2 * channels, channels, 1, bias=True)
         nn.init.zeros_(self.missing_prompt)
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
+        self._text_used = True
+
+    def text_params(self):
+        for module in (self.proj_ct, self.proj_pet, self.gate_ct,
+                       self.gate_low, self.gate_high):
+            for param in module.parameters():
+                yield param
+        yield self.missing_prompt
 
     def forward(self, ct: Tensor, pet: Tensor, missing: Tensor,
                 text_ct: Tensor, text_pet: Tensor,
                 *, use_state: bool, use_text: bool,
-                diagnostics: bool) -> tuple[Tensor, dict[str, Tensor]]:
+                diagnostics: bool,
+                _fft_calls: list | None = None) -> tuple[Tensor, dict[str, Tensor]]:
         param_dtype = self.detail_dw.weight.dtype
-        a_ct = a_pet = None
+        a_ct = a_low = a_high = None
+        e_ct_band = e_pet_band = None
         if use_text:
             qc = self.proj_ct(text_ct.to(param_dtype)).unsqueeze(-1).unsqueeze(-1)
             qp = self.proj_pet(text_pet.to(param_dtype)).unsqueeze(-1).unsqueeze(-1)
@@ -203,55 +223,62 @@ class _ScaleDetailRegionFusion(nn.Module):
                 qp = qp + missing.reshape(-1, 1, 1, 1).to(qp.dtype) * self.missing_prompt.to(qp.dtype)
             with torch.autocast(device_type=ct.device.type, enabled=False):
                 gc_in = F.adaptive_max_pool2d(ct.float(), 1) + qc.float()
-                gp_in = F.adaptive_max_pool2d(pet.float(), 1) + qp.float()
-                a_ct = torch.sigmoid(self.gate_ct(gc_in))
-                a_pet = torch.sigmoid(self.gate_pet(gp_in))
-            a_ct = a_ct.to(ct.dtype)
-            a_pet = a_pet.to(pet.dtype)
+                a_ct = torch.sigmoid(self.gate_ct(gc_in)).to(ct.dtype)
         else:
             a_ct = ct.new_ones((ct.shape[0], ct.shape[1], 1, 1))
-            a_pet = pet.new_ones((pet.shape[0], pet.shape[1], 1, 1))
         detail_in = (ct - F.avg_pool2d(ct, kernel_size=3, stride=1, padding=1,
                                        count_include_pad=False)).to(param_dtype)
-        b_raw = self.detail_pw(F.gelu(self.detail_dw(detail_in))).to(ct.dtype)
-        e_b = a_ct * b_raw
-        q = self.q_proj(pet.to(param_dtype))
-        k = self.k_proj(pet.to(param_dtype))
-        v = self.v_proj(pet.to(param_dtype))
-        _, _, h, w = q.shape
-        kh, kw = min(self.region_pool_size, h), min(self.region_pool_size, w)
-        n, d = kh * kw, q.shape[1]
-        with torch.autocast(device_type=ct.device.type, enabled=False):
-            qp = F.adaptive_avg_pool2d(q.float(), (kh, kw)).reshape(q.shape[0], d, n).transpose(1, 2)
-            kp = F.adaptive_max_pool2d(k.float(), (kh, kw)).reshape(k.shape[0], d, n).transpose(1, 2)
-            vp = F.adaptive_avg_pool2d(v.float(), (kh, kw)).reshape(v.shape[0], d, n).transpose(1, 2)
-            m = torch.softmax((qp @ kp.transpose(-2, -1)) / math.sqrt(d), dim=-1)
-            z = (m @ vp).transpose(1, 2).reshape(q.shape[0], d, kh, kw)
-        z_up = F.interpolate(z.to(param_dtype), size=(h, w), mode='bilinear',
-                             align_corners=False)
-        r_raw = self.region_out(z_up).to(pet.dtype)
-        e_r = a_pet * r_raw
-        delta = self.out_proj(torch.cat([e_b.to(param_dtype), e_r.to(param_dtype)], dim=1))
-        out = (ct + pet) + delta.to(ct.dtype)
+        b_raw = self.detail_dw(detail_in)
+        b_raw = self.detail_pw(F.gelu(b_raw)).to(ct.dtype)
+        e_ct = a_ct * b_raw
+        if use_text:
+            _, _, h, w = pet.shape
+            with torch.autocast(device_type=pet.device.type, enabled=False):
+                if _fft_calls is not None:
+                    _fft_calls.append(1)
+                spec = torch.fft.rfft2(pet.float(), dim=(-2, -1), norm='ortho')
+                mask = band_masks(h, w, self.frequency_sigma, pet.device)
+                p_low = torch.fft.irfft2(spec * mask, s=(h, w), dim=(-2, -1), norm='ortho')
+                p_high = pet.float() - p_low
+                gl_in = F.adaptive_max_pool2d(p_low, 1) + qp.float()
+                gh_in = F.adaptive_max_pool2d(p_high, 1) + qp.float()
+                a_low = torch.sigmoid(self.gate_low(gl_in))
+                a_high = torch.sigmoid(self.gate_high(gh_in))
+                p_band = a_low * p_low + a_high * p_high
+            a_low = a_low.to(pet.dtype)
+            a_high = a_high.to(pet.dtype)
+        else:
+            p_band = pet.float()
+            a_low = pet.new_ones((pet.shape[0], pet.shape[1], 1, 1))
+            a_high = pet.new_ones((pet.shape[0], pet.shape[1], 1, 1))
+        e_pet = self.pet_pw(F.gelu(p_band.to(param_dtype))).to(pet.dtype)
+        if diagnostics:
+            e_ct_band = e_ct.detach()
+            e_pet_band = e_pet.detach()
+        delta = self.out_proj(torch.cat([e_ct.to(param_dtype), e_pet.to(param_dtype)], dim=1))
+        base = ct + pet
+        out = base + delta.to(base.dtype)
         info: dict[str, Tensor] = {}
         if diagnostics:
             info['a_ct'] = a_ct.detach()
-            info['a_pet'] = a_pet.detach()
-            info['e_b'] = e_b.detach()
-            info['e_r'] = e_r.detach()
+            info['a_low'] = a_low.detach()
+            info['a_high'] = a_high.detach()
+            info['e_ct'] = e_ct_band
+            info['e_pet'] = e_pet_band
+            info['base'] = base.detach()
             info['delta'] = delta.detach()
         return out, info
 
 
-class StateTextDetailRegionFusion(nn.Module):
-    """双文本细节/区域残差融合：辅助分支 + 唯一输出残差。"""
+class StateTextDetailFrequencyFusion(nn.Module):
+    """CT解剖细节 + PET傅里叶频带调制 + 单次输出残差。"""
 
     def __init__(self, channels: Sequence[int] = DEFAULT_CHANNELS, *,
                  ct_text_feature: Tensor | None = None,
                  pet_text_feature: Tensor | None = None,
                  text_dim: int = 512,
                  text_metadata: dict[str, Any] | None = None,
-                 reduction: int = 16, region_pool_size: int = 4,
+                 reduction: int = 16, frequency_sigma: float = 0.15,
                  enabled: bool = True, use_state: bool = True, use_text: bool = True,
                  diag_enabled: bool = False, diag_interval: int = 50):
         super().__init__()
@@ -259,8 +286,8 @@ class StateTextDetailRegionFusion(nn.Module):
             raise ValueError('channels must be a nonempty sequence of integers >= 2')
         if not isinstance(reduction, int) or reduction < 1:
             raise ValueError('reduction must be a positive integer')
-        if not isinstance(region_pool_size, int) or region_pool_size < 1:
-            raise ValueError('region_pool_size must be an integer >= 1')
+        if not math.isfinite(float(frequency_sigma)) or not 0.0 < float(frequency_sigma) <= 0.5:
+            raise ValueError('frequency_sigma must be finite in (0, 0.5]')
         if ct_text_feature is None or pet_text_feature is None:
             if use_text and enabled:
                 raise ValueError('Text enabled: supply real cached ct/pet text features')
@@ -275,7 +302,7 @@ class StateTextDetailRegionFusion(nn.Module):
                 raise ValueError('CT/PET text features must share [1,D]')
         self.channels = tuple(channels)
         self.reduction = reduction
-        self.region_pool_size = region_pool_size
+        self.frequency_sigma = float(frequency_sigma)
         self.enabled, self.use_state = bool(enabled), bool(use_state)
         self.use_text = bool(use_text)
         self.diag_enabled = bool(diag_enabled)
@@ -289,16 +316,23 @@ class StateTextDetailRegionFusion(nn.Module):
         self.text_metadata = dict(text_metadata or {'ct_prompt': DEFAULT_CT_PROMPT,
                                                     'pet_prompt': DEFAULT_PET_PROMPT,
                                                     'backend': 'provided-vector'})
-        self.scales = nn.ModuleList([_ScaleDetailRegionFusion(c, ct_vector.shape[1], reduction,
-                                                              region_pool_size)
+        self.scales = nn.ModuleList([_ScaleDetailFrequencyFusion(c, ct_vector.shape[1], reduction,
+                                                                 self.frequency_sigma)
                                      for c in channels])
+        if not self.use_text:
+            for block in self.scales:
+                for param in block.text_params():
+                    param.requires_grad_(False)
+        elif not self.use_state:
+            for block in self.scales:
+                block.missing_prompt.requires_grad_(False)
         self._diag_stats: dict[str, Any] = {'forwards': 0, 'scales': {}}
         self._diag_forward_count = 0
 
     @classmethod
     def from_text_cache(cls, path: str | Path, *,
                         channels: Sequence[int] = DEFAULT_CHANNELS,
-                        **kwargs: Any) -> 'StateTextDetailRegionFusion':
+                        **kwargs: Any) -> 'StateTextDetailFrequencyFusion':
         cache = torch.load(path, map_location='cpu', weights_only=True)
         if not isinstance(cache, dict) or cache.get('format_version') != TEXT_CACHE_FORMAT_VERSION:
             raise ValueError(
@@ -315,7 +349,7 @@ class StateTextDetailRegionFusion(nn.Module):
         return {'version': EXTRA_STATE_VERSION, 'architecture': EXTRA_STATE_ARCHITECTURE,
                 'text_metadata': self.text_metadata,
                 'config': {'channels': self.channels, 'reduction': self.reduction,
-                           'region_pool_size': self.region_pool_size,
+                           'frequency_sigma': self.frequency_sigma,
                            'enabled': self.enabled, 'use_state': self.use_state,
                            'use_text': self.use_text,
                            'diag_enabled': self.diag_enabled,
@@ -327,7 +361,7 @@ class StateTextDetailRegionFusion(nn.Module):
                 'Unsupported fusion checkpoint metadata: expected '
                 f'{EXTRA_STATE_ARCHITECTURE} version={EXTRA_STATE_VERSION}, got '
                 f'version={state.get("version") if isinstance(state, dict) else type(state)}; '
-                'competitive-v1 and older AFA weights cannot convert; '
+                'detail-region-v1, competitive-v1 and older AFA weights cannot convert; '
                 'evaluate them on their branches.')
         if state.get('architecture') != EXTRA_STATE_ARCHITECTURE:
             raise ValueError(
@@ -339,7 +373,9 @@ class StateTextDetailRegionFusion(nn.Module):
             incoming.pop(key, None)
             current.pop(key, None)
         if incoming != current:
-            raise ValueError('Fusion checkpoint config differs; construct the same architecture/flags')
+            raise ValueError(
+                'Fusion checkpoint config differs (channels/reduction/frequency_sigma/'
+                'enabled/use_text/use_state); construct the same architecture/flags')
         self.text_metadata = dict(state['text_metadata'])
 
     def forward(self, ct_feats: Sequence[Tensor], pet_feats: Sequence[Tensor],
@@ -392,8 +428,9 @@ class StateTextDetailRegionFusion(nn.Module):
                     info.update(more)
                     if diag_on:
                         self._accumulate_diag(i, state, rows, more.get('a_ct'),
-                                              more.get('a_pet'), more.get('e_b'),
-                                              more.get('e_r'), more.get('delta'))
+                                              more.get('a_low'), more.get('a_high'),
+                                              more.get('e_ct'), more.get('e_pet'),
+                                              more.get('base'), more.get('delta'))
                 out = ct.index_copy(0, rows, fused.to(ct.dtype))
             outputs.append(out)
             infos.append(info)
@@ -406,7 +443,8 @@ class StateTextDetailRegionFusion(nn.Module):
         flat = x.detach().float().reshape(x.shape[0], -1)
         return flat.pow(2).mean(1).sqrt()
 
-    def _accumulate_diag(self, scale_idx, state, rows, a_ct, a_pet, e_b, e_r, delta) -> None:
+    def _accumulate_diag(self, scale_idx, state, rows, a_ct, a_low, a_high,
+                         e_ct, e_pet, base, delta) -> None:
         entry = self._diag_stats['scales'].setdefault(
             f'scale{scale_idx + 1}',
             {'full': self._empty_group(), 'missing': self._empty_group()},
@@ -424,15 +462,18 @@ class StateTextDetailRegionFusion(nn.Module):
             pos = torch.tensor(positions, device=rows.device)
             if self.use_text:
                 group['a_ct_sum'] += float(a_ct.detach().float().index_select(0, pos).mean().item()) * len(positions)
-                group['a_pet_sum'] += float(a_pet.detach().float().index_select(0, pos).mean().item()) * len(positions)
-            group['e_b_rms_sum'] += float(self._sample_rms(e_b.index_select(0, pos)).mean().item()) * len(positions)
-            group['e_r_rms_sum'] += float(self._sample_rms(e_r.index_select(0, pos)).mean().item()) * len(positions)
+                group['a_low_sum'] += float(a_low.detach().float().index_select(0, pos).mean().item()) * len(positions)
+                group['a_high_sum'] += float(a_high.detach().float().index_select(0, pos).mean().item()) * len(positions)
+            group['e_ct_rms_sum'] += float(self._sample_rms(e_ct.index_select(0, pos)).mean().item()) * len(positions)
+            group['e_pet_rms_sum'] += float(self._sample_rms(e_pet.index_select(0, pos)).mean().item()) * len(positions)
+            group['base_rms_sum'] += float(self._sample_rms(base.index_select(0, pos)).mean().item()) * len(positions)
             group['delta_rms_sum'] += float(self._sample_rms(delta.index_select(0, pos)).mean().item()) * len(positions)
 
     @staticmethod
     def _empty_group() -> dict[str, Any]:
-        return {'count': 0, 'a_ct_sum': 0.0, 'a_pet_sum': 0.0,
-                'e_b_rms_sum': 0.0, 'e_r_rms_sum': 0.0, 'delta_rms_sum': 0.0}
+        return {'count': 0, 'a_ct_sum': 0.0, 'a_low_sum': 0.0, 'a_high_sum': 0.0,
+                'e_ct_rms_sum': 0.0, 'e_pet_rms_sum': 0.0,
+                'base_rms_sum': 0.0, 'delta_rms_sum': 0.0}
 
     def reset_diag_stats(self) -> None:
         self._diag_stats = {'forwards': 0, 'scales': {}}
@@ -446,15 +487,18 @@ class StateTextDetailRegionFusion(nn.Module):
                 n = int(g['count'])
                 if n == 0:
                     out['scales'][scale][tag] = {'count': 0, 'a_ct_mean': None,
-                                                 'a_pet_mean': None, 'e_b_rms': None,
-                                                 'e_r_rms': None, 'delta_rms': None}
+                                                 'a_low_mean': None, 'a_high_mean': None,
+                                                 'e_ct_rms': None, 'e_pet_rms': None,
+                                                 'base_rms': None, 'delta_rms': None}
                     continue
                 out['scales'][scale][tag] = {
                     'count': n,
                     'a_ct_mean': g['a_ct_sum'] / n if self.use_text else 'n/a',
-                    'a_pet_mean': g['a_pet_sum'] / n if self.use_text else 'n/a',
-                    'e_b_rms': g['e_b_rms_sum'] / n,
-                    'e_r_rms': g['e_r_rms_sum'] / n,
+                    'a_low_mean': g['a_low_sum'] / n if self.use_text else 'n/a',
+                    'a_high_mean': g['a_high_sum'] / n if self.use_text else 'n/a',
+                    'e_ct_rms': g['e_ct_rms_sum'] / n,
+                    'e_pet_rms': g['e_pet_rms_sum'] / n,
+                    'base_rms': g['base_rms_sum'] / n,
                     'delta_rms': g['delta_rms_sum'] / n,
                 }
         self.reset_diag_stats()
@@ -462,7 +506,7 @@ class StateTextDetailRegionFusion(nn.Module):
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser('detail-region text-pair cache')
+    p = argparse.ArgumentParser('detail-frequency text-pair cache')
     p.add_argument('--encode-text-pair', type=str, default=None)
     p.add_argument('--model-path', type=str, default=None)
     p.add_argument('--ct-prompt', type=str, default=DEFAULT_CT_PROMPT)

@@ -199,9 +199,11 @@ def _write_module2_diag_csv(path, epoch, stats):
                 'epoch': int(epoch), 'scale': scale, 'group': tag,
                 'count': g.get('count', 0),
                 'a_ct_mean': g.get('a_ct_mean'),
-                'a_pet_mean': g.get('a_pet_mean'),
-                'e_b_rms': g.get('e_b_rms'),
-                'e_r_rms': g.get('e_r_rms'),
+                'a_low_mean': g.get('a_low_mean'),
+                'a_high_mean': g.get('a_high_mean'),
+                'e_ct_rms': g.get('e_ct_rms'),
+                'e_pet_rms': g.get('e_pet_rms'),
+                'base_rms': g.get('base_rms'),
                 'delta_rms': g.get('delta_rms'),
             })
     if not rows:
@@ -219,7 +221,7 @@ def main():
     cfg = SegMDTConfig.parse_arguments()
     pair_out = getattr(cfg, 'encode_text_pair', None)
     if pair_out:
-        from models.petct_state_text_detail_region import encode_text_pair, save_text_pair_cache
+        from models.petct_state_text_detail_frequency import encode_text_pair, save_text_pair_cache
         if not getattr(cfg, 'module2_text_model_path', None):
             raise SystemExit('--encode-text-pair requires --module2_text_model_path DIR')
         ct_v, pet_v, meta = encode_text_pair(
@@ -634,8 +636,11 @@ def main():
                 and hasattr(fusion, 'pop_diag_stats')):
             try:
                 module2_diag_stats = fusion.pop_diag_stats()
-            except Exception:
-                module2_diag_stats = None
+            except Exception as exc:
+                raise RuntimeError(
+                    f'module2 diagnostics failed at epoch {epoch}: {exc!r}; '
+                    'diagnostics must not silently corrupt training logs'
+                ) from exc
         if module2_diag_stats is not None:
             _write_module2_diag_csv(
                 os.path.join(cfg.checkpoint_dir, 'module2_diag.csv'),
