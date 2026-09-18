@@ -55,8 +55,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pspi_build_stage=4,
         pspi_cluster_max_iter=25,
         pspi_outlier_discard_rate=0.05,
-        pspi_bank_update_mode='direct',
-        pspi_ema_momentum=0.999,
+        pspi_bank_update_mode='matched_ema',
+        pspi_ema_momentum=0.95,
         pspi_retrieval_temperature=0.1,
         pspi_proto_temperature=0.02,
         pspi_collect_candidates=True,
@@ -69,6 +69,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
         module2_use_state=True,
         module2_use_text=True,
         module2_use_afa=True,
+        module2_diag_enabled=False,
+        module2_diag_interval=50,
         module2_text_feature=None,
         module2_text_metadata=None,
     ):
@@ -85,6 +87,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
         self.module2_use_state = bool(module2_use_state)
         self.module2_use_text = bool(module2_use_text)
         self.module2_use_afa = bool(module2_use_afa)
+        self.module2_diag_enabled = bool(module2_diag_enabled)
+        self.module2_diag_interval = int(module2_diag_interval)
         if self.module2_enabled:
             self._init_module2_fusion(
                 pet_channels,
@@ -195,6 +199,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 use_state=self.module2_use_state,
                 use_text=self.module2_use_text,
                 use_afa=self.module2_use_afa,
+                diag_enabled=self.module2_diag_enabled,
+                diag_interval=self.module2_diag_interval,
             )
         if not (self.module2_use_state and self.module2_use_text and self.module2_use_afa):
             for name, param in self.fusion.named_parameters():

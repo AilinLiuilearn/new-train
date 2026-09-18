@@ -637,7 +637,7 @@ def build_mdt_seg_teacher(config, *, module2_checkpoint_state=None):
         pspi_build_stage=getattr(config, 'pspi_build_stage', 4),
         pspi_cluster_max_iter=getattr(config, 'pspi_cluster_max_iter', 25),
         pspi_outlier_discard_rate=getattr(config, 'pspi_outlier_discard_rate', 0.05),
-        pspi_bank_update_mode=getattr(config, 'pspi_bank_update_mode', 'direct'),
+        pspi_bank_update_mode=getattr(config, 'pspi_bank_update_mode', 'matched_ema'),
         pspi_ema_momentum=getattr(config, 'pspi_ema_momentum', 0.95),
         pspi_retrieval_temperature=getattr(config, 'pspi_retrieval_temperature', 0.1),
         pspi_proto_temperature=getattr(config, 'pspi_proto_temperature', 0.02),
@@ -651,6 +651,8 @@ def build_mdt_seg_teacher(config, *, module2_checkpoint_state=None):
         module2_use_state=bool(getattr(config, 'module2_use_state', True)),
         module2_use_text=bool(getattr(config, 'module2_use_text', True)),
         module2_use_afa=bool(getattr(config, 'module2_use_afa', True)),
+        module2_diag_enabled=bool(getattr(config, 'module2_diag_enabled', False)),
+        module2_diag_interval=int(getattr(config, 'module2_diag_interval', 50)),
         module2_text_feature=module2_text_feature,
         module2_text_metadata=module2_text_metadata,
     )
@@ -666,6 +668,10 @@ def build_mdt_seg_teacher(config, *, module2_checkpoint_state=None):
         assert all(p.requires_grad for p in model.ct_align.parameters())
     pspi_enabled = bool(getattr(config, 'pspi_enabled', True))
     fusion_name = 'StateTextAFAFusion' if module2_on else 'AddFusion'
+    # Log the ACTUAL module1 config (not a getattr default that may disagree
+    # with real execution when restoring legacy checkpoints).
+    actual_bank_mode = getattr(model.module1.config, 'bank_update_mode', None) if model.module1 is not None else None
+    actual_bank_momentum = float(getattr(model.module1.config, 'ema_momentum', 0.95)) if model.module1 is not None else 0.95
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
@@ -702,8 +708,8 @@ def build_mdt_seg_teacher(config, *, module2_checkpoint_state=None):
         f'cold_start=epoch1 '
         f'S4_K_per_class={getattr(config, "pspi_num_clusters", 6)} '
         f'mixed_50_50 '
-        f'bank_update={getattr(config, "pspi_bank_update_mode", "direct")} '
-        f'ema_momentum={getattr(config, "pspi_ema_momentum", 0.95)} '
+        f'bank_update={actual_bank_mode} '
+        f'ema_momentum={actual_bank_momentum} '
         f'K={getattr(config, "pspi_num_clusters", 6)} '
         f'build_stage=S{getattr(config, "pspi_build_stage", 4)} '
         f'full_path={"raw_CT_plus_real_PET" if not module2_on else "CT_plus_fused_PET_StateTextAFA"} '

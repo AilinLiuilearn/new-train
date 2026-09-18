@@ -61,6 +61,9 @@ def _cpu_config(**overrides):
     cfg.random_state = 2023
     for k, v in overrides.items():
         setattr(cfg, k, v)
+    # v3 default must be matched_ema/0.95 unless the caller overrides.
+    if "pspi_bank_update_mode" not in overrides:
+        assert cfg.pspi_bank_update_mode == "matched_ema", cfg.pspi_bank_update_mode
     return cfg
 
 
@@ -176,6 +179,7 @@ def test_two_stage_cold_then_ready():
     _check_full_branch_updates(task, device)
     report = task.model.finalize_module1_epoch(epoch=1)
     assert task.model.module1.bank_ready
+    assert report["status"] == "bank_updated"
     print(f"[finalize] status={report['status']} version={int(task.model.module1.bank_version.item())}")
     stage_b = [
         _batch(device)

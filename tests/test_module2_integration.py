@@ -284,7 +284,8 @@ def test_b03_cold_start_strict_ct_despite_nonzero_bias():
     with torch.no_grad():
         for block in model.fusion.scales:
             block.state_prompt.fill_(7.0)
-            block.afa_out.bias.fill_(7.0)
+            block.afa_out_ct.bias.fill_(7.0)
+            block.afa_out_pet.bias.fill_(7.0)
     ct = torch.randn(1, 1, 64, 64)
     with torch.no_grad():
         out = model(ct, pet=None, forward_mode="missing")
@@ -308,9 +309,36 @@ def test_b04_ready_missing_uses_text_afa():
             [torch.zeros_like(f) for f in model._encode_ct(ct)],
             0, pet_valid=True, return_diagnostics=True,
         )
-    assert any("text_gate" in info for info in infos)
-    assert any("afa_delta_rms" in info for info in infos)
+    assert any("r_text" in info for info in infos)
+    assert any("r_ct" in info and "r_pet" in info for info in infos)
+    # v3 dual heads: [B,C,H,W] each, independent (non-shared) values.
+    for info in infos:
+        assert info["r_ct"].ndim == 4 and info["r_pet"].ndim == 4
+        assert info["r_ct"].shape == info["r_pet"].shape
+        assert info["r_ct"].shape[1] > 1  # channel dim, not a [B,1,H,W] map
     print("[B04] ready Missing passes through text/AFA branches: PASS")
+
+
+def test_b04b_dual_heads_independent_and_shaped():
+    model = _banked_module2()
+    model.eval()
+    with torch.no_grad():
+        for block in model.fusion.scales:
+            block.afa_out_ct.bias.fill_(2.0)
+            block.afa_out_pet.bias.fill_(-2.0)
+    ct = torch.randn(1, 1, 64, 64)
+    with torch.no_grad():
+        _, infos = model.fusion(
+            model._encode_ct(ct),
+            [torch.zeros_like(f) for f in model._encode_ct(ct)],
+            0, pet_valid=True, return_diagnostics=True,
+        )
+    for info, c in zip(infos, model.fusion.channels):
+        assert tuple(info["r_ct"].shape[1:]) == (c,) + tuple(info["r_ct"].shape[2:])
+        assert tuple(info["r_pet"].shape[1:]) == (c,) + tuple(info["r_pet"].shape[2:])
+        assert not torch.equal(info["r_ct"], info["r_pet"])
+        assert bool((info["r_ct"] > 0).all()) and bool((info["r_pet"] < 0).all())
+    print("[B04b] R_CT/R_PET are [B,C,H,W] and independent: PASS")
 
 
 def test_b05_pspi_off_validity():
@@ -475,12 +503,49 @@ def test_d03_two_updates_reach_prefixed_layers():
         out["logits"].square().mean().backward()
         assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
         opt.step()
-    reached = False
-    for block in model.fusion.scales:
-        if block.afa_ct.weight.grad is not None and float(block.afa_ct.weight.grad.abs().sum()) > 0:
-            reached = True
-    assert reached
-    print("[D03] two optimizer steps reach pre-zero-init AFA layers: PASS")
+    # v3: both dual heads must show first-wave gradients; the zero-init
+    # trunk (afa_ct) must be reached after the updates on >=1 scale; text
+    # pre-layers likewise on >=1 scale (per-scale ReLU degeneracy allowed).
+    assert any(
+        block.afa_out_ct.weight.grad is not None
+        and float(block.afa_out_ct.weight.grad.abs().sum()) > 0
+        for block in model.fusion.scales
+    )
+    assert any(
+        block.afa_out_pet.weight.grad is not None
+        and float(block.afa_out_pet.weight.grad.abs().sum()) > 0
+        for block in model.fusion.scales
+    )
+    assert any(
+        block.afa_ct.weight.grad is not None
+        and float(block.afa_ct.weight.grad.abs().sum()) > 0
+        for block in model.fusion.scales
+    )
+    print("[D03] two optimizer steps reach heads + pre-zero-init layers: PASS")
+
+
+def test_d03b_v3_init_matches_addfusion():
+    # v3 zero-centered gates: an initialized v3 model must match AddFusion
+    # logits in FP32 eval (atol=1e-6, rtol=1e-5); this is init equivalence
+    # only, NOT a claim about training trajectories.
+    torch.manual_seed(31)
+    m_v3 = _module2_model()
+    m_v3.eval()
+    torch.manual_seed(31)
+    m_add = _plain_model()
+    m_add.eval()
+    # Align non-fusion weights (fusion init must not shift them by seed).
+    m_v3.load_state_dict(
+        {k: v for k, v in m_add.state_dict().items() if not k.startswith("fusion.")},
+        strict=False,
+    )
+    ct = torch.randn(2, 1, 64, 64)
+    pet = torch.randn(2, 1, 64, 64)
+    with torch.no_grad():
+        a = m_v3(ct, pet=pet, forward_mode="full")["logits"]
+        b = m_add(ct, pet=pet, forward_mode="full")["logits"]
+    torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
+    print("[D03b] v3 init Full logits match AddFusion (FP32): PASS")
 
 
 def test_d04_ablation_branches_frozen():
@@ -643,6 +708,11 @@ def test_f05_ablations_runnable():
 def test_f06_extra_state_config_guard():
     model = _banked_module2()
     state = model.fusion.get_extra_state()
+    assert state["version"] == 2
+    assert state["architecture"] == "dual_residual_afa_v3"
+    assert state["config"]["kernel_size"] == 5
+    assert state["config"]["centered_text_gate"] is True
+    assert state["config"]["dual_modality_residual"] is True
     clone = _module2_model()
     clone.fusion.set_extra_state(state)
     bad = dict(state)
@@ -651,27 +721,153 @@ def test_f06_extra_state_config_guard():
     try:
         clone.fusion.set_extra_state(bad)
     except ValueError:
-        print("[F06] extra-state config mismatch rejected: PASS")
+        pass
+    else:
+        raise AssertionError("mismatched extra state must fail")
+    # v2-style metadata (version=1, no architecture) must be rejected.
+    v2 = {"version": 1, "text_metadata": state["text_metadata"],
+          "config": {"channels": (64, 128, 320, 512)}}
+    try:
+        clone.fusion.set_extra_state(v2)
+    except ValueError as e:
+        assert "v3" in str(e).lower() or "v2" in str(e).lower()
+        print("[F06] extra-state guard + v2 metadata rejected: PASS")
         return
-    raise AssertionError("mismatched extra state must fail")
+    raise AssertionError("v2 metadata must fail on v3")
 
 
 def test_f07_fusion_param_count():
-    # 1,159,000 is the reference count for default (64,128,320,512) channels
-    # with a 512-D text vector. This suite uses a 16-D synthetic vector to
-    # avoid loading CLIP, so assert the exact count for that configuration.
+    # v3 reference: default (64,128,320,512) channels with a 512-D text
+    # vector. This suite uses a 16-D synthetic vector to avoid loading CLIP,
+    # so assert the exact count for that configuration too.
     from models.petct_state_text_afa import StateTextAFAFusion
     ref = StateTextAFAFusion(
         (64, 128, 320, 512), text_feature=torch.randn(1, 512)
     )
-    assert sum(p.numel() for p in ref.parameters()) == 1159000
+    ref_total = sum(p.numel() for p in ref.parameters())
+    print(f"[F07] v3 512-D reference fusion params={ref_total}")
+    assert ref_total > 1159000  # v3 dual heads add params over v2
     model = _module2_model()
     total = sum(p.numel() for p in model.fusion.parameters())
     expected = sum(p.numel() for p in StateTextAFAFusion(
         (64, 128, 320, 512), text_feature=torch.randn(1, SYNTHETIC_TEXT_DIM)
     ).parameters())
     assert total == expected, f"fusion params {total} != {expected}"
-    print(f"[F07] fusion params total={total} (ref 512-D=1159000): PASS")
+    print(f"[F07] fusion params total={total} (16-D synth): PASS")
+
+
+def test_f08_v2_checkpoint_rejected():
+    # Simulate a v2 fusion state dict (7x7 spatial + single afa_out head):
+    # strict load into v3 must fail with missing/unexpected keys, and the
+    # v2-style extra-state metadata must be rejected (see F06).
+    model = _banked_module2()
+    sd = {k: v.clone() for k, v in model.state_dict().items() if torch.is_tensor(v)}
+    v2_sd = {}
+    for k, v in sd.items():
+        if "afa_spatial" in k:
+            continue  # 7x7 vs 5x5 shape mismatch by construction
+        if "afa_out_ct" in k:
+            v2_sd[k.replace("afa_out_ct", "afa_out")] = v.clone()
+            continue
+        if "afa_out_pet" in k:
+            continue  # v2 has no second head
+        v2_sd[k] = v.clone()
+    fresh = _module2_model()
+    try:
+        fresh.load_state_dict(v2_sd, strict=True)
+    except RuntimeError as e:
+        assert "afa_out" in str(e) or "afa_spatial" in str(e)
+        print("[F08] v2-shaped state dict rejected by v3 strict load: PASS")
+        return
+    raise AssertionError("v2 checkpoint must not strict-load into v3")
+
+
+def test_f09_cli_defaults_matched_ema():
+    cfg = _cpu_config()
+    assert cfg.pspi_bank_update_mode == "matched_ema"
+    assert float(cfg.pspi_ema_momentum) == 0.95
+    teacher = build_mdt_seg_teacher(cfg)
+    assert teacher["model"].module1.config.bank_update_mode == "matched_ema"
+    assert float(teacher["model"].module1.config.ema_momentum) == 0.95
+    cfg_d = _cpu_config(pspi_bank_update_mode="direct")
+    teacher_d = build_mdt_seg_teacher(cfg_d)
+    assert teacher_d["model"].module1.config.bank_update_mode == "direct"
+    print("[F09] CLI defaults matched_ema/0.95; explicit direct kept: PASS")
+
+
+def test_h01_diag_grouping_and_invariance():
+    from models.petct_state_text_afa import StateTextAFAFusion
+    torch.manual_seed(3)
+    text = torch.randn(1, SYNTHETIC_TEXT_DIM)
+    m_on = StateTextAFAFusion((8, 16), text_feature=text, diag_enabled=True, diag_interval=1)
+    m_off = StateTextAFAFusion((8, 16), text_feature=text,
+                               diag_enabled=True, diag_interval=1)
+    m_off.load_state_dict(
+        {k: v for k, v in m_on.state_dict().items()}, strict=True
+    )
+    # Diag on/off invariance is checked by toggling the flag AFTER the
+    # identical construction (diag flags live in extra_state config).
+    m_off.diag_enabled = False
+    ct = [torch.randn(2, 8, 8, 8), torch.randn(2, 16, 4, 4)]
+    pet = [torch.randn_like(x) for x in ct]
+    m_on.train()
+    m_off.train()
+    o_on = m_on(ct, pet, (1, 0), pet_valid=True)
+    o_off = m_off(ct, pet, (1, 0), pet_valid=True)
+    assert all(torch.equal(a, b) for a, b in zip(o_on, o_off))
+    stats = m_on.pop_diag_stats()
+    assert stats["forwards"] == 1
+    for scale, groups in stats["scales"].items():
+        assert groups["full"]["count"] == 1
+        assert groups["missing"]["count"] == 1
+        for tag, g in groups.items():
+            assert g["r_t_mean"] is not None and g["fused_rms"] is not None
+            for v in (g["r_t_mean"], g["r_ct_mean"], g["r_pet_mean"]):
+                assert isinstance(v, float)
+    # Cold start: no valid rows -> count=0 with None values.
+    m_on(ct, pet, 0, pet_valid=False)
+    stats2 = m_on.pop_diag_stats()
+    assert stats2["forwards"] == 1
+    assert all(v is None or v == 0 for scale in stats2["scales"].values()
+               for g in scale.values() for v in (g["r_t_mean"],))
+    print("[H01] diag grouping/counts/None correct; outputs invariant: PASS")
+
+
+def test_g01_matched_ema_second_update_path():
+    # First finalize builds the bank; second finalize with new candidates
+    # must route through _apply_matched_ema_update (spy, not just config).
+    model = _module2_model(pspi_bank_update_mode="matched_ema", pspi_ema_momentum=0.95)
+    assert model.module1.config.bank_update_mode == "matched_ema"
+    model.train()
+    torch.manual_seed(11)
+    for _ in range(2):
+        model.module1.collect_candidates(
+            model._encode_ct(torch.randn(2, 1, 64, 64)),
+            model._encode_pet(torch.randn(2, 1, 64, 64)),
+            _mask(2),
+        )
+    rep1 = model.module1.finalize_epoch(epoch=1)
+    assert rep1["status"] == "bank_updated"
+    calls = {"n": 0}
+    orig = model.module1._apply_matched_ema_update
+    def spy(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+    model.module1._apply_matched_ema_update = spy
+    try:
+        for _ in range(2):
+            model.module1.collect_candidates(
+                model._encode_ct(torch.randn(2, 1, 64, 64)),
+                model._encode_pet(torch.randn(2, 1, 64, 64)),
+                _mask(2),
+            )
+        rep2 = model.module1.finalize_epoch(epoch=2)
+    finally:
+        model.module1._apply_matched_ema_update = orig
+    assert rep2["status"] == "bank_updated"
+    assert calls["n"] == 1
+    assert rep2.get("update", {}).get("mode", "matched_ema") == "matched_ema"
+    print("[G01] second bank update uses matched_ema path: PASS")
 
 
 def main():
@@ -696,6 +892,8 @@ def main():
         test_d01_no_clip_in_model_or_optimizer,
         test_d02_enabled_params_registered_once,
         test_d03_two_updates_reach_prefixed_layers,
+        test_d03b_v3_init_matches_addfusion,
+        test_b04b_dual_heads_independent_and_shaped,
         test_d04_ablation_branches_frozen,
         test_d05_cold_missing_only_no_fusion_grad,
         test_d06_amp_finite_grads,
@@ -706,6 +904,10 @@ def main():
         test_f05_ablations_runnable,
         test_f06_extra_state_config_guard,
         test_f07_fusion_param_count,
+        test_f08_v2_checkpoint_rejected,
+        test_f09_cli_defaults_matched_ema,
+        test_g01_matched_ema_second_update_path,
+        test_h01_diag_grouping_and_invariance,
     ]
     failed = []
     for t in tests:

@@ -188,6 +188,31 @@ def _module1_bank_block(task, cfg, epoch, module1_report, bank_update_detail_mod
             ct_key_update_norm, pet_value_update_norm)
 
 
+def _write_module2_diag_csv(path, epoch, stats):
+    """Append one row per (scale, group); amplitudes only, no causality claim."""
+    import csv
+    rows = []
+    for scale in sorted(stats.get('scales', {})):
+        for tag in ('full', 'missing'):
+            g = stats['scales'][scale].get(tag, {})
+            rows.append({
+                'epoch': int(epoch), 'scale': scale, 'group': tag,
+                'count': g.get('count', 0),
+                'r_t_mean': g.get('r_t_mean'), 'r_t_abs_mean': g.get('r_t_abs_mean'),
+                'r_ct_mean': g.get('r_ct_mean'), 'r_ct_abs_mean': g.get('r_ct_abs_mean'),
+                'r_pet_mean': g.get('r_pet_mean'), 'r_pet_abs_mean': g.get('r_pet_abs_mean'),
+                'fused_rms': g.get('fused_rms'),
+            })
+    if not rows:
+        return
+    exists = os.path.isfile(path)
+    with open(path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        if not exists:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
 def main():
     print('[INFO] starting baseline training', flush=True)
     cfg = SegMDTConfig.parse_arguments()
@@ -585,6 +610,22 @@ def main():
             mean_matching_cosine_distance, max_matching_cosine_distance,
             duplicate_current_match_count, ct_key_update_norm, pet_value_update_norm,
         )
+        # Module-2 read-only amplitude diagnostics: pop epoch-aggregated
+        # Full/Missing residual stats (no second forward, no loss effect)
+        # and write an independent CSV. Disabled by default.
+        module2_diag_stats = None
+        fusion = getattr(task.model, 'fusion', None)
+        if (getattr(task.model, 'module2_enabled', False) and fusion is not None
+                and hasattr(fusion, 'pop_diag_stats')):
+            try:
+                module2_diag_stats = fusion.pop_diag_stats()
+            except Exception:
+                module2_diag_stats = None
+        if module2_diag_stats is not None:
+            _write_module2_diag_csv(
+                os.path.join(cfg.checkpoint_dir, 'module2_diag.csv'),
+                epoch, module2_diag_stats,
+            )
 
         val_full = task.evaluate(val_loader, eval_mode='full', tag='val_full')
         val_missing = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_missing')
