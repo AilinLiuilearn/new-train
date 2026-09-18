@@ -4,10 +4,10 @@ import torch
 import torch.nn as nn
 import timm
 
-from models.petct_state_text_competitive import (
+from models.petct_state_text_detail_region import (
     DEFAULT_CT_PROMPT,
     DEFAULT_PET_PROMPT,
-    StateTextCompetitiveFusion,
+    StateTextDetailRegionFusion,
     encode_text_pair,
 )
 
@@ -524,7 +524,7 @@ def _resolve_module2_text(config, pet_channels, module2_checkpoint_state=None):
             backend='clip', max_length=30, device='cpu',
         )
     if cache_path:
-        from models.petct_state_text_competitive import save_text_pair_cache as _save_cache
+        from models.petct_state_text_detail_region import save_text_pair_cache as _save_cache
         from pathlib import Path as _Path
 
         _save_cache(_Path(str(cache_path)).expanduser(), ct_vector, pet_vector, metadata)
@@ -546,8 +546,8 @@ def _validate_module2_cache(cache, ct_prompt, pet_prompt):
         raise ValueError('Module-2 text cache must be a dict file')
     if cache.get('format_version') == 1:
         raise ValueError(
-            'Single-PET v1 text cache cannot be used by the competitive module; '
-            'regenerate with: python models/petct_state_text_competitive.py '
+            'Single-PET v1 text cache cannot be used by the detail-region module; '
+            'regenerate with: python models/petct_state_text_detail_region.py '
             '--encode-text-pair pretrained/petct_competitive_text_v1.pt '
             '--model-path /root/autodl-tmp/mkd-main/new-train/pretrained/clip-vit-base-patch32'
         )
@@ -660,6 +660,7 @@ def build_mdt_seg_teacher(config, *, module2_checkpoint_state=None):
         module2_enabled=module2_on,
         module2_use_state=bool(getattr(config, 'module2_use_state', True)),
         module2_use_text=bool(getattr(config, 'module2_use_text', True)),
+        module2_region_pool_size=int(getattr(config, 'module2_region_pool_size', 4)),
         module2_diag_enabled=bool(getattr(config, 'module2_diag_enabled', False)),
         module2_diag_interval=int(getattr(config, 'module2_diag_interval', 50)),
         module2_ct_text_feature=module2_ct_text,
@@ -677,7 +678,7 @@ def build_mdt_seg_teacher(config, *, module2_checkpoint_state=None):
         assert all(p.requires_grad for p in model.enc_pet.parameters())
         assert all(p.requires_grad for p in model.ct_align.parameters())
     pspi_enabled = bool(getattr(config, 'pspi_enabled', True))
-    fusion_name = 'StateTextCompetitiveFusion' if module2_on else 'AddFusion'
+    fusion_name = 'StateTextDetailRegionFusion' if module2_on else 'AddFusion'
     # Log the ACTUAL module1 config (not a getattr default that may disagree
     # with real execution when restoring legacy checkpoints).
     actual_bank_mode = getattr(model.module1.config, 'bank_update_mode', None) if model.module1 is not None else None
@@ -721,8 +722,8 @@ def build_mdt_seg_teacher(config, *, module2_checkpoint_state=None):
         f'ema_momentum={actual_bank_momentum} '
         f'K={getattr(config, "pspi_num_clusters", 6)} '
         f'build_stage=S{getattr(config, "pspi_build_stage", 4)} '
-        f'full_path={"raw_CT_plus_real_PET" if not module2_on else "competitive_weighted_CT_PET"} '
-        f'missing_boundary={"CT_plus_ct_affine_prior" if affine_enabled and not module2_on else ("competitive_CT_plus_compensated_PET" if module2_on else "CT_plus_scale_weighted_PET_prior")} '
+        f'full_path={"raw_CT_plus_real_PET" if not module2_on else "detail_region_residual_CT_PET"} '
+        f'missing_boundary={"CT_plus_ct_affine_prior" if affine_enabled and not module2_on else ("detail_region_CT_plus_compensated_PET" if module2_on else "CT_plus_scale_weighted_PET_prior")} '
         f'prior_scale_type={"none_ct_affine_direct" if affine_enabled else "per_scale_scalar"} '
         f'prior_scale_init={prior_scale_init} '
         f'prior_scale_enabled={prior_scale_enabled} '
@@ -758,4 +759,36 @@ def _require_module2_checkpoint_consistency(state, config):
     if use_text and not (has_ct and has_pet):
         raise RuntimeError(
             'module2 text enabled but checkpoint lacks fusion.ct_text_feature/pet_text_feature'
+        )
+    expected_channels = (64, 128, 320, 512)
+    unexpected = sorted({k for k in fusion_keys
+                         if '.channel_selector.' in k or '.spatial_selector.' in k
+                         or '.vis_ct.' in k or '.vis_pet.' in k
+                         or '.state_prompt' in k or '.text_proj' in k
+                         or '.text_gate' in k or '.afa_' in k})
+    if unexpected:
+        raise RuntimeError(
+            'Checkpoint carries competitive-v1 or older AFA fusion weights '
+            f'({unexpected[0]}...); they cannot load into state_text_detail_region_v1. '
+            'Evaluate them on their branches.'
+        )
+    detail_pool = int(getattr(config, 'module2_region_pool_size', 4))
+    if detail_pool < 1:
+        raise ValueError('module2_region_pool_size must be >= 1')
+    tmp = StateTextDetailRegionFusion(
+        expected_channels,
+        ct_text_feature=torch.zeros(1, 512) if use_text else None,
+        pet_text_feature=torch.zeros(1, 512) if use_text else None,
+        text_dim=512, region_pool_size=detail_pool,
+        enabled=True, use_state=bool(getattr(config, 'module2_use_state', True)),
+        use_text=use_text,
+    )
+    tmp_keys = set(tmp.state_dict())
+    missing = sorted(k for k in tmp_keys if f'fusion.{k}' not in state)
+    extra = sorted(k for k in fusion_keys if k.startswith('fusion.scales.')
+                   and k[len('fusion.'):] not in tmp_keys)
+    if missing or extra:
+        raise RuntimeError(
+            'Checkpoint fusion keys do not match state_text_detail_region_v1 '
+            f'(missing={missing[:3]}, extra={extra[:3]}); refusing silent strict=False.'
         )

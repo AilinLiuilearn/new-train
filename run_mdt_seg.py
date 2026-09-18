@@ -198,11 +198,11 @@ def _write_module2_diag_csv(path, epoch, stats):
             rows.append({
                 'epoch': int(epoch), 'scale': scale, 'group': tag,
                 'count': g.get('count', 0),
-                'r_ct_abs_mean': g.get('r_ct_abs_mean'),
-                'r_pet_abs_mean': g.get('r_pet_abs_mean'),
-                'a_ct_mean': g.get('a_ct_mean'), 'a_pet_mean': g.get('a_pet_mean'),
-                'branch_ct_rms': g.get('branch_ct_rms'),
-                'branch_pet_rms': g.get('branch_pet_rms'),
+                'a_ct_mean': g.get('a_ct_mean'),
+                'a_pet_mean': g.get('a_pet_mean'),
+                'e_b_rms': g.get('e_b_rms'),
+                'e_r_rms': g.get('e_r_rms'),
+                'delta_rms': g.get('delta_rms'),
             })
     if not rows:
         return
@@ -219,7 +219,7 @@ def main():
     cfg = SegMDTConfig.parse_arguments()
     pair_out = getattr(cfg, 'encode_text_pair', None)
     if pair_out:
-        from models.petct_state_text_competitive import encode_text_pair, save_text_pair_cache
+        from models.petct_state_text_detail_region import encode_text_pair, save_text_pair_cache
         if not getattr(cfg, 'module2_text_model_path', None):
             raise SystemExit('--encode-text-pair requires --module2_text_model_path DIR')
         ct_v, pet_v, meta = encode_text_pair(

@@ -6,7 +6,7 @@ import torch.nn as nn
 from models.baseline_blocks import AddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.ct_conditioned_pet_affine import CTConditionedPETAffine
-from models.petct_state_text_competitive import StateTextCompetitiveFusion
+from models.petct_state_text_detail_region import StateTextDetailRegionFusion
 from models.paired_semantic_prototype_imputation import (
     PairedSemanticPrototypeImputation,
 )
@@ -68,6 +68,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         module2_enabled=False,
         module2_use_state=True,
         module2_use_text=True,
+        module2_region_pool_size=4,
         module2_diag_enabled=False,
         module2_diag_interval=50,
         module2_ct_text_feature=None,
@@ -86,6 +87,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
         self.module2_enabled = bool(module2_enabled)
         self.module2_use_state = bool(module2_use_state)
         self.module2_use_text = bool(module2_use_text)
+        if not isinstance(module2_region_pool_size, int) or int(module2_region_pool_size) < 1:
+            raise ValueError('module2_region_pool_size must be an integer >= 1')
+        self.module2_region_pool_size = int(module2_region_pool_size)
         self.module2_diag_enabled = bool(module2_diag_enabled)
         self.module2_diag_interval = int(module2_diag_interval)
         if self.module2_enabled:
@@ -171,12 +175,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
             self.pet_affine = None
 
     def _init_module2_fusion(self, pet_channels, ct_text, pet_text, text_metadata):
-        """Construct StateTextCompetitiveFusion inside a CPU fork_rng guard.
+        """Construct StateTextDetailRegionFusion inside a CPU fork_rng guard.
 
         Creating it after all original modules are built AND inside fork_rng
         keeps the seed-determined initialization of decoder/module1/affine
-        untouched, so the disabled-equivalence test can compare against the
-        base commit.
+        untouched.
         """
         import torch as _torch
 
@@ -192,7 +195,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
             ct_feature = pet_feature = None
         metadata = dict(text_metadata) if text_metadata is not None else None
         with _torch.random.fork_rng(devices=[]):
-            self.fusion = StateTextCompetitiveFusion(
+            self.fusion = StateTextDetailRegionFusion(
                 list(pet_channels),
                 ct_text_feature=ct_feature,
                 pet_text_feature=pet_feature,
@@ -200,18 +203,22 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 enabled=True,
                 use_state=self.module2_use_state,
                 use_text=self.module2_use_text,
+                region_pool_size=self.module2_region_pool_size,
                 diag_enabled=self.module2_diag_enabled,
                 diag_interval=self.module2_diag_interval,
             )
-        if not (self.module2_use_state and self.module2_use_text):
-            for name, param in self.fusion.named_parameters():
-                if not param.requires_grad:
-                    continue
-                if not self.module2_use_state and '.missing_prompt' in name:
-                    param.requires_grad_(False)
-                elif not self.module2_use_text and ('.proj_' in name or '.gate_' in name
-                                                    or '.missing_prompt' in name):
-                    param.requires_grad_(False)
+        fusion = self.fusion
+        if not self.module2_use_text:
+            for block in fusion.scales:
+                for submodule in (block.proj_ct, block.proj_pet,
+                                  block.gate_ct, block.gate_pet):
+                    for param in submodule.parameters():
+                        param.requires_grad_(False)
+                fusion_row = block.missing_prompt
+                fusion_row.requires_grad_(False)
+        elif not self.module2_use_state:
+            for block in fusion.scales:
+                block.missing_prompt.requires_grad_(False)
 
     def missing_prior_alpha_vals(self):
         """Return per-scale alpha_l = sigmoid(a_l) detached tensors (legacy).
