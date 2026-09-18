@@ -198,10 +198,11 @@ def _write_module2_diag_csv(path, epoch, stats):
             rows.append({
                 'epoch': int(epoch), 'scale': scale, 'group': tag,
                 'count': g.get('count', 0),
-                'r_t_mean': g.get('r_t_mean'), 'r_t_abs_mean': g.get('r_t_abs_mean'),
-                'r_ct_mean': g.get('r_ct_mean'), 'r_ct_abs_mean': g.get('r_ct_abs_mean'),
-                'r_pet_mean': g.get('r_pet_mean'), 'r_pet_abs_mean': g.get('r_pet_abs_mean'),
-                'fused_rms': g.get('fused_rms'),
+                'r_ct_abs_mean': g.get('r_ct_abs_mean'),
+                'r_pet_abs_mean': g.get('r_pet_abs_mean'),
+                'a_ct_mean': g.get('a_ct_mean'), 'a_pet_mean': g.get('a_pet_mean'),
+                'branch_ct_rms': g.get('branch_ct_rms'),
+                'branch_pet_rms': g.get('branch_pet_rms'),
             })
     if not rows:
         return
@@ -216,6 +217,20 @@ def _write_module2_diag_csv(path, epoch, stats):
 def main():
     print('[INFO] starting baseline training', flush=True)
     cfg = SegMDTConfig.parse_arguments()
+    pair_out = getattr(cfg, 'encode_text_pair', None)
+    if pair_out:
+        from models.petct_state_text_competitive import encode_text_pair, save_text_pair_cache
+        if not getattr(cfg, 'module2_text_model_path', None):
+            raise SystemExit('--encode-text-pair requires --module2_text_model_path DIR')
+        ct_v, pet_v, meta = encode_text_pair(
+            cfg.module2_text_model_path,
+            ct_prompt=getattr(cfg, 'module2_ct_text_prompt', None),
+            pet_prompt=getattr(cfg, 'module2_pet_text_prompt', None),
+            max_length=30,
+        )
+        save_text_pair_cache(pair_out, ct_v, pet_v, meta)
+        print(f'[INFO] dual text cache saved to {pair_out} dim={meta["text_dim"]}', flush=True)
+        return
     _assert_baseline(cfg)
     train_batch_mode = str(getattr(cfg, 'train_batch_mode', 'mixed'))
     if train_batch_mode not in ('mixed', 'alternating'):

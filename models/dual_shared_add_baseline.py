@@ -6,7 +6,7 @@ import torch.nn as nn
 from models.baseline_blocks import AddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.ct_conditioned_pet_affine import CTConditionedPETAffine
-from models.petct_state_text_afa import StateTextAFAFusion
+from models.petct_state_text_competitive import StateTextCompetitiveFusion
 from models.paired_semantic_prototype_imputation import (
     PairedSemanticPrototypeImputation,
 )
@@ -68,10 +68,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
         module2_enabled=False,
         module2_use_state=True,
         module2_use_text=True,
-        module2_use_afa=True,
         module2_diag_enabled=False,
         module2_diag_interval=50,
-        module2_text_feature=None,
+        module2_ct_text_feature=None,
+        module2_pet_text_feature=None,
         module2_text_metadata=None,
     ):
         super().__init__()
@@ -86,13 +86,13 @@ class DualSharedAddPETCTBaseline(nn.Module):
         self.module2_enabled = bool(module2_enabled)
         self.module2_use_state = bool(module2_use_state)
         self.module2_use_text = bool(module2_use_text)
-        self.module2_use_afa = bool(module2_use_afa)
         self.module2_diag_enabled = bool(module2_diag_enabled)
         self.module2_diag_interval = int(module2_diag_interval)
         if self.module2_enabled:
             self._init_module2_fusion(
                 pet_channels,
-                module2_text_feature,
+                module2_ct_text_feature,
+                module2_pet_text_feature,
                 module2_text_metadata,
             )
         else:
@@ -170,47 +170,47 @@ class DualSharedAddPETCTBaseline(nn.Module):
         else:
             self.pet_affine = None
 
-    def _init_module2_fusion(self, pet_channels, text_feature, text_metadata):
-        """Construct StateTextAFAFusion inside a CPU fork_rng guard.
+    def _init_module2_fusion(self, pet_channels, ct_text, pet_text, text_metadata):
+        """Construct StateTextCompetitiveFusion inside a CPU fork_rng guard.
 
-        The fusion adds ~1.16M random-initialized parameters. Creating it
-        after all original modules are built AND inside fork_rng keeps the
-        seed-determined initialization of decoder/module1/affine untouched,
-        so the disabled-equivalence test can compare against the base commit.
+        Creating it after all original modules are built AND inside fork_rng
+        keeps the seed-determined initialization of decoder/module1/affine
+        untouched, so the disabled-equivalence test can compare against the
+        base commit.
         """
         import torch as _torch
 
-        if text_feature is not None:
-            feature = _torch.as_tensor(text_feature).detach().float().cpu()
+        if ct_text is not None and pet_text is not None:
+            ct_feature = _torch.as_tensor(ct_text).detach().float().cpu()
+            pet_feature = _torch.as_tensor(pet_text).detach().float().cpu()
         elif self.module2_use_text:
             raise ValueError(
-                'module2 text enabled but no text_feature supplied; '
-                'builder must encode or read the cache first'
+                'module2 text enabled but no text features supplied; '
+                'builder must encode or read the pair cache first'
             )
         else:
-            feature = None
+            ct_feature = pet_feature = None
         metadata = dict(text_metadata) if text_metadata is not None else None
         with _torch.random.fork_rng(devices=[]):
-            self.fusion = StateTextAFAFusion(
+            self.fusion = StateTextCompetitiveFusion(
                 list(pet_channels),
-                text_feature=feature,
+                ct_text_feature=ct_feature,
+                pet_text_feature=pet_feature,
                 text_metadata=metadata,
                 enabled=True,
                 use_state=self.module2_use_state,
                 use_text=self.module2_use_text,
-                use_afa=self.module2_use_afa,
                 diag_enabled=self.module2_diag_enabled,
                 diag_interval=self.module2_diag_interval,
             )
-        if not (self.module2_use_state and self.module2_use_text and self.module2_use_afa):
+        if not (self.module2_use_state and self.module2_use_text):
             for name, param in self.fusion.named_parameters():
                 if not param.requires_grad:
                     continue
-                if not self.module2_use_state and '.state_prompt' in name:
+                if not self.module2_use_state and '.missing_prompt' in name:
                     param.requires_grad_(False)
-                elif not self.module2_use_text and ('.text_proj' in name or '.text_gate' in name):
-                    param.requires_grad_(False)
-                elif not self.module2_use_afa and ('.afa_' in name):
+                elif not self.module2_use_text and ('.proj_' in name or '.gate_' in name
+                                                    or '.missing_prompt' in name):
                     param.requires_grad_(False)
 
     def missing_prior_alpha_vals(self):

@@ -4,10 +4,11 @@ import torch
 import torch.nn as nn
 import timm
 
-from models.petct_state_text_afa import (
-    DEFAULT_PROMPT,
-    StateTextAFAFusion,
-    encode_fixed_text,
+from models.petct_state_text_competitive import (
+    DEFAULT_CT_PROMPT,
+    DEFAULT_PET_PROMPT,
+    StateTextCompetitiveFusion,
+    encode_text_pair,
 )
 
 try:
@@ -466,24 +467,26 @@ class ConvBNAct(nn.Module):
 
 
 def _resolve_module2_text(config, pet_channels, module2_checkpoint_state=None):
-    """Resolve Module-2 text vector/metadata without touching encoders.
+    """Resolve Module-2 dual text vectors/metadata without touching encoders.
 
-    Priority (per spec): checkpoint restore > explicit cache > offline CLIP
-    encode > text-disabled construction. Returns (text_feature, metadata) or
-    (None, None) when Module-2 or text is off. CLIP encode runs inside a CPU
-    fork_rng guard so cache hit/miss cannot shift the baseline RNG stream.
+    Priority: checkpoint dual buffers > explicit v2 pair cache > offline CLIP
+    encode of both prompts > text-disabled construction. v1 single-PET caches
+    are rejected explicitly. CLIP encode runs inside a CPU fork_rng guard so
+    cache hit/miss cannot shift the baseline RNG stream.
     """
     if not bool(getattr(config, 'module2_enabled', False)):
-        return None, None
+        return None, None, None
     if not bool(getattr(config, 'module2_use_text', True)):
-        return None, None
+        return None, None, None
     if module2_checkpoint_state is not None:
-        feature = module2_checkpoint_state.get('fusion.text_feature')
+        ct_feature = module2_checkpoint_state.get('fusion.ct_text_feature')
+        pet_feature = module2_checkpoint_state.get('fusion.pet_text_feature')
         ready = module2_checkpoint_state.get('fusion.text_ready')
-        if feature is None or ready is None:
+        if ct_feature is None or pet_feature is None or ready is None:
             raise RuntimeError(
-                'module2 checkpoint restore requires fusion.text_feature and '
-                'fusion.text_ready keys; refusing random-text fallback'
+                'module2 checkpoint restore requires fusion.ct_text_feature, '
+                'fusion.pet_text_feature and fusion.text_ready keys; refusing '
+                'random-text fallback'
             )
         if bool(ready.reshape(-1)[0].item()) is False:
             raise RuntimeError(
@@ -491,20 +494,23 @@ def _resolve_module2_text(config, pet_channels, module2_checkpoint_state=None):
             )
         metadata = _module2_metadata_from_state(module2_checkpoint_state, config)
         return (
-            torch.as_tensor(feature).detach().float().cpu().clone(),
+            torch.as_tensor(ct_feature).detach().float().cpu().clone(),
+            torch.as_tensor(pet_feature).detach().float().cpu().clone(),
             metadata,
         )
     cache_path = getattr(config, 'module2_text_cache', None)
-    prompt = str(getattr(config, 'module2_text_prompt', DEFAULT_PROMPT))
+    ct_prompt = str(getattr(config, 'module2_ct_text_prompt', DEFAULT_CT_PROMPT))
+    pet_prompt = str(getattr(config, 'module2_pet_text_prompt', DEFAULT_PET_PROMPT))
     if cache_path:
         from pathlib import Path as _Path
 
         cache_file = _Path(str(cache_path)).expanduser()
         if cache_file.is_file():
             cache = torch.load(str(cache_file), map_location='cpu', weights_only=True)
-            _validate_module2_cache(cache, prompt, config)
+            _validate_module2_cache(cache, ct_prompt, pet_prompt)
             return (
-                torch.as_tensor(cache['text_feature']).detach().float().cpu().clone(),
+                torch.as_tensor(cache['ct_text_feature']).detach().float().cpu().clone(),
+                torch.as_tensor(cache['pet_text_feature']).detach().float().cpu().clone(),
                 dict(cache['metadata']),
             )
     model_path = getattr(config, 'module2_text_model_path', None)
@@ -513,57 +519,61 @@ def _resolve_module2_text(config, pet_channels, module2_checkpoint_state=None):
             'module2 text enabled but no module2_text_model_path and no readable cache'
         )
     with torch.random.fork_rng(devices=[]):
-        vector, metadata = encode_fixed_text(
-            model_path, backend='clip', prompt=prompt,
-            max_length=30, device='cpu',
+        ct_vector, pet_vector, metadata = encode_text_pair(
+            model_path, ct_prompt=ct_prompt, pet_prompt=pet_prompt,
+            backend='clip', max_length=30, device='cpu',
         )
     if cache_path:
-        from models.petct_state_text_afa import save_text_cache as _save_cache
+        from models.petct_state_text_competitive import save_text_pair_cache as _save_cache
         from pathlib import Path as _Path
 
-        _save_cache(_Path(str(cache_path)).expanduser(), vector, metadata)
-        print(f'[Module2] text cache exported to {cache_path}', flush=True)
-    return vector, metadata
+        _save_cache(_Path(str(cache_path)).expanduser(), ct_vector, pet_vector, metadata)
+        print(f'[Module2] text pair cache exported to {cache_path}', flush=True)
+    return ct_vector, pet_vector, metadata
 
 
 def _module2_metadata_from_state(state, config):
-    prompt = str(getattr(config, 'module2_text_prompt', DEFAULT_PROMPT))
     return {
-        'prompt': prompt,
+        'ct_prompt': str(getattr(config, 'module2_ct_text_prompt', DEFAULT_CT_PROMPT)),
+        'pet_prompt': str(getattr(config, 'module2_pet_text_prompt', DEFAULT_PET_PROMPT)),
         'backend': 'clip',
-        'pooling': 'CLIP EOS pooler_output; no text_projection',
         'restored_from_checkpoint': True,
     }
 
 
-def _validate_module2_cache(cache, prompt, config):
-    if not isinstance(cache, dict) or cache.get('format_version') != 1:
-        raise ValueError('Module-2 text cache must be a version-1 save_text_cache file')
+def _validate_module2_cache(cache, ct_prompt, pet_prompt):
+    if not isinstance(cache, dict):
+        raise ValueError('Module-2 text cache must be a dict file')
+    if cache.get('format_version') == 1:
+        raise ValueError(
+            'Single-PET v1 text cache cannot be used by the competitive module; '
+            'regenerate with: python models/petct_state_text_competitive.py '
+            '--encode-text-pair pretrained/petct_competitive_text_v1.pt '
+            '--model-path /root/autodl-tmp/mkd-main/new-train/pretrained/clip-vit-base-patch32'
+        )
+    if cache.get('format_version') != 2:
+        raise ValueError('Module-2 text pair cache must be a version-2 save_text_pair_cache file')
     metadata = cache.get('metadata')
     if not isinstance(metadata, dict):
-        raise ValueError('Module-2 text cache requires metadata')
-    vector = cache.get('text_feature')
-    if not torch.is_tensor(vector) or vector.ndim not in (1, 2):
-        raise ValueError('Module-2 text cache text_feature must be [D] or [1,D]')
-    if vector.numel() != 512 or max(vector.shape) != 512:
-        raise ValueError(
-            f'Module-2 clip cache must be 512-D, got {tuple(vector.shape)}'
-        )
+        raise ValueError('Module-2 text pair cache requires metadata')
+    for key in ('ct_text_feature', 'pet_text_feature'):
+        vector = cache.get(key)
+        if not torch.is_tensor(vector) or vector.ndim not in (1, 2):
+            raise ValueError(f'Module-2 text pair cache {key} must be [D] or [1,D]')
+        if vector.numel() != 512 or max(vector.shape) != 512:
+            raise ValueError(f'Module-2 clip pair cache {key} must be 512-D, got {tuple(vector.shape)}')
+        if not bool(torch.isfinite(torch.as_tensor(vector).float()).all().item()):
+            raise ValueError('Module-2 text pair cache contains NaN/Inf')
     if metadata.get('backend') != 'clip':
         raise ValueError(
-            f"Module-2 text cache backend mismatch: {metadata.get('backend')!r} != 'clip'"
+            f"Module-2 text pair cache backend mismatch: {metadata.get('backend')!r} != 'clip'"
         )
-    if metadata.get('prompt') != prompt:
-        raise ValueError(
-            'Module-2 text cache prompt mismatch; refusing to reuse another '
-            f"experiment's cache: {metadata.get('prompt')!r}"
-        )
+    if metadata.get('ct_prompt') != ct_prompt or metadata.get('pet_prompt') != pet_prompt:
+        raise ValueError('Module-2 text pair cache prompt mismatch; refusing to reuse another cache')
     if int(metadata.get('max_length', 30)) != 30:
-        raise ValueError('Module-2 text cache max_length must be 30')
+        raise ValueError('Module-2 text pair cache max_length must be 30')
     if bool(metadata.get('normalized', False)) is not False:
-        raise ValueError('Module-2 text cache must be unnormalized (normalized=False)')
-    if not bool(torch.isfinite(torch.as_tensor(vector).float()).all().item()):
-        raise ValueError('Module-2 text cache contains NaN/Inf')
+        raise ValueError('Module-2 text pair cache must be unnormalized (normalized=False)')
 
 
 def build_mdt_seg_teacher(config, *, module2_checkpoint_state=None):
@@ -614,13 +624,13 @@ def build_mdt_seg_teacher(config, *, module2_checkpoint_state=None):
     # real vector/metadata can be passed into the constructor (never stored
     # in config JSON). Disabled or text-off paths perform zero CLIP/cache I/O.
     module2_on = bool(getattr(config, 'module2_enabled', False))
-    module2_text_feature = None
+    module2_ct_text = module2_pet_text = None
     module2_text_metadata = None
     if module2_checkpoint_state is not None and not module2_on:
         _reject_module2_key_mismatch(module2_checkpoint_state, config)
     if module2_on:
         _require_module2_checkpoint_consistency(module2_checkpoint_state, config)
-        module2_text_feature, module2_text_metadata = _resolve_module2_text(
+        module2_ct_text, module2_pet_text, module2_text_metadata = _resolve_module2_text(
             config, None, module2_checkpoint_state
         )
     model = DualSharedAddPETCTBaseline(
@@ -650,10 +660,10 @@ def build_mdt_seg_teacher(config, *, module2_checkpoint_state=None):
         module2_enabled=module2_on,
         module2_use_state=bool(getattr(config, 'module2_use_state', True)),
         module2_use_text=bool(getattr(config, 'module2_use_text', True)),
-        module2_use_afa=bool(getattr(config, 'module2_use_afa', True)),
         module2_diag_enabled=bool(getattr(config, 'module2_diag_enabled', False)),
         module2_diag_interval=int(getattr(config, 'module2_diag_interval', 50)),
-        module2_text_feature=module2_text_feature,
+        module2_ct_text_feature=module2_ct_text,
+        module2_pet_text_feature=module2_pet_text,
         module2_text_metadata=module2_text_metadata,
     )
     if bool(getattr(config, 'stage1_init_enabled', False)):
@@ -667,7 +677,7 @@ def build_mdt_seg_teacher(config, *, module2_checkpoint_state=None):
         assert all(p.requires_grad for p in model.enc_pet.parameters())
         assert all(p.requires_grad for p in model.ct_align.parameters())
     pspi_enabled = bool(getattr(config, 'pspi_enabled', True))
-    fusion_name = 'StateTextAFAFusion' if module2_on else 'AddFusion'
+    fusion_name = 'StateTextCompetitiveFusion' if module2_on else 'AddFusion'
     # Log the ACTUAL module1 config (not a getattr default that may disagree
     # with real execution when restoring legacy checkpoints).
     actual_bank_mode = getattr(model.module1.config, 'bank_update_mode', None) if model.module1 is not None else None
@@ -704,7 +714,6 @@ def build_mdt_seg_teacher(config, *, module2_checkpoint_state=None):
         f'module2_enabled={module2_on} '
         f'module2_use_state={getattr(config, "module2_use_state", True)} '
         f'module2_use_text={getattr(config, "module2_use_text", True)} '
-        f'module2_use_afa={getattr(config, "module2_use_afa", True)} '
         f'cold_start=epoch1 '
         f'S4_K_per_class={getattr(config, "pspi_num_clusters", 6)} '
         f'mixed_50_50 '
@@ -712,8 +721,8 @@ def build_mdt_seg_teacher(config, *, module2_checkpoint_state=None):
         f'ema_momentum={actual_bank_momentum} '
         f'K={getattr(config, "pspi_num_clusters", 6)} '
         f'build_stage=S{getattr(config, "pspi_build_stage", 4)} '
-        f'full_path={"raw_CT_plus_real_PET" if not module2_on else "CT_plus_fused_PET_StateTextAFA"} '
-        f'missing_boundary={"CT_plus_ct_affine_prior" if affine_enabled and not module2_on else ("module2_fused_CT_plus_compensated_PET" if module2_on else "CT_plus_scale_weighted_PET_prior")} '
+        f'full_path={"raw_CT_plus_real_PET" if not module2_on else "competitive_weighted_CT_PET"} '
+        f'missing_boundary={"CT_plus_ct_affine_prior" if affine_enabled and not module2_on else ("competitive_CT_plus_compensated_PET" if module2_on else "CT_plus_scale_weighted_PET_prior")} '
         f'prior_scale_type={"none_ct_affine_direct" if affine_enabled else "per_scale_scalar"} '
         f'prior_scale_init={prior_scale_init} '
         f'prior_scale_enabled={prior_scale_enabled} '
@@ -744,8 +753,9 @@ def _require_module2_checkpoint_consistency(state, config):
             'refusing AddFusion->Module2 hot-start without explicit request'
         )
     use_text = bool(getattr(config, 'module2_use_text', True))
-    has_feature = 'fusion.text_feature' in state
-    if use_text and not has_feature:
+    has_ct = 'fusion.ct_text_feature' in state
+    has_pet = 'fusion.pet_text_feature' in state
+    if use_text and not (has_ct and has_pet):
         raise RuntimeError(
-            'module2 text enabled but checkpoint lacks fusion.text_feature'
+            'module2 text enabled but checkpoint lacks fusion.ct_text_feature/pet_text_feature'
         )
