@@ -708,11 +708,12 @@ def test_f05_ablations_runnable():
 def test_f06_extra_state_config_guard():
     model = _banked_module2()
     state = model.fusion.get_extra_state()
-    assert state["version"] == 2
-    assert state["architecture"] == "dual_residual_afa_v3"
+    assert state["version"] == 3
+    assert state["architecture"] == "state_conditioned_value_v4"
     assert state["config"]["kernel_size"] == 5
     assert state["config"]["centered_text_gate"] is True
     assert state["config"]["dual_modality_residual"] is True
+    assert state["config"]["state_condition_only"] is True
     clone = _module2_model()
     clone.fusion.set_extra_state(state)
     bad = dict(state)
@@ -724,16 +725,19 @@ def test_f06_extra_state_config_guard():
         pass
     else:
         raise AssertionError("mismatched extra state must fail")
-    # v2-style metadata (version=1, no architecture) must be rejected.
-    v2 = {"version": 1, "text_metadata": state["text_metadata"],
-          "config": {"channels": (64, 128, 320, 512)}}
+    # v3-style metadata (version=2, additive-state arch) must be rejected by v4.
+    v3 = dict(state)
+    v3["version"] = 2
+    v3["architecture"] = "dual_residual_afa_v3"
+    v3["config"] = dict(state["config"])
+    v3["config"].pop("state_condition_only", None)
     try:
-        clone.fusion.set_extra_state(v2)
+        clone.fusion.set_extra_state(v3)
     except ValueError as e:
-        assert "v3" in str(e).lower() or "v2" in str(e).lower()
-        print("[F06] extra-state guard + v2 metadata rejected: PASS")
+        assert "v4" in str(e).lower() or "v3" in str(e).lower()
+        print("[F06] extra-state guard + v3 metadata rejected: PASS")
         return
-    raise AssertionError("v2 metadata must fail on v3")
+    raise AssertionError("v3 metadata must fail on v4")
 
 
 def test_f07_fusion_param_count():

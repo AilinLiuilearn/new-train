@@ -10,17 +10,20 @@ commit c729f396cb181e0d86b6cd3e9c93782c1df8ef56。
 本文件没有修改仓库，没有下载模型权重，没有添加损失。
 
 确定的设计（每尺度同结构，参数不共享）:
-  P_s = P + E[state]                    # 0=补偿PET，1=真实PET
+  P_cond = P + E[state]                 # 仅作为控制条件，不直接进入输出
   q   = GELU(LayerNorm(Linear(text)))
-  R_t = 2*sigmoid(text_gate(GMP(P_s*q) + q)) - 1   # 零中心残差，[B,C,1,1]
-  P_t = P_s * (1 + R_t)                 # 文本末层零初始化 -> 初始R_t=0
-  U_CT, U_PET = Conv1x1(CT), Conv1x1(P_t)  # 各压缩至 C//2
+  R_t = 2*sigmoid(text_gate(GMP(P_cond*q) + q)) - 1  # [B,C,1,1]
+  text_scale = 1 + R_t                  # 文本末层零初始化 -> 初始R_t=0
+  P_control = P_cond * text_scale        # 进入 AFA 的控制路径
+  P_value = P * text_scale               # 进入输出的 PET 值，不含加性 E
+  U_CT, U_PET = Conv1x1(CT), Conv1x1(P_control)  # 各压缩至 C//2
   U   = concat(U_CT, U_PET)
   S   = sigmoid(Conv5x5(cat(channel_mean(U), channel_max(U))))
   U_f = U_CT*S[:,0:1] + U_PET*S[:,1:2]
   H_CT, H_PET = afa_out_ct(U_f), afa_out_pet(U_f)  # 两个独立头，各mid->C
   R_CT, R_PET = 2*sigmoid(H_CT)-1, 2*sigmoid(H_PET)-1  # 均为[B,C,H,W]
-  F   = CT*(1 + R_CT) + P_t*(1 + R_PET)
+  F   = CT*(1 + R_CT) + P_value*(1 + R_PET)
+  use_afa=False: F = CT + P_value。
   pet_valid=False 的行直接返回 CT，不运行上述 PET 分支。
 
 v2 -> v3 变更:
@@ -32,6 +35,16 @@ v2 -> v3 变更:
   架构标识: extra_state version=2, architecture=dual_residual_afa_v3。
   v3因此与v2 checkpoint不兼容，不得裁剪/复制权重静默转换。
   文本缓存format_version保持1不变（不同概念）。
+
+v3 -> v4 变更（状态条件化）:
+  旧v3: P_s=P+E 同时进入文本/AFA和最终输出（状态是加性内容）。
+  新v4: P_cond=P+E 只用于文本门控与AFA控制输入；
+    最终输出使用不含E的 P_value=P*text_scale，AFA输入使用
+    P_control=P_cond*text_scale。零门控下状态不改变输出。
+  架构标识: extra_state version=3,
+    architecture=state_conditioned_value_v4，新增state_condition_only=True。
+  v4与v2/v3 checkpoint均不兼容；文本缓存format_version仍为1。
+  已有v3训练权重不得自动继承，必须按原初始化策略重新训练。
 
 来源与改动:
   MPLMM: https://github.com/zrguo/MPLMM
@@ -105,12 +118,14 @@ pet_valid: 同样形状；必须显式传递，防止冷启动偏置泄漏。
   状态提示全零；文本末层全零；AFA双输出头全零，因此初始
   R_t=R_CT=R_PET=0，有效行F=CT+PET（与AddFusion初始严格相等）。
   enabled=False: 有效行严格CT+PET，无效行CT。
-  use_text=False: 真正绕过文本分支，不用零文本假装关闭。
-  use_state=False/use_afa=False: 对应机制消融；不改变输出接口。
-  use_afa=False: F=CT+P_t（文本仍可作用于PET）。
+  use_text=False: text_scale=1，P_control与P_value都不含文本调制。
+  use_state=False: P_cond=P，控制路径退化为纯内容条件；状态不再影响输出。
+  use_afa=False: F=CT+P_value（文本仍可作用于PET）。
   零初始化使AFA前级（afa_ct/afa_pet/afa_spatial）及文本前级
   （text_proj/text_gate前层）第一步梯度为零，输出层更新后恢复，
   这是预期行为；至少2次优化更新后前级应收到有限非零梯度。
+  状态提示直接求和只用于控制分支，在零门控/零残差下不会直接
+  改变输出；文本和AFA都关闭时状态不影响输出。
   模块无BatchNorm，无新增loss，不保证Dice/HD95改善。
 
 验证: python models/petct_state_text_afa.py --self-test
@@ -256,7 +271,9 @@ class _ScaleFusion(nn.Module):
     def forward(self, ct: Tensor, pet: Tensor, states: Tensor, text: Tensor,
                 *, use_state: bool, use_text: bool, use_afa: bool,
                 diagnostics: bool) -> tuple[Tensor, dict[str, Tensor]]:
-        p = pet + self.state_prompt[states.long()].to(pet.dtype) if use_state else pet
+        # 状态提示只生成控制权重，不作为加性内容进入最终 PET 输出。
+        p_cond = (pet + self.state_prompt[states.long()].to(pet.dtype)
+                  if use_state else pet)
         # AMP: keep the explicit gate math in the feature dtype. Autocast
         # casts only whitelisted ops, so run the small gate MLPs under a
         # local autocast-disabled region with inputs cast to the parameter
@@ -266,16 +283,20 @@ class _ScaleFusion(nn.Module):
         if use_text:
             gate_param_dtype = self.text_gate[0].weight.dtype
             q = self.text_proj(text.to(gate_param_dtype)).unsqueeze(-1).unsqueeze(-1)
-            pooled = F.adaptive_max_pool2d(p.to(gate_param_dtype) * q, 1)
-            with torch.autocast(device_type=p.device.type, enabled=False):
+            pooled = F.adaptive_max_pool2d(p_cond.to(gate_param_dtype) * q, 1)
+            with torch.autocast(device_type=pet.device.type, enabled=False):
                 r_text = (2.0 * torch.sigmoid(self.text_gate(pooled + q)) - 1.0)
-            p = p * (1 + r_text.to(p.dtype))
+            text_scale = 1 + r_text.to(pet.dtype)
+        else:
+            text_scale = pet.new_ones(())
+        p_control = p_cond * text_scale
+        p_value = pet * text_scale
         if not use_afa:
-            out = ct + p
+            out = ct + p_value
         else:
             afa_param_dtype = self.afa_ct.weight.dtype
             a = self.afa_ct(ct.to(afa_param_dtype)).to(ct.dtype)
-            b = self.afa_pet(p.to(afa_param_dtype)).to(ct.dtype)
+            b = self.afa_pet(p_control.to(afa_param_dtype)).to(ct.dtype)
             joined = torch.cat((a, b), dim=1)
             statistics = torch.cat((joined.mean(1, keepdim=True),
                                     joined.amax(1, keepdim=True)), dim=1)
@@ -289,8 +310,8 @@ class _ScaleFusion(nn.Module):
                 joint_param = fused_joint.to(self.afa_out_ct.weight.dtype)
                 r_ct = 2.0 * torch.sigmoid(self.afa_out_ct(joint_param)) - 1.0
                 r_pet = 2.0 * torch.sigmoid(self.afa_out_pet(joint_param)) - 1.0
-            r_ct, r_pet = r_ct.to(ct.dtype), r_pet.to(p.dtype)
-            out = ct * (1 + r_ct) + p * (1 + r_pet)
+            r_ct, r_pet = r_ct.to(ct.dtype), r_pet.to(pet.dtype)
+            out = ct * (1 + r_ct) + p_value * (1 + r_pet)
         info: dict[str, Tensor] = {}
         if diagnostics:
             if r_text is not None:
@@ -357,27 +378,28 @@ class StateTextAFAFusion(nn.Module):
                    text_metadata=cache['metadata'], **kwargs)
 
     def get_extra_state(self) -> dict[str, Any]:
-        return {'version': 2, 'architecture': 'dual_residual_afa_v3',
+        return {'version': 3, 'architecture': 'state_conditioned_value_v4',
                 'text_metadata': self.text_metadata,
                 'config': {'channels': self.channels, 'reduction': self.reduction,
                            'enabled': self.enabled, 'use_state': self.use_state,
                            'use_text': self.use_text, 'use_afa': self.use_afa,
                            'kernel_size': 5, 'centered_text_gate': True,
                            'dual_modality_residual': True,
+                           'state_condition_only': True,
                            'diag_enabled': self.diag_enabled,
                            'diag_interval': self.diag_interval}}
 
     def set_extra_state(self, state: dict[str, Any]) -> None:
-        if not isinstance(state, dict) or state.get('version') != 2:
+        if not isinstance(state, dict) or state.get('version') != 3:
             raise ValueError(
-                'Unsupported fusion checkpoint metadata: expected v3 '
-                f"(architecture=dual_residual_afa_v3), got version={state.get('version') if isinstance(state, dict) else type(state)}; "
-                'v2 checkpoints cannot load into v3 (afa 7x7->5x5, single->dual head, gate rescale). '
-                'Evaluate v2 checkpoints on the v2 branch.'
+                'Unsupported fusion checkpoint metadata: expected v4 '
+                f"(architecture=state_conditioned_value_v4), got version={state.get('version') if isinstance(state, dict) else type(state)}; "
+                'v2/v3 checkpoints cannot load into v4 (state now conditions only, '
+                'p_cond/p_control/p_value split). Evaluate older checkpoints on their branches.'
             )
-        if state.get('architecture') != 'dual_residual_afa_v3':
+        if state.get('architecture') != 'state_conditioned_value_v4':
             raise ValueError(
-                f"Fusion architecture mismatch: {state.get('architecture')!r} != 'dual_residual_afa_v3'"
+                f"Fusion architecture mismatch: {state.get('architecture')!r} != 'state_conditioned_value_v4'"
             )
         if state.get('config') != self.get_extra_state()['config']:
             raise ValueError('Fusion checkpoint config differs; construct the same architecture/flags')
@@ -545,14 +567,17 @@ class ContractTests(unittest.TestCase):
                 self.assertTrue(torch.isfinite(y).all())
 
     def test_backward_and_frozen_text(self):
+        self.net.state_dict()
         sum(y.square().mean() for y in self.call()).backward()
         self.assertFalse(self.net.text_feature.requires_grad)
         self.assertIsNone(self.vector.grad)
         for c, p, block in zip(self.ct, self.pet, self.net.scales):
             self.assertGreater(c.grad.abs().sum().item(), 0)
             self.assertGreater(p.grad.abs().sum().item(), 0)
-            self.assertGreater(block.state_prompt.grad[0].abs().sum().item(), 0)
-            self.assertGreater(block.state_prompt.grad[1].abs().sum().item(), 0)
+            # State is now control-only. 与旧v3的加性内容不同，零初始化下
+            # state仅在控制分支中出现，第一步可能被后续的零初始化头阻断，
+            # 因此不要求全尺度非零；梯度后续覆盖在test_state_grad_after_updates验证。
+            self.assertTrue(torch.isfinite(block.state_prompt.grad).all())
             # v3 zero-centered gates: both AFA output heads receive first-step
             # gradients; their pre-layers are blocked by the zero init.
             self.assertGreater(block.afa_out_ct.weight.grad.abs().sum().item(), 0)
@@ -612,8 +637,8 @@ class ContractTests(unittest.TestCase):
         for y, c, p in zip(self.call(), self.ct, self.pet):
             self.assertTrue(torch.equal(y, c + p))
 
-    def test_v3_initial_exact_addition(self):
-        # v3 zero-centered gates: R_t=R_CT=R_PET=0 at init, so the enabled
+    def test_initial_exact_addition(self):
+        # v3/v4 zero-centered gates: R_t=R_CT=R_PET=0 at init, so the enabled
         # module initially equals CT+PET exactly (unlike v2's nonzero text g).
         outputs, infos = self.call(return_diagnostics=True)
         for y, c, p, d in zip(outputs, self.ct, self.pet, infos):
@@ -717,31 +742,86 @@ class ContractTests(unittest.TestCase):
             torch.testing.assert_close(net.text_feature, self.vector.detach())
             self.assertEqual(net.text_metadata['prompt'], DEFAULT_PROMPT)
 
-    def test_state_is_selected_per_sample(self):
+    def test_state_grad_after_updates(self):
+        torch.manual_seed(11)
+        net = StateTextAFAFusion(self.channels, text_feature=torch.randn(1, 12))
+        ct = [torch.randn(3, c, s, s) for c, s in zip(self.channels, (16, 8, 4, 2))]
+        pet = [torch.randn_like(x) for x in ct]
+        opt = torch.optim.AdamW(net.parameters(), lr=1e-3)
+        for _ in range(3):
+            opt.zero_grad(set_to_none=True)
+            loss = sum(y.square().mean() for y in net(ct, pet, (1, 0, 1), pet_valid=True))
+            self.assertTrue(torch.isfinite(loss).all())
+            loss.backward()
+            self.assertTrue(all(p.grad is None or torch.isfinite(p.grad).all()
+                                for p in net.parameters()))
+            opt.step()
+        net.zero_grad(set_to_none=True)
+        loss = sum(y.square().mean() for y in net(ct, pet, (1, 0, 1), pet_valid=True))
+        loss.backward()
+        magnitudes = [float(block.state_prompt.grad.abs().sum())
+                      for block in net.scales]
+        self.assertTrue(all(g == g for g in magnitudes))
+        self.assertGreater(max(magnitudes), 0)
+
+    def test_state_is_control_only(self):
         self.net.use_text = False
         self.net.use_afa = False
         with torch.no_grad():
             for block in self.net.scales:
                 block.state_prompt[0].fill_(2.)
                 block.state_prompt[1].fill_(5.)
-        offset = torch.tensor([5., 2., 5.]).view(3, 1, 1, 1)
+        # With text and AFA disabled, state_prompt cannot enter output values.
         for y, c, p in zip(self.call(), self.ct, self.pet):
-            torch.testing.assert_close(y, c + (p + offset), rtol=0, atol=0)
+            torch.testing.assert_close(y, c + p, rtol=0, atol=0)
 
-    def test_extra_state_v3_and_v2_rejected(self):
+    def test_state_control_nonzero_gate_and_afa(self):
+        self.net.use_text = True
+        self.net.use_afa = True
+        with torch.no_grad():
+            for block in self.net.scales:
+                block.state_prompt[0].fill_(2.)
+                block.state_prompt[1].fill_(5.)
+                # Non-degenerate open gate: nonzero weight keeps the prompt
+                # term alive through the ReLU (bias-only fill can stay dead).
+                block.text_gate[0].weight.fill_(0.1)
+                block.text_gate[-1].weight.fill_(0.1)
+                block.text_gate[-1].bias.fill_(1.0)
+                block.afa_out_ct.weight.fill_(0.05)
+                block.afa_out_pet.weight.fill_(0.05)
+        zero_state = self.net(self.ct, self.pet, 0, pet_valid=True)
+        one_state = self.net(self.ct, self.pet, 1, pet_valid=True)
+        self.assertTrue(any(not torch.equal(a, b) for a, b in zip(zero_state, one_state)))
+
+    def test_state_nonzero_does_not_change_zero_gate_output(self):
+        self.net.use_text = False
+        self.net.use_afa = True
+        with torch.no_grad():
+            for block in self.net.scales:
+                block.state_prompt.fill_(3.)
+        zero_state = self.net(self.ct, self.pet, 0, pet_valid=True)
+        one_state = self.net(self.ct, self.pet, 1, pet_valid=True)
+        for a, b, c, p in zip(zero_state, one_state, self.ct, self.pet):
+            torch.testing.assert_close(a, c + p, rtol=0, atol=0)
+            torch.testing.assert_close(b, c + p, rtol=0, atol=0)
+
+    def test_extra_state_v4_and_older_rejected(self):
         state = self.net.get_extra_state()
-        self.assertEqual(state['version'], 2)
-        self.assertEqual(state['architecture'], 'dual_residual_afa_v3')
+        self.assertEqual(state['version'], 3)
+        self.assertEqual(state['architecture'], 'state_conditioned_value_v4')
         self.assertEqual(state['config']['kernel_size'], 5)
         self.assertTrue(state['config']['centered_text_gate'])
         self.assertTrue(state['config']['dual_modality_residual'])
+        self.assertTrue(state['config']['state_condition_only'])
         clone = StateTextAFAFusion(self.channels, text_feature=torch.zeros(1, 12))
         clone.set_extra_state(state)
-        v2 = dict(state)
-        v2['version'] = 1
-        v2.pop('architecture', None)
+        older = dict(state)
+        older['version'] = 2
+        older['architecture'] = 'dual_residual_afa_v3'
+        older['config'] = dict(state['config'])
+        older['config'].pop('state_condition_only')
         with self.assertRaises(ValueError):
-            clone.set_extra_state(v2)
+            clone.set_extra_state(older)
 
     def test_disabled_mechanisms_skip_nonzero_parameters(self):
         self.net.use_text = self.net.use_state = self.net.use_afa = False
