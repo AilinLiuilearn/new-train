@@ -12,6 +12,44 @@ Tensor = torch.Tensor
 StateLike = Union[str, int, Tensor]
 
 
+CT_TEXT_DEFAULT = "A CT image showing the anatomical structure and boundaries of lung tumors."
+PET_TEXT_DEFAULT = "A PET image showing bright tumor regions in the lungs."
+
+
+@torch.no_grad()
+def build_clip_text_priors(
+    clip_path: str,
+    ct_text: str = CT_TEXT_DEFAULT,
+    pet_text: str = PET_TEXT_DEFAULT,
+) -> Tuple[Tensor, Tensor]:
+    """Encode two fixed texts once with local CLIP ViT-B/32 (frozen, CPU/fp32).
+
+    Returns ([1,D] CT prior, [1,D] PET prior) on CPU. The CLIP model is NOT
+    returned and must be freed by the caller scope; it never enters optimizer.
+    """
+    from transformers import CLIPModel, CLIPTokenizer
+
+    tokenizer = CLIPTokenizer.from_pretrained(clip_path, local_files_only=True)
+    clip_model = CLIPModel.from_pretrained(clip_path, local_files_only=True)
+    clip_model.eval()
+    for p in clip_model.parameters():
+        p.requires_grad = False
+    texts = [ct_text, pet_text]
+    tokens = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+    with torch.no_grad():
+        text_features = clip_model.get_text_features(**tokens).detach().float().cpu()
+    ct_text_feature = text_features[0:1].contiguous()
+    pet_text_feature = text_features[1:2].contiguous()
+    if ct_text_feature.shape[-1] != pet_text_feature.shape[-1]:
+        raise ValueError(
+            f"CT/PET text dim mismatch: {tuple(ct_text_feature.shape)} vs "
+            f"{tuple(pet_text_feature.shape)}"
+        )
+    del clip_model
+    del tokenizer
+    return ct_text_feature, pet_text_feature
+
+
 class TwoLayerMLP(nn.Module):
     """GeminiFusion-style MLP_2."""
     def __init__(
@@ -424,6 +462,7 @@ class TextModulatedPixelInteractionFusion(nn.Module):
 
     Hard design constraints implemented:
       - exactly two global learnable state vectors s_F / s_M
+      - state_vectors[1] = s_F (Full), state_vectors[0] = s_M (Missing)
       - state vectors shared across all scales
       - CT text modulates CT only
       - PET text + state modulates PET only
@@ -434,8 +473,8 @@ class TextModulatedPixelInteractionFusion(nn.Module):
       - final F_l = C_l^I + P_l^I
     """
 
-    FULL = 0
-    MISSING = 1
+    FULL = 1
+    MISSING = 0
 
     def __init__(
         self,

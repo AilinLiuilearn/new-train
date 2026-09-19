@@ -527,6 +527,14 @@ def build_mdt_seg_teacher(config):
         pspi_affine_enabled=affine_enabled,
         pspi_reconstruction_weight=recon_weight,
         pspi_proto_contrastive_weight=proto_weight,
+        interfusion_enabled=getattr(config, 'interfusion_enabled', True),
+        interfusion_clip_path=getattr(config, 'interfusion_clip_path', '/root/autodl-tmp/mkd-main/new-train/pretrained/clip-vit-base-patch32'),
+        interfusion_state_dim=getattr(config, 'interfusion_state_dim', 128),
+        interfusion_num_heads=getattr(config, 'interfusion_num_heads', (1, 2, 5, 8)),
+        interfusion_text_reduction=getattr(config, 'interfusion_text_reduction', 16),
+        interfusion_attn_drop=getattr(config, 'interfusion_attn_drop', 0.0),
+        interfusion_proj_drop=getattr(config, 'interfusion_proj_drop', 0.0),
+        interfusion_relation_drop=getattr(config, 'interfusion_relation_drop', 0.0),
     )
     if bool(getattr(config, 'stage1_init_enabled', False)):
         load_stage1_unimodal_initialization(
@@ -539,17 +547,33 @@ def build_mdt_seg_teacher(config):
         assert all(p.requires_grad for p in model.enc_pet.parameters())
         assert all(p.requires_grad for p in model.ct_align.parameters())
     pspi_enabled = bool(getattr(config, 'pspi_enabled', True))
+    interfusion_enabled = bool(getattr(config, 'interfusion_enabled', True))
+    interfusion_name = 'TextModulatedPixelInteractionFusion' if interfusion_enabled else 'AddFusion'
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion=AddFusion '
+        f'fusion={interfusion_name} '
         f'shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
     if pspi_enabled:
-        fusion_desc = 'downstream_fusion=AddFusion'
+        fusion_desc = f'downstream_fusion={interfusion_name}'
     else:
-        fusion_desc = 'baseline_fusion=AddFusion'
+        fusion_desc = f'baseline_fusion={interfusion_name}'
+    print(
+        f'[InterFusion] enabled={interfusion_enabled} '
+        f'module=TextModulatedPixelInteractionFusion '
+        f'text_encoder=CLIP-ViT-B-32 '
+        f'clip_path={getattr(config, "interfusion_clip_path", "/root/autodl-tmp/mkd-main/new-train/pretrained/clip-vit-base-patch32")} '
+        f'text_encoder_frozen=True '
+        f'ct_text="A CT image showing the anatomical structure and boundaries of lung tumors." '
+        f'pet_text="A PET image showing bright tumor regions in the lungs." '
+        f'state_vectors=2_global_shared '
+        f'state_semantics=1_full_0_missing '
+        f'text_modulation=DGNet_TKGM_inspired '
+        f'interaction=GeminiFusion_pixelwise_bidirectional '
+        f'final_fusion=add_interacted_features'
+    )
     print(
         f'[PSPI] enabled={pspi_enabled} '
         f'module1=paired_ct_pet_prototype_prior_retrieval '
@@ -567,7 +591,7 @@ def build_mdt_seg_teacher(config):
         f'reconstruction_weight={recon_weight} '
         f'reconstruction_loss={"balanced_multiscale_smoothl1" if affine_enabled and recon_weight > 0.0 else "none"} '
         f'reconstruction_target_detached=True '
-        f'direct_add=True '
+        f'direct_add={not interfusion_enabled} '
         f'cold_start=epoch1 '
         f'S4_K_per_class={getattr(config, "pspi_num_clusters", 6)} '
         f'mixed_50_50 '
@@ -581,7 +605,6 @@ def build_mdt_seg_teacher(config):
         f'prior_scale_init={prior_scale_init} '
         f'prior_scale_enabled={prior_scale_enabled} '
         f'{fusion_desc} '
-        f'downstream_fusion=AddFusion '
         f'decoder=UNetStyleDecoder'
     )
     return {'model': model}
