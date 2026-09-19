@@ -239,6 +239,13 @@ class GeminiPixelWiseInteraction(nn.Module):
             dim, num_heads, dropout=attn_drop, batch_first=False
         )
 
+        # S1 at 512 input is 128x128 per sample; B=16 gives B*N=262144
+        # queries in one MHA call. That exceeds the SDPA/flash kernel grid
+        # limit and fails with "CUDA error: invalid configuration argument".
+        # MHA is independent per batch item, so chunking is mathematically
+        # identical and only reduces the per-call batch size.
+        self.mha_chunk_tokens = 16384
+
         # Shared projection, matching GeminiFusion ModuleParallel weight sharing.
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -293,7 +300,23 @@ class GeminiPixelWiseInteraction(nn.Module):
         k = torch.cat([noise_k, q * relation], dim=0)
         v = torch.cat([noise_v, other], dim=0)
 
-        interacted, _ = mha(q, k, v, need_weights=False)
+        # Chunk along the B*N token axis when it is large. Each chunk is an
+        # independent set of pixel queries, so the math is unchanged.
+        total = q.shape[1]
+        if total <= self.mha_chunk_tokens:
+            interacted, _ = mha(q, k, v, need_weights=False)
+        else:
+            chunks = []
+            for start in range(0, total, self.mha_chunk_tokens):
+                end = min(start + self.mha_chunk_tokens, total)
+                out, _ = mha(
+                    q[:, start:end, :],
+                    k[:, start:end, :],
+                    v[:, start:end, :],
+                    need_weights=False,
+                )
+                chunks.append(out)
+            interacted = torch.cat(chunks, dim=1)
         interacted = interacted.squeeze(0).reshape(B, N, C)
 
         updated = query_tokens + interacted
