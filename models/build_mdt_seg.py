@@ -530,11 +530,11 @@ def build_mdt_seg_teacher(config):
         interfusion_enabled=getattr(config, 'interfusion_enabled', True),
         interfusion_clip_path=getattr(config, 'interfusion_clip_path', '/root/autodl-tmp/mkd-main/new-train/pretrained/clip-vit-base-patch32'),
         interfusion_state_dim=getattr(config, 'interfusion_state_dim', 128),
-        interfusion_num_heads=getattr(config, 'interfusion_num_heads', (1, 2, 5, 8)),
         interfusion_text_reduction=getattr(config, 'interfusion_text_reduction', 16),
-        interfusion_attn_drop=getattr(config, 'interfusion_attn_drop', 0.0),
-        interfusion_proj_drop=getattr(config, 'interfusion_proj_drop', 0.0),
-        interfusion_relation_drop=getattr(config, 'interfusion_relation_drop', 0.0),
+        interfusion_igma_gate_reduction=getattr(config, 'interfusion_igma_gate_reduction', 4),
+        interfusion_igma_channel_reduction=getattr(config, 'interfusion_igma_channel_reduction', 4),
+        interfusion_igma_spatial_reduction=getattr(config, 'interfusion_igma_spatial_reduction', 4),
+        interfusion_igma_spatial_kernel_size=getattr(config, 'interfusion_igma_spatial_kernel_size', 1),
     )
     if bool(getattr(config, 'stage1_init_enabled', False)):
         load_stage1_unimodal_initialization(
@@ -548,7 +548,7 @@ def build_mdt_seg_teacher(config):
         assert all(p.requires_grad for p in model.ct_align.parameters())
     pspi_enabled = bool(getattr(config, 'pspi_enabled', True))
     interfusion_enabled = bool(getattr(config, 'interfusion_enabled', True))
-    interfusion_name = 'TextModulatedPixelInteractionFusion' if interfusion_enabled else 'AddFusion'
+    interfusion_name = 'TextModulatedMRFSFusion' if interfusion_enabled else 'AddFusion'
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
@@ -562,17 +562,25 @@ def build_mdt_seg_teacher(config):
         fusion_desc = f'baseline_fusion={interfusion_name}'
     print(
         f'[InterFusion] enabled={interfusion_enabled} '
-        f'module=TextModulatedPixelInteractionFusion '
+        f'module=TextModulatedMRFSFusion '
         f'text_encoder=CLIP-ViT-B-32 '
-        f'clip_path={getattr(config, "interfusion_clip_path", "/root/autodl-tmp/mkd-main/new-train/pretrained/clip-vit-base-patch32")} '
+        f'clip_path={getattr(config, "interfusion_clip_path", "")} '
         f'text_encoder_frozen=True '
-        f'ct_text="A CT image showing the anatomical structure and boundaries of lung tumors." '
-        f'pet_text="A PET image showing bright tumor regions in the lungs." '
         f'state_vectors=2_global_shared '
         f'state_semantics=1_full_0_missing '
         f'text_modulation=DGNet_TKGM_inspired '
-        f'interaction=GeminiFusion_pixelwise_bidirectional '
-        f'final_fusion=add_interacted_features'
+        f'interaction=MRFS_IGM_Att '
+        f'channel_attention=joint_avg_max '
+        f'spatial_attention=joint_mean_max '
+        f'interactive_gate=pixel_channel_gate '
+        f'bidirectional_cross_injection=True '
+        f'final_fusion=add_interacted_features '
+        f'state_dim={getattr(config, "interfusion_state_dim", 128)} '
+        f'text_reduction={getattr(config, "interfusion_text_reduction", 16)} '
+        f'igma_gate_reduction={getattr(config, "interfusion_igma_gate_reduction", 4)} '
+        f'igma_channel_reduction={getattr(config, "interfusion_igma_channel_reduction", 4)} '
+        f'igma_spatial_reduction={getattr(config, "interfusion_igma_spatial_reduction", 4)} '
+        f'igma_spatial_kernel_size={getattr(config, "interfusion_igma_spatial_kernel_size", 1)}'
     )
     print(
         f'[PSPI] enabled={pspi_enabled} '

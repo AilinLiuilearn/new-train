@@ -51,15 +51,16 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--pspi_proto_contrastive_weight', type=float, default=0.0)
         p.add_argument('--pspi_reconstruction_weight', type=float, default=0.05)
         p.add_argument('--pspi_collect_candidates', type=str2bool, default=True)
-        # Module-2 / InterFusion: text-modulated pixel interaction fusion
+        # Module-2 / InterFusion:
+        # DGNet-style text modulation + MRFS IGM-Att
         p.add_argument('--interfusion_enabled', type=str2bool, default=True)
         p.add_argument('--interfusion_clip_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/clip-vit-base-patch32')
         p.add_argument('--interfusion_state_dim', type=int, default=128)
-        p.add_argument('--interfusion_num_heads', type=int, nargs=4, default=[1, 2, 5, 8])
         p.add_argument('--interfusion_text_reduction', type=int, default=16)
-        p.add_argument('--interfusion_attn_drop', type=float, default=0.0)
-        p.add_argument('--interfusion_proj_drop', type=float, default=0.0)
-        p.add_argument('--interfusion_relation_drop', type=float, default=0.0)
+        p.add_argument('--interfusion_igma_gate_reduction', type=int, default=4)
+        p.add_argument('--interfusion_igma_channel_reduction', type=int, default=4)
+        p.add_argument('--interfusion_igma_spatial_reduction', type=int, default=4)
+        p.add_argument('--interfusion_igma_spatial_kernel_size', type=int, default=1)
         # Stage-1 unimodal pretraining initialization
         p.add_argument('--stage1_init_enabled', type=str2bool, default=False)
         p.add_argument('--stage1_ct_checkpoint', type=str, default=None)

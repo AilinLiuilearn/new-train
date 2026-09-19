@@ -6,9 +6,9 @@ import torch.nn as nn
 from models.baseline_blocks import AddFusion, UNetStyleDecoder, _check_tensor, _check_tensor_list
 from models.build_mdt_seg import create_feature_backbone, load_local_weights_safe
 from models.ct_conditioned_pet_affine import CTConditionedPETAffine
-from models.text_modulated_pixel_interaction_fusion import (
-    TextModulatedPixelInteractionFusion,
-    build_clip_text_priors,
+from models.text_modulated_mrfs_igma_fusion import (
+    TextModulatedMRFSFusion,
+    build_local_clip_text_priors,
 )
 from models.paired_semantic_prototype_imputation import (
     PairedSemanticPrototypeImputation,
@@ -34,13 +34,18 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
-    """AddFusion baseline with clean Module-1 (paired PET prior retrieval).
+    """PET-CT segmentation model with clean PSPI Module-1 and optional
+    text-modulated MRFS IGM-Att Module-2.
 
-    Missing boundary (new scheme): F_missing^l = C^l + pet_comp^l with
-    pet_comp^l = gamma^l(C.detach()) * P_prior^l + beta^l(C.detach()),
-    where P_prior is the existing Module-1 retrieval output. The fusion stays
-    the original AddFusion (direct add), unchanged for the Full route:
-    F_full^l = C^l + P_real^l.
+    Full:
+        CT + real PET -> Module-2 -> decoder
+
+    Missing:
+        CT -> PSPI -> CT-affine compensated PET
+        CT + compensated PET -> Module-2 -> decoder
+
+    When interfusion_enabled=False, AddFusion is retained only as a
+    baseline/ablation fallback.
     """
 
     def __init__(
@@ -71,11 +76,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
         interfusion_enabled=True,
         interfusion_clip_path='/root/autodl-tmp/mkd-main/new-train/pretrained/clip-vit-base-patch32',
         interfusion_state_dim=128,
-        interfusion_num_heads=(1, 2, 5, 8),
         interfusion_text_reduction=16,
-        interfusion_attn_drop=0.0,
-        interfusion_proj_drop=0.0,
-        interfusion_relation_drop=0.0,
+        interfusion_igma_gate_reduction=4,
+        interfusion_igma_channel_reduction=4,
+        interfusion_igma_spatial_reduction=4,
+        interfusion_igma_spatial_kernel_size=1,
     ):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
@@ -160,32 +165,36 @@ class DualSharedAddPETCTBaseline(nn.Module):
         else:
             self.pet_affine = None
 
-        # Module-2 / InterFusion: text-modulated pixel interaction fusion.
+        # Module-2 / InterFusion: text-modulated MRFS IGM-Att fusion.
         # Channels follow pet_channels (CT already aligned to PET channels).
         self.interfusion_enabled = bool(interfusion_enabled)
         if len(pet_channels) != 4:
             raise ValueError(
                 f"InterFusion requires 4 scales, got pet_channels={pet_channels}"
             )
-        if len(tuple(interfusion_num_heads)) != 4:
-            raise ValueError(
-                "interfusion_num_heads must have 4 entries, "
-                f"got {tuple(interfusion_num_heads)}"
-            )
         if self.interfusion_enabled:
-            ct_text_feature, pet_text_feature = build_clip_text_priors(
+            ct_text_feature, pet_text_feature = build_local_clip_text_priors(
                 str(interfusion_clip_path),
+                device='cpu',
             )
+            if ct_text_feature.ndim != 2 or pet_text_feature.ndim != 2:
+                raise RuntimeError('CLIP text priors must be [1,D]')
+            if ct_text_feature.shape[-1] != pet_text_feature.shape[-1]:
+                raise RuntimeError(
+                    'CT/PET CLIP text feature dimensions do not match'
+                )
             text_dim = int(ct_text_feature.shape[-1])
-            self.interfusion = TextModulatedPixelInteractionFusion(
+            self.interfusion = TextModulatedMRFSFusion(
                 channels=tuple(int(c) for c in pet_channels),
                 text_dim=text_dim,
                 state_dim=int(interfusion_state_dim),
-                num_heads=tuple(int(h) for h in interfusion_num_heads),
                 text_reduction=int(interfusion_text_reduction),
-                attn_drop=float(interfusion_attn_drop),
-                proj_drop=float(interfusion_proj_drop),
-                relation_drop=float(interfusion_relation_drop),
+                igma_gate_reduction=int(interfusion_igma_gate_reduction),
+                igma_channel_reduction=int(interfusion_igma_channel_reduction),
+                igma_spatial_reduction=int(interfusion_igma_spatial_reduction),
+                igma_spatial_kernel_size=int(
+                    interfusion_igma_spatial_kernel_size
+                ),
             )
             self.interfusion.set_text_priors(ct_text_feature, pet_text_feature)
         else:
