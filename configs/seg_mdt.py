@@ -57,6 +57,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--interfusion_clip_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/clip-vit-base-patch32')
         p.add_argument('--interfusion_state_dim', type=int, default=128)
         p.add_argument('--interfusion_text_reduction', type=int, default=16)
+        p.add_argument('--interfusion_use_text_modulation', type=str2bool, default=True)
         p.add_argument('--interfusion_igma_gate_reduction', type=int, default=4)
         p.add_argument('--interfusion_igma_channel_reduction', type=int, default=4)
         p.add_argument('--interfusion_igma_spatial_reduction', type=int, default=4)

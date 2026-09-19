@@ -531,6 +531,7 @@ def build_mdt_seg_teacher(config):
         interfusion_clip_path=getattr(config, 'interfusion_clip_path', '/root/autodl-tmp/mkd-main/new-train/pretrained/clip-vit-base-patch32'),
         interfusion_state_dim=getattr(config, 'interfusion_state_dim', 128),
         interfusion_text_reduction=getattr(config, 'interfusion_text_reduction', 16),
+        interfusion_use_text_modulation=getattr(config, 'interfusion_use_text_modulation', True),
         interfusion_igma_gate_reduction=getattr(config, 'interfusion_igma_gate_reduction', 4),
         interfusion_igma_channel_reduction=getattr(config, 'interfusion_igma_channel_reduction', 4),
         interfusion_igma_spatial_reduction=getattr(config, 'interfusion_igma_spatial_reduction', 4),
@@ -575,6 +576,7 @@ def build_mdt_seg_teacher(config):
         f'interactive_gate=pixel_channel_gate '
         f'bidirectional_cross_injection=True '
         f'final_fusion=add_interacted_features '
+        f'use_text_modulation={bool(getattr(config, "interfusion_use_text_modulation", True))} '
         f'state_dim={getattr(config, "interfusion_state_dim", 128)} '
         f'text_reduction={getattr(config, "interfusion_text_reduction", 16)} '
         f'igma_gate_reduction={getattr(config, "interfusion_igma_gate_reduction", 4)} '

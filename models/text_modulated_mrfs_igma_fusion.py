@@ -355,7 +355,13 @@ class MRFSInteractiveGatedMixedAttention(nn.Module):
 # =============================================================================
 
 class TextModulatedMRFSStage(nn.Module):
-    """CT/PET text modulation -> MRFS IGM-Att -> Add."""
+    """CT/PET text modulation -> MRFS IGM-Att -> Add.
+
+    When use_text_modulation=False, the DGNet T-KGM text path (including the
+    PET Full/Missing state conditioning, which lives inside the PET text
+    condition) is bypassed entirely: raw CT/PET features go straight into
+    MRFS IGM-Att, then Add. This is the no-text IGM-Att-only ablation.
+    """
 
     def __init__(
         self,
@@ -367,9 +373,11 @@ class TextModulatedMRFSStage(nn.Module):
         igma_channel_reduction: int = 4,
         igma_spatial_reduction: int = 4,
         igma_spatial_kernel_size: int = 1,
+        use_text_modulation: bool = True,
     ) -> None:
         super().__init__()
         self.channels = int(channels)
+        self.use_text_modulation = bool(use_text_modulation)
 
         self.ct_modulator = ModalityTextModulator(
             self.channels, text_dim, text_reduction
@@ -397,9 +405,9 @@ class TextModulatedMRFSStage(nn.Module):
         self,
         ct: Tensor,
         pet: Tensor,
-        ct_text_feature: Tensor,
-        pet_text_feature: Tensor,
-        state_vector: Tensor,
+        ct_text_feature: Optional[Tensor] = None,
+        pet_text_feature: Optional[Tensor] = None,
+        state_vector: Optional[Tensor] = None,
         return_aux: bool = False,
     ):
         if ct.shape != pet.shape or ct.ndim != 4:
@@ -408,24 +416,36 @@ class TextModulatedMRFSStage(nn.Module):
             raise ValueError(f"expected C={self.channels}")
 
         B = int(ct.shape[0])
-        if state_vector.ndim == 1:
+        if state_vector is not None and state_vector.ndim == 1:
             state_vector = state_vector.unsqueeze(0)
-        if int(state_vector.shape[0]) == 1 and B > 1:
-            state_vector = state_vector.expand(B, -1)
-        elif int(state_vector.shape[0]) != B:
-            raise ValueError("state-vector batch mismatch")
+        if self.use_text_modulation:
+            if state_vector is None:
+                raise ValueError("text modulation requires state_vector")
+            if int(state_vector.shape[0]) == 1 and B > 1:
+                state_vector = state_vector.expand(B, -1)
+            elif int(state_vector.shape[0]) != B:
+                raise ValueError("state-vector batch mismatch")
+            if ct_text_feature is None or pet_text_feature is None:
+                raise ValueError("text modulation requires text features")
 
-        state_condition = self.state_proj(state_vector)
+            state_condition = self.state_proj(state_vector)
 
-        # CT: fixed modality text only.
-        ct_t, ct_text_gate, ct_condition = self.ct_modulator(
-            ct, ct_text_feature, state_condition=None
-        )
+            # CT: fixed modality text only.
+            ct_t, ct_text_gate, ct_condition = self.ct_modulator(
+                ct, ct_text_feature, state_condition=None
+            )
 
-        # PET: fixed modality text + Full/Missing global state.
-        pet_t, pet_text_gate, pet_condition = self.pet_modulator(
-            pet, pet_text_feature, state_condition=state_condition
-        )
+            # PET: fixed modality text + Full/Missing global state.
+            pet_t, pet_text_gate, pet_condition = self.pet_modulator(
+                pet, pet_text_feature, state_condition=state_condition
+            )
+        else:
+            # No-text ablation: raw CT/PET straight into IGM-Att.
+            # state_vector and text features are ignored here; the Full/Missing
+            # routing (real vs compensated PET) is already done upstream.
+            ct_t, pet_t = ct, pet
+            ct_text_gate = pet_text_gate = None
+            ct_condition = pet_condition = None
 
         if return_aux:
             ct_i, pet_i, interaction_aux = self.interaction(
@@ -438,17 +458,21 @@ class TextModulatedMRFSStage(nn.Module):
 
         if not return_aux:
             return fused
-        return fused, {
-            "ct_text_gate": ct_text_gate,
-            "pet_text_gate": pet_text_gate,
-            "ct_text_condition": ct_condition,
-            "pet_text_condition": pet_condition,
-            "ct_text_modulated": ct_t,
-            "pet_text_modulated": pet_t,
+        aux: Dict[str, Tensor] = {
             "ct_interacted": ct_i,
             "pet_interacted": pet_i,
             **interaction_aux,
         }
+        if self.use_text_modulation:
+            aux.update({
+                "ct_text_gate": ct_text_gate,
+                "pet_text_gate": pet_text_gate,
+                "ct_text_condition": ct_condition,
+                "pet_text_condition": pet_condition,
+                "ct_text_modulated": ct_t,
+                "pet_text_modulated": pet_t,
+            })
+        return fused, aux
 
 
 # =============================================================================
@@ -473,6 +497,9 @@ class TextModulatedMRFSFusion(nn.Module):
       - no extra alpha
       - source-faithful MRFS IGM-Att
       - final F_l = C_l^I + P_l^I
+      - use_text_modulation=False bypasses the whole DGNet text path
+        (including PET s_F/s_M conditioning) for the no-text ablation;
+        raw CT/PET go straight into MRFS IGM-Att
     """
 
     FULL = 1
@@ -488,6 +515,7 @@ class TextModulatedMRFSFusion(nn.Module):
         igma_channel_reduction: int = 4,
         igma_spatial_reduction: int = 4,
         igma_spatial_kernel_size: int = 1,
+        use_text_modulation: bool = True,
         ct_text_prior: Optional[Tensor] = None,
         pet_text_prior: Optional[Tensor] = None,
     ) -> None:
@@ -495,11 +523,13 @@ class TextModulatedMRFSFusion(nn.Module):
         self.channels = tuple(int(c) for c in channels)
         self.text_dim = int(text_dim)
         self.state_dim = int(state_dim)
+        self.use_text_modulation = bool(use_text_modulation)
 
         if not self.channels:
             raise ValueError("channels cannot be empty")
 
         # Exactly two GLOBAL states, shared by all scales.
+        # In no-text mode they are unused but kept for checkpoint compat.
         self.state_vectors = nn.Embedding(2, self.state_dim)
         nn.init.trunc_normal_(self.state_vectors.weight, std=0.02)
 
@@ -513,6 +543,7 @@ class TextModulatedMRFSFusion(nn.Module):
                 igma_channel_reduction=igma_channel_reduction,
                 igma_spatial_reduction=igma_spatial_reduction,
                 igma_spatial_kernel_size=igma_spatial_kernel_size,
+                use_text_modulation=self.use_text_modulation,
             )
             for c in self.channels
         ])
@@ -520,10 +551,15 @@ class TextModulatedMRFSFusion(nn.Module):
         self.register_buffer("ct_text_prior", torch.empty(0), persistent=True)
         self.register_buffer("pet_text_prior", torch.empty(0), persistent=True)
 
-        if ct_text_prior is not None or pet_text_prior is not None:
-            if ct_text_prior is None or pet_text_prior is None:
-                raise ValueError("CT/PET text priors must be provided together")
-            self.set_text_priors(ct_text_prior, pet_text_prior)
+        if self.use_text_modulation:
+            if ct_text_prior is not None or pet_text_prior is not None:
+                if ct_text_prior is None or pet_text_prior is None:
+                    raise ValueError("CT/PET text priors must be provided together")
+                self.set_text_priors(ct_text_prior, pet_text_prior)
+        elif ct_text_prior is not None or pet_text_prior is not None:
+            raise ValueError(
+                "use_text_modulation=False must not receive text priors"
+            )
 
     @property
     def s_F(self) -> Tensor:
@@ -639,23 +675,33 @@ class TextModulatedMRFSFusion(nn.Module):
                 )
 
         if ct_text_feature is None or pet_text_feature is None:
-            if not self.has_text_priors():
+            if not self.use_text_modulation:
+                ct_text_feature = None
+                pet_text_feature = None
+            elif not self.has_text_priors():
                 raise RuntimeError(
                     "text priors missing: call set_text_priors(...) once or "
                     "pass both text features to forward()"
                 )
-            ct_text_feature = self.ct_text_prior
-            pet_text_feature = self.pet_text_prior
+            else:
+                ct_text_feature = self.ct_text_prior
+                pet_text_feature = self.pet_text_prior
 
-        ct_text_feature = ct_text_feature.to(
-            device=device, dtype=ct_feats[0].dtype
-        )
-        pet_text_feature = pet_text_feature.to(
-            device=device, dtype=pet_feats[0].dtype
-        )
-
-        state_ids = self._state_ids(state, B, device)
-        state_vector = self.state_vectors(state_ids)
+        if self.use_text_modulation:
+            ct_text_feature = ct_text_feature.to(
+                device=device, dtype=ct_feats[0].dtype
+            )
+            pet_text_feature = pet_text_feature.to(
+                device=device, dtype=pet_feats[0].dtype
+            )
+            state_ids = self._state_ids(state, B, device)
+            state_vector = self.state_vectors(state_ids)
+        else:
+            # No-text ablation: no CLIP features, no s_F/s_M lookup.
+            # Full/Missing routing is already encoded in pet_feats itself.
+            ref = ct_feats[0]
+            state_ids = ref.new_zeros((B,), dtype=torch.long)
+            state_vector = None
 
         fused_feats: List[Tensor] = []
         aux_stages: List[Dict[str, Tensor]] = []
@@ -686,6 +732,7 @@ class TextModulatedMRFSFusion(nn.Module):
             return fused_feats, {
                 "state_ids": state_ids,
                 "state_vector": state_vector,
+                "use_text_modulation": self.use_text_modulation,
                 "stages": aux_stages,
             }
         return fused_feats
@@ -802,6 +849,24 @@ def _smoke_test() -> None:
     assert any(
         p.grad is not None for p in model.parameters() if p.requires_grad
     )
+
+    # No-text ablation: raw CT/PET straight into IGM-Att, no CLIP priors.
+    model_no_text = TextModulatedMRFSFusion(
+        channels=channels,
+        text_dim=text_dim,
+        state_dim=state_dim,
+        text_reduction=16,
+        igma_gate_reduction=4,
+        igma_channel_reduction=4,
+        igma_spatial_reduction=4,
+        igma_spatial_kernel_size=1,
+        use_text_modulation=False,
+    )
+    assert not model_no_text.has_text_priors()
+    outputs_no_text = model_no_text(ct_feats, pet_feats, state=state)
+    for y, c, s in zip(outputs_no_text, channels, spatial):
+        assert y.shape == (B, c, s, s)
+        assert torch.isfinite(y).all()
 
     print("[SMOKE] passed")
     print("[SMOKE] output shapes:", [tuple(x.shape) for x in outputs])

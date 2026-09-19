@@ -77,6 +77,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         interfusion_clip_path='/root/autodl-tmp/mkd-main/new-train/pretrained/clip-vit-base-patch32',
         interfusion_state_dim=128,
         interfusion_text_reduction=16,
+        interfusion_use_text_modulation=True,
         interfusion_igma_gate_reduction=4,
         interfusion_igma_channel_reduction=4,
         interfusion_igma_spatial_reduction=4,
@@ -172,18 +173,27 @@ class DualSharedAddPETCTBaseline(nn.Module):
             raise ValueError(
                 f"InterFusion requires 4 scales, got pet_channels={pet_channels}"
             )
+        # use_text_modulation=False keeps raw CT/PET -> MRFS IGM-Att -> Add,
+        # with no CLIP load and no text/state path (AddFusion fallback stays
+        # only for interfusion_enabled=False).
+        self.interfusion_use_text_modulation = bool(interfusion_use_text_modulation)
         if self.interfusion_enabled:
-            ct_text_feature, pet_text_feature = build_local_clip_text_priors(
-                str(interfusion_clip_path),
-                device='cpu',
-            )
-            if ct_text_feature.ndim != 2 or pet_text_feature.ndim != 2:
-                raise RuntimeError('CLIP text priors must be [1,D]')
-            if ct_text_feature.shape[-1] != pet_text_feature.shape[-1]:
-                raise RuntimeError(
-                    'CT/PET CLIP text feature dimensions do not match'
+            if self.interfusion_use_text_modulation:
+                ct_text_feature, pet_text_feature = build_local_clip_text_priors(
+                    str(interfusion_clip_path),
+                    device='cpu',
                 )
-            text_dim = int(ct_text_feature.shape[-1])
+                if ct_text_feature.ndim != 2 or pet_text_feature.ndim != 2:
+                    raise RuntimeError('CLIP text priors must be [1,D]')
+                if ct_text_feature.shape[-1] != pet_text_feature.shape[-1]:
+                    raise RuntimeError(
+                        'CT/PET CLIP text feature dimensions do not match'
+                    )
+                text_dim = int(ct_text_feature.shape[-1])
+            else:
+                # No CLIP in no-text mode; text_dim is unused downstream.
+                ct_text_feature, pet_text_feature = None, None
+                text_dim = 512
             self.interfusion = TextModulatedMRFSFusion(
                 channels=tuple(int(c) for c in pet_channels),
                 text_dim=text_dim,
@@ -195,8 +205,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 igma_spatial_kernel_size=int(
                     interfusion_igma_spatial_kernel_size
                 ),
+                use_text_modulation=self.interfusion_use_text_modulation,
             )
-            self.interfusion.set_text_priors(ct_text_feature, pet_text_feature)
+            if self.interfusion_use_text_modulation:
+                self.interfusion.set_text_priors(ct_text_feature, pet_text_feature)
         else:
             self.interfusion = None
 
