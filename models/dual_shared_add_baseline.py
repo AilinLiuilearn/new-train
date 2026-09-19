@@ -73,6 +73,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         interfusion_state_dim=128,
         interfusion_num_heads=(1, 2, 5, 8),
         interfusion_text_reduction=16,
+        interfusion_use_text_modulation=True,
         interfusion_attn_drop=0.0,
         interfusion_proj_drop=0.0,
         interfusion_relation_drop=0.0,
@@ -162,7 +163,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
 
         # Module-2 / InterFusion: text-modulated pixel interaction fusion.
         # Channels follow pet_channels (CT already aligned to PET channels).
+        # use_text_modulation=False keeps Module-1 output -> raw CT/PET straight
+        # into the Gemini interaction -> Add, with no CLIP load and no
+        # text/state path (AddFusion fallback stays only for
+        # interfusion_enabled=False).
         self.interfusion_enabled = bool(interfusion_enabled)
+        self.interfusion_use_text_modulation = bool(interfusion_use_text_modulation)
         if len(pet_channels) != 4:
             raise ValueError(
                 f"InterFusion requires 4 scales, got pet_channels={pet_channels}"
@@ -173,10 +179,15 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 f"got {tuple(interfusion_num_heads)}"
             )
         if self.interfusion_enabled:
-            ct_text_feature, pet_text_feature = build_clip_text_priors(
-                str(interfusion_clip_path),
-            )
-            text_dim = int(ct_text_feature.shape[-1])
+            if self.interfusion_use_text_modulation:
+                ct_text_feature, pet_text_feature = build_clip_text_priors(
+                    str(interfusion_clip_path),
+                )
+                text_dim = int(ct_text_feature.shape[-1])
+            else:
+                # No CLIP in no-text mode; text_dim is unused downstream.
+                ct_text_feature, pet_text_feature = None, None
+                text_dim = 512
             self.interfusion = TextModulatedPixelInteractionFusion(
                 channels=tuple(int(c) for c in pet_channels),
                 text_dim=text_dim,
@@ -186,8 +197,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 attn_drop=float(interfusion_attn_drop),
                 proj_drop=float(interfusion_proj_drop),
                 relation_drop=float(interfusion_relation_drop),
+                use_text_modulation=self.interfusion_use_text_modulation,
             )
-            self.interfusion.set_text_priors(ct_text_feature, pet_text_feature)
+            if self.interfusion_use_text_modulation:
+                self.interfusion.set_text_priors(ct_text_feature, pet_text_feature)
         else:
             self.interfusion = None
 

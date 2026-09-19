@@ -373,10 +373,15 @@ class GeminiPixelWiseInteraction(nn.Module):
 class TextModulatedPixelInteractionStage(nn.Module):
     """
     One scale:
-        CT -> CT text modulation ----------\
-                                           Gemini pixel interaction -> CT^I
-        PET -> PET text + state modulation /                         -> PET^I
+        CT -> [CT text modulation] ----------\
+                                             Gemini pixel interaction -> CT^I
+        PET -> [PET text + state modulation] /                           -> PET^I
         Final: F = CT^I + PET^I
+
+    When use_text_modulation=False, the DGNet text path (including the PET
+    Full/Missing state conditioning, which lives inside the PET text
+    condition) is bypassed: raw CT/PET go straight into the Gemini
+    interaction, then Add. This is the no-text Gemini-only ablation.
     """
     def __init__(
         self,
@@ -388,8 +393,11 @@ class TextModulatedPixelInteractionStage(nn.Module):
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
         relation_drop: float = 0.0,
+        use_text_modulation: bool = True,
     ) -> None:
         super().__init__()
+
+        self.use_text_modulation = bool(use_text_modulation)
 
         self.ct_modulator = ModalityTextModulator(
             channels, text_dim, text_reduction
@@ -417,9 +425,9 @@ class TextModulatedPixelInteractionStage(nn.Module):
         self,
         ct: Tensor,
         pet: Tensor,
-        ct_text_feature: Tensor,
-        pet_text_feature: Tensor,
-        state_vector: Tensor,
+        ct_text_feature: Optional[Tensor] = None,
+        pet_text_feature: Optional[Tensor] = None,
+        state_vector: Optional[Tensor] = None,
         return_aux: bool = False,
     ):
         if ct.shape != pet.shape:
@@ -429,22 +437,34 @@ class TextModulatedPixelInteractionStage(nn.Module):
 
         B = ct.shape[0]
 
-        if state_vector.ndim == 1:
-            state_vector = state_vector.unsqueeze(0)
-        if state_vector.shape[0] == 1 and B > 1:
-            state_vector = state_vector.expand(B, -1)
+        if self.use_text_modulation:
+            if state_vector is None:
+                raise ValueError("text modulation requires state_vector")
+            if state_vector.ndim == 1:
+                state_vector = state_vector.unsqueeze(0)
+            if state_vector.shape[0] == 1 and B > 1:
+                state_vector = state_vector.expand(B, -1)
+            if ct_text_feature is None or pet_text_feature is None:
+                raise ValueError("text modulation requires text features")
 
-        state_condition = self.state_proj(state_vector)
+            state_condition = self.state_proj(state_vector)
 
-        # CT: fixed CT text only.
-        ct_t, ct_gate, ct_condition = self.ct_modulator(
-            ct, ct_text_feature, state_condition=None
-        )
+            # CT: fixed CT text only.
+            ct_t, ct_gate, ct_condition = self.ct_modulator(
+                ct, ct_text_feature, state_condition=None
+            )
 
-        # PET: fixed PET text + global Full/Missing state.
-        pet_t, pet_gate, pet_condition = self.pet_modulator(
-            pet, pet_text_feature, state_condition=state_condition
-        )
+            # PET: fixed PET text + global Full/Missing state.
+            pet_t, pet_gate, pet_condition = self.pet_modulator(
+                pet, pet_text_feature, state_condition=state_condition
+            )
+        else:
+            # No-text ablation: raw CT/PET straight into Gemini interaction.
+            # state_vector and text features are ignored here; Full/Missing
+            # routing (real vs compensated PET) is already done upstream.
+            ct_t, pet_t = ct, pet
+            ct_gate = pet_gate = None
+            ct_condition = pet_condition = None
 
         if return_aux:
             ct_i, pet_i, interaction_aux = self.interaction(
@@ -460,17 +480,21 @@ class TextModulatedPixelInteractionStage(nn.Module):
         if not return_aux:
             return fused
 
-        return fused, {
-            "ct_text_gate": ct_gate,
-            "pet_text_gate": pet_gate,
-            "ct_text_condition": ct_condition,
-            "pet_text_condition": pet_condition,
-            "ct_text_modulated": ct_t,
-            "pet_text_modulated": pet_t,
+        aux: Dict[str, Tensor] = {
             "ct_interacted": ct_i,
             "pet_interacted": pet_i,
             **interaction_aux,
         }
+        if self.use_text_modulation:
+            aux.update({
+                "ct_text_gate": ct_gate,
+                "pet_text_gate": pet_gate,
+                "ct_text_condition": ct_condition,
+                "pet_text_condition": pet_condition,
+                "ct_text_modulated": ct_t,
+                "pet_text_modulated": pet_t,
+            })
+        return fused, aux
 
 
 class TextModulatedPixelInteractionFusion(nn.Module):
@@ -494,6 +518,9 @@ class TextModulatedPixelInteractionFusion(nn.Module):
       - no alpha parameter
       - GeminiFusion-style aligned pixel-wise bidirectional interaction
       - final F_l = C_l^I + P_l^I
+      - use_text_modulation=False bypasses the whole DGNet text path
+        (including PET s_F/s_M conditioning) for the no-text ablation;
+        raw CT/PET go straight into Gemini interaction
     """
 
     FULL = 1
@@ -509,6 +536,7 @@ class TextModulatedPixelInteractionFusion(nn.Module):
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
         relation_drop: float = 0.0,
+        use_text_modulation: bool = True,
         ct_text_prior: Optional[Tensor] = None,
         pet_text_prior: Optional[Tensor] = None,
     ) -> None:
@@ -518,6 +546,7 @@ class TextModulatedPixelInteractionFusion(nn.Module):
         self.text_dim = int(text_dim)
         self.state_dim = int(state_dim)
         self.num_heads = tuple(num_heads)
+        self.use_text_modulation = bool(use_text_modulation)
 
         if len(self.channels) != len(self.num_heads):
             raise ValueError("channels and num_heads must have same length.")
@@ -527,6 +556,7 @@ class TextModulatedPixelInteractionFusion(nn.Module):
                 raise ValueError(f"{c} must be divisible by {h} heads.")
 
         # Exactly two GLOBAL state vectors.
+        # In no-text mode they are unused but kept for checkpoint compat.
         self.state_vectors = nn.Embedding(2, self.state_dim)
         nn.init.trunc_normal_(self.state_vectors.weight, std=0.02)
 
@@ -540,6 +570,7 @@ class TextModulatedPixelInteractionFusion(nn.Module):
                 attn_drop=attn_drop,
                 proj_drop=proj_drop,
                 relation_drop=relation_drop,
+                use_text_modulation=self.use_text_modulation,
             )
             for c, h in zip(self.channels, self.num_heads)
         ])
@@ -547,12 +578,17 @@ class TextModulatedPixelInteractionFusion(nn.Module):
         self.register_buffer("ct_text_prior", torch.empty(0), persistent=True)
         self.register_buffer("pet_text_prior", torch.empty(0), persistent=True)
 
-        if ct_text_prior is not None or pet_text_prior is not None:
-            if ct_text_prior is None or pet_text_prior is None:
-                raise ValueError(
-                    "ct_text_prior and pet_text_prior must be provided together."
-                )
-            self.set_text_priors(ct_text_prior, pet_text_prior)
+        if self.use_text_modulation:
+            if ct_text_prior is not None or pet_text_prior is not None:
+                if ct_text_prior is None or pet_text_prior is None:
+                    raise ValueError(
+                        "ct_text_prior and pet_text_prior must be provided together."
+                    )
+                self.set_text_priors(ct_text_prior, pet_text_prior)
+        elif ct_text_prior is not None or pet_text_prior is not None:
+            raise ValueError(
+                "use_text_modulation=False must not receive text priors"
+            )
 
     @torch.no_grad()
     def set_text_priors(
@@ -677,23 +713,33 @@ class TextModulatedPixelInteractionFusion(nn.Module):
                 )
 
         if ct_text_feature is None or pet_text_feature is None:
-            if not self.has_text_priors():
+            if not self.use_text_modulation:
+                ct_text_feature = None
+                pet_text_feature = None
+            elif not self.has_text_priors():
                 raise RuntimeError(
                     "Call set_text_priors(ct_text, pet_text) first, "
                     "or pass both text features into forward()."
                 )
-            ct_text_feature = self.ct_text_prior
-            pet_text_feature = self.pet_text_prior
+            else:
+                ct_text_feature = self.ct_text_prior
+                pet_text_feature = self.pet_text_prior
 
-        ct_text_feature = ct_text_feature.to(
-            device=device, dtype=ct_feats[0].dtype
-        )
-        pet_text_feature = pet_text_feature.to(
-            device=device, dtype=pet_feats[0].dtype
-        )
-
-        state_ids = self._state_ids(state, B, device)
-        state_vector = self.state_vectors(state_ids)
+        if self.use_text_modulation:
+            ct_text_feature = ct_text_feature.to(
+                device=device, dtype=ct_feats[0].dtype
+            )
+            pet_text_feature = pet_text_feature.to(
+                device=device, dtype=pet_feats[0].dtype
+            )
+            state_ids = self._state_ids(state, B, device)
+            state_vector = self.state_vectors(state_ids)
+        else:
+            # No-text ablation: no CLIP features, no s_F/s_M lookup.
+            # Full/Missing routing is already encoded in pet_feats itself.
+            ref = ct_feats[0]
+            state_ids = ref.new_zeros((B,), dtype=torch.long)
+            state_vector = None
 
         fused_feats: List[Tensor] = []
         aux_stages: List[Dict[str, Tensor]] = []
@@ -725,6 +771,7 @@ class TextModulatedPixelInteractionFusion(nn.Module):
             return fused_feats, {
                 "state_ids": state_ids,
                 "state_vector": state_vector,
+                "use_text_modulation": self.use_text_modulation,
                 "stages": aux_stages,
             }
 

@@ -532,6 +532,7 @@ def build_mdt_seg_teacher(config):
         interfusion_state_dim=getattr(config, 'interfusion_state_dim', 128),
         interfusion_num_heads=getattr(config, 'interfusion_num_heads', (1, 2, 5, 8)),
         interfusion_text_reduction=getattr(config, 'interfusion_text_reduction', 16),
+        interfusion_use_text_modulation=getattr(config, 'interfusion_use_text_modulation', True),
         interfusion_attn_drop=getattr(config, 'interfusion_attn_drop', 0.0),
         interfusion_proj_drop=getattr(config, 'interfusion_proj_drop', 0.0),
         interfusion_relation_drop=getattr(config, 'interfusion_relation_drop', 0.0),
@@ -566,11 +567,12 @@ def build_mdt_seg_teacher(config):
         f'text_encoder=CLIP-ViT-B-32 '
         f'clip_path={getattr(config, "interfusion_clip_path", "/root/autodl-tmp/mkd-main/new-train/pretrained/clip-vit-base-patch32")} '
         f'text_encoder_frozen=True '
+        f'use_text_modulation={bool(getattr(config, "interfusion_use_text_modulation", True))} '
         f'ct_text="A CT image showing the anatomical structure and boundaries of lung tumors." '
         f'pet_text="A PET image showing bright tumor regions in the lungs." '
         f'state_vectors=2_global_shared '
         f'state_semantics=1_full_0_missing '
-        f'text_modulation=DGNet_TKGM_inspired '
+        f'text_modulation={"DGNet_TKGM_inspired" if bool(getattr(config, "interfusion_use_text_modulation", True)) else "disabled_raw_ct_pet_to_gemini"} '
         f'interaction=GeminiFusion_pixelwise_bidirectional '
         f'final_fusion=add_interacted_features'
     )

@@ -57,6 +57,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--interfusion_state_dim', type=int, default=128)
         p.add_argument('--interfusion_num_heads', type=int, nargs=4, default=[1, 2, 5, 8])
         p.add_argument('--interfusion_text_reduction', type=int, default=16)
+        p.add_argument('--interfusion_use_text_modulation', type=str2bool, default=True)
         p.add_argument('--interfusion_attn_drop', type=float, default=0.0)
         p.add_argument('--interfusion_proj_drop', type=float, default=0.0)
         p.add_argument('--interfusion_relation_drop', type=float, default=0.0)
