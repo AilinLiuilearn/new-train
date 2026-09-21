@@ -607,6 +607,17 @@ class PairedSemanticPrototypeImputation(nn.Module):
             "prototype_count",
             torch.zeros(2, self.num_clusters, dtype=torch.long),
         )
+        # Per-scale readiness/count: independent clustering may fill different
+        # slots at each scale, so loss/retrieval must use the per-scale mask
+        # instead of the merged union (avoids injecting unfilled zero slots).
+        self.register_buffer(
+            "prototype_ready_scale",
+            torch.zeros(self.num_scales, 2, self.num_clusters, dtype=torch.bool),
+        )
+        self.register_buffer(
+            "prototype_count_scale",
+            torch.zeros(self.num_scales, 2, self.num_clusters, dtype=torch.long),
+        )
         self.register_buffer("bank_version", torch.zeros((), dtype=torch.long))
 
         self._epoch_cache = self._new_cache()
@@ -809,6 +820,10 @@ class PairedSemanticPrototypeImputation(nn.Module):
             val_buf.copy_(new_values[s].to(val_buf.device, dtype=val_buf.dtype))
         self.prototype_ready.copy_(new_ready.to(self.prototype_ready.device))
         self.prototype_count.copy_(new_count.to(self.prototype_count.device))
+        stacked_ready = new_ready.unsqueeze(0).expand(self.num_scales, -1, -1).clone()
+        stacked_count = new_count.unsqueeze(0).expand(self.num_scales, -1, -1).clone()
+        self.prototype_ready_scale.copy_(stacked_ready.to(self.prototype_ready_scale.device))
+        self.prototype_count_scale.copy_(stacked_count.to(self.prototype_count_scale.device))
         return {"mode": "direct", "matches": {}}
 
     @torch.no_grad()
@@ -881,6 +896,10 @@ class PairedSemanticPrototypeImputation(nn.Module):
                 val_buf.copy_(new_values[s].to(val_buf.device, dtype=val_buf.dtype))
             self.prototype_ready.copy_(new_ready.to(self.prototype_ready.device))
             self.prototype_count.copy_(new_count.to(self.prototype_count.device))
+            stacked_ready = new_ready.unsqueeze(0).expand(self.num_scales, -1, -1).clone()
+            stacked_count = new_count.unsqueeze(0).expand(self.num_scales, -1, -1).clone()
+            self.prototype_ready_scale.copy_(stacked_ready.to(self.prototype_ready_scale.device))
+            self.prototype_count_scale.copy_(stacked_count.to(self.prototype_count_scale.device))
             # compute diversities after init
             diversities = {}
             for class_idx, class_name in enumerate(CLASS_NAMES):
@@ -910,14 +929,17 @@ class PairedSemanticPrototypeImputation(nn.Module):
                 "pet_value_update_norm": 0.0,
                 "prototype_diversity_background": diversities.get("background", 0.0),
                 "prototype_diversity_foreground": diversities.get("foreground", 0.0),
+                "prototype_diversity_per_scale": per_scale_diversity if "per_scale_diversity" in dir() else {},
             }
 
         out_keys = [getattr(self, f"ct_keys_s{s + 1}").detach().float().cpu().clone() for s in range(self.num_scales)]
         out_values = [getattr(self, f"pet_values_s{s + 1}").detach().float().cpu().clone() for s in range(self.num_scales)]
-        out_ready = self.prototype_ready.detach().cpu().clone()
-        out_count = self.prototype_count.detach().cpu().clone()
-        old_build = out_keys[self.build_stage_idx]
-        new_build = new_keys[self.build_stage_idx]
+        # Per-scale readiness: each scale tracks its own ready slots so EMA
+        # matching/diversity are fully independent per scale.
+        out_ready = [self.prototype_ready.detach().cpu().clone() for _ in range(self.num_scales)]
+        out_count = [self.prototype_count.detach().cpu().clone() for _ in range(self.num_scales)]
+        # Shared legacy views (kept for compat): S4 anchor only.
+        shared_ready = self.prototype_ready.detach().cpu().clone()
 
         report_matches: Dict[str, List[Dict]] = {"background": [], "foreground": []}
         all_distances: List[float] = []
@@ -926,72 +948,60 @@ class PairedSemanticPrototypeImputation(nn.Module):
         duplicate_current_match_count = 0
 
         for class_idx, class_name in enumerate(CLASS_NAMES):
-            old_slots = torch.nonzero(out_ready[class_idx], as_tuple=False).flatten().long()
-            new_slots = torch.nonzero(new_ready[class_idx], as_tuple=False).flatten().long()
-            if new_slots.numel() == 0:
-                report_matches[class_name] = []
-                continue
-            if old_slots.numel() == 0:
-                # No old anchor for this class yet -> direct init empty slots from current centroids
-                free_slots = [int(s) for s in range(self.num_clusters) if not bool(out_ready[class_idx, s])]
-                for idx, new_slot in enumerate([int(v.item()) for v in new_slots]):
-                    if idx >= len(free_slots):
-                        break
-                    target = free_slots[idx]
-                    for s in range(self.num_scales):
+            # Per-scale matching: each scale matches its own old/new keys.
+            for s in range(self.num_scales):
+                sc_ready = out_ready[s]
+                old_slots = torch.nonzero(sc_ready[class_idx], as_tuple=False).flatten().long()
+                new_slots = torch.nonzero(new_ready[class_idx], as_tuple=False).flatten().long()
+                if new_slots.numel() == 0:
+                    continue
+                if old_slots.numel() == 0:
+                    free_slots = [int(v) for v in range(self.num_clusters) if not bool(sc_ready[class_idx, v])]
+                    for idx, new_slot in enumerate([int(v.item()) for v in new_slots]):
+                        if idx >= len(free_slots):
+                            break
+                        target = free_slots[idx]
                         out_keys[s][class_idx, target] = new_keys[s][class_idx, new_slot]
                         out_values[s][class_idx, target] = new_values[s][class_idx, new_slot]
-                    out_ready[class_idx, target] = True
-                    out_count[class_idx, target] = new_count[class_idx, new_slot]
-                report_matches[class_name] = []
-                continue
-
-            # S4 cosine distance matrix old x current
-            old_keys = old_build[class_idx, old_slots]  # [n_old, C]
-            cur_keys = new_build[class_idx, new_slots]  # [n_new, C]
-            cost = _pairwise_cosine_distance(old_keys, cur_keys)  # [n_old, n_new]
-            nearest_local = cost.argmin(dim=1)  # [n_old]
-            chosen_current_slots: List[int] = []
-            for i in range(old_slots.numel()):
-                old_slot = int(old_slots[i].item())
-                new_local = int(nearest_local[i].item())
-                new_slot = int(new_slots[new_local].item())
-                dist = float(cost[i, new_local].item())
-                chosen_current_slots.append(new_slot)
-                all_distances.append(dist)
-                old_key_norms_before = [out_keys[s][class_idx, old_slot].clone() for s in range(self.num_scales)]
-                old_val_before = [out_values[s][class_idx, old_slot].clone() for s in range(self.num_scales)]
-                # Paired EMA across all 4 scales with same mapping
-                for s in range(self.num_scales):
+                        sc_ready[class_idx, target] = True
+                        out_count[s][class_idx, target] = new_count[class_idx, new_slot]
+                    continue
+                old_keys = out_keys[s][class_idx][old_slots]
+                cur_keys = new_keys[s][class_idx][new_slots]
+                cost = _pairwise_cosine_distance(old_keys, cur_keys)
+                nearest_local = cost.argmin(dim=1)
+                chosen_current_slots: List[int] = []
+                for i in range(old_slots.numel()):
+                    old_slot = int(old_slots[i].item())
+                    new_local = int(nearest_local[i].item())
+                    new_slot = int(new_slots[new_local].item())
+                    dist = float(cost[i, new_local].item())
+                    chosen_current_slots.append(new_slot)
+                    all_distances.append(dist)
+                    kb = out_keys[s][class_idx, old_slot].clone()
+                    vb = out_values[s][class_idx, old_slot].clone()
                     mixed_key = momentum * out_keys[s][class_idx, old_slot] + (1.0 - momentum) * new_keys[s][class_idx, new_slot]
                     out_keys[s][class_idx, old_slot] = F.normalize(mixed_key, dim=0, eps=EPS)
                     out_values[s][class_idx, old_slot] = momentum * out_values[s][class_idx, old_slot] + (1.0 - momentum) * new_values[s][class_idx, new_slot]
-                out_count[class_idx, old_slot] = new_count[class_idx, new_slot]
-                for s in range(self.num_scales):
-                    ct_delta = float((out_keys[s][class_idx, old_slot] - old_key_norms_before[s]).norm().item())
-                    pet_delta = float((out_values[s][class_idx, old_slot] - old_val_before[s]).norm().item())
-                    ct_update_norms.append(ct_delta)
-                    pet_update_norms.append(pet_delta)
-                report_matches[class_name].append({
-                    "old_slot": old_slot,
-                    "current_slot": new_slot,
-                    "cosine_distance": dist,
-                })
-
-            # duplicate count: number of extra matches beyond unique current
-            unique_chosen = len(set(chosen_current_slots))
-            duplicate_current_match_count += len(chosen_current_slots) - unique_chosen
-
-            # Fill remaining empty slots with still-unused current centroids (no EMA, direct init)
-            free_slots = [int(s) for s in range(self.num_clusters) if not bool(out_ready[class_idx, s])]
-            chosen_set = set(chosen_current_slots)
-            unused_new = [int(v.item()) for v in new_slots if int(v.item()) not in chosen_set]
-            for target, new_slot in zip(free_slots, unused_new):
-                for s in range(self.num_scales):
+                    out_count[s][class_idx, old_slot] = new_count[class_idx, new_slot]
+                    ct_update_norms.append(float((out_keys[s][class_idx, old_slot] - kb).norm().item()))
+                    pet_update_norms.append(float((out_values[s][class_idx, old_slot] - vb).norm().item()))
+                    if s == self.build_stage_idx:
+                        report_matches[class_name].append({
+                            "old_slot": old_slot,
+                            "current_slot": new_slot,
+                            "cosine_distance": dist,
+                        })
+                unique_chosen = len(set(chosen_current_slots))
+                duplicate_current_match_count += len(chosen_current_slots) - unique_chosen
+                free_slots = [int(v) for v in range(self.num_clusters) if not bool(sc_ready[class_idx, v])]
+                chosen_set = set(chosen_current_slots)
+                unused_new = [int(v.item()) for v in new_slots if int(v.item()) not in chosen_set]
+                for target, new_slot in zip(free_slots, unused_new):
                     out_keys[s][class_idx, target] = new_keys[s][class_idx, new_slot]
                     out_values[s][class_idx, target] = new_values[s][class_idx, new_slot]
-                out_ready[class_idx, target] = True
-                out_count[class_idx, target] = new_count[class_idx, new_slot]
+                    sc_ready[class_idx, target] = True
+                    out_count[s][class_idx, target] = new_count[class_idx, new_slot]
 
         # commit buffers
         for s in range(self.num_scales):
@@ -999,11 +1009,31 @@ class PairedSemanticPrototypeImputation(nn.Module):
             val_buf = getattr(self, f"pet_values_s{s + 1}")
             key_buf.copy_(out_keys[s].to(key_buf.device, dtype=key_buf.dtype))
             val_buf.copy_(out_values[s].to(val_buf.device, dtype=val_buf.dtype))
-        self.prototype_ready.copy_(out_ready.to(self.prototype_ready.device))
-        self.prototype_count.copy_(out_count.to(self.prototype_count.device))
+        stacked_ready = torch.stack(out_ready, dim=0)  # [S,2,K]
+        merged_ready = stacked_ready.any(dim=0)
+        stacked_count = torch.stack(out_count, dim=0)
+        merged_count = stacked_count.amax(dim=0)
+        self.prototype_ready.copy_(merged_ready.to(self.prototype_ready.device))
+        self.prototype_count.copy_(merged_count.to(self.prototype_count.device))
+        self.prototype_ready_scale.copy_(stacked_ready.to(self.prototype_ready_scale.device))
+        self.prototype_count_scale.copy_(stacked_count.to(self.prototype_count_scale.device))
 
-        # diversity after update
+        # diversity after update (per scale, S4 kept as legacy keys)
         diversities = {}
+        per_scale_diversity = {}
+        for sc in range(self.num_scales):
+            for class_idx, class_name in enumerate(CLASS_NAMES):
+                sc_keys = getattr(self, f"ct_keys_s{sc + 1}")[class_idx]
+                ready_sc = out_ready[sc][class_idx]
+                n_ready = int(ready_sc.sum().item())
+                if n_ready < 2:
+                    per_scale_diversity[f"s{sc+1}_{class_name}"] = 0.0
+                    continue
+                kn = F.normalize(sc_keys[ready_sc].float(), p=2, dim=-1, eps=EPS)
+                cos = kn @ kn.t()
+                K = cos.shape[0]
+                off = cos[~torch.eye(K, dtype=torch.bool)].mean().item()
+                per_scale_diversity[f"s{sc+1}_{class_name}"] = float(1.0 - off)
         for class_idx, class_name in enumerate(CLASS_NAMES):
             s4_keys = getattr(self, f"ct_keys_s{self.build_stage_idx + 1}")[class_idx]
             ready = self.prototype_ready[class_idx]
@@ -1183,18 +1213,20 @@ class PairedSemanticPrototypeImputation(nn.Module):
         is not ready, pet_prior is strictly zeros (no random fallback).
         """
         self._validate_features(ct_feats, None)
-        ready_flat = self.prototype_ready.flatten()
         pet_prior: List[torch.Tensor] = []
         attentions: List[torch.Tensor] = []
         entropy_list: List[float] = []
         norm_entropy_list: List[float] = []
-        any_ready = bool(ready_flat.any())
+        any_ready = bool(self.prototype_ready.any())
         for s, ct in enumerate(ct_feats):
             keys = getattr(self, f"ct_keys_s{s + 1}").reshape(2 * self.num_clusters, self.channels[s])
             values = getattr(self, f"pet_values_s{s + 1}").reshape(2 * self.num_clusters, self.channels[s])
             keys = keys.to(device=ct.device, dtype=ct.dtype)
             values = values.to(device=ct.device, dtype=ct.dtype)
-            ready = ready_flat.to(device=ct.device)
+            scale_ready = self.prototype_ready_scale[s].flatten()
+            if int(scale_ready.sum().item()) == 0:
+                scale_ready = self.prototype_ready.flatten()
+            ready = scale_ready.to(device=ct.device)
             retrieved, attention = self.attention[s](ct, keys, values, ready)
             pet_prior.append(retrieved)
             if return_attention:
@@ -1260,9 +1292,12 @@ class PairedSemanticPrototypeImputation(nn.Module):
 
         for s, pet_feat in enumerate(pet_real_feats):
             bg_mask, fg_mask = _class_masks_at_scale(mask, pet_feat.shape[-2:])
+            scale_ready = self.prototype_ready_scale[s]
+            if int(scale_ready.sum().item()) == 0:
+                scale_ready = self.prototype_ready
             for class_idx, class_mask in enumerate((bg_mask, fg_mask)):
-                target_ready = self.prototype_ready[class_idx]
-                other_ready = self.prototype_ready[1 - class_idx]
+                target_ready = scale_ready[class_idx]
+                other_ready = scale_ready[1 - class_idx]
                 if not bool(target_ready.any()) or not bool(other_ready.any()):
                     continue
                 descriptors, desc_valid = _masked_average_pool_2d(pet_feat, class_mask)
@@ -1357,9 +1392,12 @@ class PairedSemanticPrototypeImputation(nn.Module):
 
         for s, ct_feat in enumerate(ct_feats):
             bg_mask, fg_mask = _class_masks_at_scale(mask, ct_feat.shape[-2:])
+            scale_ready = self.prototype_ready_scale[s]
+            if int(scale_ready.sum().item()) == 0:
+                scale_ready = self.prototype_ready
             for class_idx, class_mask in enumerate((bg_mask, fg_mask)):
-                target_ready = self.prototype_ready[class_idx]
-                other_ready = self.prototype_ready[1 - class_idx]
+                target_ready = scale_ready[class_idx]
+                other_ready = scale_ready[1 - class_idx]
                 if not bool(target_ready.any()) or not bool(other_ready.any()):
                     continue
                 descriptors, desc_valid = _masked_average_pool_2d(ct_feat, class_mask)
