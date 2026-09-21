@@ -1057,81 +1057,79 @@ class PairedSemanticPrototypeImputation(nn.Module):
         new_count = torch.zeros(2, self.num_clusters, dtype=torch.long)
         any_candidate = False
         for class_idx, class_name in enumerate(CLASS_NAMES):
-            build_ct_raw = self._concat_cache(class_idx, "ct", self.build_stage_idx)
+            # Independent per-scale clustering: each scale clusters its OWN
+            # CT descriptors (S4=semantics, S1=texture). Membership is NOT
+            # shared across scales; each scale's key/value comes from its own
+            # kept members. Retrieval stays per-scale independent.
             class_report: Dict = {
-                "num_candidates": int(build_ct_raw.shape[0]),
-                "build_stage": int(self.config.build_stage),
-                "clustering": None,
-                "filtering": None,
+                "build_stage": "per_scale_independent",
+                "scales": {},
             }
-            if build_ct_raw.shape[0] == 0:
-                report["classes"][class_name] = class_report
-                continue
-
-            # Pre-filter: NaN / Inf / zero-norm S4 CT descriptors. The SAME
-            # valid indices are applied to S1-S4 CT AND PET descriptors so the
-            # cross-scale row alignment is preserved.
-            valid_mask = (
-                torch.isfinite(build_ct_raw).all(dim=1)
-                & (build_ct_raw.norm(dim=1) > EPS)
-            )
-            num_filtered = int((~valid_mask).sum().item())
-            if num_filtered > 0:
-                class_report["prefilter_discarded"] = num_filtered
-            if not bool(valid_mask.any()):
-                class_report["status"] = "all_candidates_filtered"
-                report["classes"][class_name] = class_report
-                continue
-            valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten().long()
-            build_ct = build_ct_raw[valid_indices]
-            filtered_caches: Dict[int, Dict[str, torch.Tensor]] = {}
+            # Gather raw caches per scale first (row-aligned across scales).
+            raw_caches: Dict[int, Dict[str, torch.Tensor]] = {}
+            n_rows = None
+            empty_scale = False
             for s in range(self.num_scales):
                 ct_all_raw = self._concat_cache(class_idx, "ct", s)
                 pet_all_raw = self._concat_cache(class_idx, "pet", s)
-                if ct_all_raw.shape[0] != build_ct_raw.shape[0] or pet_all_raw.shape[0] != build_ct_raw.shape[0]:
+                if ct_all_raw.shape[0] == 0:
+                    empty_scale = True
+                    break
+                if n_rows is None:
+                    n_rows = int(ct_all_raw.shape[0])
+                if ct_all_raw.shape[0] != n_rows or pet_all_raw.shape[0] != n_rows:
                     raise RuntimeError(
                         f"Cross-scale paired candidate misalignment: class={class_name}, "
-                        f"scale={s+1}, build={build_ct_raw.shape[0]}, "
+                        f"scale={s+1}, expected={n_rows}, "
                         f"ct={ct_all_raw.shape[0]}, pet={pet_all_raw.shape[0]}"
                     )
-                filtered_caches[s] = {
-                    "ct": ct_all_raw[valid_indices],
-                    "pet": pet_all_raw[valid_indices],
-                }
-
-            any_candidate = True
-            labels, centers, kmeans_report = deterministic_spherical_kmeans(
-                build_ct, num_clusters=self.num_clusters, max_iter=self.config.cluster_max_iter,
-            )
-            k_eff = int(centers.shape[0])
-            kept_by_cluster, filter_report = cosine_cluster_outlier_filter(
-                build_ct, labels, num_clusters=k_eff, discard_rate=self.config.outlier_discard_rate,
-            )
-            singleton_warning = bool(filter_report.get("singleton_cluster_warning", False))
-
-            # Paired cross-scale prototype build: identical kept members for
-            # CT keys (L2 normalized) and PET values (raw magnitude).
+                raw_caches[s] = {"ct": ct_all_raw, "pet": pet_all_raw}
+            if empty_scale or n_rows is None or n_rows == 0:
+                class_report["num_candidates"] = 0
+                report["classes"][class_name] = class_report
+                continue
+            class_report["num_candidates"] = int(n_rows)
             for s in range(self.num_scales):
-                ct_all = filtered_caches[s]["ct"]
-                pet_all = filtered_caches[s]["pet"]
+                ct_raw = raw_caches[s]["ct"]
+                pet_raw = raw_caches[s]["pet"]
+                scale_report: Dict = {}
+                # Per-scale pre-filter on this scale's own descriptors.
+                valid_mask = (
+                    torch.isfinite(ct_raw).all(dim=1)
+                    & (ct_raw.norm(dim=1) > EPS)
+                )
+                scale_report["prefilter_discarded"] = int((~valid_mask).sum().item())
+                if not bool(valid_mask.any()):
+                    scale_report["status"] = "all_candidates_filtered"
+                    class_report["scales"][f"s{s+1}"] = scale_report
+                    continue
+                valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten().long()
+                build_ct = ct_raw[valid_indices]
+                build_pet = pet_raw[valid_indices]
+                any_candidate = True
+                labels, centers, kmeans_report = deterministic_spherical_kmeans(
+                    build_ct, num_clusters=self.num_clusters, max_iter=self.config.cluster_max_iter,
+                )
+                k_eff = int(centers.shape[0])
+                kept_by_cluster, filter_report = cosine_cluster_outlier_filter(
+                    build_ct, labels, num_clusters=k_eff, discard_rate=self.config.outlier_discard_rate,
+                )
+                singleton_warning = bool(filter_report.get("singleton_cluster_warning", False))
                 for cluster_idx in range(k_eff):
                     kept = kept_by_cluster.get(cluster_idx)
                     if kept is None or kept.numel() == 0:
                         continue
-                    ct_key = ct_all[kept].mean(dim=0)
-                    pet_value = pet_all[kept].mean(dim=0)
+                    ct_key = build_ct[kept].mean(dim=0)
+                    pet_value = build_pet[kept].mean(dim=0)
                     new_keys[s][class_idx, cluster_idx] = F.normalize(ct_key.float(), dim=0, eps=EPS)
                     new_values[s][class_idx, cluster_idx] = pet_value.float()
-                    if s == self.build_stage_idx:
-                        new_ready[class_idx, cluster_idx] = True
-                        new_count[class_idx, cluster_idx] = int(kept.numel())
-
-            class_report["clustering"] = kmeans_report
-            class_report["filtering"] = filter_report
-            class_report["effective_clusters"] = int(k_eff)
-            class_report["cluster_count_before_filter"] = list(kmeans_report["cluster_counts"])
-            class_report["cluster_count_after_filter"] = [int(new_count[class_idx, j].item()) for j in range(self.num_clusters)]
-            class_report["singleton_cluster_warning"] = singleton_warning
+                    new_ready[class_idx, cluster_idx] = True
+                    new_count[class_idx, cluster_idx] = int(new_count[class_idx, cluster_idx].item() + kept.numel())
+                scale_report["clustering"] = kmeans_report
+                scale_report["filtering"] = filter_report
+                scale_report["effective_clusters"] = int(k_eff)
+                scale_report["singleton_cluster_warning"] = singleton_warning
+                class_report["scales"][f"s{s+1}"] = scale_report
             report["classes"][class_name] = class_report
 
         if not any_candidate or not bool(new_ready.any()):

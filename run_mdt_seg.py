@@ -606,9 +606,21 @@ def main():
             duplicate_current_match_count, ct_key_update_norm, pet_value_update_norm,
         )
 
-        val_full = task.evaluate(val_loader, eval_mode='full', tag='val_full')
+        # Missing-first validation: Full eval is optional (slow, needs PET
+        # encoder). Default OFF via --eval_full_pet False: val_full reuses
+        # val_missing stats so joint/best/ckpt logic stays intact while the
+        # epoch only runs the CT-only (fixed_missing) pass.
+        do_full = bool(getattr(cfg, 'eval_full_pet', True))
+        do_missing = bool(getattr(cfg, 'eval_fixed_missing_pet', True))
+        if not do_missing:
+            raise ValueError('eval_fixed_missing_pet=False leaves nothing to validate')
         val_missing = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_missing')
-        joint_dice = float(cfg.joint_full_weight) * val_full['dice'] + float(cfg.joint_missing_weight) * val_missing['dice']
+        if do_full:
+            val_full = task.evaluate(val_loader, eval_mode='full', tag='val_full')
+            joint_dice = float(cfg.joint_full_weight) * val_full['dice'] + float(cfg.joint_missing_weight) * val_missing['dice']
+        else:
+            val_full = {k: (v if not isinstance(v, dict) else dict(v)) for k, v in val_missing.items()}
+            joint_dice = float(val_missing['dice'])
 
         joint_improved = joint_dice > best_joint
         full_improved = val_full['dice'] > best_full
