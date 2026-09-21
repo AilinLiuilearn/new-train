@@ -48,25 +48,33 @@ class MDTSegTeacher:
         )
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
         seg_loss, loss_stats = self.criterion(logits, mask)
-        # Clean Module-1: loss_total = seg + lambda_p * PET-proto + lambda_r * L_rec.
+        # Clean Module-1: loss_total = seg + lambda_p * PET-proto + lambda_c * CT-proto + lambda_r * L_rec.
         # First round (bank not ready) yields exactly 0 for both aux terms.
         proto_raw = outputs.get('prototype_contrastive_loss', seg_loss.new_zeros(()))
         if proto_raw.dim() > 0:
             proto_raw = proto_raw.reshape(())
         proto_weight = float(getattr(self.config, 'pspi_proto_contrastive_weight', 0.0))
         proto_weighted = proto_weight * proto_raw
+        ct_proto_raw = outputs.get('ct_prototype_contrastive_loss', seg_loss.new_zeros(()))
+        if torch.is_tensor(ct_proto_raw) and ct_proto_raw.dim() > 0:
+            ct_proto_raw = ct_proto_raw.reshape(())
+        ct_proto_weight = float(getattr(self.config, 'pspi_ct_proto_contrastive_weight', 0.0))
+        ct_proto_weighted = ct_proto_weight * ct_proto_raw
         recon_raw = outputs.get('reconstruction_loss', seg_loss.new_zeros((), dtype=torch.float32))
         if recon_raw.dim() > 0:
             recon_raw = recon_raw.reshape(())
         recon_weight = float(getattr(self.config, 'pspi_reconstruction_weight', 0.0))
         recon_weighted = recon_weight * recon_raw
-        total_loss = seg_loss + proto_weighted + recon_weighted
+        total_loss = seg_loss + proto_weighted + ct_proto_weighted + recon_weighted
         stats = {
             'loss_total': total_loss.detach(),
             'loss_seg': loss_stats.get('loss_dice', seg_loss.detach()),
             'loss_seg_total': seg_loss.detach(),
             'loss_proto': proto_raw.detach(),
             'loss_proto_weighted': proto_weighted.detach(),
+            'loss_ct_proto': ct_proto_raw.detach() if torch.is_tensor(ct_proto_raw) else torch.tensor(float(ct_proto_raw)),
+            'loss_ct_proto_weighted': ct_proto_weighted.detach(),
+            'ct_proto_num_terms': outputs.get('ct_prototype_contrastive_num_terms', 0),
             'proto_num_terms': outputs.get('prototype_contrastive_num_terms', 0),
             'loss_reconstruction': recon_raw.detach(),
             'loss_reconstruction_weighted': recon_weighted.detach(),
@@ -123,6 +131,11 @@ class MDTSegTeacher:
             proto_raw = proto_raw.reshape(())
         proto_weight = float(getattr(self.config, 'pspi_proto_contrastive_weight', 0.0))
         proto_weighted = proto_weight * proto_raw
+        ct_proto_raw = outputs.get('ct_prototype_contrastive_loss', seg_total.new_zeros(())) if isinstance(outputs, dict) else seg_total.new_zeros(())
+        if torch.is_tensor(ct_proto_raw) and ct_proto_raw.dim() > 0:
+            ct_proto_raw = ct_proto_raw.reshape(())
+        ct_proto_weight = float(getattr(self.config, 'pspi_ct_proto_contrastive_weight', 0.0))
+        ct_proto_weighted = ct_proto_weight * ct_proto_raw
         recon_raw = outputs.get('reconstruction_loss', None) if isinstance(outputs, dict) else None
         if not torch.is_tensor(recon_raw):
             recon_raw = seg_total.new_zeros((), dtype=torch.float32)
@@ -130,7 +143,7 @@ class MDTSegTeacher:
             recon_raw = recon_raw.reshape(())
         recon_weight = float(getattr(self.config, 'pspi_reconstruction_weight', 0.0))
         recon_weighted = recon_weight * recon_raw
-        total_loss = seg_total + proto_weighted + recon_weighted
+        total_loss = seg_total + proto_weighted + ct_proto_weighted + recon_weighted
         stats = {
             'loss_total': total_loss.detach(),
             'loss_seg_total': seg_total.detach(),
@@ -138,6 +151,9 @@ class MDTSegTeacher:
             'loss_missing': missing_loss.detach(),
             'loss_proto': proto_raw.detach() if torch.is_tensor(proto_raw) else torch.tensor(float(proto_raw)),
             'loss_proto_weighted': proto_weighted.detach(),
+            'loss_ct_proto': ct_proto_raw.detach() if torch.is_tensor(ct_proto_raw) else torch.tensor(float(ct_proto_raw)),
+            'loss_ct_proto_weighted': ct_proto_weighted.detach(),
+            'ct_proto_num_terms': outputs.get('ct_prototype_contrastive_num_terms', 0) if isinstance(outputs, dict) else 0,
             'proto_num_terms': outputs.get('prototype_contrastive_num_terms', 0) if isinstance(outputs, dict) else 0,
             'loss_reconstruction': recon_raw.detach(),
             'loss_reconstruction_weighted': recon_weighted.detach(),

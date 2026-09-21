@@ -241,6 +241,8 @@ def main():
     pspi_route_headers = [
         'train_full_proto_loss', 'train_missing_proto_loss',
         'train_full_proto_loss_weighted', 'train_missing_proto_loss_weighted',
+        'train_full_ct_proto_loss', 'train_missing_ct_proto_loss',
+        'train_full_ct_proto_loss_weighted', 'train_missing_ct_proto_loss_weighted',
         'grad_full_enc_pet', 'grad_missing_enc_pet',
         'grad_full_module1_retrieval', 'grad_missing_module1_retrieval',
         'grad_full_prior_scale', 'grad_missing_prior_scale', 'grad_full_pet_affine', 'grad_missing_pet_affine',
@@ -253,6 +255,8 @@ def main():
             'mixed_full_weight', 'mixed_missing_weight',
             'train_full_proto_loss', 'train_missing_proto_loss',
             'train_full_proto_loss_weighted', 'train_missing_proto_loss_weighted',
+            'train_full_ct_proto_loss', 'train_missing_ct_proto_loss',
+            'train_full_ct_proto_loss_weighted', 'train_missing_ct_proto_loss_weighted',
             'val_full_loss', 'val_full_dice', 'val_full_iou', 'val_full_acc', 'val_full_acc_pixel', 'val_full_hd95',
             'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
             'joint_dice', 'best_joint', 'best_joint_epoch',
@@ -314,6 +318,8 @@ def main():
             full_loss_sum = missing_loss_sum = mixed_loss_sum = 0.0
             full_proto_sum = missing_proto_sum = 0.0
             full_proto_w_sum = missing_proto_w_sum = 0.0
+            full_ct_proto_sum = missing_ct_proto_sum = 0.0
+            full_ct_proto_w_sum = missing_ct_proto_w_sum = 0.0
             recon_loss_sum = recon_w_sum = 0.0
             recon_active_count = recon_missing_samples = 0
             recon_fg_accum = {f's{i}': [] for i in range(1, 5)}
@@ -414,6 +420,14 @@ def main():
                 missing_proto_sum += float(train_stats['loss_proto']) * num_missing
                 full_proto_w_sum += float(train_stats['loss_proto_weighted']) * num_full
                 missing_proto_w_sum += float(train_stats['loss_proto_weighted']) * num_missing
+                ct_proto_v = train_stats.get('loss_ct_proto', 0.0)
+                ct_proto_v = float(ct_proto_v.detach()) if torch.is_tensor(ct_proto_v) else float(ct_proto_v)
+                ct_proto_w_v = train_stats.get('loss_ct_proto_weighted', 0.0)
+                ct_proto_w_v = float(ct_proto_w_v.detach()) if torch.is_tensor(ct_proto_w_v) else float(ct_proto_w_v)
+                full_ct_proto_sum += ct_proto_v * num_full
+                missing_ct_proto_sum += ct_proto_v * num_missing
+                full_ct_proto_w_sum += ct_proto_w_v * num_full
+                missing_ct_proto_w_sum += ct_proto_w_v * num_missing
                 mixed_loss_sum += float(loss.detach())
                 mixed_n += 1
                 last_full_weight = float(train_stats['full_weight'])
@@ -489,6 +503,8 @@ def main():
             full_loss = missing_loss = 0.0
             full_proto = missing_proto = 0.0
             full_proto_w = missing_proto_w = 0.0
+            full_ct_proto = missing_ct_proto = 0.0
+            full_ct_proto_w = missing_ct_proto_w = 0.0
             grads = {
                 'full': {'enc_ct': [], 'enc_pet': [], 'ct_align': [], 'decoder': [], 'retrieval': [], 'prior_scale': [], 'pet_affine': []},
                 'missing': {'enc_ct': [], 'enc_pet': [], 'ct_align': [], 'decoder': [], 'retrieval': [], 'prior_scale': [], 'pet_affine': []},
@@ -551,11 +567,15 @@ def main():
                     full_loss += float(loss.detach())
                     full_proto += float(step_stats['loss_proto'].detach())
                     full_proto_w += float(step_stats['loss_proto_weighted'].detach())
+                    full_ct_proto += float(step_stats['loss_ct_proto'].detach()) if torch.is_tensor(step_stats.get('loss_ct_proto', 0.0)) else float(step_stats.get('loss_ct_proto', 0.0))
+                    full_ct_proto_w += float(step_stats['loss_ct_proto_weighted'].detach()) if torch.is_tensor(step_stats.get('loss_ct_proto_weighted', 0.0)) else float(step_stats.get('loss_ct_proto_weighted', 0.0))
                 else:
                     missing_n += 1
                     missing_loss += float(loss.detach())
                     missing_proto += float(step_stats['loss_proto'].detach())
                     missing_proto_w += float(step_stats['loss_proto_weighted'].detach())
+                    missing_ct_proto += float(step_stats['loss_ct_proto'].detach()) if torch.is_tensor(step_stats.get('loss_ct_proto', 0.0)) else float(step_stats.get('loss_ct_proto', 0.0))
+                    missing_ct_proto_w += float(step_stats['loss_ct_proto_weighted'].detach()) if torch.is_tensor(step_stats.get('loss_ct_proto_weighted', 0.0)) else float(step_stats.get('loss_ct_proto_weighted', 0.0))
 
                 _pspi_batch_stats(outputs, attn_ent_accum, nattn_ent_accum, prior_norm_vals, prior_alpha_accum)
 
@@ -731,6 +751,10 @@ def main():
                 'train_missing_proto_loss': missing_proto_sum / max(1, missing_sample_count),
                 'train_full_proto_loss_weighted': full_proto_w_sum / max(1, full_sample_count),
                 'train_missing_proto_loss_weighted': missing_proto_w_sum / max(1, missing_sample_count),
+                'train_full_ct_proto_loss': full_ct_proto_sum / max(1, full_sample_count),
+                'train_missing_ct_proto_loss': missing_ct_proto_sum / max(1, missing_sample_count),
+                'train_full_ct_proto_loss_weighted': full_ct_proto_w_sum / max(1, full_sample_count),
+                'train_missing_ct_proto_loss_weighted': missing_ct_proto_w_sum / max(1, missing_sample_count),
                 **common_pspi,
                 'epoch_time': time.time() - epoch_start,
                 **{f'diag_{k}': v for k, v in diag_stats.items()},
@@ -746,6 +770,10 @@ def main():
                 'train_missing_proto_loss': missing_proto / max(1, missing_n),
                 'train_full_proto_loss_weighted': full_proto_w / max(1, full_n),
                 'train_missing_proto_loss_weighted': missing_proto_w / max(1, missing_n),
+                'train_full_ct_proto_loss': full_ct_proto / max(1, full_n),
+                'train_missing_ct_proto_loss': missing_ct_proto / max(1, missing_n),
+                'train_full_ct_proto_loss_weighted': full_ct_proto_w / max(1, full_n),
+                'train_missing_ct_proto_loss_weighted': missing_ct_proto_w / max(1, missing_n),
                 'grad_full_enc_pet': float(np.mean(grads['full']['enc_pet'])) if grads['full']['enc_pet'] else 0.0,
                 'grad_missing_enc_pet': float(np.mean(grads['missing']['enc_pet'])) if grads['missing']['enc_pet'] else 0.0,
                 'grad_full_module1_retrieval': float(np.mean(grads['full']['retrieval'])) if grads['full']['retrieval'] else 0.0,

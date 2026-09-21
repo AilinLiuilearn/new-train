@@ -520,6 +520,9 @@ def build_mdt_seg_teacher(config):
         pspi_bank_update_mode=getattr(config, 'pspi_bank_update_mode', 'direct'),
         pspi_ema_momentum=getattr(config, 'pspi_ema_momentum', 0.95),
         pspi_retrieval_temperature=getattr(config, 'pspi_retrieval_temperature', 0.1),
+        pspi_retrieval_topk=int(getattr(config, 'pspi_retrieval_topk', 0)),
+        pspi_retrieval_per_class_topk=int(getattr(config, 'pspi_retrieval_per_class_topk', 1)),
+        pspi_retrieval_gate_temperature=float(getattr(config, 'pspi_retrieval_gate_temperature', 1.0)),
         pspi_proto_temperature=getattr(config, 'pspi_proto_temperature', 0.02),
         pspi_collect_candidates=getattr(config, 'pspi_collect_candidates', True),
         pspi_prior_scale_enabled=prior_scale_enabled,
@@ -527,6 +530,7 @@ def build_mdt_seg_teacher(config):
         pspi_affine_enabled=affine_enabled,
         pspi_reconstruction_weight=recon_weight,
         pspi_proto_contrastive_weight=proto_weight,
+        pspi_ct_proto_contrastive_weight=float(getattr(config, 'pspi_ct_proto_contrastive_weight', 0.0)),
     )
     if bool(getattr(config, 'stage1_init_enabled', False)):
         load_stage1_unimodal_initialization(
@@ -562,7 +566,11 @@ def build_mdt_seg_teacher(config):
         f'prototype_loss=pet_multi_positive_contrastive '
         f'proto_temperature={getattr(config, "pspi_proto_temperature", 0.02)} '
         f'proto_weight={proto_weight} '
+        f'ct_proto_weight={float(getattr(config, "pspi_ct_proto_contrastive_weight", 0.0))} '
         f'proto_loss_disabled={proto_weight == 0.0} '
+        f'retrieval_topk={int(getattr(config, "pspi_retrieval_topk", 0))} '
+        f'retrieval_per_class_topk={int(getattr(config, "pspi_retrieval_per_class_topk", 3))} '
+        f'retrieval_gate_temp={float(getattr(config, "pspi_retrieval_gate_temperature", 1.0))} '
         f'ct_only_direct_affine={affine_enabled} '
         f'reconstruction_weight={recon_weight} '
         f'reconstruction_loss={"balanced_multiscale_smoothl1" if affine_enabled and recon_weight > 0.0 else "none"} '

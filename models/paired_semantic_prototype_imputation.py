@@ -265,16 +265,36 @@ class PrototypeCrossAttention(nn.Module):
     K = CT prototype keys   (L2 normalized after k_proj)
     V = paired PET prototype values (NOT normalized)
 
-    logits = Normalize(W_q C_det) @ Normalize(W_k K)^T / temperature
-    A = softmax(logits) over ready slots; P_prior = A @ W_v V.
+    Ordering contract: slots are [BG x K, FG x K] (first half background,
+    second half foreground). Class-constrained path (default) retrieves
+    strictly inside each class and then mixes with a soft BG/FG gate, so a
+    background token can never directly take a foreground value and vice
+    versa. Legacy dense/global-topk path mixes all 12 slots freely.
     """
 
-    def __init__(self, channels: int, retrieval_temperature: float = 0.1):
+    def __init__(self, channels: int, retrieval_temperature: float = 0.1,
+                 retrieval_topk=None, retrieval_per_class_topk=None,
+                 retrieval_gate_temperature: float = 1.0):
         super().__init__()
         self.channels = int(channels)
         self.temperature = float(retrieval_temperature)
         if self.temperature <= 0:
             raise ValueError("retrieval_temperature must be > 0")
+        topk = 0 if retrieval_topk is None else int(retrieval_topk)
+        if topk < 0:
+            raise ValueError(f"retrieval_topk must be >= 0, got {retrieval_topk!r}")
+        # 0/None = disabled (dense softmax, legacy behavior).
+        self.topk = topk
+        # Per-class top-k inside each BG/FG group. None = default 3 (enabled);
+        # 0 = disabled (fall back to the global topk/dense path).
+        per_class_topk = 3 if retrieval_per_class_topk is None else int(retrieval_per_class_topk)
+        if per_class_topk < 0:
+            raise ValueError(f"retrieval_per_class_topk must be >= 0, got {retrieval_per_class_topk!r}")
+        self.per_class_topk = per_class_topk
+        gate_temp = float(retrieval_gate_temperature)
+        if gate_temp <= 0:
+            raise ValueError("retrieval_gate_temperature must be > 0")
+        self.gate_temperature = gate_temp
         self.q_proj = nn.Linear(self.channels, self.channels, bias=False)
         self.k_proj = nn.Linear(self.channels, self.channels, bias=False)
         self.v_proj = nn.Linear(self.channels, self.channels, bias=False)
@@ -330,10 +350,92 @@ class PrototypeCrossAttention(nn.Module):
         k = F.normalize(k.float(), p=2, dim=-1, eps=EPS)
 
         logits = torch.matmul(q, k.t()) / float(self.temperature)
+        ready_b = ready.view(1, 1, -1).to(logits.device)
         logits = logits.masked_fill(
-            ~ready.view(1, 1, -1).to(logits.device),
+            ~ready_b,
             torch.finfo(logits.dtype).min,
         )
+        num_slots = int(logits.shape[-1])
+        if num_slots % 2 != 0:
+            raise ValueError(f"class-constrained retrieval needs an even slot count, got {num_slots}")
+        per_class = num_slots // 2
+        cready = ready.view(2, per_class)
+        bg_all_dead = not bool(cready[0].any())
+        fg_all_dead = not bool(cready[1].any())
+        if bg_all_dead and fg_all_dead:
+            return (
+                torch.zeros_like(query_map),
+                torch.zeros(
+                    b, h * w, num_slots,
+                    device=query_map.device, dtype=query_map.dtype,
+                ),
+            )
+        neg_inf = torch.tensor(torch.finfo(logits.dtype).min, device=logits.device)
+        # Class-constrained path: per-class top-k inside BG and FG separately,
+        # then a soft BG/FG gate. A background token can never take a
+        # foreground value directly (and vice versa).
+        if self.per_class_topk > 0 and not (bg_all_dead or fg_all_dead):
+            finfo_min = torch.finfo(logits.dtype).min
+            logits_bg = logits[..., :per_class].masked_fill(
+                ~cready[0].view(1, 1, -1).to(logits.device), neg_inf)
+            logits_fg = logits[..., per_class:].masked_fill(
+                ~cready[1].view(1, 1, -1).to(logits.device), neg_inf)
+            eff_bg = min(self.per_class_topk, per_class)
+            eff_fg = min(self.per_class_topk, per_class)
+            if eff_bg < per_class:
+                top_bg, _ = torch.topk(logits_bg, k=eff_bg, dim=-1)
+                logits_bg = torch.where(logits_bg >= top_bg[..., -1:], logits_bg, neg_inf)
+            if eff_fg < per_class:
+                top_fg, _ = torch.topk(logits_fg, k=eff_fg, dim=-1)
+                logits_fg = torch.where(logits_fg >= top_fg[..., -1:], logits_fg, neg_inf)
+            attn_bg = torch.softmax(logits_bg, dim=-1)
+            attn_fg = torch.softmax(logits_fg, dim=-1)
+            # Dead-class fallback: rows of a fully masked class are uniform
+            # over its slots; zero them and route everything to the live class.
+            if not bool(cready[0].any()):
+                attn_bg = torch.zeros_like(attn_bg)
+            if not bool(cready[1].any()):
+                attn_fg = torch.zeros_like(attn_fg)
+            with torch.no_grad():
+                # Gate from class-summed evidence (log-sum-exp per class).
+                lse_bg = torch.logsumexp(logits_bg.float(), dim=-1)
+                lse_fg = torch.logsumexp(logits_fg.float(), dim=-1)
+            lse_bg = torch.where(
+                torch.isfinite(lse_bg),
+                lse_bg, torch.full_like(lse_bg, float(finfo_min)))
+            lse_fg = torch.where(
+                torch.isfinite(lse_fg),
+                lse_fg, torch.full_like(lse_fg, float(finfo_min)))
+            gate_logits = torch.stack([lse_bg, lse_fg], dim=-1) / float(self.gate_temperature)
+            gate = torch.softmax(gate_logits, dim=-1).to(dtype=query_map.dtype)
+            v_bg = v[:per_class].to(dtype=attn_bg.dtype)
+            v_fg = v[per_class:].to(dtype=attn_fg.dtype)
+            ret_bg = torch.matmul(attn_bg, v_bg)
+            ret_fg = torch.matmul(attn_fg, v_fg)
+            g_bg = gate[..., 0:1].to(dtype=ret_bg.dtype)
+            g_fg = gate[..., 1:2].to(dtype=ret_fg.dtype)
+            retrieved_tok = (1.0 - g_fg) * ret_bg + g_fg * ret_fg
+            attention = torch.cat([attn_bg * g_bg.to(attn_bg.dtype),
+                                   attn_fg * g_fg.to(attn_fg.dtype)], dim=-1)
+            attention = attention.to(dtype=query_map.dtype)
+            retrieved = self.out_proj(retrieved_tok.to(dtype=query_map.dtype))
+            retrieved = retrieved.transpose(1, 2).reshape(b, c, h, w)
+            retrieved = _sanitize(retrieved)
+            _finite_or_raise("prototype_attention", attention)
+            _finite_or_raise("retrieved_pet_prior", retrieved)
+            return retrieved, attention
+        # Legacy path: global top-k / dense over all slots (may mix classes).
+        # Sparse top-k retrieval: keep only the k largest logits per token so
+        # each CT token follows its nearest prototypes instead of the bank mean.
+        # topk <= 0 (or >= num slots) = dense legacy softmax.
+        if 0 < self.topk < logits.shape[-1]:
+            top_vals, _ = torch.topk(logits, k=self.topk, dim=-1)
+            thresh = top_vals[..., -1:]
+            logits = torch.where(
+                logits >= thresh,
+                logits,
+                torch.tensor(torch.finfo(logits.dtype).min, device=logits.device),
+            )
         attention = torch.softmax(logits, dim=-1).to(dtype=query_map.dtype)
         retrieved = torch.matmul(attention, v.to(dtype=attention.dtype))
         retrieved = self.out_proj(retrieved.to(dtype=query_map.dtype))
@@ -359,6 +461,9 @@ class Module1Config:
     bank_update_mode: str = "direct"
     ema_momentum: float = 0.999
     retrieval_temperature: float = 0.1
+    retrieval_topk: int = 0
+    retrieval_per_class_topk: int = 3
+    retrieval_gate_temperature: float = 1.0
     proto_temperature: float = 0.02
     collect_candidates_during_training: bool = True
 
@@ -379,6 +484,12 @@ class Module1Config:
             raise ValueError("ema_momentum must be in [0,1)")
         if float(self.retrieval_temperature) <= 0:
             raise ValueError("retrieval_temperature must be > 0")
+        if int(self.retrieval_topk) < 0:
+            raise ValueError(f"retrieval_topk must be >= 0, got {self.retrieval_topk!r}")
+        if int(self.retrieval_per_class_topk) < 0:
+            raise ValueError(f"retrieval_per_class_topk must be >= 0, got {self.retrieval_per_class_topk!r}")
+        if float(self.retrieval_gate_temperature) <= 0:
+            raise ValueError("retrieval_gate_temperature must be > 0")
         if float(self.proto_temperature) <= 0:
             raise ValueError("proto_temperature must be > 0")
 
@@ -416,6 +527,9 @@ class PairedSemanticPrototypeImputation(nn.Module):
         bank_update_mode: str = "direct",
         ema_momentum: float = 0.999,
         retrieval_temperature: float = 0.1,
+        retrieval_topk: int = 0,
+        retrieval_per_class_topk: int = 3,
+        retrieval_gate_temperature: float = 1.0,
         proto_temperature: float = 0.02,
         collect_candidates_during_training: bool = True,
         **kwargs,
@@ -447,6 +561,9 @@ class PairedSemanticPrototypeImputation(nn.Module):
             bank_update_mode=str(bank_update_mode),
             ema_momentum=float(ema_momentum),
             retrieval_temperature=float(retrieval_temperature),
+            retrieval_topk=int(retrieval_topk),
+            retrieval_per_class_topk=int(retrieval_per_class_topk),
+            retrieval_gate_temperature=float(retrieval_gate_temperature),
             proto_temperature=float(proto_temperature),
             collect_candidates_during_training=bool(collect_candidates_during_training),
         )
@@ -461,7 +578,13 @@ class PairedSemanticPrototypeImputation(nn.Module):
 
         self.attention = nn.ModuleList(
             [
-                PrototypeCrossAttention(c, retrieval_temperature=self.config.retrieval_temperature)
+                PrototypeCrossAttention(
+                    c,
+                    retrieval_temperature=self.config.retrieval_temperature,
+                    retrieval_topk=self.config.retrieval_topk,
+                    retrieval_per_class_topk=self.config.retrieval_per_class_topk,
+                    retrieval_gate_temperature=self.config.retrieval_gate_temperature,
+                )
                 for c in self.channels
             ]
         )
@@ -1132,6 +1255,8 @@ class PairedSemanticPrototypeImputation(nn.Module):
         semantic_presence = {0: bg_present, 1: fg_present}
 
         group_losses: List[torch.Tensor] = []
+        bg_group_losses: List[torch.Tensor] = []
+        fg_group_losses: List[torch.Tensor] = []
         per_scale: Dict[str, float] = {}
         details: Dict[str, int] = {}
 
@@ -1176,13 +1301,120 @@ class PairedSemanticPrototypeImputation(nn.Module):
                 group_loss = torch.stack(sample_terms).mean()
                 _finite_or_raise(f"proto_contrastive_s{s+1}_{CLASS_NAMES[class_idx]}", group_loss)
                 group_losses.append(group_loss)
+                if class_idx == 0:
+                    bg_group_losses.append(group_loss)
+                else:
+                    fg_group_losses.append(group_loss)
                 per_scale[f"s{s+1}_{CLASS_NAMES[class_idx]}"] = float(group_loss.item())
                 details[f"s{s+1}_{CLASS_NAMES[class_idx]}_terms"] = len(sample_terms)
 
-        if not group_losses:
+        # Class-balanced: L_m = mean over valid classes of {L_m^BG, L_m^FG},
+        # with L_m^c = mean over valid scales. Valid-term mean (not dead 0.5)
+        # so FG-free slices yield L_m = L_BG instead of halving.
+        class_terms = []
+        if bg_group_losses:
+            class_terms.append(torch.stack(bg_group_losses).mean())
+        if fg_group_losses:
+            class_terms.append(torch.stack(fg_group_losses).mean())
+        if not class_terms:
             return _zero_loss_result(pet_real_feats[0])
-        loss = torch.stack(group_losses).mean()
+        loss = torch.stack(class_terms).mean()
         _finite_or_raise("proto_contrastive_loss", loss)
+        return {
+            "loss": loss,
+            "num_terms": len(group_losses),
+            "per_scale": per_scale,
+            "details": details,
+        }
+
+    def compute_ct_prototype_contrastive_loss(
+        self,
+        ct_feats: Sequence[torch.Tensor],
+        mask: torch.Tensor,
+    ) -> Dict:
+        """CT-side mirror of the PET prototype contrastive loss.
+
+        Multi-positive InfoNCE of current CT descriptors against the detached
+        CT-key bank. Gradient boundary: ct_feats keep grad (CT encoder
+        updates); the prototype bank is detached; PET gets none. This is the
+        missing CT-side supervision that teaches the CT encoder to be
+        clusterable/retrievable; retrieval Q stays detached inside Module-1.
+        """
+        self._validate_features(ct_feats, None)
+        if mask.ndim != 4 or mask.shape[1] != 1:
+            raise ValueError("mask must be [B,1,H,W]")
+        if not self.bank_ready:
+            return _zero_loss_result(ct_feats[0])
+        tau = float(self.config.proto_temperature)
+
+        fg_present = mask.flatten(1).sum(dim=1) > EPS
+        bg_present = (1.0 - mask.float()).flatten(1).sum(dim=1) > EPS
+        semantic_presence = {0: bg_present, 1: fg_present}
+
+        group_losses: List[torch.Tensor] = []
+        bg_group_losses: List[torch.Tensor] = []
+        fg_group_losses: List[torch.Tensor] = []
+        per_scale: Dict[str, float] = {}
+        details: Dict[str, int] = {}
+
+        for s, ct_feat in enumerate(ct_feats):
+            bg_mask, fg_mask = _class_masks_at_scale(mask, ct_feat.shape[-2:])
+            for class_idx, class_mask in enumerate((bg_mask, fg_mask)):
+                target_ready = self.prototype_ready[class_idx]
+                other_ready = self.prototype_ready[1 - class_idx]
+                if not bool(target_ready.any()) or not bool(other_ready.any()):
+                    continue
+                descriptors, desc_valid = _masked_average_pool_2d(ct_feat, class_mask)
+                valid = (
+                    desc_valid
+                    & semantic_presence[class_idx].to(ct_feat.device)
+                    & torch.isfinite(descriptors).all(dim=1)
+                    & (descriptors.norm(dim=1) > EPS)
+                )
+                if not bool(valid.any()):
+                    continue
+
+                ct_bank = getattr(self, f"ct_keys_s{s + 1}").detach()  # [2,K,C]
+                target_protos = ct_bank[class_idx][target_ready]          # [Kt,C]
+                negative_protos = ct_bank[1 - class_idx][other_ready]     # [Kn,C]
+                target_protos_n = F.normalize(target_protos.float(), p=2, dim=-1, eps=EPS)
+                negative_protos_n = F.normalize(negative_protos.float(), p=2, dim=-1, eps=EPS)
+
+                sample_terms: List[torch.Tensor] = []
+                valid_indices = torch.nonzero(valid, as_tuple=False).flatten().long()
+                for idx in valid_indices:
+                    z = descriptors[idx : idx + 1]  # [1,C], grad to CT encoder
+                    z_n = F.normalize(z.float(), p=2, dim=-1, eps=EPS)
+                    cos_target = (z_n @ target_protos_n.t()).squeeze(0)    # [Kt]
+                    cos_negative = (z_n @ negative_protos_n.t()).squeeze(0)  # [Kn]
+                    s_c = torch.logsumexp(cos_target / tau, dim=0)
+                    s_o = torch.logsumexp(cos_negative / tau, dim=0)
+                    lse = torch.logsumexp(torch.stack([s_c, s_o]), dim=0)
+                    loss = lse - s_c
+                    _finite_or_raise(f"ct_proto_contrastive_term_s{s+1}", loss)
+                    sample_terms.append(loss)
+                if not sample_terms:
+                    continue
+                group_loss = torch.stack(sample_terms).mean()
+                _finite_or_raise(f"ct_proto_contrastive_s{s+1}_{CLASS_NAMES[class_idx]}", group_loss)
+                group_losses.append(group_loss)
+                if class_idx == 0:
+                    bg_group_losses.append(group_loss)
+                else:
+                    fg_group_losses.append(group_loss)
+                per_scale[f"s{s+1}_{CLASS_NAMES[class_idx]}"] = float(group_loss.item())
+                details[f"s{s+1}_{CLASS_NAMES[class_idx]}_terms"] = len(sample_terms)
+
+        # Same class-balanced rule as the PET side.
+        class_terms = []
+        if bg_group_losses:
+            class_terms.append(torch.stack(bg_group_losses).mean())
+        if fg_group_losses:
+            class_terms.append(torch.stack(fg_group_losses).mean())
+        if not class_terms:
+            return _zero_loss_result(ct_feats[0])
+        loss = torch.stack(class_terms).mean()
+        _finite_or_raise("ct_proto_contrastive_loss", loss)
         return {
             "loss": loss,
             "num_terms": len(group_losses),

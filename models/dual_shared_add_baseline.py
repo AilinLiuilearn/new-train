@@ -64,6 +64,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pspi_affine_enabled=False,
         pspi_reconstruction_weight=0.0,
         pspi_proto_contrastive_weight=0.01,
+        pspi_ct_proto_contrastive_weight=0.0,
+        pspi_retrieval_topk=0,
+        pspi_retrieval_per_class_topk=3,
+        pspi_retrieval_gate_temperature=1.0,
     ):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
@@ -93,6 +97,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 bank_update_mode=pspi_bank_update_mode,
                 ema_momentum=pspi_ema_momentum,
                 retrieval_temperature=pspi_retrieval_temperature,
+                retrieval_topk=pspi_retrieval_topk,
+                retrieval_per_class_topk=pspi_retrieval_per_class_topk,
+                retrieval_gate_temperature=pspi_retrieval_gate_temperature,
                 proto_temperature=pspi_proto_temperature,
                 collect_candidates_during_training=pspi_collect_candidates,
             )
@@ -143,6 +150,30 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 f"pspi_proto_contrastive_weight must be finite and >= 0, got {pspi_proto_contrastive_weight!r}"
             )
         self.pspi_proto_contrastive_weight = proto_w
+        ct_proto_w = float(pspi_ct_proto_contrastive_weight)
+        if not math.isfinite(ct_proto_w) or ct_proto_w < 0.0:
+            raise ValueError(
+                f"pspi_ct_proto_contrastive_weight must be finite and >= 0, got {pspi_ct_proto_contrastive_weight!r}"
+            )
+        self.pspi_ct_proto_contrastive_weight = ct_proto_w
+        topk = int(pspi_retrieval_topk)
+        if topk < 0:
+            raise ValueError(
+                f"pspi_retrieval_topk must be >= 0, got {pspi_retrieval_topk!r}"
+            )
+        self.pspi_retrieval_topk = topk
+        per_class_topk = int(pspi_retrieval_per_class_topk)
+        if per_class_topk < 0:
+            raise ValueError(
+                f"pspi_retrieval_per_class_topk must be >= 0, got {pspi_retrieval_per_class_topk!r}"
+            )
+        self.pspi_retrieval_per_class_topk = per_class_topk
+        gate_temp = float(pspi_retrieval_gate_temperature)
+        if gate_temp <= 0:
+            raise ValueError(
+                f"pspi_retrieval_gate_temperature must be > 0, got {pspi_retrieval_gate_temperature!r}"
+            )
+        self.pspi_retrieval_gate_temperature = gate_temp
         if self.pspi_affine_enabled and self.pspi_enabled:
             self.pet_affine = CTConditionedPETAffine(pet_channels)
         else:
@@ -293,7 +324,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
             'active': True,
         }
 
-    def _attach_pspi_stats(self, out, proto_result=None, module1_aux=None, ref_tensor=None,
+    def _attach_pspi_stats(self, out, proto_result=None, ct_proto_result=None, module1_aux=None, ref_tensor=None,
                            recon_result=None, affine_stats=None):
         def _zero(ref):
             return ref.new_zeros(()) if ref is not None else torch.tensor(0.0)
@@ -307,6 +338,13 @@ class DualSharedAddPETCTBaseline(nn.Module):
             z = _zero(ref)
             out['prototype_contrastive_loss'] = z
             out['prototype_contrastive_num_terms'] = 0
+        if ct_proto_result is not None:
+            out['ct_prototype_contrastive_loss'] = ct_proto_result['loss']
+            out['ct_prototype_contrastive_num_terms'] = ct_proto_result['num_terms']
+        else:
+            z = _zero(ref)
+            out['ct_prototype_contrastive_loss'] = z
+            out['ct_prototype_contrastive_num_terms'] = 0
         if recon_result is not None:
             out['reconstruction_loss'] = recon_result.get(
                 'loss', _zero(ref).to(dtype=torch.float32)
@@ -373,6 +411,22 @@ class DualSharedAddPETCTBaseline(nn.Module):
             out['pet_prior_norm'] = 0.0
         return out
 
+    def _proto_pair(self, ct_feats, pet_real_feats, mask):
+        """PET-proto (grad -> PET encoder) + CT-proto (grad -> CT encoder)."""
+        proto_result = None
+        ct_proto_result = None
+        if not self.pspi_enabled or self.module1 is None:
+            return proto_result, ct_proto_result
+        if not (self.training and mask is not None):
+            return proto_result, ct_proto_result
+        if self.pspi_proto_contrastive_weight > 0.0 and pet_real_feats is not None:
+            # PET prototype contrastive supervision (grad -> PET encoder).
+            proto_result = self.module1.compute_pet_prototype_contrastive_loss(pet_real_feats, mask)
+        if self.pspi_ct_proto_contrastive_weight > 0.0 and ct_feats is not None:
+            # CT prototype contrastive supervision (grad -> CT encoder).
+            ct_proto_result = self.module1.compute_ct_prototype_contrastive_loss(ct_feats, mask)
+        return proto_result, ct_proto_result
+
     def _maybe_collect(self, ct_feats, pet_feats_real, mask, collect_module1_candidates=True):
         if not collect_module1_candidates:
             return None
@@ -398,11 +452,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
         )
 
         proto_result = None
+        ct_proto_result = None
         module1_aux = None
         if self.pspi_enabled:
-            if self.training and mask is not None and self.pspi_proto_contrastive_weight > 0.0:
-                # PET prototype contrastive supervision (grad -> PET encoder).
-                proto_result = self.module1.compute_pet_prototype_contrastive_loss(pet_real_feats, mask)
+            proto_result, ct_proto_result = self._proto_pair(ct_feats, pet_real_feats, mask)
             module1_aux = {
                 "bank_ready": self.module1.bank_ready,
                 "bank_version": int(self.module1.bank_version.item()),
@@ -415,7 +468,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         # missing_prior_logits; reconstruction is strictly 0.
         fused_feats = self.fusion(ct_feats, pet_real_feats, None)
         out = self._decode(fused_feats, target_size)
-        return self._attach_pspi_stats(out, proto_result=proto_result, module1_aux=module1_aux, ref_tensor=out['logits'])
+        return self._attach_pspi_stats(out, proto_result=proto_result, ct_proto_result=ct_proto_result, module1_aux=module1_aux, ref_tensor=out['logits'])
 
     def _forward_missing(self, ct, pet, target_size, mask=None, collect_module1_candidates=True):
         ct_feats = self._encode_ct(ct)
@@ -467,8 +520,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 collect_module1_candidates=collect_module1_candidates,
             )
             proto_result = None
-            if self.pspi_proto_contrastive_weight > 0.0:
-                proto_result = self.module1.compute_pet_prototype_contrastive_loss(pet_real_feats, mask)
+            ct_proto_result = None
+            if self.pspi_enabled:
+                proto_result, ct_proto_result = self._proto_pair(ct_feats, pet_real_feats, mask)
             if self.pspi_affine_enabled and self.pet_affine is not None:
                 comp = self._compensate_missing_rows(
                     ct_feats, pet_real_feats, mask.float(),
@@ -479,7 +533,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 fused_feats = self.fusion(ct_feats, comp['pet_comp'], None)
                 out = self._decode(fused_feats, target_size)
                 return self._attach_pspi_stats(
-                    out, proto_result=proto_result, module1_aux=module1_aux,
+                    out, proto_result=proto_result, ct_proto_result=ct_proto_result, module1_aux=module1_aux,
                     ref_tensor=out['logits'], recon_result=comp['reconstruction'],
                     affine_stats=comp['affine_stats'],
                 )
@@ -488,7 +542,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
             module1_aux['pet_prior'] = pet_prior
             fused_feats = self.fusion(ct_feats, self._scaled_prior(pet_prior), None)
             out = self._decode(fused_feats, target_size)
-            return self._attach_pspi_stats(out, proto_result=proto_result, module1_aux=module1_aux, ref_tensor=out['logits'])
+            return self._attach_pspi_stats(out, proto_result=proto_result, ct_proto_result=ct_proto_result, module1_aux=module1_aux, ref_tensor=out['logits'])
         else:
             module1_aux = None
             if self.training:
@@ -615,8 +669,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 pet_feats_real, pet_comp_full, missing_index, pet_feats_real[0],
             )
             proto_result = None
-            if self.training and mask is not None and self.pspi_proto_contrastive_weight > 0.0:
-                proto_result = self.module1.compute_pet_prototype_contrastive_loss(pet_feats_real, mask)
+            ct_proto_result = None
+            if self.training and mask is not None:
+                proto_result, ct_proto_result = self._proto_pair(ct_feats, pet_feats_real, mask)
             module1_aux = {
                 "bank_ready": self.module1.bank_ready,
                 "bank_version": int(self.module1.bank_version.item()),
@@ -626,7 +681,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
             fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
             out = self._decode(fused_feats, target_size)
             out = self._attach_pspi_stats(
-                out, proto_result=proto_result, module1_aux=module1_aux,
+                out, proto_result=proto_result, ct_proto_result=ct_proto_result, module1_aux=module1_aux,
                 ref_tensor=out['logits'], recon_result=recon_dict,
                 affine_stats=affine_stats,
             )
@@ -644,16 +699,18 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 for real_feat, prior_feat in zip(pet_feats_real, prior_for_fusion)
             ]
             proto_result = None
-            if self.training and mask is not None and self.pspi_proto_contrastive_weight > 0.0:
-                proto_result = self.module1.compute_pet_prototype_contrastive_loss(pet_feats_real, mask)
+            ct_proto_result = None
+            if self.training and mask is not None:
+                proto_result, ct_proto_result = self._proto_pair(ct_feats, pet_feats_real, mask)
         else:
             module1_aux = None
             proto_result = None
+            ct_proto_result = None
             availability = pet_available.view(-1, 1, 1, 1).to(dtype=pet_feats_real[0].dtype)
             pet_for_fusion = [feat * availability for feat in pet_feats_real]
         fused_feats = self.fusion(ct_feats, pet_for_fusion, None)
         out = self._decode(fused_feats, target_size)
-        return self._attach_pspi_stats(out, proto_result=proto_result, module1_aux=module1_aux, ref_tensor=out['logits'])
+        return self._attach_pspi_stats(out, proto_result=proto_result, ct_proto_result=ct_proto_result, module1_aux=module1_aux, ref_tensor=out['logits'])
 
     @torch.no_grad()
     def finalize_module1_epoch(self, epoch):
