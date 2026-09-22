@@ -505,6 +505,31 @@ class Module1Config:
 # -----------------------------------------------------------------------------
 
 
+class CTPETAlignHead(nn.Module):
+    """PET->CT semantic aligner: proj(PET) toward detached CT.
+
+    One 2-layer MLP per scale (C->C). Only PET side + proj update;
+    CT side is detached teacher. Prevents cross-modal collapse.
+    """
+
+    def __init__(self, channels: Sequence[int]):
+        super().__init__()
+        self.projs = nn.ModuleList([
+            nn.Sequential(nn.Linear(c, c), nn.GELU(), nn.Linear(c, c))
+            for c in [int(c) for c in channels]
+        ])
+        for proj in self.projs:
+            nn.init.zeros_(proj[-1].weight)
+            nn.init.zeros_(proj[-1].bias)
+
+    def forward(self, pet_desc: torch.Tensor, ct_desc: torch.Tensor, scale_idx: int) -> torch.Tensor:
+        p = self.projs[scale_idx](pet_desc.float())
+        c = ct_desc.detach().float()
+        p_n = F.normalize(p, p=2, dim=-1, eps=EPS)
+        c_n = F.normalize(c, p=2, dim=-1, eps=EPS)
+        return (1.0 - (p_n * c_n).sum(dim=-1)).mean()
+
+
 class PairedSemanticPrototypeImputation(nn.Module):
     """
     Module-1 builds and maintains a paired CT-key/PET-value
@@ -519,7 +544,7 @@ class PairedSemanticPrototypeImputation(nn.Module):
     * Candidate collection:  collect_candidates(ct_feats, pet_feats_real, mask)
     * Bank update:           finalize_epoch(epoch)
     * Prior retrieval:       retrieve_pet_prior(ct_feats)  -- no PET argument
-    * Prototype loss:        compute_pet_prototype_contrastive_loss(pet_real, mask)
+    * Prototype loss:        compute_ct_prototype_contrastive_loss + compute_pet_ct_align_loss (single)
                              (raw loss only; task applies the weight)
     """
 
@@ -589,6 +614,7 @@ class PairedSemanticPrototypeImputation(nn.Module):
         self.build_stage_idx = _stage_to_index(
             self.config.build_stage, self.num_scales
         )
+        self.align_head = CTPETAlignHead(self.channels)
 
         self.attention = nn.ModuleList(
             [
@@ -1285,107 +1311,6 @@ class PairedSemanticPrototypeImputation(nn.Module):
     # PET multi-positive prototype contrastive loss (raw, unweighted)
     # ------------------------------------------------------------------
 
-    def compute_pet_prototype_contrastive_loss(
-        self,
-        pet_real_feats: Sequence[torch.Tensor],
-        mask: torch.Tensor,
-    ) -> Dict:
-        """
-        Multi-positive prototype contrastive loss on real PET descriptors.
-
-        Returns the RAW loss only (no internal weighting; the training task
-        multiplies by its own weight).
-
-        Gradient boundary: pet_real_feats keep grad (PET encoder updates);
-        the prototype bank is detached; CT/retrieval/prior-scale get none.
-        """
-        self._validate_features(pet_real_feats, None)
-        if mask.ndim != 4 or mask.shape[1] != 1:
-            raise ValueError("mask must be [B,1,H,W]")
-        if not self.bank_ready:
-            return _zero_loss_result(pet_real_feats[0])
-        tau = float(self.config.proto_temperature)
-
-        fg_present = mask.flatten(1).sum(dim=1) > EPS
-        bg_present = (1.0 - mask.float()).flatten(1).sum(dim=1) > EPS
-        semantic_presence = {0: bg_present, 1: fg_present}
-
-        group_losses: List[torch.Tensor] = []
-        bg_group_losses: List[torch.Tensor] = []
-        fg_group_losses: List[torch.Tensor] = []
-        per_scale: Dict[str, float] = {}
-        details: Dict[str, int] = {}
-
-        for s, pet_feat in enumerate(pet_real_feats):
-            bg_mask, fg_mask = _class_masks_at_scale(mask, pet_feat.shape[-2:])
-            scale_ready = self.prototype_ready_scale[s]
-            if int(scale_ready.sum().item()) == 0:
-                scale_ready = self.prototype_ready
-            for class_idx, class_mask in enumerate((bg_mask, fg_mask)):
-                target_ready = scale_ready[class_idx]
-                other_ready = scale_ready[1 - class_idx]
-                if not bool(target_ready.any()) or not bool(other_ready.any()):
-                    continue
-                descriptors, desc_valid = _masked_average_pool_2d(pet_feat, class_mask)
-                valid = (
-                    desc_valid
-                    & semantic_presence[class_idx].to(pet_feat.device)
-                    & torch.isfinite(descriptors).all(dim=1)
-                    & (descriptors.norm(dim=1) > EPS)
-                )
-                if not bool(valid.any()):
-                    continue
-
-                pet_bank = getattr(self, f"pet_values_s{s + 1}").detach()  # [2,K,C]
-                target_protos = pet_bank[class_idx][target_ready]          # [Kt,C]
-                negative_protos = pet_bank[1 - class_idx][other_ready]     # [Kn,C]
-                target_protos_n = F.normalize(target_protos.float(), p=2, dim=-1, eps=EPS)
-                negative_protos_n = F.normalize(negative_protos.float(), p=2, dim=-1, eps=EPS)
-
-                sample_terms: List[torch.Tensor] = []
-                valid_indices = torch.nonzero(valid, as_tuple=False).flatten().long()
-                for idx in valid_indices:
-                    z = descriptors[idx : idx + 1]  # [1,C], grad to PET encoder
-                    z_n = F.normalize(z.float(), p=2, dim=-1, eps=EPS)
-                    cos_target = (z_n @ target_protos_n.t()).squeeze(0)    # [Kt]
-                    cos_negative = (z_n @ negative_protos_n.t()).squeeze(0)  # [Kn]
-                    s_c = torch.logsumexp(cos_target / tau, dim=0)
-                    s_o = torch.logsumexp(cos_negative / tau, dim=0)
-                    lse = torch.logsumexp(torch.stack([s_c, s_o]), dim=0)
-                    loss = lse - s_c
-                    _finite_or_raise(f"proto_contrastive_term_s{s+1}", loss)
-                    sample_terms.append(loss)
-                if not sample_terms:
-                    continue
-                group_loss = torch.stack(sample_terms).mean()
-                _finite_or_raise(f"proto_contrastive_s{s+1}_{CLASS_NAMES[class_idx]}", group_loss)
-                group_losses.append(group_loss)
-                if class_idx == 0:
-                    bg_group_losses.append(group_loss)
-                else:
-                    fg_group_losses.append(group_loss)
-                per_scale[f"s{s+1}_{CLASS_NAMES[class_idx]}"] = float(group_loss.item())
-                details[f"s{s+1}_{CLASS_NAMES[class_idx]}_terms"] = len(sample_terms)
-
-        # Class-balanced: L_m = mean over valid classes of {L_m^BG, L_m^FG},
-        # with L_m^c = mean over valid scales. Valid-term mean (not dead 0.5)
-        # so FG-free slices yield L_m = L_BG instead of halving.
-        class_terms = []
-        if bg_group_losses:
-            class_terms.append(torch.stack(bg_group_losses).mean())
-        if fg_group_losses:
-            class_terms.append(torch.stack(fg_group_losses).mean())
-        if not class_terms:
-            return _zero_loss_result(pet_real_feats[0])
-        loss = torch.stack(class_terms).mean()
-        _finite_or_raise("proto_contrastive_loss", loss)
-        return {
-            "loss": loss,
-            "num_terms": len(group_losses),
-            "per_scale": per_scale,
-            "details": details,
-        }
-
     def compute_ct_prototype_contrastive_loss(
         self,
         ct_feats: Sequence[torch.Tensor],
@@ -1484,6 +1409,63 @@ class PairedSemanticPrototypeImputation(nn.Module):
             "details": details,
         }
 
+    def compute_pet_ct_align_loss(
+        self,
+        ct_feats: Sequence[torch.Tensor],
+        pet_real_feats: Sequence[torch.Tensor],
+        mask: torch.Tensor,
+    ) -> Dict:
+        """PET->CT semantic align: same-sample same-class descriptors.
+
+        L_align = mean over valid (s, class, sample) of
+        1 - cos(proj_s(z_pet), z_ct.detach()).
+        Grad -> PET encoder + align head; CT detached teacher.
+        """
+        self._validate_features(ct_feats, pet_real_feats)
+        if mask.ndim != 4 or mask.shape[1] != 1:
+            raise ValueError("mask must be [B,1,H,W]")
+        if not self.bank_ready:
+            ref = pet_real_feats[0] if len(pet_real_feats) else ct_feats[0]
+            return _zero_loss_result(ref)
+        fg_present = mask.flatten(1).sum(dim=1) > EPS
+        bg_present = (1.0 - mask.float()).flatten(1).sum(dim=1) > EPS
+        semantic_presence = {0: bg_present, 1: fg_present}
+        sample_terms: List[torch.Tensor] = []
+        per_scale: Dict[str, float] = {}
+        details: Dict[str, int] = {}
+        n_terms = 0
+        for s, (ct_feat, pet_feat) in enumerate(zip(ct_feats, pet_real_feats)):
+            bg_mask, fg_mask = _class_masks_at_scale(mask, ct_feat.shape[-2:])
+            for class_idx, class_mask in enumerate((bg_mask, fg_mask)):
+                ct_desc, ct_valid = _masked_average_pool_2d(ct_feat, class_mask)
+                pet_desc, pet_valid = _masked_average_pool_2d(pet_feat, class_mask)
+                valid = (
+                    ct_valid & pet_valid
+                    & semantic_presence[class_idx].to(ct_feat.device)
+                    & torch.isfinite(ct_desc).all(dim=1) & torch.isfinite(pet_desc).all(dim=1)
+                    & (ct_desc.norm(dim=1) > EPS) & (pet_desc.norm(dim=1) > EPS)
+                )
+                if not bool(valid.any()):
+                    continue
+                idx = torch.nonzero(valid, as_tuple=False).flatten().long()
+                t = self.align_head(pet_desc[idx], ct_desc[idx], s)
+                _finite_or_raise(f"pet_ct_align_s{s+1}_{CLASS_NAMES[class_idx]}", t)
+                sample_terms.append(t)
+                n_terms += int(idx.numel())
+                per_scale[f"s{s+1}_{CLASS_NAMES[class_idx]}"] = float(t.item())
+                details[f"s{s+1}_{CLASS_NAMES[class_idx]}_terms"] = int(idx.numel())
+        if not sample_terms:
+            ref = pet_real_feats[0]
+            return _zero_loss_result(ref)
+        loss = torch.stack(sample_terms).mean()
+        _finite_or_raise("pet_ct_align_loss", loss)
+        return {
+            "loss": loss,
+            "num_terms": n_terms,
+            "per_scale": per_scale,
+            "details": details,
+        }
+
 
 # -----------------------------------------------------------------------------
 # Minimal self-check
@@ -1530,7 +1512,8 @@ def _self_check() -> None:
         assert prior_zero[s].shape == ct[s].shape
         assert bool((prior_zero[s] == 0).all())
     assert aux_zero["bank_ready"] is False
-    assert float(empty.compute_pet_prototype_contrastive_loss(pet_a, mask)["loss"]) == 0.0
+    assert float(empty.compute_ct_prototype_contrastive_loss(ct, mask)["loss"]) == 0.0
+    assert float(empty.compute_pet_ct_align_loss(ct, pet_a, mask)["loss"]) == 0.0
 
     # Ready: shapes + default no attention map.
     module.eval()
@@ -1556,16 +1539,17 @@ def _self_check() -> None:
 
     # Contrastive loss finite, >= 0, raw (unweighted).
     module.train()
-    proto = module.compute_pet_prototype_contrastive_loss(pet_a, mask)
-    assert proto["num_terms"] > 0 and float(proto["loss"].item()) >= 0.0
-    assert "weighted_loss" not in proto
+    cproto = module.compute_ct_prototype_contrastive_loss(ct, mask)
+    assert cproto["num_terms"] > 0 and float(cproto["loss"].item()) >= 0.0
 
     # Gradient boundaries: PET encoder only.
+    align = module.compute_pet_ct_align_loss(ct, pet_a, mask)
+    assert align["num_terms"] > 0 and float(align["loss"].item()) >= 0.0
     module.zero_grad(set_to_none=True)
     for p in pet_a:
         p.grad = None
-    proto["loss"].backward()
-    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in pet_a)
+    align["loss"].backward()
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in module.align_head.parameters())
     assert all(p.grad is None or float(p.grad.abs().sum()) == 0 for p in ct)
 
     print("[SELF-CHECK] passed")

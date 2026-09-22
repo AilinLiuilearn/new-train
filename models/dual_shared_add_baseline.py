@@ -416,19 +416,32 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return out
 
     def _proto_pair(self, ct_feats, pet_real_feats, mask):
-        """PET-proto (grad -> PET encoder) + CT-proto (grad -> CT encoder)."""
+        """Single proto loss: (L_ct + L_align)/2.
+
+        L_ct: CT class-contrastive (grad -> CT encoder), via bank.
+        L_align: PET->CT semantic align (grad -> PET encoder + align head),
+        CT detached teacher. Old PET-proto (z_pet->V) removed.
+        Single weight pspi_proto_contrastive_weight; ct weight unused.
+        """
         proto_result = None
         ct_proto_result = None
         if not self.pspi_enabled or self.module1 is None:
             return proto_result, ct_proto_result
         if not (self.training and mask is not None):
             return proto_result, ct_proto_result
-        if self.pspi_proto_contrastive_weight > 0.0 and pet_real_feats is not None:
-            # PET prototype contrastive supervision (grad -> PET encoder).
-            proto_result = self.module1.compute_pet_prototype_contrastive_loss(pet_real_feats, mask)
-        if self.pspi_ct_proto_contrastive_weight > 0.0 and ct_feats is not None:
-            # CT prototype contrastive supervision (grad -> CT encoder).
+        if self.pspi_proto_contrastive_weight > 0.0 and ct_feats is not None and pet_real_feats is not None:
             ct_proto_result = self.module1.compute_ct_prototype_contrastive_loss(ct_feats, mask)
+            align_result = self.module1.compute_pet_ct_align_loss(ct_feats, pet_real_feats, mask)
+            terms, n = [], 0
+            if ct_proto_result is not None and torch.is_tensor(ct_proto_result.get('loss')):
+                terms.append(ct_proto_result['loss']); n += ct_proto_result.get('num_terms', 0)
+            if align_result is not None and torch.is_tensor(align_result.get('loss')):
+                terms.append(align_result['loss']); n += align_result.get('num_terms', 0)
+            if terms:
+                loss = torch.stack(terms).mean()
+                proto_result = {'loss': loss, 'num_terms': n,
+                                'per_scale': {**ct_proto_result.get('per_scale', {}), **align_result.get('per_scale', {})},
+                                'details': {'ct': ct_proto_result.get('details', {}), 'align': align_result.get('details', {})}}
         return proto_result, ct_proto_result
 
     def _maybe_collect(self, ct_feats, pet_feats_real, mask, collect_module1_candidates=True):
