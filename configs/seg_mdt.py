@@ -38,6 +38,8 @@ class SegMDTConfig(ConfigBase):
         # PSPI / Module-1: paired CT-PET prototype prior retrieval
         p.add_argument('--pspi_enabled', type=str2bool, default=True)
         p.add_argument('--pspi_num_clusters', type=int, default=6)
+        p.add_argument('--pspi_num_clusters_bg', type=int, default=0)
+        p.add_argument('--pspi_num_clusters_fg', type=int, default=0)
         p.add_argument('--pspi_build_stage', type=int, default=4)
         p.add_argument('--pspi_cluster_max_iter', type=int, default=25)
         p.add_argument('--pspi_outlier_discard_rate', type=float, default=0.05)

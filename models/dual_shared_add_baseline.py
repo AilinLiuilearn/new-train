@@ -51,6 +51,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
         use_deep_supervision=False,
         pspi_enabled=True,
         pspi_num_clusters=6,
+        pspi_num_clusters_bg=0,
+        pspi_num_clusters_fg=0,
         pspi_build_stage=4,
         pspi_cluster_max_iter=25,
         pspi_outlier_discard_rate=0.05,
@@ -91,6 +93,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
             self.module1 = PairedSemanticPrototypeImputation(
                 channels=pet_channels,
                 num_clusters=pspi_num_clusters,
+                num_clusters_bg=pspi_num_clusters_bg,
+                num_clusters_fg=pspi_num_clusters_fg,
                 build_stage=pspi_build_stage,
                 cluster_max_iter=pspi_cluster_max_iter,
                 outlier_discard_rate=pspi_outlier_discard_rate,

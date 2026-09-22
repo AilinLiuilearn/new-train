@@ -455,6 +455,8 @@ class PrototypeCrossAttention(nn.Module):
 class Module1Config:
     channels: Tuple[int, ...]
     num_clusters: int = 6
+    num_clusters_bg: int = 0  # 0/None = follow num_clusters
+    num_clusters_fg: int = 0  # 0/None = follow num_clusters
     build_stage: int = 4
     cluster_max_iter: int = 25
     outlier_discard_rate: float = 0.05
@@ -472,6 +474,10 @@ class Module1Config:
             raise ValueError("channels cannot be empty")
         if self.num_clusters < 1:
             raise ValueError("num_clusters must be >= 1")
+        if int(self.num_clusters_bg or 0) < 0:
+            raise ValueError("num_clusters_bg must be >= 0")
+        if int(self.num_clusters_fg or 0) < 0:
+            raise ValueError("num_clusters_fg must be >= 0")
         _stage_to_index(self.build_stage, len(self.channels))
         if self.cluster_max_iter < 1:
             raise ValueError("cluster_max_iter must be >= 1")
@@ -521,6 +527,8 @@ class PairedSemanticPrototypeImputation(nn.Module):
         self,
         channels: Sequence[int],
         num_clusters: int = 6,
+        num_clusters_bg: int = 0,
+        num_clusters_fg: int = 0,
         build_stage: int = 4,
         cluster_max_iter: int = 25,
         outlier_discard_rate: float = 0.05,
@@ -555,6 +563,8 @@ class PairedSemanticPrototypeImputation(nn.Module):
         self.config = Module1Config(
             channels=tuple(int(c) for c in channels),
             num_clusters=int(num_clusters),
+            num_clusters_bg=int(num_clusters_bg or 0),
+            num_clusters_fg=int(num_clusters_fg or 0),
             build_stage=int(build_stage),
             cluster_max_iter=int(cluster_max_iter),
             outlier_discard_rate=float(outlier_discard_rate),
@@ -572,6 +582,10 @@ class PairedSemanticPrototypeImputation(nn.Module):
         self.channels = self.config.channels
         self.num_scales = len(self.channels)
         self.num_clusters = self.config.num_clusters
+        # Per-class slot counts: Kb for BG, Kf for FG (0 = follow num_clusters).
+        self.num_clusters_bg = int(self.config.num_clusters_bg or self.config.num_clusters)
+        self.num_clusters_fg = int(self.config.num_clusters_fg or self.config.num_clusters)
+        self.num_clusters_max = max(self.num_clusters_bg, self.num_clusters_fg)
         self.build_stage_idx = _stage_to_index(
             self.config.build_stage, self.num_scales
         )
@@ -592,31 +606,31 @@ class PairedSemanticPrototypeImputation(nn.Module):
         for scale_idx, c in enumerate(self.channels):
             self.register_buffer(
                 f"ct_keys_s{scale_idx + 1}",
-                torch.zeros(2, self.num_clusters, c, dtype=torch.float32),
+                torch.zeros(2, self.num_clusters_max, c, dtype=torch.float32),
             )
             self.register_buffer(
                 f"pet_values_s{scale_idx + 1}",
-                torch.zeros(2, self.num_clusters, c, dtype=torch.float32),
+                torch.zeros(2, self.num_clusters_max, c, dtype=torch.float32),
             )
 
         self.register_buffer(
             "prototype_ready",
-            torch.zeros(2, self.num_clusters, dtype=torch.bool),
+            torch.zeros(2, self.num_clusters_max, dtype=torch.bool),
         )
         self.register_buffer(
             "prototype_count",
-            torch.zeros(2, self.num_clusters, dtype=torch.long),
+            torch.zeros(2, self.num_clusters_max, dtype=torch.long),
         )
         # Per-scale readiness/count: independent clustering may fill different
         # slots at each scale, so loss/retrieval must use the per-scale mask
         # instead of the merged union (avoids injecting unfilled zero slots).
         self.register_buffer(
             "prototype_ready_scale",
-            torch.zeros(self.num_scales, 2, self.num_clusters, dtype=torch.bool),
+            torch.zeros(self.num_scales, 2, self.num_clusters_max, dtype=torch.bool),
         )
         self.register_buffer(
             "prototype_count_scale",
-            torch.zeros(self.num_scales, 2, self.num_clusters, dtype=torch.long),
+            torch.zeros(self.num_scales, 2, self.num_clusters_max, dtype=torch.long),
         )
         self.register_buffer("bank_version", torch.zeros((), dtype=torch.long))
 
@@ -829,6 +843,7 @@ class PairedSemanticPrototypeImputation(nn.Module):
     @torch.no_grad()
     def _apply_matched_ema_update(self, new_keys, new_values, new_ready, new_count) -> Dict:
         momentum = float(self.config.ema_momentum)
+        class_K = [int(self.num_clusters_bg), int(self.num_clusters_fg)]
         report = {"mode": "matched_ema", "matches": {}}
         out_keys = [getattr(self, f"ct_keys_s{s + 1}").detach().float().cpu().clone() for s in range(self.num_scales)]
         out_values = [getattr(self, f"pet_values_s{s + 1}").detach().float().cpu().clone() for s in range(self.num_scales)]
@@ -860,9 +875,9 @@ class PairedSemanticPrototypeImputation(nn.Module):
                     out_ready[class_idx, old_slot] = True
                     out_count[class_idx, old_slot] = new_count[class_idx, new_slot]
                     class_pairs.append({"old_slot": old_slot, "new_slot": new_slot, "cosine_distance": float(cost[old_local, new_local])})
-            free_slots = [s for s in range(self.num_clusters) if s not in used_old and (not bool(out_ready[class_idx, s]) or s in used_old)]
+            free_slots = [s for s in range(class_K[class_idx]) if s not in used_old and (not bool(out_ready[class_idx, s]) or s in used_old)]
             if len(free_slots) < (len(new_slots) - len(used_new)):
-                free_slots.extend(s for s in range(self.num_clusters) if s not in used_old and s not in free_slots)
+                free_slots.extend(s for s in range(class_K[class_idx]) if s not in used_old and s not in free_slots)
             for new_slot in [int(v.item()) for v in new_slots if int(v.item()) not in used_new]:
                 if not free_slots:
                     break
@@ -936,6 +951,7 @@ class PairedSemanticPrototypeImputation(nn.Module):
         out_values = [getattr(self, f"pet_values_s{s + 1}").detach().float().cpu().clone() for s in range(self.num_scales)]
         # Per-scale readiness: each scale tracks its own ready slots so EMA
         # matching/diversity are fully independent per scale.
+        class_K = [int(self.num_clusters_bg), int(self.num_clusters_fg)]
         out_ready = [self.prototype_ready.detach().cpu().clone() for _ in range(self.num_scales)]
         out_count = [self.prototype_count.detach().cpu().clone() for _ in range(self.num_scales)]
         # Shared legacy views (kept for compat): S4 anchor only.
@@ -956,7 +972,7 @@ class PairedSemanticPrototypeImputation(nn.Module):
                 if new_slots.numel() == 0:
                     continue
                 if old_slots.numel() == 0:
-                    free_slots = [int(v) for v in range(self.num_clusters) if not bool(sc_ready[class_idx, v])]
+                    free_slots = [int(v) for v in range(class_K[class_idx]) if not bool(sc_ready[class_idx, v])]
                     for idx, new_slot in enumerate([int(v.item()) for v in new_slots]):
                         if idx >= len(free_slots):
                             break
@@ -994,7 +1010,7 @@ class PairedSemanticPrototypeImputation(nn.Module):
                         })
                 unique_chosen = len(set(chosen_current_slots))
                 duplicate_current_match_count += len(chosen_current_slots) - unique_chosen
-                free_slots = [int(v) for v in range(self.num_clusters) if not bool(sc_ready[class_idx, v])]
+                free_slots = [int(v) for v in range(class_K[class_idx]) if not bool(sc_ready[class_idx, v])]
                 chosen_set = set(chosen_current_slots)
                 unused_new = [int(v.item()) for v in new_slots if int(v.item()) not in chosen_set]
                 for target, new_slot in zip(free_slots, unused_new):
@@ -1081,10 +1097,12 @@ class PairedSemanticPrototypeImputation(nn.Module):
             "bank_version_before": int(self.bank_version.item()),
             "classes": {},
         }
-        new_keys = [torch.zeros(2, self.num_clusters, c, dtype=torch.float32) for c in self.channels]
-        new_values = [torch.zeros(2, self.num_clusters, c, dtype=torch.float32) for c in self.channels]
-        new_ready = torch.zeros(2, self.num_clusters, dtype=torch.bool)
-        new_count = torch.zeros(2, self.num_clusters, dtype=torch.long)
+        Kmax = int(self.num_clusters_max)
+        class_K = [int(self.num_clusters_bg), int(self.num_clusters_fg)]
+        new_keys = [torch.zeros(2, Kmax, c, dtype=torch.float32) for c in self.channels]
+        new_values = [torch.zeros(2, Kmax, c, dtype=torch.float32) for c in self.channels]
+        new_ready = torch.zeros(2, Kmax, dtype=torch.bool)
+        new_count = torch.zeros(2, Kmax, dtype=torch.long)
         any_candidate = False
         for class_idx, class_name in enumerate(CLASS_NAMES):
             # Independent per-scale clustering: each scale clusters its OWN
@@ -1138,7 +1156,7 @@ class PairedSemanticPrototypeImputation(nn.Module):
                 build_pet = pet_raw[valid_indices]
                 any_candidate = True
                 labels, centers, kmeans_report = deterministic_spherical_kmeans(
-                    build_ct, num_clusters=self.num_clusters, max_iter=self.config.cluster_max_iter,
+                    build_ct, num_clusters=class_K[class_idx], max_iter=self.config.cluster_max_iter,
                 )
                 k_eff = int(centers.shape[0])
                 kept_by_cluster, filter_report = cosine_cluster_outlier_filter(
@@ -1218,15 +1236,23 @@ class PairedSemanticPrototypeImputation(nn.Module):
         entropy_list: List[float] = []
         norm_entropy_list: List[float] = []
         any_ready = bool(self.prototype_ready.any())
+        Kb = int(self.num_clusters_bg); Kf = int(self.num_clusters_fg)
+        if Kb != Kf and int(self.attention[0].per_class_topk) > 0:
+            raise ValueError(
+                f"asymmetric slots BG={Kb} FG={Kf} require retrieval_per_class_topk=0 "
+                "(class-constrained path assumes equal halves); use dense/global-topk."
+            )
         for s, ct in enumerate(ct_feats):
-            keys = getattr(self, f"ct_keys_s{s + 1}").reshape(2 * self.num_clusters, self.channels[s])
-            values = getattr(self, f"pet_values_s{s + 1}").reshape(2 * self.num_clusters, self.channels[s])
+            bank_k = getattr(self, f"ct_keys_s{s + 1}")  # [2,Kmax,C]
+            bank_v = getattr(self, f"pet_values_s{s + 1}")
+            keys = torch.cat([bank_k[0, :Kb], bank_k[1, :Kf]], dim=0)
+            values = torch.cat([bank_v[0, :Kb], bank_v[1, :Kf]], dim=0)
             keys = keys.to(device=ct.device, dtype=ct.dtype)
             values = values.to(device=ct.device, dtype=ct.dtype)
-            scale_ready = self.prototype_ready_scale[s].flatten()
-            if int(scale_ready.sum().item()) == 0:
-                scale_ready = self.prototype_ready.flatten()
-            ready = scale_ready.to(device=ct.device)
+            sc = self.prototype_ready_scale[s]  # [2,Kmax]
+            if int(sc.sum().item()) == 0:
+                sc = self.prototype_ready
+            ready = torch.cat([sc[0, :Kb], sc[1, :Kf]], dim=0).to(device=ct.device)
             retrieved, attention = self.attention[s](ct, keys, values, ready)
             pet_prior.append(retrieved)
             if return_attention:

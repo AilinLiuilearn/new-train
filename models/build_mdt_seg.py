@@ -514,6 +514,8 @@ def build_mdt_seg_teacher(config):
         use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
         pspi_enabled=getattr(config, 'pspi_enabled', True),
         pspi_num_clusters=getattr(config, 'pspi_num_clusters', 6),
+        pspi_num_clusters_bg=int(getattr(config, 'pspi_num_clusters_bg', 0) or 0),
+        pspi_num_clusters_fg=int(getattr(config, 'pspi_num_clusters_fg', 0) or 0),
         pspi_build_stage=getattr(config, 'pspi_build_stage', 4),
         pspi_cluster_max_iter=getattr(config, 'pspi_cluster_max_iter', 25),
         pspi_outlier_discard_rate=getattr(config, 'pspi_outlier_discard_rate', 0.05),
