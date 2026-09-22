@@ -416,12 +416,13 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return out
 
     def _proto_pair(self, ct_feats, pet_real_feats, mask):
-        """Single proto loss: (L_ct + L_align)/2.
+        """Split proto weights: L_ct vs L_align.
 
-        L_ct: CT class-contrastive (grad -> CT encoder), via bank.
-        L_align: PET->CT semantic align (grad -> PET encoder + align head),
-        CT detached teacher. Old PET-proto (z_pet->V) removed.
-        Single weight pspi_proto_contrastive_weight; ct weight unused.
+        proto_result = L_ct (CT class-contrastive, grad -> CT encoder),
+        weighted by pspi_proto_contrastive_weight (0.08).
+        ct_proto_result = L_align (PET->CT align, grad -> PET encoder +
+        align head), weighted by pspi_ct_proto_contrastive_weight (0.02).
+        Old PET-proto (z_pet->V) removed. Task applies the two weights.
         """
         proto_result = None
         ct_proto_result = None
@@ -429,19 +430,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
             return proto_result, ct_proto_result
         if not (self.training and mask is not None):
             return proto_result, ct_proto_result
-        if self.pspi_proto_contrastive_weight > 0.0 and ct_feats is not None and pet_real_feats is not None:
-            ct_proto_result = self.module1.compute_ct_prototype_contrastive_loss(ct_feats, mask)
-            align_result = self.module1.compute_pet_ct_align_loss(ct_feats, pet_real_feats, mask)
-            terms, n = [], 0
-            if ct_proto_result is not None and torch.is_tensor(ct_proto_result.get('loss')):
-                terms.append(ct_proto_result['loss']); n += ct_proto_result.get('num_terms', 0)
-            if align_result is not None and torch.is_tensor(align_result.get('loss')):
-                terms.append(align_result['loss']); n += align_result.get('num_terms', 0)
-            if terms:
-                loss = torch.stack(terms).mean()
-                proto_result = {'loss': loss, 'num_terms': n,
-                                'per_scale': {**ct_proto_result.get('per_scale', {}), **align_result.get('per_scale', {})},
-                                'details': {'ct': ct_proto_result.get('details', {}), 'align': align_result.get('details', {})}}
+        if self.pspi_proto_contrastive_weight > 0.0 and ct_feats is not None:
+            proto_result = self.module1.compute_ct_prototype_contrastive_loss(ct_feats, mask)
+        if self.pspi_ct_proto_contrastive_weight > 0.0 and ct_feats is not None and pet_real_feats is not None:
+            ct_proto_result = self.module1.compute_pet_ct_align_loss(ct_feats, pet_real_feats, mask)
         return proto_result, ct_proto_result
 
     def _maybe_collect(self, ct_feats, pet_feats_real, mask, collect_module1_candidates=True):
