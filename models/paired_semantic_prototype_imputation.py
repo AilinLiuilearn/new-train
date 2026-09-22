@@ -519,7 +519,7 @@ class CTPETAlignHead(nn.Module):
             for c in [int(c) for c in channels]
         ])
         for proj in self.projs:
-            nn.init.zeros_(proj[-1].weight)
+            nn.init.normal_(proj[-1].weight, std=0.02)
             nn.init.zeros_(proj[-1].bias)
 
     def forward(self, pet_desc: torch.Tensor, ct_desc: torch.Tensor, scale_idx: int) -> torch.Tensor:
