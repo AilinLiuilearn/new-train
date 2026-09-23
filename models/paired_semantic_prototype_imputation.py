@@ -530,6 +530,30 @@ class CTPETAlignHead(nn.Module):
         return (1.0 - (p_n * c_n).sum(dim=-1)).mean()
 
 
+class CTPseudoPETHead(nn.Module):
+    """CT->pseudo-PET translator, S4 only (new paradigm).
+
+    1x1-conv MLP on the aligned S4 CT feature: full-conv equivalent of a
+    per-location MLP. Small-normal (non-zero) init on the last layer so the
+    S4 MSE loss has finite gradients from step 0.
+    Grad flows to this head + CT encoder; the real PET side is detached.
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        hidden = max(8, channels // 2)
+        self.proj = nn.Sequential(
+            nn.Conv2d(channels, hidden, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden, channels, 1),
+        )
+        nn.init.normal_(self.proj[-1].weight, std=0.02)
+        nn.init.zeros_(self.proj[-1].bias)
+
+    def forward(self, ct_s4: torch.Tensor) -> torch.Tensor:
+        return self.proj(ct_s4)
+
+
 class PairedSemanticPrototypeImputation(nn.Module):
     """
     Module-1 builds and maintains a paired CT-key/PET-value
@@ -615,6 +639,8 @@ class PairedSemanticPrototypeImputation(nn.Module):
             self.config.build_stage, self.num_scales
         )
         self.align_head = CTPETAlignHead(self.channels)
+        # New paradigm: S4-only CT->pseudo-PET translator (pure-PET bank).
+        self.pseudo_head = CTPseudoPETHead(int(self.channels[-1]))
 
         self.attention = nn.ModuleList(
             [
@@ -1224,6 +1250,17 @@ class PairedSemanticPrototypeImputation(nn.Module):
         report["bank_version_after"] = int(self.bank_version.item())
         report["ready_count"] = int(self.prototype_ready.sum().item())
         report["total_slots"] = int(self.prototype_ready.numel())
+        # Empty-slot supervision: which (class, slot) never filled (log only).
+        ready_cpu = self.prototype_ready.detach().cpu()
+        empty_slots = [
+            f"{CLASS_NAMES[c]}:{k}"
+            for c in range(2) for k in range(class_K[c])
+            if not bool(ready_cpu[c, k])
+        ]
+        report["empty_slots"] = empty_slots
+        if empty_slots:
+            print(f"[PSPI][BANK] empty_slots={empty_slots} "
+                  f"(ready {int(ready_cpu.sum().item())}/{int(ready_cpu.numel())})")
         report["prototype_count"] = self.prototype_count.detach().cpu().tolist()
         # Expose FedMEPD monitoring fields at top level when present
         if isinstance(update_report, dict):
@@ -1407,6 +1444,42 @@ class PairedSemanticPrototypeImputation(nn.Module):
             "num_terms": len(group_losses),
             "per_scale": per_scale,
             "details": details,
+        }
+
+    def compute_pseudo_pet_loss(
+        self,
+        ct_feats: Sequence[torch.Tensor],
+        pet_real_feats: Sequence[torch.Tensor],
+    ) -> Dict:
+        """S4-only CT->pseudo-PET generation loss (new paradigm).
+
+        L_gen = MSE(z_pseudo_s4, z_pet_s4.detach()) over the full batch
+        (Full + Missing privileged rows), whole-map, no mask, no BG/FG
+        split, no normalization. Single term, zero inner weights.
+        Grad -> pseudo head + CT encoder; real PET is the detached teacher
+        (updated only by the segmentation path). Also reports the mean
+        cosine (diagnostic only, not optimized) for translation monitoring.
+        """
+        self._validate_features(ct_feats, pet_real_feats)
+        ct_s4, pet_s4 = ct_feats[-1], pet_real_feats[-1]
+        if ct_s4.shape != pet_s4.shape:
+            raise ValueError(
+                f"S4 CT/PET shape mismatch: {tuple(ct_s4.shape)} vs {tuple(pet_s4.shape)}"
+            )
+        z_pseudo = self.pseudo_head(ct_s4.float())
+        z_pet = pet_s4.detach().float()
+        loss = F.mse_loss(z_pseudo, z_pet)
+        _finite_or_raise("pseudo_pet_gen_loss", loss)
+        with torch.no_grad():
+            cos = F.cosine_similarity(
+                z_pseudo.flatten(1), z_pet.flatten(1), dim=1, eps=EPS
+            ).mean()
+        return {
+            "loss": loss,
+            "num_terms": int(ct_s4.shape[0]),
+            "per_scale": {"s4": float(loss.item())},
+            "details": {"s4_terms": int(ct_s4.shape[0])},
+            "cos": float(cos.item()),
         }
 
     def compute_pet_ct_align_loss(
