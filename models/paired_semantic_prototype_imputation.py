@@ -1450,15 +1450,17 @@ class PairedSemanticPrototypeImputation(nn.Module):
         self,
         ct_feats: Sequence[torch.Tensor],
         pet_real_feats: Sequence[torch.Tensor],
+        mask: torch.Tensor,
     ) -> Dict:
-        """S4-only CT->pseudo-PET generation loss (new paradigm).
+        """S4-only CT->pseudo-PET align loss (new paradigm).
 
-        L_gen = MSE(z_pseudo_s4, z_pet_s4.detach()) over the full batch
-        (Full + Missing privileged rows), whole-map, no mask, no BG/FG
-        split, no normalization. Single term, zero inner weights.
+        L_align = 0.5*mean_{FG}(1-cos) + 0.5*mean_{BG}(1-cos) over the full
+        batch (Full + Missing privileged rows), per-location cosine at S4
+        between z_pseudo and the detached real PET. FG/BG split by the
+        downsampled mask with equal weight so background cannot dominate;
+        empty FG is skipped (valid part only). Mask is training-loss only.
         Grad -> pseudo head + CT encoder; real PET is the detached teacher
-        (updated only by the segmentation path). Also reports the mean
-        cosine (diagnostic only, not optimized) for translation monitoring.
+        (updated only by the segmentation path). Reports mean cosine.
         """
         self._validate_features(ct_feats, pet_real_feats)
         ct_s4, pet_s4 = ct_feats[-1], pet_real_feats[-1]
@@ -1468,12 +1470,21 @@ class PairedSemanticPrototypeImputation(nn.Module):
             )
         z_pseudo = self.pseudo_head(ct_s4.float())
         z_pet = pet_s4.detach().float()
-        loss = F.mse_loss(z_pseudo, z_pet)
-        _finite_or_raise("pseudo_pet_gen_loss", loss)
+        if mask.ndim != 4 or mask.shape[1] != 1:
+            raise ValueError("mask must be [B,1,H,W]")
+        per_loc = 1.0 - F.cosine_similarity(z_pseudo, z_pet, dim=1, eps=EPS)
+        bg_mask, fg_mask = _class_masks_at_scale(mask, ct_s4.shape[-2:])
+        terms = []
+        if bool(fg_mask.any()):
+            terms.append(per_loc[fg_mask.expand_as(per_loc)].mean())
+        if bool(bg_mask.any()):
+            terms.append(per_loc[bg_mask.expand_as(per_loc)].mean())
+        if not terms:
+            return _zero_loss_result(ct_s4)
+        loss = torch.stack(terms).mean()
+        _finite_or_raise("pseudo_pet_align_loss", loss)
         with torch.no_grad():
-            cos = F.cosine_similarity(
-                z_pseudo.flatten(1), z_pet.flatten(1), dim=1, eps=EPS
-            ).mean()
+            cos = (1.0 - loss).clamp(-1.0, 1.0)
         return {
             "loss": loss,
             "num_terms": int(ct_s4.shape[0]),

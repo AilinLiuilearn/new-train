@@ -436,9 +436,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
 
         proto_result = L_ct (CT class-contrastive, grad -> CT encoder),
         weighted by pspi_proto_contrastive_weight (0 = off for the new paradigm).
-        ct_proto_result = L_gen = MSE(z_pseudo_s4, z_pet_s4.detach()) over the
-        full 16-row batch (Full + Missing privileged), grad -> pseudo head +
-        CT encoder, weighted by pspi_ct_proto_contrastive_weight (0.04).
+        ct_proto_result = L_align = 0.5*FG(1-cos) + 0.5*BG(1-cos) at S4
+        over the full 16-row batch (Full + Missing privileged), grad ->
+        pseudo head + CT encoder, weighted by pspi_ct_proto_contrastive_weight.
         Old L_align (PET->CT) superseded by the pseudo-PET translator.
         """
         proto_result = None
@@ -450,7 +450,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         if self.pspi_proto_contrastive_weight > 0.0 and ct_feats is not None:
             proto_result = self.module1.compute_ct_prototype_contrastive_loss(ct_feats, mask)
         if self.pspi_ct_proto_contrastive_weight > 0.0 and ct_feats is not None and pet_real_feats is not None:
-            ct_proto_result = self.module1.compute_pseudo_pet_loss(ct_feats, pet_real_feats)
+            ct_proto_result = self.module1.compute_pseudo_pet_loss(ct_feats, pet_real_feats, mask)
         return proto_result, ct_proto_result
 
     def _maybe_collect(self, ct_feats, pet_feats_real, mask, collect_module1_candidates=True):
