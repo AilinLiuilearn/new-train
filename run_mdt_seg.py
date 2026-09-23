@@ -91,6 +91,35 @@ def module_grad_norm(module):
     return float(total.sqrt().item()) if total is not None else 0.0
 
 
+def isolated_backward(task, loss, outputs):
+    """Two-part backward with PET-encoder isolation for Missing seg.
+
+    loss_rest (Full seg + all aux losses) backprops to every parameter.
+    loss_seg_isolated (Missing seg only) backprops to non-PET-encoder
+    parameters via autograd inputs=, so Missing rows' segmentation can never
+    update the PET encoder (no-leakage guarantee). Costs one retain_graph
+    (activation memory ~2x); Full-only batches take the single-loss path.
+    """
+    rest = outputs.get('loss_rest') if isinstance(outputs, dict) else None
+    iso = outputs.get('loss_seg_isolated') if isinstance(outputs, dict) else None
+    if rest is None or iso is None or not torch.is_tensor(iso):
+        if task.scaler.is_enabled():
+            task.scaler.scale(loss).backward()
+            task.scaler.unscale_(task.optimizer)
+        else:
+            loss.backward()
+        return
+    pet_ids = set(map(id, task.model.enc_pet.parameters()))
+    non_pet = [p for p in task.model.parameters() if id(p) not in pet_ids]
+    if task.scaler.is_enabled():
+        task.scaler.scale(rest).backward(retain_graph=True)
+        torch.autograd.backward(task.scaler.scale(iso), inputs=non_pet)
+        task.scaler.unscale_(task.optimizer)
+    else:
+        rest.backward(retain_graph=True)
+        torch.autograd.backward(iso, inputs=non_pet)
+
+
 def _checkpoint_paths(checkpoint_dir):
     return {
         'best_joint': os.path.join(checkpoint_dir, 'ckpt.best_joint.pth.tar'),
@@ -363,11 +392,7 @@ def main():
                 if not torch.isfinite(loss):
                     raise RuntimeError('loss became non-finite')
 
-                if task.scaler.is_enabled():
-                    task.scaler.scale(loss).backward()
-                    task.scaler.unscale_(task.optimizer)
-                else:
-                    loss.backward()
+                isolated_backward(task, loss, outputs)
 
                 grads['enc_ct'].append(module_grad_norm(task.model.enc_ct))
                 grads['ct_align'].append(module_grad_norm(task.model.ct_align))
@@ -523,11 +548,7 @@ def main():
                 if not torch.isfinite(loss):
                     raise RuntimeError('loss became non-finite')
 
-                if task.scaler.is_enabled():
-                    task.scaler.scale(loss).backward()
-                    task.scaler.unscale_(task.optimizer)
-                else:
-                    loss.backward()
+                isolated_backward(task, loss, outputs)
 
                 grads[route]['enc_ct'].append(module_grad_norm(task.model.enc_ct))
                 grads[route]['ct_align'].append(module_grad_norm(task.model.ct_align))

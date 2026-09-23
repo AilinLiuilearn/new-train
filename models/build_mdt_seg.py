@@ -533,6 +533,8 @@ def build_mdt_seg_teacher(config):
         pspi_reconstruction_weight=recon_weight,
         pspi_proto_contrastive_weight=proto_weight,
         pspi_ct_proto_contrastive_weight=float(getattr(config, 'pspi_ct_proto_contrastive_weight', 0.0)),
+        m2_enabled=bool(getattr(config, 'm2_enabled', False)),
+        m2_checkpoint=bool(getattr(config, 'm2_checkpoint', False)),
     )
     if bool(getattr(config, 'stage1_init_enabled', False)):
         load_stage1_unimodal_initialization(
@@ -545,17 +547,24 @@ def build_mdt_seg_teacher(config):
         assert all(p.requires_grad for p in model.enc_pet.parameters())
         assert all(p.requires_grad for p in model.ct_align.parameters())
     pspi_enabled = bool(getattr(config, 'pspi_enabled', True))
+    m2_enabled = bool(getattr(config, 'm2_enabled', False))
+    m2_checkpoint = bool(getattr(config, 'm2_checkpoint', False))
+    fusion_name = type(model.fusion).__name__
+    m2_params = (
+        sum(p.numel() for p in model.fusion.parameters())
+        if m2_enabled else 0
+    )
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion=AddFusion '
+        f'fusion={fusion_name} '
         f'shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
     if pspi_enabled:
-        fusion_desc = 'downstream_fusion=AddFusion'
+        fusion_desc = f'downstream_fusion={fusion_name}'
     else:
-        fusion_desc = 'baseline_fusion=AddFusion'
+        fusion_desc = f'baseline_fusion={fusion_name}'
     print(
         f'[PSPI] enabled={pspi_enabled} '
         f'module1=paired_ct_pet_prototype_prior_retrieval '
@@ -577,7 +586,9 @@ def build_mdt_seg_teacher(config):
         f'reconstruction_weight={recon_weight} '
         f'reconstruction_loss={"balanced_multiscale_smoothl1" if affine_enabled and recon_weight > 0.0 else "none"} '
         f'reconstruction_target_detached=True '
-        f'direct_add=True '
+        f'fusion_params={m2_params} '
+        f'm2_checkpoint={m2_checkpoint} '
+        f'direct_add={not m2_enabled} '
         f'cold_start=epoch1 '
         f'S4_K_per_class={getattr(config, "pspi_num_clusters", 6)} '
         f'mixed_50_50 '
@@ -585,13 +596,12 @@ def build_mdt_seg_teacher(config):
         f'ema_momentum={getattr(config, "pspi_ema_momentum", 0.95)} '
         f'K={getattr(config, "pspi_num_clusters", 6)} '
         f'build_stage=S{getattr(config, "pspi_build_stage", 4)} '
-        f'full_path=raw_CT_plus_real_PET '
-        f'missing_boundary={"CT_plus_ct_affine_prior" if affine_enabled else "CT_plus_scale_weighted_PET_prior"} '
+        f'full_path=raw_CT_plus_real_PET_m2_{fusion_name} '
+        f'missing_boundary={("CT_plus_wavelet_LL_prior" if affine_enabled else "CT_plus_wavelet_LL_scaled_prior") if m2_enabled else ("CT_plus_ct_affine_prior" if affine_enabled else "CT_plus_scale_weighted_PET_prior")} '
         f'prior_scale_type={"none_ct_affine_direct" if affine_enabled else "per_scale_scalar"} '
         f'prior_scale_init={prior_scale_init} '
         f'prior_scale_enabled={prior_scale_enabled} '
         f'{fusion_desc} '
-        f'downstream_fusion=AddFusion '
         f'decoder=UNetStyleDecoder'
     )
     return {'model': model}

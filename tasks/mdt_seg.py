@@ -66,6 +66,18 @@ class MDTSegTeacher:
         recon_weight = float(getattr(self.config, 'pspi_reconstruction_weight', 0.0))
         recon_weighted = recon_weight * recon_raw
         total_loss = seg_loss + proto_weighted + ct_proto_weighted + recon_weighted
+        # No-leakage isolation: on a Missing route the seg part must never
+        # update the PET encoder (Missing rows' own real PET contributes
+        # exactly 0 to Missing logits; only BN batch-stat crosstalk from Full
+        # rows remains, which the isolated backward below removes). The run
+        # loop backprops loss_rest (all params) + loss_seg_isolated (non-PET
+        # params only). Full route: single loss, unchanged behavior.
+        if isinstance(outputs, dict) and forward_mode == 'missing':
+            outputs['loss_rest'] = total_loss - seg_loss
+            outputs['loss_seg_isolated'] = seg_loss
+        elif isinstance(outputs, dict):
+            outputs['loss_rest'] = total_loss
+            outputs['loss_seg_isolated'] = None
         stats = {
             'loss_total': total_loss.detach(),
             'loss_seg': loss_stats.get('loss_dice', seg_loss.detach()),
@@ -145,6 +157,9 @@ class MDTSegTeacher:
         recon_weight = float(getattr(self.config, 'pspi_reconstruction_weight', 0.0))
         recon_weighted = recon_weight * recon_raw
         total_loss = seg_total + proto_weighted + ct_proto_weighted + recon_weighted
+        if isinstance(outputs, dict):
+            outputs['loss_rest'] = total_loss - missing_weight * missing_loss
+            outputs['loss_seg_isolated'] = missing_weight * missing_loss
         stats = {
             'loss_total': total_loss.detach(),
             'loss_seg_total': seg_total.detach(),

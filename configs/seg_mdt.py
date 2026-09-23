@@ -55,6 +55,9 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--pspi_retrieval_topk', type=int, default=0)
         p.add_argument('--pspi_retrieval_per_class_topk', type=int, default=3)
         p.add_argument('--pspi_retrieval_gate_temperature', type=float, default=1.0)
+        # Module-2: state-aware wavelet fusion (default off, old runs unchanged).
+        p.add_argument('--m2_enabled', type=str2bool, default=False)
+        p.add_argument('--m2_checkpoint', type=str2bool, default=False)
         p.add_argument('--pspi_reconstruction_weight', type=float, default=0.05)
         p.add_argument('--pspi_collect_candidates', type=str2bool, default=True)
         # Stage-1 unimodal pretraining initialization
