@@ -759,7 +759,9 @@ class PairedSemanticPrototypeImputation(nn.Module):
         # New paradigm: S4-only CT->pseudo-PET translator (pure-PET bank).
         # S4 determines the cluster assignment; S1-S3 reuse the S4 weights
         # with their own-scale banks ("one query, four values").
-        self.pseudo_head = CTPseudoPETHead(int(self.channels[-1]))
+        self.pseudo_head = nn.ModuleList(
+            [CTPseudoPETHead(int(c)) for c in self.channels]
+        )
 
         self.attention = nn.ModuleList(
             [
@@ -1414,73 +1416,44 @@ class PairedSemanticPrototypeImputation(nn.Module):
         norm_entropy_list: List[float] = []
         any_ready = bool(self.prototype_ready.any())
         Kb = int(self.num_clusters_bg); Kf = int(self.num_clusters_fg)
-        # ONE QUERY AT S4: pseudo-PET queries the S4 bank; the resulting
-        # weights are reused by S1-S3 with their own-scale banks
-        # ("S4 determines assignment, every scale owns its values").
-        s4_idx = self.num_scales - 1
-        ct_s4 = ct_feats[s4_idx]
-        q_s4 = self.pseudo_head(ct_s4.float()).to(dtype=ct_s4.dtype)
-        bank_k = getattr(self, f"ct_keys_s{s4_idx + 1}")
-        bank_v = getattr(self, f"pet_values_s{s4_idx + 1}")
-        keys = torch.cat([bank_k[0, :Kb], bank_k[1, :Kf]], dim=0)
-        values = torch.cat([bank_v[0, :Kb], bank_v[1, :Kf]], dim=0)
-        keys = keys.to(device=q_s4.device, dtype=q_s4.dtype)
-        values = values.to(device=q_s4.device, dtype=q_s4.dtype)
-        sc = self.prototype_ready_scale[s4_idx]
-        if int(sc.sum().item()) == 0:
-            sc = self.prototype_ready
-        ready = torch.cat([sc[0, :Kb], sc[1, :Kf]], dim=0).to(device=q_s4.device)
-        if mask is not None:
-            if mask.ndim != 4 or mask.shape[1] != 1:
-                raise ValueError("mask must be [B,1,H,W]")
-            if int(mask.shape[0]) != int(q_s4.shape[0]):
-                raise ValueError("mask batch mismatch")
-            bg_m, fg_m = _class_masks_at_scale(mask, q_s4.shape[-2:])
-            ready_bg = torch.cat([ready[:Kb], torch.zeros_like(ready[Kb:])])
-            ready_fg = torch.cat([torch.zeros_like(ready[:Kb]), ready[Kb:]])
-            _, attn_bg_full = self.attention[s4_idx](q_s4, keys, values, ready_bg)
-            _, attn_fg_full = self.attention[s4_idx](q_s4, keys, values, ready_fg)
-            attn_bg_full = attn_bg_full[..., :Kb]
-            attn_fg_full = attn_fg_full[..., Kb:]
-            s4_attention = torch.cat([attn_bg_full, attn_fg_full], dim=-1)
-            w_bg = attn_bg_full.to(torch.float32)
-            w_fg = attn_fg_full.to(torch.float32)
-        else:
-            _, s4_attention = self.attention[s4_idx](q_s4, keys, values, ready)
-            w_all = s4_attention.to(torch.float32)
-            w_bg, w_fg = w_all[..., :Kb], w_all[..., Kb:]
         for s, ct in enumerate(ct_feats):
-            bank_v_s = getattr(self, f"pet_values_s{s + 1}")
-            v_s = torch.cat([bank_v_s[0, :Kb], bank_v_s[1, :Kf]], dim=0)
-            v_s = v_s.to(device=ct.device, dtype=torch.float32)
-            v_bg, v_fg = v_s[:Kb], v_s[Kb:]
-            r_bg = torch.matmul(w_bg.to(device=ct.device), v_bg).to(dtype=ct.dtype)
-            r_fg = torch.matmul(w_fg.to(device=ct.device), v_fg).to(dtype=ct.dtype)
-            # Weights live at S4 resolution; resample the S4 prior maps to
-            # this scale (values are this scale's own bank).
-            h4, w4 = ct_feats[self.num_scales - 1].shape[-2:]
-            c_s = int(ct.shape[1])
-            r_bg = r_bg.transpose(1, 2).reshape(ct.shape[0], c_s, h4, w4)
-            r_fg = r_fg.transpose(1, 2).reshape(ct.shape[0], c_s, h4, w4)
-            if tuple(r_bg.shape[-2:]) != tuple(ct.shape[-2:]):
-                r_bg = F.interpolate(r_bg, size=ct.shape[-2:], mode="bilinear", align_corners=False)
-                r_fg = F.interpolate(r_fg, size=ct.shape[-2:], mode="bilinear", align_corners=False)
-            if mask is not None:
-                bg_ms, fg_ms = _class_masks_at_scale(mask, ct.shape[-2:])
-                fg_exp = fg_ms[:, 0].to(device=ct.device).bool()
-                retrieved = torch.where(
-                    fg_exp[:, None, :, :].expand_as(r_bg), r_fg, r_bg)
+            q = self.pseudo_head[s](ct)
+            bank_v = getattr(self, f"pet_values_s{s + 1}")
+            bank_k = getattr(self, f"ct_keys_s{s + 1}")
+            keys = torch.cat([bank_k[0, :Kb], bank_k[1, :Kf]], dim=0)
+            values = torch.cat([bank_v[0, :Kb], bank_v[1, :Kf]], dim=0)
+            keys = keys.to(device=ct.device, dtype=ct.dtype)
+            values = values.to(device=ct.device, dtype=ct.dtype)
+            sc = self.prototype_ready_scale[s]  # [2,Kmax]
+            if int(sc.sum().item()) == 0:
+                sc = self.prototype_ready
+            ready6 = torch.cat([sc[0, :Kb], sc[1, :Kf]], dim=0).to(device=ct.device)
+            if mask is None:
+                retrieved, attention = self.attention[s](q, keys, values, ready6)
             else:
-                retrieved = r_bg + r_fg
+                bg_m, fg_m = _class_masks_at_scale(mask, ct.shape[-2:])
+                fg_m = fg_m[:, 0].bool()
+                ready_bg = torch.cat([sc[0, :Kb], torch.zeros(Kf, dtype=torch.bool)], dim=0).to(device=ct.device)
+                ready_fg = torch.cat([torch.zeros(Kb, dtype=torch.bool), sc[1, :Kf]], dim=0).to(device=ct.device)
+                ret_bg, _ = self.attention[s](q, keys, values, ready_bg)
+                ret_fg, _ = self.attention[s](q, keys, values, ready_fg)
+                fg_exp = fg_m[:, None].expand_as(ret_bg)
+                retrieved = torch.where(fg_exp, ret_fg.to(ret_bg.dtype), ret_bg)
+                attention = torch.zeros(
+                    ct.shape[0], ct.shape[-2] * ct.shape[-1], Kb + Kf,
+                    device=ct.device, dtype=ct.dtype,
+                )
             pet_prior.append(retrieved)
+            if return_attention:
+                attentions.append(attention)
             with torch.no_grad():
                 if not any_ready:
                     entropy_list.append(0.0)
                     norm_entropy_list.append(0.0)
                 else:
-                    p = torch.cat([w_bg, w_fg], dim=-1).clamp_min(1e-12)
+                    p = attention.detach().float().clamp_min(1e-12)
                     ent = float(-(p * p.log()).sum(dim=-1).mean().item())
-                    k_ready = int(ready.sum().item())
+                    k_ready = int(ready6.sum().item())
                     max_ent = math.log(k_ready) if k_ready > 1 else 0.0
                     norm_ent = 0.0 if max_ent <= 0.0 else min(1.0, max(0.0, ent / max_ent))
                     entropy_list.append(ent)
@@ -1490,8 +1463,7 @@ class PairedSemanticPrototypeImputation(nn.Module):
             "bank_version": int(self.bank_version.item()),
             "attention_entropy": entropy_list,
             "normalized_attention_entropy": norm_entropy_list,
-            # Single S4 query: attention is the S4 weight map only.
-            "attention": [s4_attention] if (return_attention and s4_attention is not None) else None,
+            "attention": attentions if return_attention else None,
         }
         return pet_prior, aux
 
@@ -1603,44 +1575,58 @@ class PairedSemanticPrototypeImputation(nn.Module):
         pet_real_feats: Sequence[torch.Tensor],
         mask: torch.Tensor,
     ) -> Dict:
-        """S4-only CT->pseudo-PET align loss (new paradigm).
+        """Per-scale CT->pseudo-PET align loss (new paradigm, full design).
 
-        L_align = 0.5*mean_{FG}(1-cos) + 0.5*mean_{BG}(1-cos) at S4 between
-        z_pseudo (S4 translator) and the detached real PET, over the full
-        batch (Full + Missing privileged rows). FG/BG split by the
-        downsampled mask with equal weight; empty FG skipped. Mask is
-        training-loss only. Grad -> pseudo head + CT encoder; real PET is
-        the detached teacher. Reports mean cosine.
+        L_align = mean over 4 scales of
+          [0.5*mean_{FG}(1-cos) + 0.5*mean_{BG}(1-cos)]
+        per-location between z_pseudo_s (own-scale translator) and the
+        detached real PET at the same scale, over the full batch (Full +
+        Missing privileged rows). FG/BG split by the downsampled mask with
+        equal weight; empty FG skipped. Mask is training-loss only.
+        Grad -> pseudo heads + CT encoder; real PET is the detached teacher.
+        Reports mean cosine (1 - loss, diagnostic).
         """
         self._validate_features(ct_feats, pet_real_feats)
         if mask.ndim != 4 or mask.shape[1] != 1:
             raise ValueError("mask must be [B,1,H,W]")
-        ct_s4, pet_s4 = ct_feats[-1], pet_real_feats[-1]
-        if ct_s4.shape != pet_s4.shape:
-            raise ValueError(
-                f"S4 CT/PET shape mismatch: {tuple(ct_s4.shape)} vs {tuple(pet_s4.shape)}"
-            )
-        z_pseudo = self.pseudo_head(ct_s4.float())
-        z_pet = pet_s4.detach().float()
-        per_loc = 1.0 - F.cosine_similarity(z_pseudo, z_pet, dim=1, eps=EPS)
-        bg_mask, fg_mask = _class_masks_at_scale(mask, ct_s4.shape[-2:])
-        fg_m, bg_m = fg_mask[:, 0].bool(), bg_mask[:, 0].bool()
-        terms = []
-        if bool(fg_m.any()):
-            terms.append(per_loc[fg_m].mean())
-        if bool(bg_m.any()):
-            terms.append(per_loc[bg_m].mean())
-        if not terms:
-            return _zero_loss_result(ct_s4)
-        loss = torch.stack(terms).mean()
+        scale_terms = []
+        per_scale: Dict[str, float] = {}
+        details: Dict[str, int] = {}
+        n_terms = 0
+        for s, (ct_feat, pet_feat) in enumerate(zip(ct_feats, pet_real_feats)):
+            if ct_feat.shape != pet_feat.shape:
+                raise ValueError(
+                    f"S{s+1} CT/PET shape mismatch: {tuple(ct_feat.shape)} vs {tuple(pet_feat.shape)}"
+                )
+            z_pseudo = self.pseudo_head[s](ct_feat.float())
+            z_pet = pet_feat.detach().float()
+            per_loc = 1.0 - F.cosine_similarity(z_pseudo, z_pet, dim=1, eps=EPS)
+            bg_mask, fg_mask = _class_masks_at_scale(mask, ct_feat.shape[-2:])
+            fg_m, bg_m = fg_mask[:, 0].bool(), bg_mask[:, 0].bool()
+            terms = []
+            if bool(fg_m.any()):
+                terms.append(per_loc[fg_m].mean())
+            if bool(bg_m.any()):
+                terms.append(per_loc[bg_m].mean())
+            if not terms:
+                continue
+            t = torch.stack(terms).mean()
+            _finite_or_raise(f"pseudo_pet_align_s{s+1}", t)
+            scale_terms.append(t)
+            n_terms += int(ct_feat.shape[0])
+            per_scale[f"s{s+1}"] = float(t.item())
+            details[f"s{s+1}_terms"] = int(ct_feat.shape[0])
+        if not scale_terms:
+            return _zero_loss_result(ct_feats[0])
+        loss = torch.stack(scale_terms).mean()
         _finite_or_raise("pseudo_pet_align_loss", loss)
         with torch.no_grad():
             cos = (1.0 - loss).clamp(-1.0, 1.0)
         return {
             "loss": loss,
-            "num_terms": int(ct_s4.shape[0]),
-            "per_scale": {"s4": float(loss.item())},
-            "details": {"s4_terms": int(ct_s4.shape[0])},
+            "num_terms": n_terms,
+            "per_scale": per_scale,
+            "details": details,
             "cos": float(cos.item()),
         }
 
@@ -1758,7 +1744,7 @@ def _self_check() -> None:
         assert bool(torch.isfinite(pet_prior[s]).all())
     assert aux["attention"] is None
     pet_prior2, aux2 = module.retrieve_pet_prior(ct, return_attention=True)
-    assert aux2["attention"] is not None and len(aux2["attention"]) == 1
+    assert aux2["attention"] is not None and len(aux2["attention"]) == 4
     for a in aux2["attention"]:
         assert bool(torch.isfinite(a).all())
         assert torch.allclose(a.float().sum(dim=-1), torch.ones(a.shape[0], a.shape[1]), atol=1e-5)
