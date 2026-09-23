@@ -70,6 +70,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pspi_retrieval_topk=0,
         pspi_retrieval_per_class_topk=3,
         pspi_retrieval_gate_temperature=1.0,
+        pspi_per_scale_clustering=False,
+        pspi_cluster_geometry='euclidean',
+        pspi_retrieval_geometry='cosine',
         m2_enabled=False,
         m2_checkpoint=False,
     ):
@@ -108,6 +111,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 retrieval_gate_temperature=pspi_retrieval_gate_temperature,
                 proto_temperature=pspi_proto_temperature,
                 collect_candidates_during_training=pspi_collect_candidates,
+                per_scale_clustering=pspi_per_scale_clustering,
+                cluster_geometry=pspi_cluster_geometry,
+                retrieval_geometry=pspi_retrieval_geometry,
             )
         else:
             self.module1 = None

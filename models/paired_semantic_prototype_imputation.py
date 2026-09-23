@@ -585,6 +585,10 @@ class Module1Config:
     retrieval_gate_temperature: float = 1.0
     proto_temperature: float = 0.02
     collect_candidates_during_training: bool = True
+    # New paradigm (pure-PET bank):
+    per_scale_clustering: bool = False  # False = S4 labels reused by S1-S3
+    cluster_geometry: str = "euclidean"  # {"euclidean", "spherical"}
+    retrieval_geometry: str = "cosine"  # {"cosine", "euclidean"}
 
     def validate(self) -> None:
         if len(self.channels) == 0:
@@ -615,6 +619,14 @@ class Module1Config:
             raise ValueError("retrieval_gate_temperature must be > 0")
         if float(self.proto_temperature) <= 0:
             raise ValueError("proto_temperature must be > 0")
+        if self.cluster_geometry not in ("euclidean", "spherical"):
+            raise ValueError(
+                f"cluster_geometry must be 'euclidean' or 'spherical', got {self.cluster_geometry!r}"
+            )
+        if self.retrieval_geometry not in ("cosine", "euclidean"):
+            raise ValueError(
+                f"retrieval_geometry must be 'cosine' or 'euclidean', got {self.retrieval_geometry!r}"
+            )
 
 
 # -----------------------------------------------------------------------------
@@ -706,6 +718,9 @@ class PairedSemanticPrototypeImputation(nn.Module):
         retrieval_gate_temperature: float = 1.0,
         proto_temperature: float = 0.02,
         collect_candidates_during_training: bool = True,
+        per_scale_clustering: bool = False,
+        cluster_geometry: str = "euclidean",
+        retrieval_geometry: str = "cosine",
         **kwargs,
     ):
         super().__init__()
@@ -742,6 +757,9 @@ class PairedSemanticPrototypeImputation(nn.Module):
             retrieval_gate_temperature=float(retrieval_gate_temperature),
             proto_temperature=float(proto_temperature),
             collect_candidates_during_training=bool(collect_candidates_during_training),
+            per_scale_clustering=bool(per_scale_clustering),
+            cluster_geometry=str(cluster_geometry),
+            retrieval_geometry=str(retrieval_geometry),
         )
         self.config.validate()
 
@@ -1275,13 +1293,29 @@ class PairedSemanticPrototypeImputation(nn.Module):
         new_ready = torch.zeros(2, Kmax, dtype=torch.bool)
         new_count = torch.zeros(2, Kmax, dtype=torch.long)
         any_candidate = False
-        # NEW PARADIGM: pure-PET grouping. S4 PET descriptors are clustered
-        # (Euclidean, per class); the S4 membership is REUSED by S1-S3, but
-        # every scale owns its bank: V_s[c,k] = mean of scale-s PET members.
-        # Keys are self-keyed (normalized V); CT never enters the bank.
+        # NEW PARADIGM: pure-PET grouping, CT never enters the bank.
+        #  - per_scale_clustering=True : each scale clusters its OWN PET
+        #    descriptors (independent slots per scale).
+        #  - per_scale_clustering=False: S4 clusters PET; the S4 membership is
+        #    reused by S1-S3, but every scale still banks its own PET values.
+        # cluster_geometry selects Euclidean vs spherical k-means; values are
+        # always stored UN-normalized (magnitude kept); keys = normalized V.
+        geometry = self.config.cluster_geometry
+        kmeans_fn = (
+            deterministic_euclid_kmeans if geometry == "euclidean"
+            else deterministic_spherical_kmeans
+        )
+        filter_fn = (
+            euclid_cluster_outlier_filter if geometry == "euclidean"
+            else cosine_cluster_outlier_filter
+        )
         for class_idx, class_name in enumerate(CLASS_NAMES):
             class_report: Dict = {
-                "build_stage": "s4_labels_reused_all_scales",
+                "build_stage": (
+                    "per_scale_independent" if self.config.per_scale_clustering
+                    else "s4_labels_reused_all_scales"
+                ),
+                "cluster_geometry": geometry,
                 "scales": {},
             }
             raw_caches: Dict[int, Dict[str, torch.Tensor]] = {}
@@ -1305,41 +1339,81 @@ class PairedSemanticPrototypeImputation(nn.Module):
                 report["classes"][class_name] = class_report
                 continue
             class_report["num_candidates"] = int(n_rows)
-            # S4 membership from S4 PET (Euclidean k-means + Euclidean filter).
-            s4_pet = raw_caches[self.num_scales - 1]["pet"]
-            valid_mask = torch.isfinite(s4_pet).all(dim=1) & (s4_pet.norm(dim=1) > EPS)
-            if not bool(valid_mask.any()):
-                class_report["status"] = "all_candidates_filtered"
-                report["classes"][class_name] = class_report
-                continue
-            valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten().long()
-            build_pet = s4_pet[valid_indices]
-            any_candidate = True
-            labels, centers, kmeans_report = deterministic_euclid_kmeans(
-                build_pet, num_clusters=class_K[class_idx], max_iter=self.config.cluster_max_iter,
-            )
-            k_eff = int(centers.shape[0])
-            kept_by_cluster, filter_report = euclid_cluster_outlier_filter(
-                build_pet, labels, num_clusters=k_eff, discard_rate=self.config.outlier_discard_rate,
-            )
-            singleton_warning = bool(filter_report.get("singleton_cluster_warning", False))
-            class_report["clustering"] = kmeans_report
-            class_report["filtering"] = filter_report
-            class_report["effective_clusters"] = int(k_eff)
-            class_report["singleton_cluster_warning"] = singleton_warning
-            # Reuse S4 membership at every scale; each scale banks its own PET.
-            for sc in range(self.num_scales):
-                sc_pet = raw_caches[sc]["pet"][valid_indices]
-                for cluster_idx in range(k_eff):
-                    kept = kept_by_cluster.get(cluster_idx)
-                    if kept is None or kept.numel() == 0:
+            if self.config.per_scale_clustering:
+                # Independent per-scale clustering over each scale's own PET.
+                for sc in range(self.num_scales):
+                    sc_pet = raw_caches[sc]["pet"]
+                    valid = torch.isfinite(sc_pet).all(dim=1) & (sc_pet.norm(dim=1) > EPS)
+                    scale_report: Dict = {"prefilter_discarded": int((~valid).sum().item())}
+                    if not bool(valid.any()):
+                        scale_report["status"] = "all_candidates_filtered"
+                        class_report["scales"][f"s{sc+1}"] = scale_report
                         continue
-                    pet_value = sc_pet[kept].mean(dim=0).float()
-                    new_values[sc][class_idx, cluster_idx] = pet_value
-                    new_keys[sc][class_idx, cluster_idx] = F.normalize(pet_value, dim=0, eps=EPS)
-                    new_ready[class_idx, cluster_idx] = True
-                    new_count[class_idx, cluster_idx] = int(new_count[class_idx, cluster_idx].item() + kept.numel())
-                class_report["scales"][f"s{sc+1}"] = {"reused_s4_labels": True}
+                    idx = torch.nonzero(valid, as_tuple=False).flatten().long()
+                    build = sc_pet[idx]
+                    any_candidate = True
+                    labels, centers, km = kmeans_fn(
+                        build, num_clusters=class_K[class_idx], max_iter=self.config.cluster_max_iter,
+                    )
+                    k_eff = int(centers.shape[0])
+                    kept_by_cluster, filt = filter_fn(
+                        build, labels, num_clusters=k_eff, discard_rate=self.config.outlier_discard_rate,
+                    )
+                    for cluster_idx in range(k_eff):
+                        kept = kept_by_cluster.get(cluster_idx)
+                        if kept is None or kept.numel() == 0:
+                            continue
+                        pet_value = build[kept].mean(dim=0).float()
+                        if not bool(torch.isfinite(pet_value).all()):
+                            continue
+                        new_values[sc][class_idx, cluster_idx] = pet_value
+                        new_keys[sc][class_idx, cluster_idx] = F.normalize(pet_value, dim=0, eps=EPS)
+                        new_ready[class_idx, cluster_idx] = True
+                        new_count[class_idx, cluster_idx] = int(kept.numel())
+                    scale_report["clustering"] = km
+                    scale_report["filtering"] = filt
+                    scale_report["effective_clusters"] = int(k_eff)
+                    scale_report["singleton_cluster_warning"] = bool(
+                        filt.get("singleton_cluster_warning", False))
+                    class_report["scales"][f"s{sc+1}"] = scale_report
+            else:
+                # S4 PET membership, reused at every scale (own-scale values).
+                s4_pet = raw_caches[self.num_scales - 1]["pet"]
+                valid_mask = torch.isfinite(s4_pet).all(dim=1) & (s4_pet.norm(dim=1) > EPS)
+                if not bool(valid_mask.any()):
+                    class_report["status"] = "all_candidates_filtered"
+                    report["classes"][class_name] = class_report
+                    continue
+                valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten().long()
+                build_pet = s4_pet[valid_indices]
+                any_candidate = True
+                labels, centers, kmeans_report = kmeans_fn(
+                    build_pet, num_clusters=class_K[class_idx], max_iter=self.config.cluster_max_iter,
+                )
+                k_eff = int(centers.shape[0])
+                kept_by_cluster, filter_report = filter_fn(
+                    build_pet, labels, num_clusters=k_eff, discard_rate=self.config.outlier_discard_rate,
+                )
+                class_report["clustering"] = kmeans_report
+                class_report["filtering"] = filter_report
+                class_report["effective_clusters"] = int(k_eff)
+                class_report["singleton_cluster_warning"] = bool(
+                    filter_report.get("singleton_cluster_warning", False))
+                for sc in range(self.num_scales):
+                    sc_pet = raw_caches[sc]["pet"][valid_indices]
+                    for cluster_idx in range(k_eff):
+                        kept = kept_by_cluster.get(cluster_idx)
+                        if kept is None or kept.numel() == 0:
+                            continue
+                        pet_value = sc_pet[kept].mean(dim=0).float()
+                        if not bool(torch.isfinite(pet_value).all()):
+                            continue
+                        new_values[sc][class_idx, cluster_idx] = pet_value
+                        new_keys[sc][class_idx, cluster_idx] = F.normalize(pet_value, dim=0, eps=EPS)
+                        new_ready[class_idx, cluster_idx] = True
+                        # Count from S4 membership once (not summed per scale).
+                        new_count[class_idx, cluster_idx] = int(kept.numel())
+                    class_report["scales"][f"s{sc+1}"] = {"reused_s4_labels": True}
             report["classes"][class_name] = class_report
 
         if not any_candidate or not bool(new_ready.any()):
@@ -1398,13 +1472,16 @@ class PairedSemanticPrototypeImputation(nn.Module):
         return_attention: bool = False,
         mask: torch.Tensor = None,
     ) -> Tuple[List[torch.Tensor], Dict]:
-        """Retrieve population-level PET prior from pseudo-PET queries.
+        """Direct PET-space retrieval with a same-modality pseudo-PET query.
 
-        NEW PARADIGM: Q_s = pseudo_head_s(C_s) (same-modality query into the
-        pure-PET bank); K = normalized V (self-keyed), V keeps magnitude.
-        With a mask: strict per-class retrieval (BG positions take BG slots
-        only, FG positions FG slots only) assembled by the downsampled mask.
-        Without a mask (eval Missing): single dense call over all ready slots.
+        Q_s = T_s(C_s)  (pseudo head; gradient PRESERVED, so the Missing seg
+                          loss can train the translator + CT encoder),
+        A_s = softmax(sim(Q_s, V_s) / tau),      (global over all ready slots)
+        P_s = A_s V_s,                           (V keeps magnitude)
+        where sim is cosine or negative squared distance per retrieval_geometry.
+        The bank V is treated as label-free history (no grad). Deployment
+        parity: retrieval NEVER consumes the segmentation mask; FG/BG labels
+        are used only for building the bank and weighting the align loss.
         When the bank is not ready, pet_prior is strictly zeros.
         """
         self._validate_features(ct_feats, None)
@@ -1416,36 +1493,35 @@ class PairedSemanticPrototypeImputation(nn.Module):
         norm_entropy_list: List[float] = []
         any_ready = bool(self.prototype_ready.any())
         Kb = int(self.num_clusters_bg); Kf = int(self.num_clusters_fg)
+        tau = float(self.config.retrieval_temperature)
+        use_cosine = self.config.retrieval_geometry == "cosine"
         for s, ct in enumerate(ct_feats):
-            q = self.pseudo_head[s](ct)
-            bank_v = getattr(self, f"pet_values_s{s + 1}")
-            bank_k = getattr(self, f"ct_keys_s{s + 1}")
-            keys = torch.cat([bank_k[0, :Kb], bank_k[1, :Kf]], dim=0)
+            bank_v = getattr(self, f"pet_values_s{s + 1}")  # [2,Kmax,C]
             values = torch.cat([bank_v[0, :Kb], bank_v[1, :Kf]], dim=0)
-            keys = keys.to(device=ct.device, dtype=ct.dtype)
-            values = values.to(device=ct.device, dtype=ct.dtype)
+            values = values.to(device=ct.device, dtype=torch.float32)
             sc = self.prototype_ready_scale[s]  # [2,Kmax]
             if int(sc.sum().item()) == 0:
                 sc = self.prototype_ready
-            ready6 = torch.cat([sc[0, :Kb], sc[1, :Kf]], dim=0).to(device=ct.device)
-            if mask is None:
-                retrieved, attention = self.attention[s](q, keys, values, ready6)
+            ready = torch.cat([sc[0, :Kb], sc[1, :Kf]], dim=0).to(device=ct.device)
+            q = self.pseudo_head[s](ct.float())  # [B,C,h,w] (grad preserved)
+            b, c, h, w = q.shape
+            q_flat = q.flatten(2).transpose(1, 2).float()  # [B,N,C]
+            if use_cosine:
+                q_hat = F.normalize(q_flat, dim=-1, eps=EPS)
+                v_hat = F.normalize(values, dim=1, eps=EPS)
+                logits = q_hat @ v_hat.t() / tau
             else:
-                bg_m, fg_m = _class_masks_at_scale(mask, ct.shape[-2:])
-                fg_m = fg_m[:, 0].bool()
-                ready_bg = torch.cat([sc[0, :Kb], torch.zeros(Kf, dtype=torch.bool)], dim=0).to(device=ct.device)
-                ready_fg = torch.cat([torch.zeros(Kb, dtype=torch.bool), sc[1, :Kf]], dim=0).to(device=ct.device)
-                ret_bg, _ = self.attention[s](q, keys, values, ready_bg)
-                ret_fg, _ = self.attention[s](q, keys, values, ready_fg)
-                fg_exp = fg_m[:, None].expand_as(ret_bg)
-                retrieved = torch.where(fg_exp, ret_fg.to(ret_bg.dtype), ret_bg)
-                attention = torch.zeros(
-                    ct.shape[0], ct.shape[-2] * ct.shape[-1], Kb + Kf,
-                    device=ct.device, dtype=ct.dtype,
-                )
-            pet_prior.append(retrieved)
+                logits = -((q_flat[:, :, None, :] - values[None, None, :, :]) ** 2).sum(dim=-1) / tau
+            logits = logits.masked_fill(
+                ~ready.view(1, 1, -1).to(device=logits.device),
+                torch.finfo(logits.dtype).min,
+            )
+            attention = torch.softmax(logits, dim=-1)
+            retrieved = torch.matmul(attention, values)
+            retrieved = retrieved.to(dtype=q.dtype).transpose(1, 2).reshape(b, c, h, w)
+            pet_prior.append(_sanitize(retrieved))
             if return_attention:
-                attentions.append(attention)
+                attentions.append(attention.to(dtype=q.dtype))
             with torch.no_grad():
                 if not any_ready:
                     entropy_list.append(0.0)
@@ -1453,7 +1529,7 @@ class PairedSemanticPrototypeImputation(nn.Module):
                 else:
                     p = attention.detach().float().clamp_min(1e-12)
                     ent = float(-(p * p.log()).sum(dim=-1).mean().item())
-                    k_ready = int(ready6.sum().item())
+                    k_ready = int(ready.sum().item())
                     max_ent = math.log(k_ready) if k_ready > 1 else 0.0
                     norm_ent = 0.0 if max_ent <= 0.0 else min(1.0, max(0.0, ent / max_ent))
                     entropy_list.append(ent)
@@ -1602,12 +1678,15 @@ class PairedSemanticPrototypeImputation(nn.Module):
             z_pet = pet_feat.detach().float()
             per_loc = 1.0 - F.cosine_similarity(z_pseudo, z_pet, dim=1, eps=EPS)
             bg_mask, fg_mask = _class_masks_at_scale(mask, ct_feat.shape[-2:])
-            fg_m, bg_m = fg_mask[:, 0].bool(), bg_mask[:, 0].bool()
+            # SOFT weights: a boundary location counts proportionally in both
+            # groups (no boolean binarization), so a 0.1/0.9 pixel adds 0.1
+            # to the FG mean and 0.9 to the BG mean instead of full weight.
             terms = []
-            if bool(fg_m.any()):
-                terms.append(per_loc[fg_m].mean())
-            if bool(bg_m.any()):
-                terms.append(per_loc[bg_m].mean())
+            for weight in (fg_mask[:, 0], bg_mask[:, 0]):
+                w = weight.float()
+                wsum = w.sum()
+                if float(wsum.item()) > EPS:
+                    terms.append((per_loc * w).sum() / wsum)
             if not terms:
                 continue
             t = torch.stack(terms).mean()
@@ -1751,27 +1830,44 @@ def _self_check() -> None:
     for v in aux2["normalized_attention_entropy"]:
         assert 0.0 <= v <= 1.0
 
-    # CT detach: no grad to CT through Module-1.
+    # Retrieval query is NOT detached: the Missing-seg loss must be able to
+    # train the pseudo head (and CT encoder) through the retrieval path.
     module.train()
     ct_g = [c.clone().detach().requires_grad_(True) for c in ct]
     pet_prior_g, _ = module.retrieve_pet_prior(ct_g)
+    module.zero_grad(set_to_none=True)
     sum(x.float().pow(2).mean() for x in pet_prior_g).backward()
-    assert all(c.grad is None for c in ct_g), "CT must be detached inside Module-1"
+    assert all(c.grad is not None and float(c.grad.abs().sum()) > 0 for c in ct_g), \
+        "CT encoder must receive retrieval gradient (query must NOT be detached)"
+    assert any(
+        p.grad is not None and float(p.grad.abs().sum()) > 0
+        for p in module.pseudo_head.parameters()
+    ), "pseudo head must receive retrieval gradient"
+    # The bank V is label-free history: it must NOT receive gradient.
+    assert all(
+        getattr(module, f"pet_values_s{s+1}").grad is None for s in range(4)
+    ), "bank values must be detached history"
 
     # Contrastive loss finite, >= 0, raw (unweighted).
     module.train()
     cproto = module.compute_ct_prototype_contrastive_loss(ct, mask)
     assert cproto["num_terms"] > 0 and float(cproto["loss"].item()) >= 0.0
 
-    # Gradient boundaries: PET encoder only.
-    align = module.compute_pet_ct_align_loss(ct, pet_a, mask)
-    assert align["num_terms"] > 0 and float(align["loss"].item()) >= 0.0
+    # Pseudo-PET align: PET is the detached teacher, CT/head are students.
     module.zero_grad(set_to_none=True)
-    for p in pet_a:
-        p.grad = None
+    ct_p = [c.clone().detach().requires_grad_(True) for c in ct]
+    pet_p = [p.clone().detach().requires_grad_(True) for p in pet_a]
+    align = module.compute_pseudo_pet_loss(ct_p, pet_p, mask)
+    assert align["num_terms"] > 0 and float(align["loss"].item()) >= 0.0
     align["loss"].backward()
-    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in module.align_head.parameters())
-    assert all(p.grad is None or float(p.grad.abs().sum()) == 0 for p in ct)
+    assert any(
+        p.grad is not None and float(p.grad.abs().sum()) > 0
+        for p in module.pseudo_head.parameters()
+    ), "pseudo head must receive L_align gradient"
+    assert all(c.grad is not None and float(c.grad.abs().sum()) > 0 for c in ct_p), \
+        "CT encoder must receive L_align gradient"
+    assert all(p.grad is None or float(p.grad.abs().sum()) == 0 for p in pet_p), \
+        "real PET must NOT receive L_align gradient (detached teacher)"
 
     print("[SELF-CHECK] passed")
 

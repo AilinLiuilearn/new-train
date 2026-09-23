@@ -533,6 +533,9 @@ def build_mdt_seg_teacher(config):
         pspi_reconstruction_weight=recon_weight,
         pspi_proto_contrastive_weight=proto_weight,
         pspi_ct_proto_contrastive_weight=float(getattr(config, 'pspi_ct_proto_contrastive_weight', 0.0)),
+        pspi_per_scale_clustering=bool(getattr(config, 'pspi_per_scale_clustering', False)),
+        pspi_cluster_geometry=str(getattr(config, 'pspi_cluster_geometry', 'euclidean')),
+        pspi_retrieval_geometry=str(getattr(config, 'pspi_retrieval_geometry', 'cosine')),
         m2_enabled=bool(getattr(config, 'm2_enabled', False)),
         m2_checkpoint=bool(getattr(config, 'm2_checkpoint', False)),
     )
@@ -596,6 +599,9 @@ def build_mdt_seg_teacher(config):
         f'ema_momentum={getattr(config, "pspi_ema_momentum", 0.95)} '
         f'K={getattr(config, "pspi_num_clusters", 6)} '
         f'build_stage=S{getattr(config, "pspi_build_stage", 4)} '
+        f'bank_grouping={"per_scale" if getattr(config, "pspi_per_scale_clustering", False) else "s4_reuse"} '
+        f'cluster_geometry={getattr(config, "pspi_cluster_geometry", "euclidean")} '
+        f'retrieval_geometry={getattr(config, "pspi_retrieval_geometry", "cosine")} '
         f'full_path=raw_CT_plus_real_PET_m2_{fusion_name} '
         f'missing_boundary={("CT_plus_wavelet_LL_prior" if affine_enabled else "CT_plus_wavelet_LL_scaled_prior") if m2_enabled else ("CT_plus_ct_affine_prior" if affine_enabled else "CT_plus_scale_weighted_PET_prior")} '
         f'prior_scale_type={"none_ct_affine_direct" if affine_enabled else "per_scale_scalar"} '

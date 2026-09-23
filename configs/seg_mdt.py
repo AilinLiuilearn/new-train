@@ -59,6 +59,11 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--m2_enabled', type=str2bool, default=False)
         p.add_argument('--m2_checkpoint', type=str2bool, default=False)
         p.add_argument('--pspi_reconstruction_weight', type=float, default=0.05)
+        p.add_argument('--pspi_per_scale_clustering', type=str2bool, default=False)
+        p.add_argument('--pspi_cluster_geometry', type=str, default='euclidean',
+                       choices=('euclidean', 'spherical'))
+        p.add_argument('--pspi_retrieval_geometry', type=str, default='cosine',
+                       choices=('cosine', 'euclidean'))
         p.add_argument('--pspi_collect_candidates', type=str2bool, default=True)
         # Stage-1 unimodal pretraining initialization
         p.add_argument('--stage1_init_enabled', type=str2bool, default=False)
