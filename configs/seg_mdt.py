@@ -59,7 +59,7 @@ class SegMDTConfig(ConfigBase):
         # Module-2: state-aware wavelet fusion (default off, old runs unchanged).
         p.add_argument('--m2_enabled', type=str2bool, default=False)
         p.add_argument('--m2_checkpoint', type=str2bool, default=False)
-        p.add_argument('--pspi_reconstruction_weight', type=float, default=0.0)
+        p.add_argument('--pspi_reconstruction_weight', type=float, default=0.05)
         p.add_argument('--pspi_per_scale_clustering', type=str2bool, default=True)
         p.add_argument('--pspi_cluster_geometry', type=str, default='euclidean',
                        choices=('euclidean', 'spherical'))

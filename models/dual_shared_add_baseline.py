@@ -331,8 +331,14 @@ class DualSharedAddPETCTBaseline(nn.Module):
             }
         pet_comp, gammas, betas = self.pet_affine(ct_feats_missing, pet_prior)
         if compute_reconstruction and self.training:
+            # Reconstruction ANCHOR: supervise pet_comp toward the privileged
+            # real PET. The prior is DETACHED here so the anchor's gradient
+            # lands on the affine gamma/beta (its job: calibrate amplitude),
+            # not on the translator (which L_align already trains).
+            prior_for_recon = [p.detach() for p in pet_prior]
+            comp_for_recon, _, _ = self.pet_affine(ct_feats_missing, prior_for_recon)
             recon = balanced_multi_scale_smooth_l1_reconstruction(
-                pet_comp, pet_real_missing, mask_missing
+                comp_for_recon, pet_real_missing, mask_missing
             )
         else:
             ref = pet_comp[0]
@@ -747,8 +753,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 pet_comp_m, gammas_m, betas_m = self.pet_affine(ct_missing, pet_prior_m)
                 recon = None
                 if self.training:
+                    # Anchor on the affine (prior detached; see _compensate_missing_rows).
+                    prior_for_recon = [p.detach() for p in pet_prior_m]
+                    comp_for_recon, _, _ = self.pet_affine(ct_missing, prior_for_recon)
                     recon = balanced_multi_scale_smooth_l1_reconstruction(
-                        pet_comp_m, pet_real_missing, mask_missing
+                        comp_for_recon, pet_real_missing, mask_missing
                     )
                     recon_dict = recon
                 else:
