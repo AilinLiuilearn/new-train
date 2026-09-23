@@ -1474,11 +1474,13 @@ class PairedSemanticPrototypeImputation(nn.Module):
             raise ValueError("mask must be [B,1,H,W]")
         per_loc = 1.0 - F.cosine_similarity(z_pseudo, z_pet, dim=1, eps=EPS)
         bg_mask, fg_mask = _class_masks_at_scale(mask, ct_s4.shape[-2:])
+        fg_mask = fg_mask[:, 0].bool()
+        bg_mask = bg_mask[:, 0].bool()
         terms = []
         if bool(fg_mask.any()):
-            terms.append(per_loc[fg_mask.expand_as(per_loc)].mean())
+            terms.append(per_loc[fg_mask].mean())
         if bool(bg_mask.any()):
-            terms.append(per_loc[bg_mask.expand_as(per_loc)].mean())
+            terms.append(per_loc[bg_mask].mean())
         if not terms:
             return _zero_loss_result(ct_s4)
         loss = torch.stack(terms).mean()
