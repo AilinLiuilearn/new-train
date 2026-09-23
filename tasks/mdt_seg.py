@@ -58,7 +58,8 @@ class MDTSegTeacher:
         ct_proto_raw = outputs.get('ct_prototype_contrastive_loss', seg_loss.new_zeros(()))
         if torch.is_tensor(ct_proto_raw) and ct_proto_raw.dim() > 0:
             ct_proto_raw = ct_proto_raw.reshape(())
-        ct_proto_weight = float(getattr(self.config, 'pspi_ct_proto_contrastive_weight', 0.0))
+        ct_proto_weight = float(getattr(self.config, 'pspi_pseudo_align_weight',
+                                        getattr(self.config, 'pspi_ct_proto_contrastive_weight', 0.0)))
         ct_proto_weighted = ct_proto_weight * ct_proto_raw
         recon_raw = outputs.get('reconstruction_loss', seg_loss.new_zeros((), dtype=torch.float32))
         if recon_raw.dim() > 0:
@@ -86,6 +87,9 @@ class MDTSegTeacher:
             'loss_proto_weighted': proto_weighted.detach(),
             'loss_ct_proto': ct_proto_raw.detach() if torch.is_tensor(ct_proto_raw) else torch.tensor(float(ct_proto_raw)),
             'loss_ct_proto_weighted': ct_proto_weighted.detach(),
+            'loss_pseudo_align': ct_proto_raw.detach() if torch.is_tensor(ct_proto_raw) else torch.tensor(float(ct_proto_raw)),
+            'loss_pseudo_align_weighted': ct_proto_weighted.detach(),
+            'pseudo_align_weight': ct_proto_weight,
             'ct_proto_num_terms': outputs.get('ct_prototype_contrastive_num_terms', 0),
             'pseudo_pet_cos': float(outputs.get('pseudo_pet_cos', 0.0)) if isinstance(outputs, dict) else 0.0,
             'proto_num_terms': outputs.get('prototype_contrastive_num_terms', 0),
@@ -147,7 +151,8 @@ class MDTSegTeacher:
         ct_proto_raw = outputs.get('ct_prototype_contrastive_loss', seg_total.new_zeros(())) if isinstance(outputs, dict) else seg_total.new_zeros(())
         if torch.is_tensor(ct_proto_raw) and ct_proto_raw.dim() > 0:
             ct_proto_raw = ct_proto_raw.reshape(())
-        ct_proto_weight = float(getattr(self.config, 'pspi_ct_proto_contrastive_weight', 0.0))
+        ct_proto_weight = float(getattr(self.config, 'pspi_pseudo_align_weight',
+                                        getattr(self.config, 'pspi_ct_proto_contrastive_weight', 0.0)))
         ct_proto_weighted = ct_proto_weight * ct_proto_raw
         recon_raw = outputs.get('reconstruction_loss', None) if isinstance(outputs, dict) else None
         if not torch.is_tensor(recon_raw):
@@ -169,6 +174,9 @@ class MDTSegTeacher:
             'loss_proto_weighted': proto_weighted.detach(),
             'loss_ct_proto': ct_proto_raw.detach() if torch.is_tensor(ct_proto_raw) else torch.tensor(float(ct_proto_raw)),
             'loss_ct_proto_weighted': ct_proto_weighted.detach(),
+            'loss_pseudo_align': ct_proto_raw.detach() if torch.is_tensor(ct_proto_raw) else torch.tensor(float(ct_proto_raw)),
+            'loss_pseudo_align_weighted': ct_proto_weighted.detach(),
+            'pseudo_align_weight': ct_proto_weight,
             'ct_proto_num_terms': outputs.get('ct_prototype_contrastive_num_terms', 0) if isinstance(outputs, dict) else 0,
             'pseudo_pet_cos': float(outputs.get('pseudo_pet_cos', 0.0)) if isinstance(outputs, dict) else 0.0,
             'proto_num_terms': outputs.get('prototype_contrastive_num_terms', 0) if isinstance(outputs, dict) else 0,

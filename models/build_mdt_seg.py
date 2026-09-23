@@ -523,7 +523,7 @@ def build_mdt_seg_teacher(config):
         pspi_ema_momentum=getattr(config, 'pspi_ema_momentum', 0.95),
         pspi_retrieval_temperature=getattr(config, 'pspi_retrieval_temperature', 0.1),
         pspi_retrieval_topk=int(getattr(config, 'pspi_retrieval_topk', 0)),
-        pspi_retrieval_per_class_topk=int(getattr(config, 'pspi_retrieval_per_class_topk', 1)),
+        pspi_retrieval_per_class_topk=int(getattr(config, 'pspi_retrieval_per_class_topk', 0)),
         pspi_retrieval_gate_temperature=float(getattr(config, 'pspi_retrieval_gate_temperature', 1.0)),
         pspi_proto_temperature=getattr(config, 'pspi_proto_temperature', 0.02),
         pspi_collect_candidates=getattr(config, 'pspi_collect_candidates', True),
@@ -533,8 +533,9 @@ def build_mdt_seg_teacher(config):
         pspi_reconstruction_weight=recon_weight,
         pspi_proto_contrastive_weight=proto_weight,
         pspi_ct_proto_contrastive_weight=float(getattr(config, 'pspi_ct_proto_contrastive_weight', 0.0)),
-        pspi_per_scale_clustering=bool(getattr(config, 'pspi_per_scale_clustering', False)),
-        pspi_cluster_geometry=str(getattr(config, 'pspi_cluster_geometry', 'euclidean')),
+        pspi_pseudo_align_weight=float(getattr(config, 'pspi_pseudo_align_weight', 1.0)),
+        pspi_per_scale_clustering=bool(getattr(config, 'pspi_per_scale_clustering', True)),
+        pspi_cluster_geometry=str(getattr(config, 'pspi_cluster_geometry', 'spherical')),
         pspi_retrieval_geometry=str(getattr(config, 'pspi_retrieval_geometry', 'cosine')),
         m2_enabled=bool(getattr(config, 'm2_enabled', False)),
         m2_checkpoint=bool(getattr(config, 'm2_checkpoint', False)),
@@ -568,22 +569,33 @@ def build_mdt_seg_teacher(config):
         fusion_desc = f'downstream_fusion={fusion_name}'
     else:
         fusion_desc = f'baseline_fusion={fusion_name}'
+    # Parse the effective grouping/loss config once, and use it for BOTH the
+    # model build and the log (no hard-coded, contradictory strings).
+    per_scale = bool(getattr(config, 'pspi_per_scale_clustering', True))
+    cluster_geom = str(getattr(config, 'pspi_cluster_geometry', 'spherical'))
+    retrieval_geom = str(getattr(config, 'pspi_retrieval_geometry', 'cosine'))
+    per_class_topk = int(getattr(config, 'pspi_retrieval_per_class_topk', 0))
+    pseudo_align_weight = float(getattr(config, 'pspi_pseudo_align_weight', 1.0))
+    retrieval_topk = int(getattr(config, 'pspi_retrieval_topk', 0))
     print(
         f'[PSPI] enabled={pspi_enabled} '
-        f'module1=paired_ct_pet_prototype_prior_retrieval '
-        f'clustering=spherical_cosine '
+        f'module1=pure_pet_prototype_prior_retrieval '
+        f'bank=PET_only '
+        f'bank_grouping={"per_scale_independent" if per_scale else "s4_labels_reused"} '
+        f'cluster_geometry={cluster_geom} '
         f'cluster_init=deterministic_mean_farthest '
-        f'outlier_filter=cosine_top5_percent '
-        f'retrieval=cosine_soft '
+        f'outlier_filter={"euclidean_top5_percent" if cluster_geom == "euclidean" else "cosine_top5_percent"} '
+        f'retrieval_geometry={retrieval_geom} '
+        f'retrieval=global_all_ready_slots '
         f'retrieval_temperature={getattr(config, "pspi_retrieval_temperature", 0.1)} '
         f'personalization={"ct_only_direct_affine" if affine_enabled else "none"} '
-        f'prototype_loss=pet_multi_positive_contrastive '
-        f'proto_temperature={getattr(config, "pspi_proto_temperature", 0.02)} '
-        f'proto_weight={proto_weight} '
+        f'align_loss=fg_bg_mean(1-cos(pseudo_PET, PET.detach)) '
+        f'pseudo_align_weight={pseudo_align_weight} '
         f'ct_proto_weight={float(getattr(config, "pspi_ct_proto_contrastive_weight", 0.0))} '
-        f'proto_loss_disabled={proto_weight == 0.0} '
-        f'retrieval_topk={int(getattr(config, "pspi_retrieval_topk", 0))} '
-        f'retrieval_per_class_topk={int(getattr(config, "pspi_retrieval_per_class_topk", 3))} '
+        f'proto_weight={proto_weight} '
+        f'old_proto_loss_disabled={proto_weight == 0.0} '
+        f'retrieval_topk={retrieval_topk} '
+        f'retrieval_per_class_topk={per_class_topk} '
         f'retrieval_gate_temp={float(getattr(config, "pspi_retrieval_gate_temperature", 1.0))} '
         f'ct_only_direct_affine={affine_enabled} '
         f'reconstruction_weight={recon_weight} '
@@ -593,15 +605,13 @@ def build_mdt_seg_teacher(config):
         f'm2_checkpoint={m2_checkpoint} '
         f'direct_add={not m2_enabled} '
         f'cold_start=epoch1 '
-        f'S4_K_per_class={getattr(config, "pspi_num_clusters", 6)} '
+        f'K_per_class={getattr(config, "pspi_num_clusters", 6)} '
+        f'Kb={int(getattr(config, "pspi_num_clusters_bg", 0) or getattr(config, "pspi_num_clusters", 6))} '
+        f'Kf={int(getattr(config, "pspi_num_clusters_fg", 0) or getattr(config, "pspi_num_clusters", 6))} '
         f'mixed_50_50 '
         f'bank_update={getattr(config, "pspi_bank_update_mode", "direct")} '
         f'ema_momentum={getattr(config, "pspi_ema_momentum", 0.95)} '
-        f'K={getattr(config, "pspi_num_clusters", 6)} '
         f'build_stage=S{getattr(config, "pspi_build_stage", 4)} '
-        f'bank_grouping={"per_scale" if getattr(config, "pspi_per_scale_clustering", False) else "s4_reuse"} '
-        f'cluster_geometry={getattr(config, "pspi_cluster_geometry", "euclidean")} '
-        f'retrieval_geometry={getattr(config, "pspi_retrieval_geometry", "cosine")} '
         f'full_path=raw_CT_plus_real_PET_m2_{fusion_name} '
         f'missing_boundary={("CT_plus_wavelet_LL_prior" if affine_enabled else "CT_plus_wavelet_LL_scaled_prior") if m2_enabled else ("CT_plus_ct_affine_prior" if affine_enabled else "CT_plus_scale_weighted_PET_prior")} '
         f'prior_scale_type={"none_ct_affine_direct" if affine_enabled else "per_scale_scalar"} '

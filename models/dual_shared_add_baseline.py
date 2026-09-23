@@ -67,6 +67,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pspi_reconstruction_weight=0.0,
         pspi_proto_contrastive_weight=0.01,
         pspi_ct_proto_contrastive_weight=0.0,
+        pspi_pseudo_align_weight=1.0,
         pspi_retrieval_topk=0,
         pspi_retrieval_per_class_topk=3,
         pspi_retrieval_gate_temperature=1.0,
@@ -168,6 +169,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 f"pspi_ct_proto_contrastive_weight must be finite and >= 0, got {pspi_ct_proto_contrastive_weight!r}"
             )
         self.pspi_ct_proto_contrastive_weight = ct_proto_w
+        pseudo_align_w = float(pspi_pseudo_align_weight)
+        if not math.isfinite(pseudo_align_w) or pseudo_align_w < 0.0:
+            raise ValueError(
+                f"pspi_pseudo_align_weight must be finite and >= 0, got {pspi_pseudo_align_weight!r}"
+            )
+        self.pspi_pseudo_align_weight = pseudo_align_w
         topk = int(pspi_retrieval_topk)
         if topk < 0:
             raise ValueError(
@@ -438,14 +445,14 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return out
 
     def _proto_pair(self, ct_feats, pet_real_feats, mask):
-        """Split proto weights: L_ct (proto weight) vs pseudo-PET L_gen (ct weight).
+        """Split loss terms for the new paradigm.
 
-        proto_result = L_ct (CT class-contrastive, grad -> CT encoder),
-        weighted by pspi_proto_contrastive_weight (0 = off for the new paradigm).
-        ct_proto_result = L_align = 0.5*FG(1-cos) + 0.5*BG(1-cos) at S4
-        over the full 16-row batch (Full + Missing privileged), grad ->
-        pseudo head + CT encoder, weighted by pspi_ct_proto_contrastive_weight.
-        Old L_align (PET->CT) superseded by the pseudo-PET translator.
+        proto_result = OLD CT class-contrastive L_ct (disabled by default,
+        weighted by pspi_proto_contrastive_weight; 0 = off).
+        ct_proto_result = L_align = mean_scales[FG/BG-mean(1-cos(pseudo_PET,
+        PET.detach()))], grad -> pseudo heads + CT encoder, gated by
+        pspi_pseudo_align_weight (>0 enables; the task applies the weight).
+        Old PET->CT align head is superseded by the pseudo-PET translator.
         """
         proto_result = None
         ct_proto_result = None
@@ -455,7 +462,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
             return proto_result, ct_proto_result
         if self.pspi_proto_contrastive_weight > 0.0 and ct_feats is not None:
             proto_result = self.module1.compute_ct_prototype_contrastive_loss(ct_feats, mask)
-        if self.pspi_ct_proto_contrastive_weight > 0.0 and ct_feats is not None and pet_real_feats is not None:
+        if self.pspi_pseudo_align_weight > 0.0 and ct_feats is not None and pet_real_feats is not None:
             ct_proto_result = self.module1.compute_pseudo_pet_loss(ct_feats, pet_real_feats, mask)
         return proto_result, ct_proto_result
 

@@ -287,6 +287,7 @@ def main():
             'train_full_ct_proto_loss', 'train_missing_ct_proto_loss',
             'train_full_ct_proto_loss_weighted', 'train_missing_ct_proto_loss_weighted',
             'pseudo_pet_cos',
+            'train_pseudo_align_loss',
             'val_full_loss', 'val_full_dice', 'val_full_iou', 'val_full_acc', 'val_full_acc_pixel', 'val_full_hd95',
             'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
             'joint_dice', 'best_joint', 'best_joint_epoch',
@@ -351,6 +352,7 @@ def main():
             full_ct_proto_sum = missing_ct_proto_sum = 0.0
             full_ct_proto_w_sum = missing_ct_proto_w_sum = 0.0
             pseudo_cos_sum = 0.0
+            pseudo_align_sum = 0.0
             recon_loss_sum = recon_w_sum = 0.0
             recon_active_count = recon_missing_samples = 0
             recon_fg_accum = {f's{i}': [] for i in range(1, 5)}
@@ -456,6 +458,7 @@ def main():
                 full_ct_proto_w_sum += ct_proto_w_v * num_full
                 missing_ct_proto_w_sum += ct_proto_w_v * num_missing
                 pseudo_cos_sum += float(train_stats.get('pseudo_pet_cos', 0.0)) * (num_full + num_missing)
+                pseudo_align_sum += float(train_stats.get('loss_pseudo_align', 0.0)) * (num_full + num_missing)
                 mixed_loss_sum += float(loss.detach())
                 mixed_n += 1
                 last_full_weight = float(train_stats['full_weight'])
@@ -792,6 +795,7 @@ def main():
                 'train_full_ct_proto_loss_weighted': full_ct_proto_w_sum / max(1, full_sample_count),
                 'train_missing_ct_proto_loss_weighted': missing_ct_proto_w_sum / max(1, missing_sample_count),
                 'pseudo_pet_cos': pseudo_cos_sum / max(1, full_sample_count + missing_sample_count),
+                'train_pseudo_align_loss': pseudo_align_sum / max(1, full_sample_count + missing_sample_count),
                 **common_pspi,
                 'epoch_time': time.time() - epoch_start,
                 **{f'diag_{k}': v for k, v in diag_stats.items()},
