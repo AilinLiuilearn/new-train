@@ -298,7 +298,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         if not self.pspi_affine_enabled or self.pet_affine is None:
             raise RuntimeError('_compensate_missing_rows requires pspi_affine_enabled=True')
         pet_prior, aux = self.module1.retrieve_pet_prior(
-            ct_feats_missing, return_attention=False
+            ct_feats_missing, return_attention=False, mask=mask_missing,
         )
         if not bool(aux.get('bank_ready', False)):
             # Cold start bypass: skip the entire affine so that even a
@@ -730,7 +730,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
             if mask_missing is None and self.training:
                 raise ValueError('mixed affine training requires mask for the Missing subset')
             if self.module1.bank_ready:
-                pet_prior_m, _ = self.module1.retrieve_pet_prior(ct_missing, return_attention=False)
+                pet_prior_m, _ = self.module1.retrieve_pet_prior(ct_missing, return_attention=False, mask=mask_missing)
                 pet_comp_m, gammas_m, betas_m = self.pet_affine(ct_missing, pet_prior_m)
                 recon = None
                 if self.training:

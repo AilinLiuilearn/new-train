@@ -203,6 +203,123 @@ def deterministic_spherical_kmeans(
 
 
 @torch.no_grad()
+def deterministic_euclid_kmeans(
+    x: torch.Tensor,
+    num_clusters: int,
+    max_iter: int = 25,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+    """Traditional Euclidean k-means (deterministic): direction + magnitude.
+
+    Same structure as the spherical variant but NO normalization: assignment
+    and centers use ||x-c||^2. Init mirrors mean_farthest (first = farthest
+    from the mean direction, then farthest-from-centers). Used for the pure
+    PET bank where SUV magnitude is signal, not noise.
+    """
+    if x.ndim != 2:
+        raise ValueError(f"x must be [N,D], got {tuple(x.shape)}")
+    n, _ = x.shape
+    if n == 0:
+        raise ValueError("Cannot cluster an empty tensor")
+    if num_clusters < 1:
+        raise ValueError("num_clusters must be >= 1")
+
+    k = min(int(num_clusters), int(n))
+    x_f = x.float()
+    mean_vec = x_f.mean(dim=0)
+    if float(mean_vec.norm().item()) <= EPS:
+        first_idx = 0
+    else:
+        first_idx = int(torch.argmax(((x_f - mean_vec) ** 2).sum(dim=1)).item())
+    center_indices: List[int] = [first_idx]
+    while len(center_indices) < k:
+        centers_now = x_f[
+            torch.tensor(center_indices, device=x_f.device, dtype=torch.long)
+        ]
+        nearest_sq = ((x_f[:, None, :] - centers_now[None, :, :]) ** 2).sum(dim=-1).min(dim=1).values
+        nearest_sq[
+            torch.tensor(center_indices, device=x_f.device, dtype=torch.long)
+        ] = -float("inf")
+        center_indices.append(int(torch.argmax(nearest_sq).item()))
+    centers = x_f[
+        torch.tensor(center_indices, device=x_f.device, dtype=torch.long)
+    ].clone()
+    labels = torch.full((n,), -1, dtype=torch.long, device=x_f.device)
+    converged_iter = max_iter
+    for iteration in range(max_iter):
+        dist_sq = ((x_f[:, None, :] - centers[None, :, :]) ** 2).sum(dim=-1)
+        new_labels = dist_sq.argmin(dim=1)
+        if torch.equal(new_labels, labels):
+            labels = new_labels
+            converged_iter = iteration
+            break
+        labels = new_labels
+        new_centers: List[torch.Tensor] = []
+        used_replacements = set()
+        for cluster_idx in range(k):
+            members = x_f[labels == cluster_idx]
+            if members.numel() > 0:
+                new_centers.append(members.mean(dim=0))
+            else:
+                scores = dist_sq.min(dim=1).values.clone()
+                for idx in used_replacements:
+                    scores[idx] = float("inf")
+                replacement_idx = int(torch.argmin(scores).item())
+                used_replacements.add(replacement_idx)
+                new_centers.append(x_f[replacement_idx])
+        centers = torch.stack(new_centers, dim=0)
+    cluster_counts = [int((labels == j).sum().item()) for j in range(k)]
+    report = {
+        "num_candidates": int(n),
+        "num_effective_clusters": int(k),
+        "first_center_index": int(first_idx),
+        "initial_center_indices": [int(v) for v in center_indices],
+        "iterations": int(converged_iter),
+        "cluster_counts": cluster_counts,
+        "geometry": "euclidean",
+    }
+    return labels, centers, report
+
+
+@torch.no_grad()
+def euclid_cluster_outlier_filter(
+    build_features: torch.Tensor,
+    labels: torch.Tensor,
+    num_clusters: int,
+    discard_rate: float,
+) -> Tuple[Dict[int, torch.Tensor], Dict]:
+    """Euclidean outlier filter: drop the farthest ||x-c||^2 members."""
+    if not 0.0 <= float(discard_rate) < 1.0:
+        raise ValueError("discard_rate must be in [0,1)")
+    if build_features.ndim != 2 or labels.ndim != 1:
+        raise ValueError("build_features must be [N,D] and labels must be [N]")
+    if build_features.shape[0] != labels.shape[0]:
+        raise ValueError("build_features / labels length mismatch")
+    x_f = build_features.float()
+    kept: Dict[int, torch.Tensor] = {}
+    report: Dict[str, Dict] = {}
+    singleton_warning = False
+    for cluster_idx in range(int(num_clusters)):
+        member_indices = torch.nonzero(
+            labels == cluster_idx, as_tuple=False
+        ).flatten().long()
+        n = int(member_indices.numel())
+        if n == 0:
+            continue
+        if n == 1:
+            singleton_warning = True
+        members = x_f[member_indices]
+        center = members.mean(dim=0)
+        distances = ((members - center) ** 2).sum(dim=1)
+        order = torch.argsort(distances, descending=False, stable=True)
+        discard_n = int(math.floor(float(discard_rate) * n))
+        keep_n = max(1, n - discard_n)
+        kept[cluster_idx] = member_indices[order[:keep_n]]
+        report[str(cluster_idx)] = {"n": n, "kept": int(keep_n)}
+    report["singleton_cluster_warning"] = singleton_warning
+    return kept, report
+
+
+@torch.no_grad()
 def cosine_cluster_outlier_filter(
     build_features: torch.Tensor,
     labels: torch.Tensor,
@@ -639,8 +756,11 @@ class PairedSemanticPrototypeImputation(nn.Module):
             self.config.build_stage, self.num_scales
         )
         self.align_head = CTPETAlignHead(self.channels)
-        # New paradigm: S4-only CT->pseudo-PET translator (pure-PET bank).
-        self.pseudo_head = CTPseudoPETHead(int(self.channels[-1]))
+        # New paradigm: per-scale CT->pseudo-PET translators (pure-PET bank).
+        # S4 membership is reused by S1-S3, but every scale owns its bank.
+        self.pseudo_head = nn.ModuleList(
+            [CTPseudoPETHead(int(c)) for c in self.channels]
+        )
 
         self.attention = nn.ModuleList(
             [
@@ -813,10 +933,8 @@ class PairedSemanticPrototypeImputation(nn.Module):
             if accepted_count == 0:
                 continue
             for scale_idx in range(self.num_scales):
-                self._epoch_cache[class_idx]["ct"][scale_idx].append(
-                    descriptors[class_idx]["ct"][scale_idx][common_valid]
-                    .detach().to(device="cpu", dtype=torch.float32).contiguous()
-                )
+                # Pure-PET bank: CT descriptors are never cached; CT only
+                # lives in the pseudo-PET translators, never in the bank.
                 self._epoch_cache[class_idx]["pet"][scale_idx].append(
                     descriptors[class_idx]["pet"][scale_idx][common_valid]
                     .detach().to(device="cpu", dtype=torch.float32).contiguous()
@@ -1156,80 +1274,71 @@ class PairedSemanticPrototypeImputation(nn.Module):
         new_ready = torch.zeros(2, Kmax, dtype=torch.bool)
         new_count = torch.zeros(2, Kmax, dtype=torch.long)
         any_candidate = False
+        # NEW PARADIGM: pure-PET grouping. S4 PET descriptors are clustered
+        # (Euclidean, per class); the S4 membership is REUSED by S1-S3, but
+        # every scale owns its bank: V_s[c,k] = mean of scale-s PET members.
+        # Keys are self-keyed (normalized V); CT never enters the bank.
         for class_idx, class_name in enumerate(CLASS_NAMES):
-            # Independent per-scale clustering: each scale clusters its OWN
-            # CT descriptors (S4=semantics, S1=texture). Membership is NOT
-            # shared across scales; each scale's key/value comes from its own
-            # kept members. Retrieval stays per-scale independent.
             class_report: Dict = {
-                "build_stage": "per_scale_independent",
+                "build_stage": "s4_labels_reused_all_scales",
                 "scales": {},
             }
-            # Gather raw caches per scale first (row-aligned across scales).
             raw_caches: Dict[int, Dict[str, torch.Tensor]] = {}
             n_rows = None
             empty_scale = False
-            for s in range(self.num_scales):
-                ct_all_raw = self._concat_cache(class_idx, "ct", s)
-                pet_all_raw = self._concat_cache(class_idx, "pet", s)
-                if ct_all_raw.shape[0] == 0:
+            for sc in range(self.num_scales):
+                pet_all_raw = self._concat_cache(class_idx, "pet", sc)
+                if pet_all_raw.shape[0] == 0:
                     empty_scale = True
                     break
                 if n_rows is None:
-                    n_rows = int(ct_all_raw.shape[0])
-                if ct_all_raw.shape[0] != n_rows or pet_all_raw.shape[0] != n_rows:
+                    n_rows = int(pet_all_raw.shape[0])
+                if pet_all_raw.shape[0] != n_rows:
                     raise RuntimeError(
-                        f"Cross-scale paired candidate misalignment: class={class_name}, "
-                        f"scale={s+1}, expected={n_rows}, "
-                        f"ct={ct_all_raw.shape[0]}, pet={pet_all_raw.shape[0]}"
+                        f"Cross-scale candidate misalignment: class={class_name}, "
+                        f"scale={sc+1}, expected={n_rows}, pet={pet_all_raw.shape[0]}"
                     )
-                raw_caches[s] = {"ct": ct_all_raw, "pet": pet_all_raw}
+                raw_caches[sc] = {"pet": pet_all_raw}
             if empty_scale or n_rows is None or n_rows == 0:
                 class_report["num_candidates"] = 0
                 report["classes"][class_name] = class_report
                 continue
             class_report["num_candidates"] = int(n_rows)
-            for s in range(self.num_scales):
-                ct_raw = raw_caches[s]["ct"]
-                pet_raw = raw_caches[s]["pet"]
-                scale_report: Dict = {}
-                # Per-scale pre-filter on this scale's own descriptors.
-                valid_mask = (
-                    torch.isfinite(ct_raw).all(dim=1)
-                    & (ct_raw.norm(dim=1) > EPS)
-                )
-                scale_report["prefilter_discarded"] = int((~valid_mask).sum().item())
-                if not bool(valid_mask.any()):
-                    scale_report["status"] = "all_candidates_filtered"
-                    class_report["scales"][f"s{s+1}"] = scale_report
-                    continue
-                valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten().long()
-                build_ct = ct_raw[valid_indices]
-                build_pet = pet_raw[valid_indices]
-                any_candidate = True
-                labels, centers, kmeans_report = deterministic_spherical_kmeans(
-                    build_ct, num_clusters=class_K[class_idx], max_iter=self.config.cluster_max_iter,
-                )
-                k_eff = int(centers.shape[0])
-                kept_by_cluster, filter_report = cosine_cluster_outlier_filter(
-                    build_ct, labels, num_clusters=k_eff, discard_rate=self.config.outlier_discard_rate,
-                )
-                singleton_warning = bool(filter_report.get("singleton_cluster_warning", False))
+            # S4 membership from S4 PET (Euclidean k-means + Euclidean filter).
+            s4_pet = raw_caches[self.num_scales - 1]["pet"]
+            valid_mask = torch.isfinite(s4_pet).all(dim=1) & (s4_pet.norm(dim=1) > EPS)
+            if not bool(valid_mask.any()):
+                class_report["status"] = "all_candidates_filtered"
+                report["classes"][class_name] = class_report
+                continue
+            valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten().long()
+            build_pet = s4_pet[valid_indices]
+            any_candidate = True
+            labels, centers, kmeans_report = deterministic_euclid_kmeans(
+                build_pet, num_clusters=class_K[class_idx], max_iter=self.config.cluster_max_iter,
+            )
+            k_eff = int(centers.shape[0])
+            kept_by_cluster, filter_report = euclid_cluster_outlier_filter(
+                build_pet, labels, num_clusters=k_eff, discard_rate=self.config.outlier_discard_rate,
+            )
+            singleton_warning = bool(filter_report.get("singleton_cluster_warning", False))
+            class_report["clustering"] = kmeans_report
+            class_report["filtering"] = filter_report
+            class_report["effective_clusters"] = int(k_eff)
+            class_report["singleton_cluster_warning"] = singleton_warning
+            # Reuse S4 membership at every scale; each scale banks its own PET.
+            for sc in range(self.num_scales):
+                sc_pet = raw_caches[sc]["pet"][valid_indices]
                 for cluster_idx in range(k_eff):
                     kept = kept_by_cluster.get(cluster_idx)
                     if kept is None or kept.numel() == 0:
                         continue
-                    ct_key = build_ct[kept].mean(dim=0)
-                    pet_value = build_pet[kept].mean(dim=0)
-                    new_keys[s][class_idx, cluster_idx] = F.normalize(ct_key.float(), dim=0, eps=EPS)
-                    new_values[s][class_idx, cluster_idx] = pet_value.float()
+                    pet_value = sc_pet[kept].mean(dim=0).float()
+                    new_values[sc][class_idx, cluster_idx] = pet_value
+                    new_keys[sc][class_idx, cluster_idx] = F.normalize(pet_value, dim=0, eps=EPS)
                     new_ready[class_idx, cluster_idx] = True
                     new_count[class_idx, cluster_idx] = int(new_count[class_idx, cluster_idx].item() + kept.numel())
-                scale_report["clustering"] = kmeans_report
-                scale_report["filtering"] = filter_report
-                scale_report["effective_clusters"] = int(k_eff)
-                scale_report["singleton_cluster_warning"] = singleton_warning
-                class_report["scales"][f"s{s+1}"] = scale_report
+                class_report["scales"][f"s{sc+1}"] = {"reused_s4_labels": True}
             report["classes"][class_name] = class_report
 
         if not any_candidate or not bool(new_ready.any()):
@@ -1286,28 +1395,30 @@ class PairedSemanticPrototypeImputation(nn.Module):
         self,
         ct_feats: Sequence[torch.Tensor],
         return_attention: bool = False,
+        mask: torch.Tensor = None,
     ) -> Tuple[List[torch.Tensor], Dict]:
-        """Retrieve population-level PET prior from available CT features.
+        """Retrieve population-level PET prior from pseudo-PET queries.
 
-        Returns (pet_prior, aux) where pet_prior is a List[Tensor] matching
-        ct_feats shapes; aux carries bank/entropy statistics. When the bank
-        is not ready, pet_prior is strictly zeros (no random fallback).
+        NEW PARADIGM: Q_s = pseudo_head_s(C_s) (same-modality query into the
+        pure-PET bank); K = normalized V (self-keyed), V keeps magnitude.
+        With a mask: strict per-class retrieval (BG positions take BG slots
+        only, FG positions FG slots only) assembled by the downsampled mask.
+        Without a mask (eval Missing): single dense call over all ready slots.
+        When the bank is not ready, pet_prior is strictly zeros.
         """
         self._validate_features(ct_feats, None)
+        if mask is not None and (mask.ndim != 4 or mask.shape[1] != 1):
+            raise ValueError("mask must be [B,1,H,W]")
         pet_prior: List[torch.Tensor] = []
         attentions: List[torch.Tensor] = []
         entropy_list: List[float] = []
         norm_entropy_list: List[float] = []
         any_ready = bool(self.prototype_ready.any())
         Kb = int(self.num_clusters_bg); Kf = int(self.num_clusters_fg)
-        if Kb != Kf and int(self.attention[0].per_class_topk) > 0:
-            raise ValueError(
-                f"asymmetric slots BG={Kb} FG={Kf} require retrieval_per_class_topk=0 "
-                "(class-constrained path assumes equal halves); use dense/global-topk."
-            )
         for s, ct in enumerate(ct_feats):
-            bank_k = getattr(self, f"ct_keys_s{s + 1}")  # [2,Kmax,C]
+            q = self.pseudo_head[s](ct)
             bank_v = getattr(self, f"pet_values_s{s + 1}")
+            bank_k = getattr(self, f"ct_keys_s{s + 1}")
             keys = torch.cat([bank_k[0, :Kb], bank_k[1, :Kf]], dim=0)
             values = torch.cat([bank_v[0, :Kb], bank_v[1, :Kf]], dim=0)
             keys = keys.to(device=ct.device, dtype=ct.dtype)
@@ -1315,8 +1426,22 @@ class PairedSemanticPrototypeImputation(nn.Module):
             sc = self.prototype_ready_scale[s]  # [2,Kmax]
             if int(sc.sum().item()) == 0:
                 sc = self.prototype_ready
-            ready = torch.cat([sc[0, :Kb], sc[1, :Kf]], dim=0).to(device=ct.device)
-            retrieved, attention = self.attention[s](ct, keys, values, ready)
+            ready6 = torch.cat([sc[0, :Kb], sc[1, :Kf]], dim=0).to(device=ct.device)
+            if mask is None:
+                retrieved, attention = self.attention[s](q, keys, values, ready6)
+            else:
+                bg_m, fg_m = _class_masks_at_scale(mask, ct.shape[-2:])
+                fg_m = fg_m[:, 0].bool()
+                ready_bg = torch.cat([sc[0, :Kb], torch.zeros(Kf, dtype=torch.bool)], dim=0).to(device=ct.device)
+                ready_fg = torch.cat([torch.zeros(Kb, dtype=torch.bool), sc[1, :Kf]], dim=0).to(device=ct.device)
+                ret_bg, _ = self.attention[s](q, keys, values, ready_bg)
+                ret_fg, _ = self.attention[s](q, keys, values, ready_fg)
+                fg_exp = fg_m[:, None].expand_as(ret_bg)
+                retrieved = torch.where(fg_exp, ret_fg.to(ret_bg.dtype), ret_bg)
+                attention = torch.zeros(
+                    ct.shape[0], ct.shape[-2] * ct.shape[-1], Kb + Kf,
+                    device=ct.device, dtype=ct.dtype,
+                )
             pet_prior.append(retrieved)
             if return_attention:
                 attentions.append(attention)
@@ -1327,12 +1452,9 @@ class PairedSemanticPrototypeImputation(nn.Module):
                 else:
                     p = attention.detach().float().clamp_min(1e-12)
                     ent = float(-(p * p.log()).sum(dim=-1).mean().item())
-                    k_ready = int(ready.sum().item())
+                    k_ready = int(ready6.sum().item())
                     max_ent = math.log(k_ready) if k_ready > 1 else 0.0
-                    if max_ent <= 0.0:
-                        norm_ent = 0.0
-                    else:
-                        norm_ent = min(1.0, max(0.0, ent / max_ent))
+                    norm_ent = 0.0 if max_ent <= 0.0 else min(1.0, max(0.0, ent / max_ent))
                     entropy_list.append(ent)
                     norm_entropy_list.append(norm_ent)
         aux = {
@@ -1452,46 +1574,58 @@ class PairedSemanticPrototypeImputation(nn.Module):
         pet_real_feats: Sequence[torch.Tensor],
         mask: torch.Tensor,
     ) -> Dict:
-        """S4-only CT->pseudo-PET align loss (new paradigm).
+        """Per-scale CT->pseudo-PET align loss (new paradigm, full design).
 
-        L_align = 0.5*mean_{FG}(1-cos) + 0.5*mean_{BG}(1-cos) over the full
-        batch (Full + Missing privileged rows), per-location cosine at S4
-        between z_pseudo and the detached real PET. FG/BG split by the
-        downsampled mask with equal weight so background cannot dominate;
-        empty FG is skipped (valid part only). Mask is training-loss only.
-        Grad -> pseudo head + CT encoder; real PET is the detached teacher
-        (updated only by the segmentation path). Reports mean cosine.
+        L_align = mean over 4 scales of
+          [0.5*mean_{FG}(1-cos) + 0.5*mean_{BG}(1-cos)]
+        per-location between z_pseudo_s (own-scale translator) and the
+        detached real PET at the same scale, over the full batch (Full +
+        Missing privileged rows). FG/BG split by the downsampled mask with
+        equal weight; empty FG skipped. Mask is training-loss only.
+        Grad -> pseudo heads + CT encoder; real PET is the detached teacher.
+        Reports mean cosine (1 - loss, diagnostic).
         """
         self._validate_features(ct_feats, pet_real_feats)
-        ct_s4, pet_s4 = ct_feats[-1], pet_real_feats[-1]
-        if ct_s4.shape != pet_s4.shape:
-            raise ValueError(
-                f"S4 CT/PET shape mismatch: {tuple(ct_s4.shape)} vs {tuple(pet_s4.shape)}"
-            )
-        z_pseudo = self.pseudo_head(ct_s4.float())
-        z_pet = pet_s4.detach().float()
         if mask.ndim != 4 or mask.shape[1] != 1:
             raise ValueError("mask must be [B,1,H,W]")
-        per_loc = 1.0 - F.cosine_similarity(z_pseudo, z_pet, dim=1, eps=EPS)
-        bg_mask, fg_mask = _class_masks_at_scale(mask, ct_s4.shape[-2:])
-        fg_mask = fg_mask[:, 0].bool()
-        bg_mask = bg_mask[:, 0].bool()
-        terms = []
-        if bool(fg_mask.any()):
-            terms.append(per_loc[fg_mask].mean())
-        if bool(bg_mask.any()):
-            terms.append(per_loc[bg_mask].mean())
-        if not terms:
-            return _zero_loss_result(ct_s4)
-        loss = torch.stack(terms).mean()
+        scale_terms = []
+        per_scale: Dict[str, float] = {}
+        details: Dict[str, int] = {}
+        n_terms = 0
+        for s, (ct_feat, pet_feat) in enumerate(zip(ct_feats, pet_real_feats)):
+            if ct_feat.shape != pet_feat.shape:
+                raise ValueError(
+                    f"S{s+1} CT/PET shape mismatch: {tuple(ct_feat.shape)} vs {tuple(pet_feat.shape)}"
+                )
+            z_pseudo = self.pseudo_head[s](ct_feat.float())
+            z_pet = pet_feat.detach().float()
+            per_loc = 1.0 - F.cosine_similarity(z_pseudo, z_pet, dim=1, eps=EPS)
+            bg_mask, fg_mask = _class_masks_at_scale(mask, ct_feat.shape[-2:])
+            fg_m, bg_m = fg_mask[:, 0].bool(), bg_mask[:, 0].bool()
+            terms = []
+            if bool(fg_m.any()):
+                terms.append(per_loc[fg_m].mean())
+            if bool(bg_m.any()):
+                terms.append(per_loc[bg_m].mean())
+            if not terms:
+                continue
+            t = torch.stack(terms).mean()
+            _finite_or_raise(f"pseudo_pet_align_s{s+1}", t)
+            scale_terms.append(t)
+            n_terms += int(ct_feat.shape[0])
+            per_scale[f"s{s+1}"] = float(t.item())
+            details[f"s{s+1}_terms"] = int(ct_feat.shape[0])
+        if not scale_terms:
+            return _zero_loss_result(ct_feats[0])
+        loss = torch.stack(scale_terms).mean()
         _finite_or_raise("pseudo_pet_align_loss", loss)
         with torch.no_grad():
             cos = (1.0 - loss).clamp(-1.0, 1.0)
         return {
             "loss": loss,
-            "num_terms": int(ct_s4.shape[0]),
-            "per_scale": {"s4": float(loss.item())},
-            "details": {"s4_terms": int(ct_s4.shape[0])},
+            "num_terms": n_terms,
+            "per_scale": per_scale,
+            "details": details,
             "cos": float(cos.item()),
         }
 
