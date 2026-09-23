@@ -535,7 +535,7 @@ def build_mdt_seg_teacher(config):
         pspi_ct_proto_contrastive_weight=float(getattr(config, 'pspi_ct_proto_contrastive_weight', 0.0)),
         pspi_pseudo_align_weight=float(getattr(config, 'pspi_pseudo_align_weight', 1.0)),
         pspi_per_scale_clustering=bool(getattr(config, 'pspi_per_scale_clustering', True)),
-        pspi_cluster_geometry=str(getattr(config, 'pspi_cluster_geometry', 'spherical')),
+        pspi_cluster_geometry=str(getattr(config, 'pspi_cluster_geometry', 'euclidean')),
         pspi_retrieval_geometry=str(getattr(config, 'pspi_retrieval_geometry', 'cosine')),
         m2_enabled=bool(getattr(config, 'm2_enabled', False)),
         m2_checkpoint=bool(getattr(config, 'm2_checkpoint', False)),
@@ -572,7 +572,7 @@ def build_mdt_seg_teacher(config):
     # Parse the effective grouping/loss config once, and use it for BOTH the
     # model build and the log (no hard-coded, contradictory strings).
     per_scale = bool(getattr(config, 'pspi_per_scale_clustering', True))
-    cluster_geom = str(getattr(config, 'pspi_cluster_geometry', 'spherical'))
+    cluster_geom = str(getattr(config, 'pspi_cluster_geometry', 'euclidean'))
     retrieval_geom = str(getattr(config, 'pspi_retrieval_geometry', 'cosine'))
     per_class_topk = int(getattr(config, 'pspi_retrieval_per_class_topk', 0))
     pseudo_align_weight = float(getattr(config, 'pspi_pseudo_align_weight', 1.0))

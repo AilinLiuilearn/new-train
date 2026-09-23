@@ -61,7 +61,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--m2_checkpoint', type=str2bool, default=False)
         p.add_argument('--pspi_reconstruction_weight', type=float, default=0.0)
         p.add_argument('--pspi_per_scale_clustering', type=str2bool, default=True)
-        p.add_argument('--pspi_cluster_geometry', type=str, default='spherical',
+        p.add_argument('--pspi_cluster_geometry', type=str, default='euclidean',
                        choices=('euclidean', 'spherical'))
         p.add_argument('--pspi_retrieval_geometry', type=str, default='cosine',
                        choices=('cosine', 'euclidean'))
