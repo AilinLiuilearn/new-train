@@ -7,6 +7,7 @@ import torch
 
 from utils.seg_losses import BCEDiceLoss
 from utils.metrics_seg import SegmentationMetricsCIPA
+from utils.ema import ModelEMA
 
 
 def _flatten_grads(grads):
@@ -31,6 +32,23 @@ class MDTSegTeacher:
         self.global_batch_step = 0
         self.criterion = BCEDiceLoss(smooth=config.loss_smooth, bce_weight=config.bce_weight, dice_weight=config.dice_weight)
         self.metrics = SegmentationMetricsCIPA()
+        self.ema = None
+        if bool(getattr(config, 'ema_enabled', False)):
+            self.ema = ModelEMA(
+                self.model,
+                decay=float(getattr(config, 'ema_decay', 0.999)),
+                warmup=bool(getattr(config, 'ema_warmup', True)),
+                device=self.device,
+            )
+
+    def update_ema(self):
+        if self.ema is not None:
+            return self.ema.update(self.model)
+        return None
+
+    def eval_model(self):
+        """Model used for evaluation: EMA copy when enabled, else the model."""
+        return self.ema.model if self.ema is not None else self.model
 
     def trainable_parameters(self):
         return [p for p in self.model.parameters() if p.requires_grad]
@@ -93,9 +111,12 @@ class MDTSegTeacher:
         return total_loss, logits, outputs, stats
 
     @torch.no_grad()
-    def evaluate(self, loader, eval_mode='full', tag='val'):
+    def evaluate(self, loader, eval_mode='full', tag='val', model=None):
+        active = model if model is not None else self.model
         was_training = self.model.training
-        self.model.eval()
+        active.eval()
+        if model is None:
+            self.model.eval()
         total_loss = 0.0
         sample_count = 0
         self.metrics.reset()
@@ -117,7 +138,7 @@ class MDTSegTeacher:
                 pet_available = batch.get('pet_available')
                 if pet_available is not None:
                     pet_available = pet_available.to(self.device, non_blocking=True)
-            outputs = self.model(ct, pet=pet, pet_available=pet_available, forward_mode=forward_mode)
+            outputs = active(ct, pet=pet, pet_available=pet_available, forward_mode=forward_mode)
             logits = outputs['logits'] if isinstance(outputs, dict) else outputs
             loss, _ = self.criterion(logits, mask)
             self.metrics.update(logits, mask)
@@ -125,7 +146,8 @@ class MDTSegTeacher:
             sample_count += batch_size
         out = self.metrics.compute()
         out['total_loss'] = total_loss / max(1, sample_count)
-        self.model.train(was_training)
+        if model is None:
+            self.model.train(was_training)
         return out
 
     def _module_param_grads(self, module):
@@ -193,6 +215,8 @@ class MDTSegTeacher:
             'global_batch_step': self.global_batch_step,
             'train_batch_mode': getattr(self.config, 'train_batch_mode', 'alternating'),
             'model': self.model.state_dict(),
+            'model_ema': self.ema.state_dict() if self.ema is not None else None,
+            'ema_updates': self.ema.updates if self.ema is not None else 0,
             'optimizer': self.optimizer.state_dict(),
             'scheduler': None if self.scheduler is None else self.scheduler.state_dict(),
             'scaler': self.scaler.state_dict(),

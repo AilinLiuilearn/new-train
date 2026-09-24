@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from configs.seg_mdt import SegMDTConfig
+from configs.base import str2bool
 from models.build_mdt_seg import build_mdt_seg_teacher
 from tasks.mdt_seg import MDTSegTeacher
 from utils.metrics_seg import SegmentationMetricsCIPA
@@ -63,6 +64,7 @@ def main():
     p.add_argument('--checkpoint_dir', type=str, required=True)
     p.add_argument('--root', type=str, default='/root/autodl-tmp/data/PCLT20K')
     p.add_argument('--random_state', type=int, default=2023)
+    p.add_argument('--use_ema', type=str2bool, default=False)
     args = p.parse_args()
 
     ckpt = torch.load(os.path.join(args.checkpoint_dir, 'ckpt.best_joint.pth.tar'), map_location='cpu')
@@ -75,7 +77,15 @@ def main():
     cfg = SegMDTConfig(args=saved_config)
 
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
-    task.model.load_state_dict(ckpt['model'], strict=True)
+    state_dict = ckpt['model']
+    if args.use_ema:
+        if ckpt.get('model_ema') is None:
+            raise SystemExit('--use_ema requested but the checkpoint has no model_ema')
+        state_dict = ckpt['model_ema']
+        print('[eval_joint_baseline] using EMA weights for evaluation')
+    else:
+        print('[eval_joint_baseline] using raw model weights for evaluation')
+    task.model.load_state_dict(state_dict, strict=True)
     task.model.eval()
 
     from datasets.pclt20k_seg import get_pclt20k_loaders_cipa_aligned

@@ -123,6 +123,14 @@ def main():
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
     total_params, trainable_params = _count_parameters(task.model)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
+    if task.ema is not None:
+        print(
+            f'[INFO] ema_enabled=True decay={task.ema.decay} '
+            f'warmup={task.ema.warmup} eval_uses_ema=True',
+            flush=True,
+        )
+    else:
+        print('[INFO] ema_enabled=False eval_uses_ema=False', flush=True)
     task.scheduler = get_cosine_scheduler(
         task.optimizer,
         epochs=cfg.epochs,
@@ -142,6 +150,7 @@ def main():
             'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
             'joint_dice', 'best_joint', 'best_joint_epoch',
             'grad_mixed_enc_ct', 'grad_mixed_ct_align', 'grad_mixed_decoder',
+            'ema_enabled', 'ema_updates',
             'epoch_time',
         ]
     else:
@@ -152,6 +161,7 @@ def main():
             'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
             'joint_dice', 'best_joint', 'best_joint_epoch',
             'grad_full_enc_ct', 'grad_missing_enc_ct', 'grad_full_ct_align', 'grad_missing_ct_align', 'grad_full_decoder', 'grad_missing_decoder',
+            'ema_enabled', 'ema_updates',
             'epoch_time',
         ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
@@ -219,6 +229,7 @@ def main():
                     task.optimizer.step()
 
                 task.scheduler.step()
+                task.update_ema()
 
                 num_full = int(train_stats['num_full'])
                 num_missing = int(train_stats['num_missing'])
@@ -301,8 +312,8 @@ def main():
         if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is not None and epoch % int(cfg.gradient_diagnostics_interval) == 0:
             diag_stats = task.gradient_diagnostics(fixed_diag_batch, max_samples=min(1, int(cfg.gradient_diagnostics_num_samples))) or {}
 
-        val_full = task.evaluate(val_loader, eval_mode='full', tag='val_full')
-        val_missing = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_missing')
+        val_full = task.evaluate(val_loader, eval_mode='full', tag='val_full', model=task.eval_model())
+        val_missing = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_missing', model=task.eval_model())
         joint_dice = float(cfg.joint_full_weight) * val_full['dice'] + float(cfg.joint_missing_weight) * val_missing['dice']
 
         joint_improved = joint_dice > best_joint
@@ -355,6 +366,8 @@ def main():
                 'grad_mixed_enc_ct': float(np.mean(grads['enc_ct'])) if grads['enc_ct'] else 0.0,
                 'grad_mixed_ct_align': float(np.mean(grads['ct_align'])) if grads['ct_align'] else 0.0,
                 'grad_mixed_decoder': float(np.mean(grads['decoder'])) if grads['decoder'] else 0.0,
+                'ema_enabled': 1.0 if task.ema is not None else 0.0,
+                'ema_updates': float(task.ema.updates) if task.ema is not None else 0.0,
                 'epoch_time': time.time() - epoch_start,
                 **{f'diag_{k}': v for k, v in diag_stats.items()},
             }
@@ -371,6 +384,8 @@ def main():
                 'grad_missing_ct_align': float(np.mean(grads['missing']['ct_align'])) if grads['missing']['ct_align'] else 0.0,
                 'grad_full_decoder': float(np.mean(grads['full']['decoder'])) if grads['full']['decoder'] else 0.0,
                 'grad_missing_decoder': float(np.mean(grads['missing']['decoder'])) if grads['missing']['decoder'] else 0.0,
+                'ema_enabled': 1.0 if task.ema is not None else 0.0,
+                'ema_updates': float(task.ema.updates) if task.ema is not None else 0.0,
                 'epoch_time': time.time() - epoch_start,
                 **{f'diag_{k}': v for k, v in diag_stats.items()},
             }
