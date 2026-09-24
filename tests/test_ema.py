@@ -10,7 +10,7 @@ from tasks.mdt_seg import MDTSegTeacher
 def _cfg(**over):
     base = dict(learning_rate=1e-4, weight_decay=1e-4, mixed_precision=False,
                 loss_smooth=1.0, bce_weight=1.0, dice_weight=1.0, random_state=2023,
-                ema_enabled=True, ema_decay=0.9, ema_warmup=False,
+                ema_enabled=True, ema_decay=0.9, ema_decay_warmup=False, ema_start_epoch=0,
                 mffa_enabled=False, mffa_checkpoint_attention=False)
     base.update(over)
     return type('C', (), base)()
@@ -96,3 +96,47 @@ def test_ema_eval_runs_and_checkpoint_roundtrips():
     fresh = DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None)
     msg = fresh.load_state_dict(ckpt['model_ema'], strict=True)
     assert not msg.missing_keys and not msg.unexpected_keys
+
+
+def test_ema_start_epoch_delays_activation():
+    torch.manual_seed(0)
+    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None)},
+                         _cfg(ema_enabled=True, ema_start_epoch=3))
+    assert task.ema is not None
+    assert task.ema_active is False
+    # Warmup epochs: eval uses the raw model and update_ema is a no-op.
+    for ep in (1, 2, 3):
+        task.begin_epoch(ep)
+        assert task.ema_active is False
+        assert task.eval_model() is task.model
+        assert task.update_ema() is None
+    assert task.ema.updates == 0
+    # The EMA copy must still hold the *initial* weights during warmup.
+    # First active epoch hard-syncs, then tracks.
+    task.begin_epoch(4)
+    assert task.ema_active is True
+    assert task.eval_model() is task.ema.model
+    with torch.no_grad():
+        for p in task.model.parameters():
+            p.add_(0.3)
+    task.begin_epoch(4)  # idempotent once active
+    task.update_ema()
+    assert task.ema.updates == 1
+
+
+def test_ema_warmup_epochs_do_not_pollute_ema():
+    """After the delay the EMA is hard-synced, so it never blends the stale
+    pre-warmup initialization into the average."""
+    torch.manual_seed(0)
+    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None)},
+                         _cfg(ema_enabled=True, ema_decay=0.9, ema_decay_warmup=False, ema_start_epoch=2))
+    # Move the live weights a lot during warmup (EMA must ignore this).
+    with torch.no_grad():
+        for p in task.model.parameters():
+            p.add_(5.0)
+    task.begin_epoch(3)
+    assert task.ema_active is True
+    task.begin_epoch(3)
+    # reset() hard-copied the *current* live weights into the EMA.
+    for k, v in task.model.state_dict().items():
+        assert torch.allclose(task.ema.model.state_dict()[k], v, atol=1e-6)

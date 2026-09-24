@@ -33,22 +33,35 @@ class MDTSegTeacher:
         self.criterion = BCEDiceLoss(smooth=config.loss_smooth, bce_weight=config.bce_weight, dice_weight=config.dice_weight)
         self.metrics = SegmentationMetricsCIPA()
         self.ema = None
+        self.ema_active = False
+        self.ema_start_epoch = int(getattr(config, 'ema_start_epoch', 0))
         if bool(getattr(config, 'ema_enabled', False)):
             self.ema = ModelEMA(
                 self.model,
                 decay=float(getattr(config, 'ema_decay', 0.999)),
-                warmup=bool(getattr(config, 'ema_warmup', True)),
+                warmup=bool(getattr(config, 'ema_decay_warmup', True)),
                 device=self.device,
             )
+            self.ema_active = self.ema_start_epoch <= 0
+
+    def begin_epoch(self, epoch):
+        """Activate the EMA after the warmup epochs, hard-syncing on the switch."""
+        if self.ema is None or self.ema_active:
+            return
+        if int(epoch) > self.ema_start_epoch:
+            self.ema.reset(self.model)
+            self.ema_active = True
 
     def update_ema(self):
-        if self.ema is not None:
+        if self.ema is not None and self.ema_active:
             return self.ema.update(self.model)
         return None
 
     def eval_model(self):
-        """Model used for evaluation: EMA copy when enabled, else the model."""
-        return self.ema.model if self.ema is not None else self.model
+        """Model used for evaluation: EMA copy when active, else the model."""
+        if self.ema is not None and self.ema_active:
+            return self.ema.model
+        return self.model
 
     def trainable_parameters(self):
         return [p for p in self.model.parameters() if p.requires_grad]

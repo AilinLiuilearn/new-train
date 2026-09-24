@@ -46,5 +46,15 @@ class ModelEMA:
                 ema_val.copy_(src_val)
         return decay
 
+    @torch.no_grad()
+    def reset(self, model):
+        """Hard-sync the EMA copy to ``model`` and restart the decay ramp.
+
+        Used when the EMA is (re)activated after a warmup delay, so the EMA
+        does not blend in stale weights from before it started tracking.
+        """
+        self.model.load_state_dict(model.state_dict())
+        self.updates = 0
+
     def state_dict(self):
         return self.model.state_dict()

@@ -126,7 +126,8 @@ def main():
     if task.ema is not None:
         print(
             f'[INFO] ema_enabled=True decay={task.ema.decay} '
-            f'warmup={task.ema.warmup} eval_uses_ema=True',
+            f'decay_warmup={task.ema.warmup} start_epoch={task.ema_start_epoch} '
+            f'(EMA active from epoch {task.ema_start_epoch + 1}) eval_uses_ema_after_start=True',
             flush=True,
         )
     else:
@@ -178,6 +179,7 @@ def main():
 
     for epoch in range(1, cfg.epochs + 1):
         task.model.train()
+        task.begin_epoch(epoch)
         grad_norm_accum = 0.0
         grad_norm_steps = 0
         epoch_start = time.time()
