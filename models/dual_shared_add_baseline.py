@@ -21,7 +21,7 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
-    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False):
+    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, mffa_enabled=False, mffa_checkpoint_attention=False):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
@@ -31,8 +31,20 @@ class DualSharedAddPETCTBaseline(nn.Module):
         ct_channels = list(self.enc_ct.feature_info.channels())
         pet_channels = list(self.enc_pet.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
+        # Keep the original construction order/state_dict identical when MFFA is
+        # off: AddFusion (no parameters) and the shared decoder are created
+        # first, then the fusion is replaced. Swapping the fusion before the
+        # decoder would change RNG consumption and silently re-init the decoder.
         self.fusion = AddFusion()
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
+        self.mffa_enabled = bool(mffa_enabled)
+        self.mffa_checkpoint_attention = bool(mffa_checkpoint_attention)
+        if self.mffa_enabled:
+            from models.petct_full_mffa import PETCTFullMFFA
+            self.fusion = PETCTFullMFFA(
+                channels=tuple(pet_channels),
+                checkpoint_attention=self.mffa_checkpoint_attention,
+            )
 
     @staticmethod
     def _to_3ch(x):
@@ -57,17 +69,43 @@ class DualSharedAddPETCTBaseline(nn.Module):
         out['aux'] = {}
         return out
 
+    def _fuse_features(self, ct_feats, pet_feats, state):
+        """Unified fusion entry.
+
+        AddFusion ignores the third argument (original ``self.fusion(ct, pet, None)``
+        behaviour is preserved exactly). MFFA uses the explicit state to apply a
+        Full-only residual and return the CT identity for Missing rows.
+
+        Under AMP the CT branch (ConvNeXt + BatchNorm) may be float32 while the
+        PET branch (MiT + LayerNorm) may be float16; MFFA requires identical
+        dtypes, so cast PET to the CT dtype with a grad-preserving cast (never
+        detach). Only done when MFFA is enabled, so the AddFusion baseline is
+        untouched.
+        """
+        if self.mffa_enabled and pet_feats is not None:
+            pet_feats = [
+                p if p.dtype == c.dtype else p.to(dtype=c.dtype)
+                for c, p in zip(ct_feats, pet_feats)
+            ]
+        return self.fusion(ct_feats, pet_feats, state)
+
     def _forward_full(self, ct, pet, target_size):
         ct_feats = self._encode_ct(ct)
         pet_feats = self._encode_pet(pet)
-        fused_feats = self.fusion(ct_feats, pet_feats, None)
+        state = torch.ones(ct.shape[0], dtype=torch.long, device=ct.device)
+        fused_feats = self._fuse_features(ct_feats, pet_feats, state)
         return self._decode(fused_feats, target_size)
 
     def _forward_missing(self, ct, pet, target_size):
+        # Preserve the baseline contract: real PET is still encoded, then the
+        # Missing rows are zeroed before fusion (encode-then-zero). With MFFA the
+        # all-Missing state makes fusion return the CT identity, so the output
+        # equals CT exactly.
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
         pet_feats_masked = [torch.zeros_like(feat) for feat in pet_feats_real]
-        fused_feats = self.fusion(ct_feats, pet_feats_masked, None)
+        state = torch.zeros(ct.shape[0], dtype=torch.long, device=ct.device)
+        fused_feats = self._fuse_features(ct_feats, pet_feats_masked, state)
         return self._decode(fused_feats, target_size)
 
     def _forward_auto(self, ct, pet, pet_available, target_size):
@@ -82,7 +120,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         for feat in pet_feats_real:
             availability_mask = pet_available.to(device=feat.device, dtype=feat.dtype).view(-1, 1, 1, 1)
             pet_feats_masked.append(feat * availability_mask)
-        fused_feats = self.fusion(ct_feats, pet_feats_masked, None)
+        fused_feats = self._fuse_features(ct_feats, pet_feats_masked, pet_available)
         out = self._decode(fused_feats, target_size)
         out['pet_available'] = pet_available.detach().cpu()
         out['num_full'] = int(pet_available.eq(1).sum())

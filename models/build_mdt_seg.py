@@ -360,11 +360,23 @@ def build_mdt_seg_teacher(config):
         out_channels=1,
         decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
         use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
+        mffa_enabled=bool(getattr(config, 'mffa_enabled', False)),
+        mffa_checkpoint_attention=bool(getattr(config, 'mffa_checkpoint_attention', False)),
     )
+    mffa_enabled = bool(getattr(config, 'mffa_enabled', False))
+    fusion_name = type(model.fusion).__name__
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion=add shared_decoder=UNetStyleDecoder '
+        f'fusion={fusion_name} shared_decoder=UNetStyleDecoder '
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
+    print(
+        f'[fusion] enabled={mffa_enabled} '
+        f'mffa_checkpoint_attention={bool(getattr(config, "mffa_checkpoint_attention", False))} '
+        f'fusion_type={fusion_name}'
+    )
+    if mffa_enabled and hasattr(model.fusion, 'config'):
+        print(f'[fusion] config={model.fusion.config}')
+        print(f'[fusion] parameter_report={model.fusion.parameter_report()}')
     return {'model': model}
