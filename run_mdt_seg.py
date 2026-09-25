@@ -14,6 +14,19 @@ from utils.optimization import get_cosine_scheduler
 from utils.train_logger import append_epoch_log, init_train_log
 
 
+def module_grad_norm(module):
+    """Total L2 grad norm over a module's parameters without modifying grads."""
+    total_sq = 0.0
+    for p in module.parameters():
+        if p.grad is not None:
+            g = p.grad.detach().float()
+            if torch.isfinite(g).all():
+                total_sq += float(g.pow(2).sum())
+            else:
+                return float('inf')
+    return float(total_sq ** 0.5)
+
+
 def _seed(cfg):
     random.seed(cfg.random_state)
     np.random.seed(cfg.random_state)
