@@ -105,9 +105,21 @@ class DualSharedAddPETCTBaseline(nn.Module):
         full_idx = state.eq(1).nonzero(as_tuple=True)[0]
         if full_idx.numel() == 0:
             return list(ct_feats)
+        batch = ct_feats[0].shape[0]
+        dtype = ct_feats[0].dtype
+        # AMP: the two heterogeneous backbones may emit different dtypes under
+        # autocast (e.g. CT fp16 vs PET fp32). Align PET to the CT dtype with a
+        # grad-preserving cast instead of rejecting the batch.
+        pet_feats = [p.to(dtype=dtype) if p.dtype != dtype else p for p in pet_feats]
         for c, p in zip(ct_feats, pet_feats):
-            if c.shape != p.shape or c.shape[1:] != c.shape[1:] or tuple(c.shape[-2:]) != tuple(p.shape[-2:]):
+            if tuple(c.shape) != tuple(p.shape):
                 raise ValueError('CT/PET feature shapes must match per scale; no implicit interpolation')
+            if c.shape[0] != batch:
+                raise ValueError('CT/PET features must share the batch size across scales')
+            if p.dtype != c.dtype or c.dtype != dtype:
+                raise ValueError('CT/PET features must share dtype across scales')
+            if p.device != c.device or c.device != ct_feats[0].device:
+                raise ValueError('CT/PET features must share device across scales')
         ct_full = [c.index_select(0, full_idx) for c in ct_feats]
         pet_full = [p.index_select(0, full_idx).to(dtype=c.dtype)
                     for c, p in zip(ct_feats, pet_feats)]
@@ -125,9 +137,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
 
     def _forward_missing(self, ct, pet, target_size):
         # Preserve the baseline contract: real PET is still encoded, then the
-        # Missing rows are zeroed before fusion (encode-then-zero). With MFFA the
-        # all-Missing state makes fusion return the CT identity, so the output
-        # equals CT exactly.
+        # Missing rows are zeroed before fusion (encode-then-zero). With the
+        # asymmetric fusion enabled the all-Missing state bypasses the new
+        # module and returns the CT identity, so the output equals CT exactly.
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
         pet_feats_masked = [torch.zeros_like(feat) for feat in pet_feats_real]
@@ -138,11 +150,19 @@ class DualSharedAddPETCTBaseline(nn.Module):
     def _forward_auto(self, ct, pet, pet_available, target_size):
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
-        pet_available = torch.as_tensor(pet_available, device=ct.device).long().view(-1)
-        if pet_available.numel() != ct.shape[0]:
+        # Strict validation on the RAW state: length-B 0/1 integers or bools.
+        # Never .long() first: that would silently truncate 0.5 -> 0.
+        raw = torch.as_tensor(pet_available, device=ct.device)
+        if raw.numel() != ct.shape[0]:
             raise ValueError('pet_available must contain one state per sample')
-        if not torch.all((pet_available == 0) | (pet_available == 1)):
-            raise ValueError('pet_available values must be 0 or 1')
+        if raw.dtype == torch.bool:
+            pet_available = raw.long().view(-1)
+        elif raw.dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+            if not torch.all((raw == 0) | (raw == 1)):
+                raise ValueError('pet_available values must be 0 or 1')
+            pet_available = raw.long().view(-1)
+        else:
+            raise ValueError('pet_available must be 0/1 integers or bools, no silent float truncation')
         pet_feats_masked = []
         for feat in pet_feats_real:
             availability_mask = pet_available.to(device=feat.device, dtype=feat.dtype).view(-1, 1, 1, 1)
