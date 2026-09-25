@@ -4,3 +4,4 @@ __pycache__/
 checkpoints_new/
 outputs/
 wandb/
+pretrained/
