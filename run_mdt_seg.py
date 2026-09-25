@@ -77,7 +77,20 @@ def build_balanced_pet_available(batch_size, global_batch_step, random_state, de
     return state.to(device)
 
 
-def module_grad_norm(module):
+def _optimizer_step_succeeded(task, amp_enabled):
+    """Step the optimizer; return True iff the step was applied.
+
+    GradScaler overflow skips the optimizer update (scale drops). Compare the
+    scale before/after to detect skips; step() returning None is NOT reliable.
+    """
+    if task.scaler.is_enabled():
+        before = task.scaler.get_scale()
+        task.scaler.step(task.optimizer)
+        task.scaler.update()
+        after = task.scaler.get_scale()
+        return bool(after >= before)
+    task.optimizer.step()
+    return True
     total = None
     for p in module.parameters():
         if p.grad is None:

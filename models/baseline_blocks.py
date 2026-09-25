@@ -19,24 +19,50 @@ def _sanitize(x):
     return torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
 
 
+def _norm_layer(channels, norm_type='bn'):
+    if norm_type == 'bn':
+        return nn.BatchNorm2d(channels)
+    if norm_type == 'group':
+        # Largest power-of-two group count (>=2) dividing the channels; GroupNorm
+        # normalizes per-sample so Full/Missing rows are decoupled.
+        groups = 8
+        while groups > 1 and channels % groups != 0:
+            groups //= 2
+        return nn.GroupNorm(groups, channels)
+    raise ValueError(f'Unsupported decoder norm_type: {norm_type!r}')
+
+
+def _conv_norm_act(in_channels, out_channels, norm_type, kernel_size=1, stride=1, dilation=1):
+    """Conv + (Batch|Group)Norm + ReLU, order identical to ConvBNAct when BN."""
+    padding = (kernel_size // 2) * dilation
+    return nn.Sequential(
+        nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, bias=False),
+        _norm_layer(out_channels, norm_type),
+        nn.ReLU(inplace=True),
+    )
+
+
 class UNetStyleDecoder(nn.Module):
-    def __init__(self, encoder_channels=(64, 128, 320, 512), decoder_channels=(512, 256, 128, 64), out_channels=1, use_deep_supervision=False):
+    def __init__(self, encoder_channels=(64, 128, 320, 512), decoder_channels=(512, 256, 128, 64), out_channels=1, use_deep_supervision=False, norm_type='bn'):
         super().__init__()
         c1, c2, c3, c4 = encoder_channels
         d4, d3, d2, d1 = decoder_channels
         self.use_deep_supervision = bool(use_deep_supervision)
-        self.proj4 = ConvBNAct(c4, d4, kernel_size=1)
-        self.proj3 = ConvBNAct(c3, d3, kernel_size=1)
-        self.proj2 = ConvBNAct(c2, d2, kernel_size=1)
-        self.proj1 = ConvBNAct(c1, d1, kernel_size=1)
-        self.fuse3 = nn.Sequential(ConvBNAct(d4 + d3, d3, kernel_size=3), ConvBNAct(d3, d3, kernel_size=3))
-        self.fuse2 = nn.Sequential(ConvBNAct(d3 + d2, d2, kernel_size=3), ConvBNAct(d2, d2, kernel_size=3))
-        self.fuse1 = nn.Sequential(ConvBNAct(d2 + d1, d1, kernel_size=3), ConvBNAct(d1, d1, kernel_size=3))
+        self.norm_type = norm_type
+        self.proj4 = _conv_norm_act(c4, d4, norm_type, kernel_size=1)
+        self.proj3 = _conv_norm_act(c3, d3, norm_type, kernel_size=1)
+        self.proj2 = _conv_norm_act(c2, d2, norm_type, kernel_size=1)
+        self.proj1 = _conv_norm_act(c1, d1, norm_type, kernel_size=1)
+        self.fuse3 = nn.Sequential(_conv_norm_act(d4 + d3, d3, norm_type, kernel_size=3), _conv_norm_act(d3, d3, norm_type, kernel_size=3))
+        self.fuse2 = nn.Sequential(_conv_norm_act(d3 + d2, d2, norm_type, kernel_size=3), _conv_norm_act(d2, d2, norm_type, kernel_size=3))
+        self.fuse1 = nn.Sequential(_conv_norm_act(d2 + d1, d1, norm_type, kernel_size=3), _conv_norm_act(d1, d1, norm_type, kernel_size=3))
         self.seg_head = nn.Conv2d(d1, out_channels, kernel_size=1)
         if self.use_deep_supervision:
             self.aux_head_d2 = nn.Conv2d(d2, out_channels, kernel_size=1)
             self.aux_head_d3 = nn.Conv2d(d3, out_channels, kernel_size=1)
             self.aux_head_d4 = nn.Conv2d(d4, out_channels, kernel_size=1)
+        if norm_type != 'bn':
+            print(f'[UNetStyleDecoder] norm_type={norm_type} (per-sample; decouples Full/Missing rows)')
 
     def forward(self, features, target_size):
         x1, x2, x3, x4 = features

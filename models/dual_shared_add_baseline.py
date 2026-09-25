@@ -21,7 +21,10 @@ class StageChannelAlign(nn.Module):
 
 
 class DualSharedAddPETCTBaseline(nn.Module):
-    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, mffa_enabled=False, mffa_checkpoint_attention=False):
+    def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False,
+                 asym_fusion_enabled=False, asym_use_text=True, asym_clip_path='pretrained/clip-vit-base-patch32',
+                 asym_checkpoint_attention=False, asym_grid_cap=32, asym_pet_dims=(64, 128, 160, 256), asym_heads=4,
+                 fusion_text_embeddings=None, decoder_norm='bn'):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
@@ -31,19 +34,28 @@ class DualSharedAddPETCTBaseline(nn.Module):
         ct_channels = list(self.enc_ct.feature_info.channels())
         pet_channels = list(self.enc_pet.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
-        # Keep the original construction order/state_dict identical when MFFA is
-        # off: AddFusion (no parameters) and the shared decoder are created
-        # first, then the fusion is replaced. Swapping the fusion before the
-        # decoder would change RNG consumption and silently re-init the decoder.
+        # Keep the original construction order/state_dict identical when the
+        # asymmetric fusion is off: AddFusion (no parameters) and the shared
+        # decoder are created first, then the fusion is replaced. Swapping the
+        # fusion before the decoder would change RNG consumption and silently
+        # re-init the decoder.
         self.fusion = AddFusion()
-        self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
-        self.mffa_enabled = bool(mffa_enabled)
-        self.mffa_checkpoint_attention = bool(mffa_checkpoint_attention)
-        if self.mffa_enabled:
-            from models.petct_full_mffa import PETCTFullMFFA
-            self.fusion = PETCTFullMFFA(
+        if decoder_norm not in ('bn', 'group'):
+            raise ValueError(f'Unsupported decoder_norm={decoder_norm!r}')
+        self.decoder_norm = decoder_norm
+        self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision, norm_type=decoder_norm)
+        self.asym_fusion_enabled = bool(asym_fusion_enabled)
+        if self.asym_fusion_enabled:
+            from models.full_petct_asymmetric_fusion import FullPETCTAsymmetricFusion
+            self.fusion = FullPETCTAsymmetricFusion(
+                clip_path=asym_clip_path if fusion_text_embeddings is None else None,
                 channels=tuple(pet_channels),
-                checkpoint_attention=self.mffa_checkpoint_attention,
+                pet_dims=tuple(asym_pet_dims),
+                heads=int(asym_heads),
+                grid_cap=int(asym_grid_cap),
+                use_text=bool(asym_use_text),
+                text_embeddings=fusion_text_embeddings,
+                checkpoint_attention=bool(asym_checkpoint_attention),
             )
 
     @staticmethod
@@ -72,22 +84,37 @@ class DualSharedAddPETCTBaseline(nn.Module):
     def _fuse_features(self, ct_feats, pet_feats, state):
         """Unified fusion entry.
 
-        AddFusion ignores the third argument (original ``self.fusion(ct, pet, None)``
-        behaviour is preserved exactly). MFFA uses the explicit state to apply a
-        Full-only residual and return the CT identity for Missing rows.
-
-        Under AMP the CT branch (ConvNeXt + BatchNorm) may be float32 while the
-        PET branch (MiT + LayerNorm) may be float16; MFFA requires identical
-        dtypes, so cast PET to the CT dtype with a grad-preserving cast (never
-        detach). Only done when MFFA is enabled, so the AddFusion baseline is
-        untouched.
+        Baseline (asym off): AddFusion ignores the third argument exactly.
+        Asymmetric fusion (on): per-row routing. Full rows call the Full-only
+        module with ``state='full'``; Missing rows return the aligned-CT
+        features without entering the new module. Whole-batch decode once.
         """
-        if self.mffa_enabled and pet_feats is not None:
-            pet_feats = [
-                p if p.dtype == c.dtype else p.to(dtype=c.dtype)
-                for c, p in zip(ct_feats, pet_feats)
-            ]
-        return self.fusion(ct_feats, pet_feats, state)
+        if not self.asym_fusion_enabled:
+            return self.fusion(ct_feats, pet_feats, state)
+        state = torch.as_tensor(state, device=ct_feats[0].device).view(-1)
+        if state.numel() != ct_feats[0].shape[0]:
+            raise ValueError('fusion state must contain one value per sample')
+        if state.dtype != torch.long:
+            if not torch.isfinite(state.float()).all():
+                raise ValueError('fusion state must be finite 0/1 values')
+            if not torch.all((state == 0) | (state == 1)):
+                raise ValueError('fusion state values must be 0 or 1')
+            state = state.long()
+        elif not torch.all((state == 0) | (state == 1)):
+            raise ValueError('fusion state values must be 0 or 1')
+        full_idx = state.eq(1).nonzero(as_tuple=True)[0]
+        if full_idx.numel() == 0:
+            return list(ct_feats)
+        for c, p in zip(ct_feats, pet_feats):
+            if c.shape != p.shape or c.shape[1:] != c.shape[1:] or tuple(c.shape[-2:]) != tuple(p.shape[-2:]):
+                raise ValueError('CT/PET feature shapes must match per scale; no implicit interpolation')
+        ct_full = [c.index_select(0, full_idx) for c in ct_feats]
+        pet_full = [p.index_select(0, full_idx).to(dtype=c.dtype)
+                    for c, p in zip(ct_feats, pet_feats)]
+        fused_full = self.fusion(ct_full, pet_full, state='full')
+        # AMP: fusion output may be fp16/bf16 while the CT base is fp32.
+        return [c.index_copy(0, full_idx, f.to(dtype=c.dtype))
+                for c, f in zip(ct_feats, fused_full)]
 
     def _forward_full(self, ct, pet, target_size):
         ct_feats = self._encode_ct(ct)

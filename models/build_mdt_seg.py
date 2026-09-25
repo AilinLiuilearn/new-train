@@ -349,8 +349,19 @@ class ConvBNAct(nn.Module):
         return self.block(x)
 
 
-def build_mdt_seg_teacher(config):
+def build_mdt_seg_teacher(config, fusion_text_embeddings=None):
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
+    if bool(getattr(config, 'mffa_enabled', False)):
+        raise RuntimeError(
+            'mffa_enabled=True is no longer supported: the old MFFA module was removed. '
+            'Use asym_fusion_enabled or re-run with mffa_enabled=false for the clean AddFusion baseline.')
+    asym_enabled = bool(getattr(config, 'asym_fusion_enabled', False))
+    asym_use_text = bool(getattr(config, 'asym_use_text', True))
+    asym_clip_path = getattr(config, 'asym_clip_path', 'pretrained/clip-vit-base-patch32')
+    asym_checkpoint_attention = bool(getattr(config, 'asym_checkpoint_attention', False))
+    asym_grid_cap = int(getattr(config, 'asym_grid_cap', 32))
+    asym_pet_dims = tuple(getattr(config, 'asym_pet_dims', (64, 128, 160, 256)))
+    asym_heads = int(getattr(config, 'asym_heads', 4))
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
@@ -360,10 +371,16 @@ def build_mdt_seg_teacher(config):
         out_channels=1,
         decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
         use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
-        mffa_enabled=bool(getattr(config, 'mffa_enabled', False)),
-        mffa_checkpoint_attention=bool(getattr(config, 'mffa_checkpoint_attention', False)),
+        asym_fusion_enabled=asym_enabled,
+        asym_use_text=asym_use_text,
+        asym_clip_path=asym_clip_path,
+        asym_checkpoint_attention=asym_checkpoint_attention,
+        asym_grid_cap=asym_grid_cap,
+        asym_pet_dims=asym_pet_dims,
+        asym_heads=asym_heads,
+        fusion_text_embeddings=fusion_text_embeddings,
+        decoder_norm=str(getattr(config, 'decoder_norm', 'bn')),
     )
-    mffa_enabled = bool(getattr(config, 'mffa_enabled', False))
     fusion_name = type(model.fusion).__name__
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
@@ -372,11 +389,13 @@ def build_mdt_seg_teacher(config):
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
     print(
-        f'[fusion] enabled={mffa_enabled} '
-        f'mffa_checkpoint_attention={bool(getattr(config, "mffa_checkpoint_attention", False))} '
+        f'[fusion] enabled={asym_enabled} use_text={asym_use_text} '
+        f'clip_path={asym_clip_path if (asym_enabled and asym_use_text and fusion_text_embeddings is None) else ("injected" if (asym_enabled and asym_use_text) else "n/a")} '
         f'fusion_type={fusion_name}'
     )
-    if mffa_enabled and hasattr(model.fusion, 'config'):
-        print(f'[fusion] config={model.fusion.config}')
-        print(f'[fusion] parameter_report={model.fusion.parameter_report()}')
+    if asym_enabled:
+        pet_channels = list(model.enc_pet.feature_info.channels())
+        print(f'[fusion] channels={pet_channels} pet_dims={list(asym_pet_dims)} heads={asym_heads} grid_cap={asym_grid_cap} checkpoint_attention={asym_checkpoint_attention}')
+        print(f'[fusion] trainable_params={sum(p.numel() for p in model.fusion.parameters() if p.requires_grad)}')
+    print(f'[INFO] train_batch_mode={getattr(config, "train_batch_mode", "alternating")} ema_enabled={bool(getattr(config, "ema_enabled", False))} ema_start_epoch={int(getattr(config, "ema_start_epoch", 0))}', flush=True)
     return {'model': model}
