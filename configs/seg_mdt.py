@@ -29,6 +29,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--pet_pretrained_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1')
         p.add_argument('--decoder_channels', type=int, nargs=4, default=[512, 256, 128, 64])
         p.add_argument('--decoder_norm', type=str, default='bn', choices=('bn', 'group'))
+        p.add_argument('--model_type', type=str, default='dual_shared', choices=('dual_shared', 'ct_pet_add'))
         p.add_argument('--use_deep_supervision', type=str2bool, default=False)
         p.add_argument('--deep_supervision', type=str2bool, default=False)
         p.add_argument('--asym_fusion_enabled', type=str2bool, default=False)
