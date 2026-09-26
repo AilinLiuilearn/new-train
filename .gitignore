@@ -5,3 +5,5 @@ checkpoints_new/
 outputs/
 wandb/
 pretrained/
+
+.ipynb_checkpoints/

@@ -19,9 +19,7 @@ def _sanitize(x):
     return torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
 
 
-def _norm_layer(channels, norm_type='bn'):
-    if norm_type == 'bn':
-        return nn.BatchNorm2d(channels)
+def _norm_layer(channels, norm_type='group'):
     if norm_type == 'group':
         # Largest power-of-two group count (>=2) dividing the channels; GroupNorm
         # normalizes per-sample so Full/Missing rows are decoupled.
@@ -32,14 +30,25 @@ def _norm_layer(channels, norm_type='bn'):
     raise ValueError(f'Unsupported decoder norm_type: {norm_type!r}')
 
 
-def _conv_norm_act(in_channels, out_channels, norm_type, kernel_size=1, stride=1, dilation=1):
-    """Conv + (Batch|Group)Norm + ReLU, order identical to ConvBNAct when BN."""
+def _conv_group_act(in_channels, out_channels, kernel_size=1, stride=1, dilation=1):
+    """Conv + GroupNorm + ReLU, used only for norm_type='group'."""
     padding = (kernel_size // 2) * dilation
     return nn.Sequential(
         nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, bias=False),
-        _norm_layer(out_channels, norm_type),
+        _norm_layer(out_channels, 'group'),
         nn.ReLU(inplace=True),
     )
+
+
+def _decoder_block(in_channels, out_channels, norm_type, kernel_size=1, stride=1, dilation=1):
+    # norm_type='bn' keeps the original ConvBNAct (with its .block wrapper) so
+    # the module hierarchy, parameter keys and compute order are identical to
+    # the old baseline: old checkpoints load with strict=True.
+    if norm_type == 'bn':
+        return ConvBNAct(in_channels, out_channels, kernel_size=kernel_size, stride=stride, dilation=dilation)
+    if norm_type == 'group':
+        return _conv_group_act(in_channels, out_channels, kernel_size=kernel_size, stride=stride, dilation=dilation)
+    raise ValueError(f'Unsupported decoder norm_type: {norm_type!r}')
 
 
 class UNetStyleDecoder(nn.Module):
@@ -49,13 +58,13 @@ class UNetStyleDecoder(nn.Module):
         d4, d3, d2, d1 = decoder_channels
         self.use_deep_supervision = bool(use_deep_supervision)
         self.norm_type = norm_type
-        self.proj4 = _conv_norm_act(c4, d4, norm_type, kernel_size=1)
-        self.proj3 = _conv_norm_act(c3, d3, norm_type, kernel_size=1)
-        self.proj2 = _conv_norm_act(c2, d2, norm_type, kernel_size=1)
-        self.proj1 = _conv_norm_act(c1, d1, norm_type, kernel_size=1)
-        self.fuse3 = nn.Sequential(_conv_norm_act(d4 + d3, d3, norm_type, kernel_size=3), _conv_norm_act(d3, d3, norm_type, kernel_size=3))
-        self.fuse2 = nn.Sequential(_conv_norm_act(d3 + d2, d2, norm_type, kernel_size=3), _conv_norm_act(d2, d2, norm_type, kernel_size=3))
-        self.fuse1 = nn.Sequential(_conv_norm_act(d2 + d1, d1, norm_type, kernel_size=3), _conv_norm_act(d1, d1, norm_type, kernel_size=3))
+        self.proj4 = _decoder_block(c4, d4, norm_type, kernel_size=1)
+        self.proj3 = _decoder_block(c3, d3, norm_type, kernel_size=1)
+        self.proj2 = _decoder_block(c2, d2, norm_type, kernel_size=1)
+        self.proj1 = _decoder_block(c1, d1, norm_type, kernel_size=1)
+        self.fuse3 = nn.Sequential(_decoder_block(d4 + d3, d3, norm_type, kernel_size=3), _decoder_block(d3, d3, norm_type, kernel_size=3))
+        self.fuse2 = nn.Sequential(_decoder_block(d3 + d2, d2, norm_type, kernel_size=3), _decoder_block(d2, d2, norm_type, kernel_size=3))
+        self.fuse1 = nn.Sequential(_decoder_block(d2 + d1, d1, norm_type, kernel_size=3), _decoder_block(d1, d1, norm_type, kernel_size=3))
         self.seg_head = nn.Conv2d(d1, out_channels, kernel_size=1)
         if self.use_deep_supervision:
             self.aux_head_d2 = nn.Conv2d(d2, out_channels, kernel_size=1)

@@ -326,12 +326,20 @@ def main():
             diag_stats = task.gradient_diagnostics(fixed_diag_batch, max_samples=min(1, int(cfg.gradient_diagnostics_num_samples))) or {}
 
         val_full = task.evaluate(val_loader, eval_mode='full', tag='val_full', model=task.eval_model())
-        val_missing = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_missing', model=task.eval_model())
-        joint_dice = float(cfg.joint_full_weight) * val_full['dice'] + float(cfg.joint_missing_weight) * val_missing['dice']
+        skip_missing_eval = (train_batch_mode == 'full')
+        if skip_missing_eval:
+            # Stage-1 Full training: only the Full path is trained, so only Full
+            # is validated (saves one full val pass per epoch). Missing columns
+            # are logged as NaN to keep the CSV schema stable.
+            val_missing = {k: float('nan') for k in ('total_loss', 'dice', 'iou', 'acc', 'acc_pixel', 'hd95')}
+            joint_dice = float(val_full['dice'])
+        else:
+            val_missing = task.evaluate(val_loader, eval_mode='fixed_missing', tag='val_missing', model=task.eval_model())
+            joint_dice = float(cfg.joint_full_weight) * val_full['dice'] + float(cfg.joint_missing_weight) * val_missing['dice']
 
         joint_improved = joint_dice > best_joint
         full_improved = val_full['dice'] > best_full
-        missing_improved = val_missing['dice'] > best_missing
+        missing_improved = (not skip_missing_eval) and val_missing['dice'] > best_missing
         if joint_improved:
             best_joint = joint_dice
             best_joint_epoch = epoch
@@ -358,12 +366,20 @@ def main():
             train_loss = train_mixed_loss
         else:
             train_loss = (full_loss + missing_loss) / max(1, full_n + missing_n)
-        val_loss = 0.5 * val_full['total_loss'] + 0.5 * val_missing['total_loss']
-        val_dice = joint_dice
-        val_iou = 0.5 * val_full['iou'] + 0.5 * val_missing['iou']
-        val_acc = 0.5 * val_full['acc'] + 0.5 * val_missing['acc']
-        val_acc_pixel = 0.5 * val_full.get('acc_pixel', 0.0) + 0.5 * val_missing.get('acc_pixel', 0.0)
-        val_hd95 = 0.5 * val_full['hd95'] + 0.5 * val_missing['hd95']
+        if skip_missing_eval:
+            val_loss = val_full['total_loss']
+            val_dice = val_full['dice']
+            val_iou = val_full['iou']
+            val_acc = val_full['acc']
+            val_acc_pixel = val_full.get('acc_pixel', 0.0)
+            val_hd95 = val_full['hd95']
+        else:
+            val_loss = 0.5 * val_full['total_loss'] + 0.5 * val_missing['total_loss']
+            val_dice = joint_dice
+            val_iou = 0.5 * val_full['iou'] + 0.5 * val_missing['iou']
+            val_acc = 0.5 * val_full['acc'] + 0.5 * val_missing['acc']
+            val_acc_pixel = 0.5 * val_full.get('acc_pixel', 0.0) + 0.5 * val_missing.get('acc_pixel', 0.0)
+            val_hd95 = 0.5 * val_full['hd95'] + 0.5 * val_missing['hd95']
         avg_grad_norm = grad_norm_accum / max(1, grad_norm_steps)
         if train_batch_mode == 'mixed':
             extra = {
@@ -431,7 +447,10 @@ def main():
             },
         )
 
-        print(f'[EPOCH {epoch}] joint_dice={joint_dice:.4f} best_joint={best_joint:.4f} lr={task.optimizer.param_groups[0]["lr"]:.8f}', flush=True)
+        if skip_missing_eval:
+            print(f'[EPOCH {epoch}] full_dice={val_full["dice"]:.4f} best_full={best_full:.4f} lr={task.optimizer.param_groups[0]["lr"]:.8f}', flush=True)
+        else:
+            print(f'[EPOCH {epoch}] joint_dice={joint_dice:.4f} best_joint={best_joint:.4f} lr={task.optimizer.param_groups[0]["lr"]:.8f}', flush=True)
         if no_improve >= patience:
             print(f'[EARLY STOP] no improvement for {patience} epochs', flush=True)
             break

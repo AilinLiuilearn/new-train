@@ -24,6 +24,12 @@ def test_bn_default_has_batchnorm_only():
     bns, gns = _norms(dec)
     assert len(bns) > 0 and len(gns) == 0
     assert dec.norm_type == 'bn'
+    # BN path keeps the original ConvBNAct (.block wrapper): old baseline
+    # checkpoint keys like 'fuse1.0.block.0.weight' must exist unchanged.
+    keys = set(dec.state_dict().keys())
+    assert 'fuse1.0.block.0.weight' in keys
+    assert 'proj4.block.1.weight' in keys  # BatchNorm weight inside .block
+    assert not any(k.startswith('fuse1.0.0.') or k.startswith('proj4.0.') for k in keys)
 
 
 def test_group_has_no_batchnorm():

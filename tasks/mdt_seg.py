@@ -84,13 +84,21 @@ class MDTSegTeacher:
         ct = batch['ct'].to(self.device, non_blocking=True)
         pet = batch['pet'].to(self.device, non_blocking=True)
         mask = batch['mask'].to(self.device, non_blocking=True).float()
-        state = torch.as_tensor(pet_available, device=ct.device, dtype=torch.long).view(-1)
-        if state.numel() != ct.shape[0]:
+        raw_state = torch.as_tensor(pet_available, device=ct.device)
+        if raw_state.numel() != ct.shape[0]:
             raise ValueError(
-                f'pet_available must contain one state per sample: got {state.numel()} for batch {ct.shape[0]}'
+                f'pet_available must contain one state per sample: got {raw_state.numel()} for batch {ct.shape[0]}'
             )
-        if not torch.all((state == 0) | (state == 1)):
-            raise ValueError('pet_available values must be 0 or 1')
+        # Strict 0/1 integer-or-bool validation on the raw values first:
+        # .long() before validating would silently truncate 0.5 -> 0.
+        if raw_state.dtype == torch.bool:
+            state = raw_state.long().view(-1)
+        elif raw_state.dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+            if not torch.all((raw_state == 0) | (raw_state == 1)):
+                raise ValueError('pet_available values must be 0 or 1')
+            state = raw_state.long().view(-1)
+        else:
+            raise ValueError('pet_available must be 0/1 integers or bools, no silent float truncation')
         full_index = state.eq(1)
         missing_index = state.eq(0)
         num_full = int(full_index.sum())
