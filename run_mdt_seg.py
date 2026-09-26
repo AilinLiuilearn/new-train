@@ -15,16 +15,13 @@ from utils.train_logger import append_epoch_log, init_train_log
 
 
 def module_grad_norm(module):
-    """Total L2 grad norm over a module's parameters without modifying grads."""
-    total_sq = 0.0
+    total = None
     for p in module.parameters():
-        if p.grad is not None:
-            g = p.grad.detach().float()
-            if torch.isfinite(g).all():
-                total_sq += float(g.pow(2).sum())
-            else:
-                return float('inf')
-    return float(total_sq ** 0.5)
+        if p.grad is None:
+            continue
+        value = p.grad.detach().float().pow(2).sum()
+        total = value if total is None else total + value
+    return float(total.sqrt().item()) if total is not None else 0.0
 
 
 def _seed(cfg):
@@ -90,27 +87,15 @@ def build_balanced_pet_available(batch_size, global_batch_step, random_state, de
     return state.to(device)
 
 
-def _optimizer_step_succeeded(task, amp_enabled):
-    """Step the optimizer; return True iff the step was applied.
-
-    GradScaler overflow skips the optimizer update (scale drops). Compare the
-    scale before/after to detect skips; step() returning None is NOT reliable.
-    """
-    if task.scaler.is_enabled():
-        before = task.scaler.get_scale()
-        task.scaler.step(task.optimizer)
-        task.scaler.update()
-        after = task.scaler.get_scale()
-        return bool(after >= before)
-    task.optimizer.step()
-    return True
-    total = None
-    for p in module.parameters():
-        if p.grad is None:
-            continue
-        val = p.grad.detach().float().pow(2).sum()
-        total = val if total is None else total + val
-    return float(total.sqrt().item()) if total is not None else 0.0
+def _optimizer_step_succeeded(task):
+    if not task.scaler.is_enabled():
+        task.optimizer.step()
+        return True
+    before = task.scaler.get_scale()
+    task.scaler.step(task.optimizer)
+    task.scaler.update()
+    after = task.scaler.get_scale()
+    return bool(after >= before)
 
 
 def _checkpoint_paths(checkpoint_dir):
@@ -133,7 +118,7 @@ def main():
     cfg = SegMDTConfig.parse_arguments()
     _assert_baseline(cfg)
     train_batch_mode = str(getattr(cfg, 'train_batch_mode', 'alternating'))
-    if train_batch_mode not in ('alternating', 'mixed'):
+    if train_batch_mode not in ('alternating', 'mixed', 'full'):
         raise ValueError(f'unsupported train_batch_mode={train_batch_mode!r}')
     print(f'[INFO] train_batch_mode={train_batch_mode}', flush=True)
     _seed(cfg)
@@ -177,7 +162,7 @@ def main():
             'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
             'joint_dice', 'best_joint', 'best_joint_epoch',
             'grad_mixed_enc_ct', 'grad_mixed_ct_align', 'grad_mixed_decoder',
-            'ema_enabled', 'ema_updates',
+            'ema_enabled', 'ema_updates', 'skipped_updates',
             'epoch_time',
         ]
     else:
@@ -188,7 +173,7 @@ def main():
             'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc', 'val_missing_acc_pixel', 'val_missing_hd95',
             'joint_dice', 'best_joint', 'best_joint_epoch',
             'grad_full_enc_ct', 'grad_missing_enc_ct', 'grad_full_ct_align', 'grad_missing_ct_align', 'grad_full_decoder', 'grad_missing_decoder',
-            'ema_enabled', 'ema_updates',
+            'ema_enabled', 'ema_updates', 'skipped_updates',
             'epoch_time',
         ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
@@ -208,6 +193,7 @@ def main():
         task.begin_epoch(epoch)
         grad_norm_accum = 0.0
         grad_norm_steps = 0
+        skipped_update_count = 0
         epoch_start = time.time()
         fixed_diag_batch = None
         diag_stats = {}
@@ -250,14 +236,12 @@ def main():
                 grad_norm_accum += float(total_grad_norm)
                 grad_norm_steps += 1
 
-                if task.scaler.is_enabled():
-                    task.scaler.step(task.optimizer)
-                    task.scaler.update()
+                step_succeeded = _optimizer_step_succeeded(task)
+                if step_succeeded:
+                    task.scheduler.step()
+                    task.update_ema()
                 else:
-                    task.optimizer.step()
-
-                task.scheduler.step()
-                task.update_ema()
+                    skipped_update_count += 1
 
                 num_full = int(train_stats['num_full'])
                 num_missing = int(train_stats['num_missing'])
@@ -290,7 +274,9 @@ def main():
             }
 
             for batch_idx, batch in enumerate(train_loader):
-                route = 'full' if global_batch_step % 2 == 0 else 'missing'
+                # Stage-1 Full training: every batch routes Full so the encoders,
+                # fusion and decoder are jointly trained on full-modality data.
+                route = 'full' if (train_batch_mode == 'full' or global_batch_step % 2 == 0) else 'missing'
                 task.optimizer.zero_grad(set_to_none=True)
                 with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
                     loss, _, _, _ = task.train_step(batch, forward_mode=route)
@@ -310,13 +296,12 @@ def main():
                 grad_norm_accum += float(total_grad_norm)
                 grad_norm_steps += 1
 
-                if task.scaler.is_enabled():
-                    task.scaler.step(task.optimizer)
-                    task.scaler.update()
+                step_succeeded = _optimizer_step_succeeded(task)
+                if step_succeeded:
+                    task.scheduler.step()
+                    task.update_ema()
                 else:
-                    task.optimizer.step()
-
-                task.scheduler.step()
+                    skipped_update_count += 1
 
                 if (batch_idx + 1) % 100 == 0:
                     print(f'[BATCH {batch_idx + 1}] route={route} loss={float(loss.detach()):.6f}', flush=True)
@@ -396,6 +381,7 @@ def main():
                 'grad_mixed_decoder': float(np.mean(grads['decoder'])) if grads['decoder'] else 0.0,
                 'ema_enabled': 1.0 if task.ema is not None else 0.0,
                 'ema_updates': float(task.ema.updates) if task.ema is not None else 0.0,
+                'skipped_updates': float(skipped_update_count),
                 'epoch_time': time.time() - epoch_start,
                 **{f'diag_{k}': v for k, v in diag_stats.items()},
             }
@@ -414,6 +400,7 @@ def main():
                 'grad_missing_decoder': float(np.mean(grads['missing']['decoder'])) if grads['missing']['decoder'] else 0.0,
                 'ema_enabled': 1.0 if task.ema is not None else 0.0,
                 'ema_updates': float(task.ema.updates) if task.ema is not None else 0.0,
+                'skipped_updates': float(skipped_update_count),
                 'epoch_time': time.time() - epoch_start,
                 **{f'diag_{k}': v for k, v in diag_stats.items()},
             }

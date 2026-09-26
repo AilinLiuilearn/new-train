@@ -70,7 +70,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--final_test_missing_rates', type=float, nargs='+', default=[0.0, 0.25, 0.5, 0.75, 1.0])
         p.add_argument('--train_pet_drop_prob', type=float, default=0.0)
         p.add_argument('--missing_loss_weight', type=float, default=1.0)
-        p.add_argument('--train_batch_mode', type=str, default='alternating', choices=('alternating', 'mixed'))
+        p.add_argument('--train_batch_mode', type=str, default='alternating', choices=('alternating', 'mixed', 'full'))
         p.add_argument('--vis_every_epoch', type=str2bool, default=False)
         p.add_argument('--eval_full_pet', type=str2bool, default=True)
         p.add_argument('--eval_fixed_missing_pet', type=str2bool, default=True)
