@@ -24,7 +24,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
     def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False,
                  asym_fusion_enabled=False, asym_use_text=True, asym_clip_path='pretrained/clip-vit-base-patch32',
                  asym_checkpoint_attention=False, asym_grid_cap=32, asym_pet_dims=(64, 128, 160, 256), asym_heads=4,
-                 fusion_text_embeddings=None, decoder_norm='bn'):
+                 fusion_text_embeddings=None, decoder_norm='bn', fusion_version='v1'):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
@@ -45,9 +45,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
         self.decoder_norm = decoder_norm
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision, norm_type=decoder_norm)
         self.asym_fusion_enabled = bool(asym_fusion_enabled)
+        if fusion_version not in ('v1', 'v2'):
+            raise ValueError(f'Unsupported fusion_version={fusion_version!r}')
+        self.fusion_version = fusion_version
         if self.asym_fusion_enabled:
-            from models.full_petct_asymmetric_fusion import FullPETCTAsymmetricFusion
-            self.fusion = FullPETCTAsymmetricFusion(
+            fusion_kwargs = dict(
                 clip_path=asym_clip_path if fusion_text_embeddings is None else None,
                 channels=tuple(pet_channels),
                 pet_dims=tuple(asym_pet_dims),
@@ -57,6 +59,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 text_embeddings=fusion_text_embeddings,
                 checkpoint_attention=bool(asym_checkpoint_attention),
             )
+            if fusion_version == 'v2':
+                from models.full_petct_asymmetric_fusion_v2 import FullPETCTAsymmetricFusionV2
+                self.fusion = FullPETCTAsymmetricFusionV2(**fusion_kwargs)
+            else:
+                from models.full_petct_asymmetric_fusion import FullPETCTAsymmetricFusion
+                self.fusion = FullPETCTAsymmetricFusion(**fusion_kwargs)
 
     @staticmethod
     def _to_3ch(x):

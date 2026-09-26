@@ -380,6 +380,7 @@ def build_mdt_seg_teacher(config, fusion_text_embeddings=None):
         asym_heads=asym_heads,
         fusion_text_embeddings=fusion_text_embeddings,
         decoder_norm=str(getattr(config, 'decoder_norm', 'bn')),
+        fusion_version=str(getattr(config, 'fusion_version', 'v1')),
     )
     fusion_name = type(model.fusion).__name__
     print(

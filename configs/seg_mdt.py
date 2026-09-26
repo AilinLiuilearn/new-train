@@ -38,6 +38,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--asym_grid_cap', type=int, default=32)
         p.add_argument('--asym_pet_dims', type=int, nargs=4, default=[64, 128, 160, 256])
         p.add_argument('--asym_heads', type=int, default=4)
+        p.add_argument('--fusion_version', type=str, default='v1', choices=('v1', 'v2'))
         p.add_argument('--joint_full_weight', type=float, default=0.5)
         p.add_argument('--joint_missing_weight', type=float, default=0.5)
         p.add_argument('--enable_gradient_diagnostics', type=str2bool, default=False)
