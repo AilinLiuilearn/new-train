@@ -239,9 +239,10 @@ class PairedGlobalAttention(nn.Module):
 class FusionScale(nn.Module):
     def __init__(self, channels: int, inner: int, heads: int, query_size: int,
                  kv_size: int, text_dim: int, text_reduction: int,
-                 checkpoint_attention: bool):
+                 checkpoint_attention: bool, residual: bool = False):
         super().__init__()
         self.channels, self.inner = channels, inner
+        self.residual = bool(residual)
         r = max(8, channels // text_reduction)
         self.ct_gate = LightTextChannelGate(channels, r, 'avg')
         self.pet_gate = LightTextChannelGate(channels, r, 'max')
