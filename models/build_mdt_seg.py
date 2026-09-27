@@ -421,6 +421,7 @@ def build_mdt_seg_teacher(config, fusion_text_embeddings=None):
         fusion_version=str(getattr(config, 'fusion_version', 'v1')),
         text_dim=int(text_dim),
         text_encoder=str(text_encoder),
+        pgf_residual=bool(getattr(config, 'pgf_residual', True)),
     )
     fusion_name = type(model.fusion).__name__
     print(

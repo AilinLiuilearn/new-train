@@ -25,7 +25,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
                  asym_fusion_enabled=False, asym_use_text=True, asym_clip_path='pretrained/clip-vit-base-patch32',
                  asym_checkpoint_attention=False, asym_grid_cap=32, asym_pet_dims=(64, 128, 160, 256), asym_heads=4,
                  fusion_text_embeddings=None, decoder_norm='bn', fusion_version='v1', text_dim=512,
-                 text_encoder='clip'):
+                 text_encoder='clip', pgf_residual=True):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
@@ -46,9 +46,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
         self.decoder_norm = decoder_norm
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision, norm_type=decoder_norm)
         self.asym_fusion_enabled = bool(asym_fusion_enabled)
-        if fusion_version not in ('v1', 'v2'):
+        if fusion_version not in ('v1', 'v2', 'pgf'):
             raise ValueError(f'Unsupported fusion_version={fusion_version!r}')
         self.fusion_version = fusion_version
+        self.pgf_residual = bool(pgf_residual)
         if self.asym_fusion_enabled:
             fusion_kwargs = dict(
                 clip_path=asym_clip_path if fusion_text_embeddings is None else None,
@@ -64,6 +65,17 @@ class DualSharedAddPETCTBaseline(nn.Module):
             if fusion_version == 'v2':
                 from models.full_petct_asymmetric_fusion_v2 import FullPETCTAsymmetricFusionV2
                 self.fusion = FullPETCTAsymmetricFusionV2(text_encoder=str(text_encoder), **fusion_kwargs)
+            elif fusion_version == 'pgf':
+                from models.petct_paired_global_fusion import PETCTPairedGlobalFusion
+                self.fusion = PETCTPairedGlobalFusion(
+                    channels=tuple(pet_channels),
+                    inner_channels=tuple(asym_pet_dims),
+                    num_heads=int(asym_heads),
+                    use_text=bool(asym_use_text),
+                    text_dim=int(text_dim),
+                    text_embeddings=fusion_text_embeddings,
+                    checkpoint_attention=bool(asym_checkpoint_attention),
+                )
             else:
                 from models.full_petct_asymmetric_fusion import FullPETCTAsymmetricFusion
                 self.fusion = FullPETCTAsymmetricFusion(**fusion_kwargs)
@@ -134,6 +146,12 @@ class DualSharedAddPETCTBaseline(nn.Module):
         pet_full = [p.index_select(0, full_idx).to(dtype=c.dtype)
                     for c, p in zip(ct_feats, pet_feats)]
         fused_full = self.fusion(ct_full, pet_full, state='full')
+        if self.fusion_version == 'pgf' and self.pgf_residual:
+            # Stage-1 design decision: the paired module outputs an unbounded
+            # correction, so anchor it on CT (fused = ct + delta). Bank deltas
+            # are then exactly (fused - ct). Disable with pgf_residual=False
+            # to run the module author's raw output.
+            fused_full = [c + f.to(dtype=c.dtype) for c, f in zip(ct_full, fused_full)]
         # AMP: fusion output may be fp16/bf16 while the CT base is fp32.
         return [c.index_copy(0, full_idx, f.to(dtype=c.dtype))
                 for c, f in zip(ct_feats, fused_full)]
