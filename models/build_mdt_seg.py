@@ -387,6 +387,19 @@ def build_mdt_seg_teacher(config, fusion_text_embeddings=None):
     asym_grid_cap = int(getattr(config, 'asym_grid_cap', 32))
     asym_pet_dims = tuple(getattr(config, 'asym_pet_dims', (64, 128, 160, 256)))
     asym_heads = int(getattr(config, 'asym_heads', 4))
+    text_encoder = str(getattr(config, 'text_encoder', 'clip'))
+    text_encoder_path = str(getattr(config, 'text_encoder_path', '') or '')
+    text_encoder_vocab = str(getattr(config, 'text_encoder_vocab', '') or '')
+    text_dim = 512
+    if asym_enabled and asym_use_text and fusion_text_embeddings is None:
+        from models.text_encoders import load_text_embeddings
+        fusion_text_embeddings, text_dim = load_text_embeddings(
+            text_encoder,
+            encoder_path=text_encoder_path or None,
+            vocab_path=text_encoder_vocab or None)
+        print(f'[text] encoder={text_encoder} dim={text_dim}', flush=True)
+    elif asym_enabled and asym_use_text and fusion_text_embeddings is not None:
+        text_dim = int(fusion_text_embeddings.shape[1])
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
@@ -406,6 +419,8 @@ def build_mdt_seg_teacher(config, fusion_text_embeddings=None):
         fusion_text_embeddings=fusion_text_embeddings,
         decoder_norm=str(getattr(config, 'decoder_norm', 'bn')),
         fusion_version=str(getattr(config, 'fusion_version', 'v1')),
+        text_dim=int(text_dim),
+        text_encoder=str(text_encoder),
     )
     fusion_name = type(model.fusion).__name__
     print(

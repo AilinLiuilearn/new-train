@@ -187,7 +187,8 @@ class FullPETCTAsymmetricFusionV2(nn.Module):
                  heads: int = 4, grid_cap: int = 32, text_dim: int = 512,
                  use_text: bool = True, text_embeddings: Tensor | None = None,
                  prompts: Sequence[str] = (CT_PROMPT, PET_PROMPT),
-                 checkpoint_attention: bool = False):
+                 checkpoint_attention: bool = False,
+                 text_encoder: str = 'clip'):
         super().__init__()
         self.channels = tuple(channels)
         dims = tuple(pet_dims)
@@ -203,7 +204,8 @@ class FullPETCTAsymmetricFusionV2(nn.Module):
         self.use_text = use_text
         self._contract = dict(version=2, channels=list(self.channels), pet_dims=list(dims),
                               heads=heads, grid_cap=grid_cap, text_dim=text_dim,
-                              use_text=use_text, prompts=list(prompts))
+                              use_text=use_text, prompts=list(prompts),
+                              text_encoder=str(text_encoder))
         if use_text:
             if text_embeddings is None:
                 if clip_path is None:
