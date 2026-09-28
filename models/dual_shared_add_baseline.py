@@ -25,7 +25,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
                  asym_fusion_enabled=False, asym_use_text=True, asym_clip_path='pretrained/clip-vit-base-patch32',
                  asym_checkpoint_attention=False, asym_grid_cap=32, asym_pet_dims=(64, 128, 160, 256), asym_heads=4,
                  fusion_text_embeddings=None, decoder_norm='bn', fusion_version='v1', text_dim=512,
-                 text_encoder='clip', pgf_residual=True):
+                 text_encoder='clip', pgf_residual=True,
+                 inc_region_grids=(16, 16, 16, 16), inc_num_points=4, inc_offset_radius=0.5,
+                 inc_query_chunk_size=512, inc_checkpoint_attention=True, inc_missing_policy='error'):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
@@ -46,10 +48,20 @@ class DualSharedAddPETCTBaseline(nn.Module):
         self.decoder_norm = decoder_norm
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision, norm_type=decoder_norm)
         self.asym_fusion_enabled = bool(asym_fusion_enabled)
-        if fusion_version not in ('v1', 'v2', 'pgf'):
+        if fusion_version not in ('v1', 'v2', 'pgf', 'inc'):
             raise ValueError(f'Unsupported fusion_version={fusion_version!r}')
         self.fusion_version = fusion_version
         self.pgf_residual = bool(pgf_residual)
+        if inc_missing_policy not in ('error', 'zero'):
+            raise ValueError(f"Unsupported inc_missing_policy={inc_missing_policy!r}")
+        self.inc_missing_policy = inc_missing_policy
+        self._inc_cfg = dict(
+            region_grids=tuple(tuple(g) if isinstance(g, (list, tuple)) else g for g in inc_region_grids),
+            num_points=int(inc_num_points),
+            offset_radius=float(inc_offset_radius),
+            query_chunk_size=int(inc_query_chunk_size),
+            checkpoint_attention=bool(inc_checkpoint_attention),
+        )
         if self.asym_fusion_enabled:
             fusion_kwargs = dict(
                 clip_path=asym_clip_path if fusion_text_embeddings is None else None,
@@ -65,6 +77,18 @@ class DualSharedAddPETCTBaseline(nn.Module):
             if fusion_version == 'v2':
                 from models.full_petct_asymmetric_fusion_v2 import FullPETCTAsymmetricFusionV2
                 self.fusion = FullPETCTAsymmetricFusionV2(text_encoder=str(text_encoder), **fusion_kwargs)
+            elif fusion_version == 'inc':
+                from models.petct_increment_fusion import PETCTIncrementFusion
+                self.fusion = PETCTIncrementFusion(
+                    channels=tuple(pet_channels),
+                    inner_channels=tuple(asym_pet_dims),
+                    num_heads=int(asym_heads),
+                    region_grids=self._inc_cfg['region_grids'],
+                    num_points=self._inc_cfg['num_points'],
+                    offset_radius=self._inc_cfg['offset_radius'],
+                    query_chunk_size=self._inc_cfg['query_chunk_size'],
+                    checkpoint_attention=self._inc_cfg['checkpoint_attention'],
+                )
             elif fusion_version == 'pgf':
                 from models.petct_paired_global_fusion import PETCTPairedGlobalFusion
                 self.fusion = PETCTPairedGlobalFusion(
@@ -103,7 +127,104 @@ class DualSharedAddPETCTBaseline(nn.Module):
         out['aux'] = {}
         return out
 
+    def _require_inc(self):
+        if not (self.asym_fusion_enabled and self.fusion_version == 'inc'):
+            raise RuntimeError('inc routing used without fusion_version=inc')
+
+    @staticmethod
+    def _validate_state_tensor(state, batch, name='pet_available'):
+        raw = torch.as_tensor(state)
+        if raw.numel() != batch:
+            raise ValueError(f'{name} must contain one state per sample')
+        if raw.dtype == torch.bool:
+            return raw.long().view(-1)
+        if raw.dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+            if not torch.all((raw == 0) | (raw == 1)):
+                raise ValueError(f'{name} values must be 0 or 1')
+            return raw.long().view(-1)
+        raise ValueError(f'{name} must be 0/1 integers or bools, no silent float truncation')
+
+    def _inc_fuse_full_subset(self, ct_feats, pet_feats):
+        """Call the increment module on an all-Full subset; no c+f anywhere."""
+        self._require_inc()
+        dtype = ct_feats[0].dtype
+        pet_feats = [p.to(dtype=dtype) if p.dtype != dtype else p for p in pet_feats]
+        fused = self.fusion(ct_feats, pet_feats, state='full')
+        return [f.to(dtype=dtype) if f.dtype != dtype else f for f in fused]
+
+    def _inc_fuse_ct_only_subset(self, ct_feats):
+        self._require_inc()
+        dtype = ct_feats[0].dtype
+        fused = self.fusion(ct_feats, state='ct_only')
+        return [f.to(dtype=dtype) if f.dtype != dtype else f for f in fused]
+
+    def _fuse_features_inc(self, ct_feats, pet_feats, state):
+        """inc dispatch for the unified entry: Full-only here, never legacy bypass."""
+        self._require_inc()
+        state = self._validate_state_tensor(state, ct_feats[0].shape[0], name='fusion state')
+        if int(state.eq(0).sum()) > 0:
+            raise ValueError('inc _fuse_features requires an all-Full state; route Missing '
+                             'through _forward_missing/_forward_auto (ct_only or bank).')
+        return self._inc_fuse_full_subset(ct_feats, pet_feats)
+
+    def _forward_full_inc(self, ct, pet, target_size):
+        self._require_inc()
+        ct_feats = self._encode_ct(ct)
+        pet_feats = self._encode_pet(pet)
+        return self._decode(self._inc_fuse_full_subset(ct_feats, pet_feats), target_size)
+
+    def _forward_missing_inc(self, ct, pet, target_size):
+        self._require_inc()
+        # Decided BEFORE any PET encoding: pet may be None here.
+        if self.inc_missing_policy == 'error':
+            raise RuntimeError('increment bank not connected; use full pretraining '
+                               'or explicit zero-increment ablation')
+        ct_feats = self._encode_ct(ct)
+        return self._decode(self._inc_fuse_ct_only_subset(ct_feats), target_size)
+
+    def _forward_auto_inc(self, ct, pet, pet_available, target_size):
+        self._require_inc()
+        batch = ct.shape[0]
+        state = self._validate_state_tensor(pet_available, batch)
+        num_full = int(state.eq(1).sum())
+        num_missing = batch - num_full
+        if num_missing > 0 and self.inc_missing_policy == 'error':
+            raise RuntimeError('increment bank not connected; use full pretraining '
+                               'or explicit zero-increment ablation')
+        device = ct.device
+        full_idx = state.eq(1).nonzero(as_tuple=True)[0].to(device)
+        miss_idx = state.eq(0).nonzero(as_tuple=True)[0].to(device)
+        ct_feats = self._encode_ct(ct)
+        dtype = ct_feats[0].dtype
+        if num_missing == 0:
+            pet_feats = self._encode_pet(pet)
+            fused = self._inc_fuse_full_subset(ct_feats, pet_feats)
+        elif num_full == 0:
+            # All-Missing + zero policy: CT encoder only, pet never touched.
+            fused = self._inc_fuse_ct_only_subset(ct_feats)
+        else:
+            # Mixed + zero policy: PET encoder sees Full rows only; Missing
+            # PET is never encoded (no encode-then-zero-mask for inc).
+            ct_full = [c.index_select(0, full_idx) for c in ct_feats]
+            ct_miss = [c.index_select(0, miss_idx) for c in ct_feats]
+            pet_full = self._encode_pet(pet.index_select(0, full_idx).contiguous())
+            fused_full = self._inc_fuse_full_subset(ct_full, pet_full)
+            fused_miss = self._inc_fuse_ct_only_subset(ct_miss)
+            fused = [c.index_copy(0, full_idx, f.to(dtype=dtype))
+                     for c, f in zip(ct_feats, fused_full)]
+            fused = [base.index_copy(0, miss_idx, fm.to(dtype=dtype))
+                     for base, fm in zip(fused, fused_miss)]
+        out = self._decode(fused, target_size)
+        out['pet_available'] = state.detach().cpu()
+        out['num_full'] = num_full
+        out['num_missing'] = num_missing
+        if self.inc_missing_policy == 'zero' and num_missing > 0:
+            out['zero_increment_ablation'] = True
+        return out
+
     def _fuse_features(self, ct_feats, pet_feats, state):
+        if self.asym_fusion_enabled and self.fusion_version == 'inc':
+            return self._fuse_features_inc(ct_feats, pet_feats, state)
         """Unified fusion entry.
 
         Baseline (asym off): AddFusion ignores the third argument exactly.
@@ -157,6 +278,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
                 for c, f in zip(ct_feats, fused_full)]
 
     def _forward_full(self, ct, pet, target_size):
+        if self.asym_fusion_enabled and self.fusion_version == 'inc':
+            return self._forward_full_inc(ct, pet, target_size)
         ct_feats = self._encode_ct(ct)
         pet_feats = self._encode_pet(pet)
         state = torch.ones(ct.shape[0], dtype=torch.long, device=ct.device)
@@ -164,6 +287,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return self._decode(fused_feats, target_size)
 
     def _forward_missing(self, ct, pet, target_size):
+        if self.asym_fusion_enabled and self.fusion_version == 'inc':
+            return self._forward_missing_inc(ct, pet, target_size)
         # Preserve the baseline contract: real PET is still encoded, then the
         # Missing rows are zeroed before fusion (encode-then-zero). With the
         # asymmetric fusion enabled the all-Missing state bypasses the new
@@ -176,6 +301,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return self._decode(fused_feats, target_size)
 
     def _forward_auto(self, ct, pet, pet_available, target_size):
+        if self.asym_fusion_enabled and self.fusion_version == 'inc':
+            return self._forward_auto_inc(ct, pet, pet_available, target_size)
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
         # Strict validation on the RAW state: length-B 0/1 integers or bools.

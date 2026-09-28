@@ -88,6 +88,10 @@ def main():
     task.model.load_state_dict(state_dict, strict=True)
     task.model.eval()
 
+    is_inc = bool(getattr(task.model, 'asym_fusion_enabled', False)) and \
+        str(getattr(task.model, 'fusion_version', 'v1')) == 'inc'
+    inc_zero = is_inc and str(getattr(task.model, 'inc_missing_policy', 'error')) == 'zero'
+
     from datasets.pclt20k_seg import get_pclt20k_loaders_cipa_aligned
     _, _, test_loader = get_pclt20k_loaders_cipa_aligned(
         cfg.root,
@@ -110,6 +114,10 @@ def main():
     all_case_ids = sorted(set(all_case_ids))
 
     rates = [0.0, 0.25, 0.5, 0.75, 1.0]
+    if is_inc and not inc_zero:
+        # Stage 1 has no bank: only the Full (rate-0) operating point exists.
+        rates = [0.0]
+        print('[eval_joint_baseline] inc+error: only missing_rate=0 is valid (bank not connected)')
     results = []
     assignments = {}
     for rate in rates:
@@ -118,6 +126,7 @@ def main():
         out = _run_full_test(task, test_loader, case_mask)
         results.append({
             'missing_rate': rate,
+            'note': 'zero_increment_ablation' if inc_zero else '',
             'dice': out['dice'],
             'iou': out['iou'],
             'acc': out['acc'],

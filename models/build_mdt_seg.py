@@ -387,11 +387,27 @@ def build_mdt_seg_teacher(config, fusion_text_embeddings=None):
     asym_grid_cap = int(getattr(config, 'asym_grid_cap', 32))
     asym_pet_dims = tuple(getattr(config, 'asym_pet_dims', (64, 128, 160, 256)))
     asym_heads = int(getattr(config, 'asym_heads', 4))
+    fusion_version = str(getattr(config, 'fusion_version', 'v1'))
+    inc_region_grids = tuple(getattr(config, 'inc_region_grids', (16, 16, 16, 16)))
+    inc_num_points = int(getattr(config, 'inc_num_points', 4))
+    inc_offset_radius = float(getattr(config, 'inc_offset_radius', 0.5))
+    inc_query_chunk_size = int(getattr(config, 'inc_query_chunk_size', 512))
+    inc_checkpoint_attention = bool(getattr(config, 'inc_checkpoint_attention', True))
+    inc_missing_policy = str(getattr(config, 'inc_missing_policy', 'error'))
+    if fusion_version == 'inc' and model_type == 'ct_pet_add':
+        raise ValueError("fusion_version='inc' requires model_type='dual_shared'; "
+                         'the ct_pet_add model has no increment-fusion slot.')
     text_encoder = str(getattr(config, 'text_encoder', 'clip'))
     text_encoder_path = str(getattr(config, 'text_encoder_path', '') or '')
     text_encoder_vocab = str(getattr(config, 'text_encoder_vocab', '') or '')
     text_dim = 512
-    if asym_enabled and asym_use_text and fusion_text_embeddings is None:
+    # The increment module owns no text path: skip the text-encoder load
+    # entirely (no CLIP/transformers import) and force text off for this build.
+    effective_use_text = asym_use_text
+    if asym_enabled and fusion_version == 'inc':
+        effective_use_text = False
+        print('[inc] text disabled by design (no text encoder loaded)', flush=True)
+    if asym_enabled and effective_use_text and fusion_text_embeddings is None:
         from models.text_encoders import load_text_embeddings
         fusion_text_embeddings, text_dim = load_text_embeddings(
             text_encoder,
@@ -410,7 +426,7 @@ def build_mdt_seg_teacher(config, fusion_text_embeddings=None):
         decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
         use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
         asym_fusion_enabled=asym_enabled,
-        asym_use_text=asym_use_text,
+        asym_use_text=effective_use_text,
         asym_clip_path=asym_clip_path,
         asym_checkpoint_attention=asym_checkpoint_attention,
         asym_grid_cap=asym_grid_cap,
@@ -422,6 +438,12 @@ def build_mdt_seg_teacher(config, fusion_text_embeddings=None):
         text_dim=int(text_dim),
         text_encoder=str(text_encoder),
         pgf_residual=bool(getattr(config, 'pgf_residual', True)),
+        inc_region_grids=inc_region_grids,
+        inc_num_points=inc_num_points,
+        inc_offset_radius=inc_offset_radius,
+        inc_query_chunk_size=inc_query_chunk_size,
+        inc_checkpoint_attention=inc_checkpoint_attention,
+        inc_missing_policy=inc_missing_policy,
     )
     fusion_name = type(model.fusion).__name__
     print(
@@ -431,13 +453,20 @@ def build_mdt_seg_teacher(config, fusion_text_embeddings=None):
         f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
     )
     print(
-        f'[fusion] enabled={asym_enabled} use_text={asym_use_text} '
-        f'clip_path={asym_clip_path if (asym_enabled and asym_use_text and fusion_text_embeddings is None) else ("injected" if (asym_enabled and asym_use_text) else "n/a")} '
+        f'[fusion] enabled={asym_enabled} use_text={effective_use_text} '
+        f'clip_path={asym_clip_path if (asym_enabled and effective_use_text and fusion_text_embeddings is None) else ("injected" if (asym_enabled and effective_use_text) else "n/a")} '
         f'fusion_type={fusion_name}'
     )
     if asym_enabled:
         pet_channels = list(model.enc_pet.feature_info.channels())
         print(f'[fusion] channels={pet_channels} pet_dims={list(asym_pet_dims)} heads={asym_heads} grid_cap={asym_grid_cap} checkpoint_attention={asym_checkpoint_attention}')
         print(f'[fusion] trainable_params={sum(p.numel() for p in model.fusion.parameters() if p.requires_grad)}')
+        if fusion_version == 'inc':
+            extra = model.fusion.get_extra_state()
+            print(f'[inc] inner_channels={list(extra["inner_channels"])} region_grids={list(extra["region_grids"])} '
+                  f'num_points={extra["num_points"]} heads={extra["num_heads"]} '
+                  f'offset_radius={extra["offset_radius"]} query_chunk={model.fusion.stages[0].query_chunk_size} '
+                  f'checkpoint_attention={model.fusion.stages[0].checkpoint_attention} '
+                  f'missing_policy={model.inc_missing_policy} params={sum(p.numel() for p in model.fusion.parameters())}')
     print(f'[INFO] train_batch_mode={getattr(config, "train_batch_mode", "alternating")} ema_enabled={bool(getattr(config, "ema_enabled", False))} ema_start_epoch={int(getattr(config, "ema_start_epoch", 0))}', flush=True)
     return {'model': model}

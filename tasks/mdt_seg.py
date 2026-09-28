@@ -191,12 +191,24 @@ class MDTSegTeacher:
             params_align = list(self.model.ct_align.parameters())
             params_dec = list(self.model.decoder.parameters())
             outputs_full = self.model(ct, pet=pet, forward_mode='full')
-            outputs_missing = self.model(ct, pet=pet, forward_mode='missing')
+            is_inc = bool(getattr(self.model, 'asym_fusion_enabled', False)) and \
+                str(getattr(self.model, 'fusion_version', 'v1')) == 'inc'
             logits_full = outputs_full['logits'] if isinstance(outputs_full, dict) else outputs_full
-            logits_missing = outputs_missing['logits'] if isinstance(outputs_missing, dict) else outputs_missing
             loss_full, _ = self.criterion(logits_full.float(), mask.float())
-            loss_missing, _ = self.criterion(logits_missing.float(), mask.float())
+            if is_inc:
+                # No bank is connected in stage 1: only Full diagnostics exist.
+                print('[diagnostics] inc model: Missing path unavailable (bank not connected); '
+                      'reporting Full-only gradient norms', flush=True)
             g_full_shared = torch.autograd.grad(loss_full, params_shared, retain_graph=True, allow_unused=True)
+            if is_inc:
+                full_vec = _flatten_grads(g_full_shared)
+                return {
+                    'full_shared_grad_norm': float(full_vec.norm()),
+                    'missing_unavailable_bank_not_connected': 1.0,
+                }
+            outputs_missing = self.model(ct, pet=pet, forward_mode='missing')
+            logits_missing = outputs_missing['logits'] if isinstance(outputs_missing, dict) else outputs_missing
+            loss_missing, _ = self.criterion(logits_missing.float(), mask.float())
             g_missing_shared = torch.autograd.grad(loss_missing, params_shared, retain_graph=True, allow_unused=True)
             g_full_ct = torch.autograd.grad(loss_full, params_ct, retain_graph=True, allow_unused=True)
             g_missing_ct = torch.autograd.grad(loss_missing, params_ct, retain_graph=True, allow_unused=True)
