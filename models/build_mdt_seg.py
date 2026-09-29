@@ -353,31 +353,6 @@ def build_mdt_seg_teacher(config):
     from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
     if bool(getattr(config, 'mffa_enabled', False)):
         raise RuntimeError('mffa_enabled is not supported on the Full-baseline branch.')
-    model_type = str(getattr(config, 'model_type', 'dual_shared'))
-    if model_type == 'ct_pet_add':
-        from models.ct_pet_add_baseline import CTPETAddBaseline
-        model = CTPETAddBaseline(
-            ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
-            pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
-            ct_pretrained_path=getattr(config, 'ct_pretrained_path', None),
-            pet_pretrained_path=getattr(config, 'pet_pretrained_path', None),
-            in_channels=3,
-            out_channels=1,
-            decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
-            use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
-            decoder_norm=str(getattr(config, 'decoder_norm', 'bn')),
-        )
-        print(
-            f'[ct_pet_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
-            f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-            f'fusion=per-scale-add shared_decoder=UNetStyleDecoder '
-            f'norm={model.decoder_norm}'
-        )
-        print(f'[fusion] fusion_type=CTPETAddBaseline params_total={sum(p.numel() for p in model.parameters())}')
-        print(f'[INFO] train_batch_mode={getattr(config, "train_batch_mode", "alternating")} ema_enabled={bool(getattr(config, "ema_enabled", False))} ema_start_epoch={int(getattr(config, "ema_start_epoch", 0))}', flush=True)
-        return {'model': model}
-    if model_type != 'dual_shared':
-        raise ValueError(f'Unsupported model_type={model_type!r}')
     model = DualSharedAddPETCTBaseline(
         ct_backbone=getattr(config, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(config, 'pet_backbone', 'mit_b1'),
