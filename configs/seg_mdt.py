@@ -51,7 +51,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--ema_start_epoch', type=int, default=3)
         p.add_argument('--ema_decay_warmup', type=str2bool, default=True)
         p.add_argument('--grad_clip', type=float, default=5.0)
-        p.add_argument('--early_stop_patience', type=int, default=10)
+        p.add_argument('--early_stop_patience', type=int, default=5)
         p.add_argument('--random_state', type=int, default=2023)
         return p
 

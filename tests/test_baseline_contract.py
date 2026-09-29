@@ -118,7 +118,7 @@ def test_full_logits_depend_on_pet_content():
 def test_checkpoint_save_and_eval_config_contract(tmp_path):
     task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline()}, _make_cfg())
     path = tmp_path / 'ckpt.pth.tar'
-    task.save_checkpoint(str(path), 1, best_joint=0.1, best_full=0.2, best_joint_epoch=1, val_full={'dice': 0.2}, joint_dice=0.25)
+    task.save_checkpoint(str(path), 1, best=0.1, best_epoch=1, val={'dice': 0.2}, dice=0.25)
     ckpt = torch.load(path, map_location='cpu')
     saved_config = dict(ckpt['config'])
     saved_config.pop('checkpoint_dir', None)

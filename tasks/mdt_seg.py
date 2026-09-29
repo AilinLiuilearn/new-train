@@ -146,7 +146,7 @@ class MDTSegTeacher:
                 m.track_running_stats = state
             self.model.train(was_training)
 
-    def save_checkpoint(self, path, epoch, best_joint=None, best_full=None, best_joint_epoch=None, val_full=None, joint_dice=None):
+    def save_checkpoint(self, path, epoch, best=None, best_epoch=None, val=None, dice=None):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         payload = {
             'epoch': epoch,
@@ -158,11 +158,10 @@ class MDTSegTeacher:
             'optimizer': self.optimizer.state_dict(),
             'scheduler': None if self.scheduler is None else self.scheduler.state_dict(),
             'scaler': self.scaler.state_dict(),
-            'best_joint': best_joint,
-            'best_full': best_full,
-            'best_joint_epoch': best_joint_epoch,
-            'val_full': val_full,
-            'joint_dice': joint_dice,
+            'best': best,
+            'best_epoch': best_epoch,
+            'val': val,
+            'dice': dice,
             'random_state': getattr(self.config, 'random_state', None),
             'seed': getattr(self.config, 'random_state', None),
             'config': vars(self.config),

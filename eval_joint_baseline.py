@@ -48,7 +48,7 @@ def main():
     p.add_argument('--use_ema', type=str2bool, default=False)
     args = p.parse_args()
 
-    ckpt = torch.load(os.path.join(args.checkpoint_dir, 'ckpt.best_joint.pth.tar'), map_location='cpu')
+    ckpt = torch.load(os.path.join(args.checkpoint_dir, 'ckpt.best.pth.tar'), map_location='cpu')
     saved_config = dict(ckpt['config'])
     saved_config.pop('checkpoint_dir', None)
     saved_config['root'] = args.root

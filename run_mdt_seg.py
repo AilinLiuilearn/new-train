@@ -67,10 +67,45 @@ def _optimizer_step_succeeded(task):
     return bool(after >= before)
 
 
+def _run_final_test(cfg, paths, task, test_loader):
+    """Evaluate the best checkpoint on the held-out test split once."""
+    best_path = paths['best'] if os.path.exists(paths['best']) else paths['last']
+    ckpt = torch.load(best_path, map_location='cpu')
+    use_ema = bool(task.ema_active) and ckpt.get('model_ema') is not None
+    state_dict = ckpt['model_ema'] if use_ema else ckpt['model']
+    model = build_mdt_seg_teacher(cfg)['model'].to(task.device)
+    model.load_state_dict(state_dict, strict=True)
+    out = task.evaluate(test_loader, tag='test', model=model)
+    result = {
+        'checkpoint': os.path.basename(best_path),
+        'weights': 'ema' if use_ema else 'raw',
+        'best_val_dice': ckpt.get('dice'),
+        'best_epoch': ckpt.get('best_epoch'),
+        'test_loss': out['total_loss'],
+        'test_dice': out['dice'],
+        'test_iou': out['iou'],
+        'test_acc': out['acc'],
+        'test_acc_pixel': out.get('acc_pixel', 0.0),
+        'test_hd95': out['hd95'],
+    }
+    with open(os.path.join(cfg.checkpoint_dir, 'final_test_metrics.json'), 'w') as f:
+        json.dump(result, f, indent=2)
+    print(f"[FINAL TEST] weights={result['weights']} dice={result['test_dice']:.4f} "
+          f"iou={result['test_iou']:.4f} hd95={result['test_hd95']:.4f}", flush=True)
+    return result
+    if not task.scaler.is_enabled():
+        task.optimizer.step()
+        return True
+    before = task.scaler.get_scale()
+    task.scaler.step(task.optimizer)
+    task.scaler.update()
+    after = task.scaler.get_scale()
+    return bool(after >= before)
+
+
 def _checkpoint_paths(checkpoint_dir):
     return {
-        'best_joint': os.path.join(checkpoint_dir, 'ckpt.best_joint.pth.tar'),
-        'best_full': os.path.join(checkpoint_dir, 'ckpt.best_full.pth.tar'),
+        'best': os.path.join(checkpoint_dir, 'ckpt.best.pth.tar'),
         'last': os.path.join(checkpoint_dir, 'ckpt.last.pth.tar'),
     }
 
@@ -90,7 +125,7 @@ def main():
     with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
         json.dump(vars(cfg), f, indent=2, default=str)
 
-    train_loader, val_loader, _ = _loaders(cfg)
+    train_loader, val_loader, test_loader = _loaders(cfg)
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)}', flush=True)
 
     task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
@@ -116,17 +151,16 @@ def main():
 
     extra_headers = [
         'train_full_loss', 'full_train_batches',
-        'val_full_loss', 'val_full_dice', 'val_full_iou', 'val_full_acc', 'val_full_acc_pixel', 'val_full_hd95',
-        'joint_dice', 'best_joint', 'best_joint_epoch',
+        'val_loss', 'val_dice', 'val_iou', 'val_acc', 'val_acc_pixel', 'val_hd95',
+        'best', 'best_epoch',
         'grad_full_enc_ct', 'grad_full_ct_align', 'grad_full_decoder',
         'ema_enabled', 'ema_updates', 'skipped_updates',
         'epoch_time',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'), extra_headers=extra_headers)
 
-    best_joint = -1.0
-    best_full = -1.0
-    best_joint_epoch = 0
+    best = -1.0
+    best_epoch = 0
     global_batch_step = 0
     amp_enabled = bool(cfg.mixed_precision)
     patience = int(getattr(cfg, 'early_stop_patience', 10))
@@ -191,33 +225,29 @@ def main():
         if getattr(cfg, 'enable_gradient_diagnostics', False) and fixed_diag_batch is not None and epoch % int(cfg.gradient_diagnostics_interval) == 0:
             diag_stats = task.gradient_diagnostics(fixed_diag_batch, max_samples=min(1, int(cfg.gradient_diagnostics_num_samples))) or {}
 
-        val_full = task.evaluate(val_loader, tag='val_full', model=task.eval_model())
-        joint_dice = float(val_full['dice'])
+        val = task.evaluate(val_loader, tag='val', model=task.eval_model())
+        dice = float(val['dice'])
 
-        joint_improved = joint_dice > best_joint
-        full_improved = val_full['dice'] > best_full
-        if joint_improved:
-            best_joint = joint_dice
-            best_joint_epoch = epoch
+        if dice > best:
+            best = dice
+            best_epoch = epoch
             no_improve = 0
+            improved = True
         else:
             no_improve += 1
-        if full_improved:
-            best_full = val_full['dice']
+            improved = False
 
-        if joint_improved:
-            task.save_checkpoint(paths['best_joint'], epoch, best_joint, best_full, best_joint_epoch, val_full, joint_dice)
-        if full_improved:
-            task.save_checkpoint(paths['best_full'], epoch, best_joint, best_full, best_joint_epoch, val_full, joint_dice)
-        task.save_checkpoint(paths['last'], epoch, best_joint, best_full, best_joint_epoch, val_full, joint_dice)
+        if improved:
+            task.save_checkpoint(paths['best'], epoch, best, best_epoch, val, dice)
+        task.save_checkpoint(paths['last'], epoch, best, best_epoch, val, dice)
 
         train_loss = full_loss_sum / max(1, full_n)
-        val_loss = val_full['total_loss']
-        val_dice = val_full['dice']
-        val_iou = val_full['iou']
-        val_acc = val_full['acc']
-        val_acc_pixel = val_full.get('acc_pixel', 0.0)
-        val_hd95 = val_full['hd95']
+        val_loss = val['total_loss']
+        val_dice = val['dice']
+        val_iou = val['iou']
+        val_acc = val['acc']
+        val_acc_pixel = val.get('acc_pixel', 0.0)
+        val_hd95 = val['hd95']
         avg_grad_norm = grad_norm_accum / max(1, grad_norm_steps)
         extra = {
             'train_full_loss': train_loss,
@@ -240,23 +270,23 @@ def main():
             grad_norm=avg_grad_norm,
             extra_metrics={
                 **extra,
-                'val_full_loss': val_full['total_loss'],
-                'val_full_dice': val_full['dice'],
-                'val_full_iou': val_full['iou'],
-                'val_full_acc': val_full['acc'],
-                'val_full_acc_pixel': val_full.get('acc_pixel', 0.0),
-                'val_full_hd95': val_full['hd95'],
-                'joint_dice': joint_dice,
-                'best_joint': best_joint,
-                'best_joint_epoch': best_joint_epoch,
+                'val_loss': val['total_loss'],
+                'val_dice': val['dice'],
+                'val_iou': val['iou'],
+                'val_acc': val['acc'],
+                'val_acc_pixel': val.get('acc_pixel', 0.0),
+                'val_hd95': val['hd95'],
+                'best': best,
+                'best_epoch': best_epoch,
             },
         )
 
-        print(f'[EPOCH {epoch}] full_dice={val_full["dice"]:.4f} best_full={best_full:.4f} lr={task.optimizer.param_groups[0]["lr"]:.8f}', flush=True)
+        print(f'[EPOCH {epoch}] full_dice={val["dice"]:.4f} best={best:.4f} lr={task.optimizer.param_groups[0]["lr"]:.8f}', flush=True)
         if no_improve >= patience:
             print(f'[EARLY STOP] no improvement for {patience} epochs', flush=True)
             break
 
+    _run_final_test(cfg, paths, task, test_loader)
     print('done', flush=True)
 
 
