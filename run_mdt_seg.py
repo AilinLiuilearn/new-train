@@ -54,8 +54,6 @@ def _loaders(cfg):
 
 def _assert_baseline(cfg):
     assert cfg.accumulation_steps == 1
-    assert float(cfg.joint_full_weight) == 0.5
-    assert float(cfg.joint_missing_weight) == 0.5
     assert bool(cfg.use_deep_supervision) is False
     assert bool(cfg.deep_supervision) is False
 

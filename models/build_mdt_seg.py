@@ -362,7 +362,6 @@ def build_mdt_seg_teacher(config):
         out_channels=1,
         decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
         use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
-        decoder_norm=str(getattr(config, 'decoder_norm', 'bn')),
     )
     fusion_name = type(model.fusion).__name__
     print(
