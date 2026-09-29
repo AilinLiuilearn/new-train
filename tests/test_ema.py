@@ -9,7 +9,7 @@ from tasks.mdt_seg import MDTSegTeacher
 
 def _cfg(**over):
     base = dict(learning_rate=1e-4, weight_decay=1e-4, mixed_precision=False,
-                loss_smooth=1.0, bce_weight=1.0, dice_weight=1.0, random_state=2023,
+                random_state=2023,
                 ema_enabled=True, ema_decay=0.9, ema_decay_warmup=False, ema_start_epoch=0)
     base.update(over)
     return type('C', (), base)()

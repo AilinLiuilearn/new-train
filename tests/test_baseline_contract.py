@@ -16,9 +16,6 @@ def _make_cfg(**kwargs):
         'learning_rate': 1e-4,
         'weight_decay': 1e-4,
         'mixed_precision': False,
-        'loss_smooth': 1.0,
-        'bce_weight': 1.0,
-        'dice_weight': 1.0,
         'random_state': 2023,
     }
     base.update(kwargs)
@@ -26,12 +23,13 @@ def _make_cfg(**kwargs):
 
 
 def test_model_imports():
-    model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
-    assert model.decoder.use_deep_supervision is False
+    model = DualSharedAddPETCTBaseline()
+    assert not hasattr(model.decoder, 'use_deep_supervision')
+    assert not any(n.startswith('aux_head') for n, _ in model.decoder.named_parameters())
 
 
 def test_forward_full_shapes():
-    model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
+    model = DualSharedAddPETCTBaseline()
     ct = torch.randn(2, 1, 64, 64)
     pet = torch.randn(2, 1, 64, 64)
     out = model(ct, pet)
@@ -49,7 +47,7 @@ def test_bce_dice_loss_unpack():
 
 
 def test_task_train_step_unpacks_logits():
-    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(use_deep_supervision=False)}, _make_cfg())
+    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline()}, _make_cfg())
     batch = {'ct': torch.randn(1, 1, 64, 64), 'pet': torch.randn(1, 1, 64, 64), 'mask': torch.zeros(1, 1, 64, 64)}
     loss, logits, outputs, stats = task.train_step(batch)
     assert torch.is_tensor(loss)
@@ -59,7 +57,7 @@ def test_task_train_step_unpacks_logits():
 
 
 def test_build_teacher():
-    cfg = _make_cfg(ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False, deep_supervision=False)
+    cfg = _make_cfg(ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, decoder_channels=(512, 256, 128, 64))
     out = build_mdt_seg_teacher(cfg)
     assert 'model' in out
 
@@ -89,7 +87,7 @@ def test_module_grad_norm_preserves_grad_and_value():
 
 
 def test_full_path_encodes_both_modalities(monkeypatch):
-    model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
+    model = DualSharedAddPETCTBaseline()
     calls = {'n': 0}
     orig = model.enc_pet.forward
 
@@ -108,7 +106,7 @@ def test_full_path_encodes_both_modalities(monkeypatch):
 
 
 def test_full_logits_depend_on_pet_content():
-    model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
+    model = DualSharedAddPETCTBaseline()
     model.eval()
     ct = torch.randn(1, 1, 64, 64)
     with torch.no_grad():
@@ -118,7 +116,7 @@ def test_full_logits_depend_on_pet_content():
 
 
 def test_checkpoint_save_and_eval_config_contract(tmp_path):
-    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(use_deep_supervision=False)}, _make_cfg())
+    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline()}, _make_cfg())
     path = tmp_path / 'ckpt.pth.tar'
     task.save_checkpoint(str(path), 1, best_joint=0.1, best_full=0.2, best_joint_epoch=1, val_full={'dice': 0.2}, joint_dice=0.25)
     ckpt = torch.load(path, map_location='cpu')

@@ -28,8 +28,6 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--ct_pretrained_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano')
         p.add_argument('--pet_pretrained_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1')
         p.add_argument('--decoder_channels', type=int, nargs=4, default=[512, 256, 128, 64])
-        p.add_argument('--use_deep_supervision', type=str2bool, default=False)
-        p.add_argument('--deep_supervision', type=str2bool, default=False)
         p.add_argument('--enable_gradient_diagnostics', type=str2bool, default=False)
         p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
@@ -60,9 +58,6 @@ class SegMDTConfig(ConfigBase):
     @staticmethod
     def task_specific_parser():
         p = argparse.ArgumentParser('Task', add_help=False)
-        p.add_argument('--loss_smooth', type=float, default=1.0)
-        p.add_argument('--bce_weight', type=float, default=1.0)
-        p.add_argument('--dice_weight', type=float, default=1.0)
         return p
 
     @classmethod

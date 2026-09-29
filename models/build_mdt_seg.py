@@ -361,14 +361,12 @@ def build_mdt_seg_teacher(config):
         in_channels=3,
         out_channels=1,
         decoder_channels=getattr(config, 'decoder_channels', (512, 256, 128, 64)),
-        use_deep_supervision=bool(getattr(config, 'use_deep_supervision', False) or getattr(config, 'deep_supervision', False)),
     )
     fusion_name = type(model.fusion).__name__
     print(
         f'[dual_shared_add_baseline] ct={getattr(config, "ct_backbone", "convnextv2_nano")} '
         f'pet={getattr(config, "pet_backbone", "mit_b1")} '
-        f'fusion={fusion_name} shared_decoder=UNetStyleDecoder '
-        f'deep_supervision={bool(getattr(config, "use_deep_supervision", False) or getattr(config, "deep_supervision", False))}'
+        f'fusion={fusion_name} shared_decoder=UNetStyleDecoder'
     )
     print(f'[fusion] fusion_type={fusion_name} '
           f'params_total={sum(p.numel() for p in model.parameters())}')

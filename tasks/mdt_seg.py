@@ -30,7 +30,7 @@ class MDTSegTeacher:
         self.scheduler = None
         self.scaler = torch.cuda.amp.GradScaler(enabled=bool(config.mixed_precision))
         self.global_batch_step = 0
-        self.criterion = BCEDiceLoss(smooth=config.loss_smooth, bce_weight=config.bce_weight, dice_weight=config.dice_weight)
+        self.criterion = BCEDiceLoss()
         self.metrics = SegmentationMetricsCIPA()
         self.ema = None
         self.ema_active = False
