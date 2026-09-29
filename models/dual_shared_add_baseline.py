@@ -22,12 +22,7 @@ class StageChannelAlign(nn.Module):
 
 class DualSharedAddPETCTBaseline(nn.Module):
     def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1', ct_pretrained_path=None, pet_pretrained_path=None, in_channels=3, out_channels=1, decoder_channels=(512, 256, 128, 64), use_deep_supervision=False,
-                 asym_fusion_enabled=False, asym_use_text=True, asym_clip_path='pretrained/clip-vit-base-patch32',
-                 asym_checkpoint_attention=False, asym_grid_cap=32, asym_pet_dims=(64, 128, 160, 256), asym_heads=4,
-                 fusion_text_embeddings=None, decoder_norm='bn', fusion_version='v1', text_dim=512,
-                 text_encoder='clip', pgf_residual=True,
-                 inc_region_grids=(16, 16, 16, 16), inc_num_points=4, inc_offset_radius=0.5,
-                 inc_query_chunk_size=512, inc_checkpoint_attention=True, inc_missing_policy='error'):
+                 decoder_norm='bn'):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
@@ -37,72 +32,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
         ct_channels = list(self.enc_ct.feature_info.channels())
         pet_channels = list(self.enc_pet.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, pet_channels)
-        # Keep the original construction order/state_dict identical when the
-        # asymmetric fusion is off: AddFusion (no parameters) and the shared
-        # decoder are created first, then the fusion is replaced. Swapping the
-        # fusion before the decoder would change RNG consumption and silently
-        # re-init the decoder.
         self.fusion = AddFusion()
         if decoder_norm not in ('bn', 'group'):
             raise ValueError(f'Unsupported decoder_norm={decoder_norm!r}')
         self.decoder_norm = decoder_norm
         self.decoder = UNetStyleDecoder(pet_channels, decoder_channels=decoder_channels, out_channels=out_channels, use_deep_supervision=self.use_deep_supervision, norm_type=decoder_norm)
-        self.asym_fusion_enabled = bool(asym_fusion_enabled)
-        if fusion_version not in ('v1', 'v2', 'pgf', 'inc'):
-            raise ValueError(f'Unsupported fusion_version={fusion_version!r}')
-        self.fusion_version = fusion_version
-        self.pgf_residual = bool(pgf_residual)
-        if inc_missing_policy not in ('error', 'zero'):
-            raise ValueError(f"Unsupported inc_missing_policy={inc_missing_policy!r}")
-        self.inc_missing_policy = inc_missing_policy
-        self._inc_cfg = dict(
-            region_grids=tuple(tuple(g) if isinstance(g, (list, tuple)) else g for g in inc_region_grids),
-            num_points=int(inc_num_points),
-            offset_radius=float(inc_offset_radius),
-            query_chunk_size=int(inc_query_chunk_size),
-            checkpoint_attention=bool(inc_checkpoint_attention),
-        )
-        if self.asym_fusion_enabled:
-            fusion_kwargs = dict(
-                clip_path=asym_clip_path if fusion_text_embeddings is None else None,
-                channels=tuple(pet_channels),
-                pet_dims=tuple(asym_pet_dims),
-                heads=int(asym_heads),
-                grid_cap=int(asym_grid_cap),
-                use_text=bool(asym_use_text),
-                text_embeddings=fusion_text_embeddings,
-                text_dim=int(text_dim),
-                checkpoint_attention=bool(asym_checkpoint_attention),
-            )
-            if fusion_version == 'v2':
-                from models.full_petct_asymmetric_fusion_v2 import FullPETCTAsymmetricFusionV2
-                self.fusion = FullPETCTAsymmetricFusionV2(text_encoder=str(text_encoder), **fusion_kwargs)
-            elif fusion_version == 'inc':
-                from models.petct_increment_fusion import PETCTIncrementFusion
-                self.fusion = PETCTIncrementFusion(
-                    channels=tuple(pet_channels),
-                    inner_channels=tuple(asym_pet_dims),
-                    num_heads=int(asym_heads),
-                    region_grids=self._inc_cfg['region_grids'],
-                    num_points=self._inc_cfg['num_points'],
-                    offset_radius=self._inc_cfg['offset_radius'],
-                    query_chunk_size=self._inc_cfg['query_chunk_size'],
-                    checkpoint_attention=self._inc_cfg['checkpoint_attention'],
-                )
-            elif fusion_version == 'pgf':
-                from models.petct_paired_global_fusion import PETCTPairedGlobalFusion
-                self.fusion = PETCTPairedGlobalFusion(
-                    channels=tuple(pet_channels),
-                    inner_channels=tuple(asym_pet_dims),
-                    num_heads=int(asym_heads),
-                    use_text=bool(asym_use_text),
-                    text_dim=int(text_dim),
-                    text_embeddings=fusion_text_embeddings,
-                    checkpoint_attention=bool(asym_checkpoint_attention),
-                )
-            else:
-                from models.full_petct_asymmetric_fusion import FullPETCTAsymmetricFusion
-                self.fusion = FullPETCTAsymmetricFusion(**fusion_kwargs)
 
     @staticmethod
     def _to_3ch(x):
@@ -127,159 +61,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
         out['aux'] = {}
         return out
 
-    def _require_inc(self):
-        if not (self.asym_fusion_enabled and self.fusion_version == 'inc'):
-            raise RuntimeError('inc routing used without fusion_version=inc')
-
-    @staticmethod
-    def _validate_state_tensor(state, batch, name='pet_available'):
-        raw = torch.as_tensor(state)
-        if raw.numel() != batch:
-            raise ValueError(f'{name} must contain one state per sample')
-        if raw.dtype == torch.bool:
-            return raw.long().view(-1)
-        if raw.dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
-            if not torch.all((raw == 0) | (raw == 1)):
-                raise ValueError(f'{name} values must be 0 or 1')
-            return raw.long().view(-1)
-        raise ValueError(f'{name} must be 0/1 integers or bools, no silent float truncation')
-
-    def _inc_fuse_full_subset(self, ct_feats, pet_feats):
-        """Call the increment module on an all-Full subset; no c+f anywhere."""
-        self._require_inc()
-        dtype = ct_feats[0].dtype
-        pet_feats = [p.to(dtype=dtype) if p.dtype != dtype else p for p in pet_feats]
-        fused = self.fusion(ct_feats, pet_feats, state='full')
-        return [f.to(dtype=dtype) if f.dtype != dtype else f for f in fused]
-
-    def _inc_fuse_ct_only_subset(self, ct_feats):
-        self._require_inc()
-        dtype = ct_feats[0].dtype
-        fused = self.fusion(ct_feats, state='ct_only')
-        return [f.to(dtype=dtype) if f.dtype != dtype else f for f in fused]
-
-    def _fuse_features_inc(self, ct_feats, pet_feats, state):
-        """inc dispatch for the unified entry: Full-only here, never legacy bypass."""
-        self._require_inc()
-        state = self._validate_state_tensor(state, ct_feats[0].shape[0], name='fusion state')
-        if int(state.eq(0).sum()) > 0:
-            raise ValueError('inc _fuse_features requires an all-Full state; route Missing '
-                             'through _forward_missing/_forward_auto (ct_only or bank).')
-        return self._inc_fuse_full_subset(ct_feats, pet_feats)
-
-    def _forward_full_inc(self, ct, pet, target_size):
-        self._require_inc()
-        ct_feats = self._encode_ct(ct)
-        pet_feats = self._encode_pet(pet)
-        return self._decode(self._inc_fuse_full_subset(ct_feats, pet_feats), target_size)
-
-    def _forward_missing_inc(self, ct, pet, target_size):
-        self._require_inc()
-        # Decided BEFORE any PET encoding: pet may be None here.
-        if self.inc_missing_policy == 'error':
-            raise RuntimeError('increment bank not connected; use full pretraining '
-                               'or explicit zero-increment ablation')
-        ct_feats = self._encode_ct(ct)
-        return self._decode(self._inc_fuse_ct_only_subset(ct_feats), target_size)
-
-    def _forward_auto_inc(self, ct, pet, pet_available, target_size):
-        self._require_inc()
-        batch = ct.shape[0]
-        state = self._validate_state_tensor(pet_available, batch)
-        num_full = int(state.eq(1).sum())
-        num_missing = batch - num_full
-        if num_missing > 0 and self.inc_missing_policy == 'error':
-            raise RuntimeError('increment bank not connected; use full pretraining '
-                               'or explicit zero-increment ablation')
-        device = ct.device
-        full_idx = state.eq(1).nonzero(as_tuple=True)[0].to(device)
-        miss_idx = state.eq(0).nonzero(as_tuple=True)[0].to(device)
-        ct_feats = self._encode_ct(ct)
-        dtype = ct_feats[0].dtype
-        if num_missing == 0:
-            pet_feats = self._encode_pet(pet)
-            fused = self._inc_fuse_full_subset(ct_feats, pet_feats)
-        elif num_full == 0:
-            # All-Missing + zero policy: CT encoder only, pet never touched.
-            fused = self._inc_fuse_ct_only_subset(ct_feats)
-        else:
-            # Mixed + zero policy: PET encoder sees Full rows only; Missing
-            # PET is never encoded (no encode-then-zero-mask for inc).
-            ct_full = [c.index_select(0, full_idx) for c in ct_feats]
-            ct_miss = [c.index_select(0, miss_idx) for c in ct_feats]
-            pet_full = self._encode_pet(pet.index_select(0, full_idx).contiguous())
-            fused_full = self._inc_fuse_full_subset(ct_full, pet_full)
-            fused_miss = self._inc_fuse_ct_only_subset(ct_miss)
-            fused = [c.index_copy(0, full_idx, f.to(dtype=dtype))
-                     for c, f in zip(ct_feats, fused_full)]
-            fused = [base.index_copy(0, miss_idx, fm.to(dtype=dtype))
-                     for base, fm in zip(fused, fused_miss)]
-        out = self._decode(fused, target_size)
-        out['pet_available'] = state.detach().cpu()
-        out['num_full'] = num_full
-        out['num_missing'] = num_missing
-        if self.inc_missing_policy == 'zero' and num_missing > 0:
-            out['zero_increment_ablation'] = True
-        return out
-
     def _fuse_features(self, ct_feats, pet_feats, state):
-        if self.asym_fusion_enabled and self.fusion_version == 'inc':
-            return self._fuse_features_inc(ct_feats, pet_feats, state)
-        """Unified fusion entry.
-
-        Baseline (asym off): AddFusion ignores the third argument exactly.
-        Asymmetric fusion (on): per-row routing. Full rows call the Full-only
-        module with ``state='full'``; Missing rows return the aligned-CT
-        features without entering the new module. Whole-batch decode once.
-        """
-        if not self.asym_fusion_enabled:
-            return self.fusion(ct_feats, pet_feats, state)
-        state = torch.as_tensor(state, device=ct_feats[0].device).view(-1)
-        if state.numel() != ct_feats[0].shape[0]:
-            raise ValueError('fusion state must contain one value per sample')
-        if state.dtype != torch.long:
-            if not torch.isfinite(state.float()).all():
-                raise ValueError('fusion state must be finite 0/1 values')
-            if not torch.all((state == 0) | (state == 1)):
-                raise ValueError('fusion state values must be 0 or 1')
-            state = state.long()
-        elif not torch.all((state == 0) | (state == 1)):
-            raise ValueError('fusion state values must be 0 or 1')
-        full_idx = state.eq(1).nonzero(as_tuple=True)[0]
-        if full_idx.numel() == 0:
-            return list(ct_feats)
-        batch = ct_feats[0].shape[0]
-        dtype = ct_feats[0].dtype
-        # AMP: the two heterogeneous backbones may emit different dtypes under
-        # autocast (e.g. CT fp16 vs PET fp32). Align PET to the CT dtype with a
-        # grad-preserving cast instead of rejecting the batch.
-        pet_feats = [p.to(dtype=dtype) if p.dtype != dtype else p for p in pet_feats]
-        for c, p in zip(ct_feats, pet_feats):
-            if tuple(c.shape) != tuple(p.shape):
-                raise ValueError('CT/PET feature shapes must match per scale; no implicit interpolation')
-            if c.shape[0] != batch:
-                raise ValueError('CT/PET features must share the batch size across scales')
-            if p.dtype != c.dtype or c.dtype != dtype:
-                raise ValueError('CT/PET features must share dtype across scales')
-            if p.device != c.device or c.device != ct_feats[0].device:
-                raise ValueError('CT/PET features must share device across scales')
-        ct_full = [c.index_select(0, full_idx) for c in ct_feats]
-        pet_full = [p.index_select(0, full_idx).to(dtype=c.dtype)
-                    for c, p in zip(ct_feats, pet_feats)]
-        fused_full = self.fusion(ct_full, pet_full, state='full')
-        if self.fusion_version == 'pgf' and self.pgf_residual:
-            # Stage-1 design decision: the paired module outputs an unbounded
-            # correction, so anchor it on CT (fused = ct + delta). Bank deltas
-            # are then exactly (fused - ct). Disable with pgf_residual=False
-            # to run the module author's raw output.
-            fused_full = [c + f.to(dtype=c.dtype) for c, f in zip(ct_full, fused_full)]
-        # AMP: fusion output may be fp16/bf16 while the CT base is fp32.
-        return [c.index_copy(0, full_idx, f.to(dtype=c.dtype))
-                for c, f in zip(ct_feats, fused_full)]
+        """Unified fusion entry: per-scale AddFusion of CT and PET."""
+        return self.fusion(ct_feats, pet_feats, state)
 
     def _forward_full(self, ct, pet, target_size):
-        if self.asym_fusion_enabled and self.fusion_version == 'inc':
-            return self._forward_full_inc(ct, pet, target_size)
         ct_feats = self._encode_ct(ct)
         pet_feats = self._encode_pet(pet)
         state = torch.ones(ct.shape[0], dtype=torch.long, device=ct.device)
@@ -287,12 +73,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return self._decode(fused_feats, target_size)
 
     def _forward_missing(self, ct, pet, target_size):
-        if self.asym_fusion_enabled and self.fusion_version == 'inc':
-            return self._forward_missing_inc(ct, pet, target_size)
         # Preserve the baseline contract: real PET is still encoded, then the
-        # Missing rows are zeroed before fusion (encode-then-zero). With the
-        # asymmetric fusion enabled the all-Missing state bypasses the new
-        # module and returns the CT identity, so the output equals CT exactly.
+        # Missing rows are zeroed before fusion (encode-then-zero).
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
         pet_feats_masked = [torch.zeros_like(feat) for feat in pet_feats_real]
@@ -301,8 +83,6 @@ class DualSharedAddPETCTBaseline(nn.Module):
         return self._decode(fused_feats, target_size)
 
     def _forward_auto(self, ct, pet, pet_available, target_size):
-        if self.asym_fusion_enabled and self.fusion_version == 'inc':
-            return self._forward_auto_inc(ct, pet, pet_available, target_size)
         ct_feats = self._encode_ct(ct)
         pet_feats_real = self._encode_pet(pet)
         # Strict validation on the RAW state: length-B 0/1 integers or bools.
