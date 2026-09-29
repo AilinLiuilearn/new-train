@@ -90,7 +90,7 @@ class UNetStyleDecoder(nn.Module):
 
 
 class AddFusion(nn.Module):
-    def forward(self, ct_feats, pet_feats, pet_available=None):
+    def forward(self, ct_feats, pet_feats):
         fused = []
         for ct_feat, pet_feat in zip(ct_feats, pet_feats):
             if pet_feat.shape[-2:] != ct_feat.shape[-2:]:

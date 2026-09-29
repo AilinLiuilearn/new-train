@@ -373,5 +373,5 @@ def build_mdt_seg_teacher(config):
     )
     print(f'[fusion] fusion_type={fusion_name} '
           f'params_total={sum(p.numel() for p in model.parameters())}')
-    print(f'[INFO] train_batch_mode={getattr(config, "train_batch_mode", "alternating")} ema_enabled={bool(getattr(config, "ema_enabled", False))} ema_start_epoch={int(getattr(config, "ema_start_epoch", 0))}', flush=True)
+    print(f'[INFO] ema_enabled={bool(getattr(config, "ema_enabled", False))} ema_start_epoch={int(getattr(config, "ema_start_epoch", 3))}', flush=True)
     return {'model': model}

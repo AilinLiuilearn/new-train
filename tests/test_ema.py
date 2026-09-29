@@ -74,14 +74,13 @@ def test_ema_eval_runs_and_checkpoint_roundtrips():
     task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None)},
                          _cfg(ema_enabled=True))
     batch = _batch()
-    state = torch.tensor([1, 1, 0, 0], dtype=torch.long)
     task.optimizer.zero_grad(set_to_none=True)
-    loss, _, _, _ = task.train_step_mixed(batch, pet_available=state)
+    loss, _, _, _ = task.train_step(batch)
     loss.backward()
     task.optimizer.step()
     task.update_ema()
 
-    metrics = task.evaluate([batch], eval_mode='full', model=task.eval_model())
+    metrics = task.evaluate([batch], model=task.eval_model())
     assert 0.0 <= metrics['dice'] <= 1.0
 
     import os

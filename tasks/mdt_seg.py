@@ -66,73 +66,21 @@ class MDTSegTeacher:
     def trainable_parameters(self):
         return [p for p in self.model.parameters() if p.requires_grad]
 
-    def train_step(self, batch, forward_mode='full'):
+    def train_step(self, batch):
         ct = batch['ct'].to(self.device, non_blocking=True)
         pet = batch['pet'].to(self.device, non_blocking=True)
         mask = batch['mask'].to(self.device, non_blocking=True).float()
-        outputs = self.model(ct, pet=pet, forward_mode=forward_mode)
+        outputs = self.model(ct, pet=pet)
         logits = outputs['logits'] if isinstance(outputs, dict) else outputs
         loss, loss_stats = self.criterion(logits, mask)
         stats = {
             'loss_total': loss.detach(),
             'loss_seg': loss_stats.get('loss_dice', loss.detach()),
-            'loss_boundary': torch.tensor(0.0, device=loss.device),
         }
         return loss, logits, outputs, stats
 
-    def train_step_mixed(self, batch, pet_available, missing_loss_weight=1.0):
-        ct = batch['ct'].to(self.device, non_blocking=True)
-        pet = batch['pet'].to(self.device, non_blocking=True)
-        mask = batch['mask'].to(self.device, non_blocking=True).float()
-        raw_state = torch.as_tensor(pet_available, device=ct.device)
-        if raw_state.numel() != ct.shape[0]:
-            raise ValueError(
-                f'pet_available must contain one state per sample: got {raw_state.numel()} for batch {ct.shape[0]}'
-            )
-        # Strict 0/1 integer-or-bool validation on the raw values first:
-        # .long() before validating would silently truncate 0.5 -> 0.
-        if raw_state.dtype == torch.bool:
-            state = raw_state.long().view(-1)
-        elif raw_state.dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
-            if not torch.all((raw_state == 0) | (raw_state == 1)):
-                raise ValueError('pet_available values must be 0 or 1')
-            state = raw_state.long().view(-1)
-        else:
-            raise ValueError('pet_available must be 0/1 integers or bools, no silent float truncation')
-        full_index = state.eq(1)
-        missing_index = state.eq(0)
-        num_full = int(full_index.sum())
-        num_missing = int(missing_index.sum())
-        if num_full == 0 or num_missing == 0:
-            raise ValueError(
-                f'mixed batch requires non-empty full and missing subsets: got full={num_full} missing={num_missing}'
-            )
-        outputs = self.model(ct, pet=pet, pet_available=state, forward_mode='auto')
-        logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-        full_loss, full_stats = self.criterion(logits[full_index], mask[full_index])
-        missing_loss, missing_stats = self.criterion(logits[missing_index], mask[missing_index])
-        missing_loss_weight = float(missing_loss_weight)
-        denom = 1.0 + missing_loss_weight
-        full_weight = 1.0 / denom
-        missing_weight = missing_loss_weight / denom
-        total_loss = full_weight * full_loss + missing_weight * missing_loss
-        stats = {
-            'loss_total': total_loss.detach(),
-            'loss_full': full_loss.detach(),
-            'loss_missing': missing_loss.detach(),
-            'num_full': num_full,
-            'num_missing': num_missing,
-            'full_weight': full_weight,
-            'missing_weight': missing_weight,
-            'full_bce': full_stats.get('loss_bce', full_loss.detach()).detach(),
-            'full_dice': full_stats.get('loss_dice', full_loss.detach()).detach(),
-            'missing_bce': missing_stats.get('loss_bce', missing_loss.detach()).detach(),
-            'missing_dice': missing_stats.get('loss_dice', missing_loss.detach()).detach(),
-        }
-        return total_loss, logits, outputs, stats
-
     @torch.no_grad()
-    def evaluate(self, loader, eval_mode='full', tag='val', model=None):
+    def evaluate(self, loader, tag='val', model=None):
         active = model if model is not None else self.model
         was_training = self.model.training
         active.eval()
@@ -143,23 +91,10 @@ class MDTSegTeacher:
         self.metrics.reset()
         for batch in loader:
             ct = batch['ct'].to(self.device, non_blocking=True)
+            pet = batch['pet'].to(self.device, non_blocking=True)
             mask = batch['mask'].to(self.device, non_blocking=True).float()
             batch_size = ct.shape[0]
-            if eval_mode == 'full':
-                pet = batch['pet'].to(self.device, non_blocking=True)
-                forward_mode = 'full'
-                pet_available = None
-            elif eval_mode == 'fixed_missing':
-                pet = batch['pet'].to(self.device, non_blocking=True)
-                forward_mode = 'missing'
-                pet_available = None
-            else:
-                pet = batch['pet'].to(self.device, non_blocking=True)
-                forward_mode = 'auto'
-                pet_available = batch.get('pet_available')
-                if pet_available is not None:
-                    pet_available = pet_available.to(self.device, non_blocking=True)
-            outputs = active(ct, pet=pet, pet_available=pet_available, forward_mode=forward_mode)
+            outputs = active(ct, pet=pet)
             logits = outputs['logits'] if isinstance(outputs, dict) else outputs
             loss, _ = self.criterion(logits, mask)
             self.metrics.update(logits, mask)
@@ -190,38 +125,20 @@ class MDTSegTeacher:
             params_ct = list(self.model.enc_ct.parameters())
             params_align = list(self.model.ct_align.parameters())
             params_dec = list(self.model.decoder.parameters())
-            outputs_full = self.model(ct, pet=pet, forward_mode='full')
+            outputs_full = self.model(ct, pet=pet)
             logits_full = outputs_full['logits'] if isinstance(outputs_full, dict) else outputs_full
             loss_full, _ = self.criterion(logits_full.float(), mask.float())
             g_full_shared = torch.autograd.grad(loss_full, params_shared, retain_graph=True, allow_unused=True)
-            outputs_missing = self.model(ct, pet=pet, forward_mode='missing')
-            logits_missing = outputs_missing['logits'] if isinstance(outputs_missing, dict) else outputs_missing
-            loss_missing, _ = self.criterion(logits_missing.float(), mask.float())
-            g_missing_shared = torch.autograd.grad(loss_missing, params_shared, retain_graph=True, allow_unused=True)
             g_full_ct = torch.autograd.grad(loss_full, params_ct, retain_graph=True, allow_unused=True)
-            g_missing_ct = torch.autograd.grad(loss_missing, params_ct, retain_graph=True, allow_unused=True)
             g_full_align = torch.autograd.grad(loss_full, params_align, retain_graph=True, allow_unused=True)
-            g_missing_align = torch.autograd.grad(loss_missing, params_align, retain_graph=True, allow_unused=True)
             g_full_dec = torch.autograd.grad(loss_full, params_dec, retain_graph=True, allow_unused=True)
-            g_missing_dec = torch.autograd.grad(loss_missing, params_dec, retain_graph=True, allow_unused=True)
-
-            def cos(a, b):
-                a = _flatten_grads(a)
-                b = _flatten_grads(b)
-                eps = 1e-8
-                return float(torch.dot(a, b) / (a.norm() * b.norm() + eps))
 
             full_vec = _flatten_grads(g_full_shared)
-            missing_vec = _flatten_grads(g_missing_shared)
             stats = {
-                'shared_grad_cosine_total': cos(g_full_shared, g_missing_shared),
-                'ct_encoder_grad_cosine': cos(g_full_ct, g_missing_ct),
-                'ct_alignment_grad_cosine': cos(g_full_align, g_missing_align),
-                'shared_decoder_grad_cosine': cos(g_full_dec, g_missing_dec),
                 'full_shared_grad_norm': float(full_vec.norm()),
-                'missing_shared_grad_norm': float(missing_vec.norm()),
-                'full_missing_grad_norm_ratio': float(full_vec.norm() / (missing_vec.norm() + 1e-8)),
-                'negative_parameter_tensor_ratio': float(np.mean([x < 0 for x in [cos(g_full_ct, g_missing_ct), cos(g_full_align, g_missing_align), cos(g_full_dec, g_missing_dec)]])),
+                'full_ct_grad_norm': float(_flatten_grads(g_full_ct).norm()),
+                'full_align_grad_norm': float(_flatten_grads(g_full_align).norm()),
+                'full_dec_grad_norm': float(_flatten_grads(g_full_dec).norm()),
             }
             return stats
         finally:
@@ -229,12 +146,12 @@ class MDTSegTeacher:
                 m.track_running_stats = state
             self.model.train(was_training)
 
-    def save_checkpoint(self, path, epoch, best_joint=None, best_full=None, best_missing=None, best_joint_epoch=None, val_full=None, val_missing=None, joint_dice=None):
+    def save_checkpoint(self, path, epoch, best_joint=None, best_full=None, best_joint_epoch=None, val_full=None, joint_dice=None):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         payload = {
             'epoch': epoch,
             'global_batch_step': self.global_batch_step,
-            'train_batch_mode': getattr(self.config, 'train_batch_mode', 'alternating'),
+            'train_batch_mode': 'full',
             'model': self.model.state_dict(),
             'model_ema': self.ema.state_dict() if self.ema is not None else None,
             'ema_updates': self.ema.updates if self.ema is not None else 0,
@@ -243,10 +160,8 @@ class MDTSegTeacher:
             'scaler': self.scaler.state_dict(),
             'best_joint': best_joint,
             'best_full': best_full,
-            'best_missing': best_missing,
             'best_joint_epoch': best_joint_epoch,
             'val_full': val_full,
-            'val_missing': val_missing,
             'joint_dice': joint_dice,
             'random_state': getattr(self.config, 'random_state', None),
             'seed': getattr(self.config, 'random_state', None),

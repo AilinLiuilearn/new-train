@@ -30,13 +30,13 @@ def test_model_imports():
     assert model.decoder.use_deep_supervision is False
 
 
-def test_forward_full_missing_shapes():
+def test_forward_full_shapes():
     model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
     ct = torch.randn(2, 1, 64, 64)
     pet = torch.randn(2, 1, 64, 64)
-    out_full = model(ct, pet, forward_mode='full')
-    out_missing = model(ct, pet, forward_mode='missing')
-    assert out_full['logits'].shape == out_missing['logits'].shape
+    out = model(ct, pet)
+    assert out['logits'].shape == (2, 1, 64, 64)
+    assert torch.isfinite(out['logits']).all()
 
 
 def test_bce_dice_loss_unpack():
@@ -51,7 +51,7 @@ def test_bce_dice_loss_unpack():
 def test_task_train_step_unpacks_logits():
     task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(use_deep_supervision=False)}, _make_cfg())
     batch = {'ct': torch.randn(1, 1, 64, 64), 'pet': torch.randn(1, 1, 64, 64), 'mask': torch.zeros(1, 1, 64, 64)}
-    loss, logits, outputs, stats = task.train_step(batch, forward_mode='full')
+    loss, logits, outputs, stats = task.train_step(batch)
     assert torch.is_tensor(loss)
     assert isinstance(outputs, dict)
     assert 'logits' in outputs
@@ -88,7 +88,7 @@ def test_module_grad_norm_preserves_grad_and_value():
         assert torch.allclose(b, a)
 
 
-def test_missing_path_encodes_pet_then_zeroes_features(monkeypatch):
+def test_full_path_encodes_both_modalities(monkeypatch):
     model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
     calls = {'n': 0}
     orig = model.enc_pet.forward
@@ -102,25 +102,25 @@ def test_missing_path_encodes_pet_then_zeroes_features(monkeypatch):
     pet = torch.randn(1, 1, 64, 64)
     model.eval()
     with torch.no_grad():
-        out = model(ct, pet, forward_mode='missing')
+        out = model(ct, pet)
     assert 'logits' in out
-    assert calls['n'] == 1, 'API-style contract requires PET encoding before fusion-time masking'
+    assert calls['n'] == 1, 'Full baseline must encode PET exactly once'
 
 
-def test_missing_logits_independent_of_pet_content():
+def test_full_logits_depend_on_pet_content():
     model = DualSharedAddPETCTBaseline(use_deep_supervision=False)
     model.eval()
     ct = torch.randn(1, 1, 64, 64)
     with torch.no_grad():
-        logits_a = model(ct, torch.randn(1, 1, 64, 64), forward_mode='missing')['logits']
-        logits_b = model(ct, torch.randn(1, 1, 64, 64), forward_mode='missing')['logits']
-    assert torch.allclose(logits_a, logits_b, atol=1e-5)
+        logits_a = model(ct, torch.randn(1, 1, 64, 64))['logits']
+        logits_b = model(ct, torch.randn(1, 1, 64, 64))['logits']
+    assert not torch.allclose(logits_a, logits_b, atol=1e-5)
 
 
 def test_checkpoint_save_and_eval_config_contract(tmp_path):
     task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(use_deep_supervision=False)}, _make_cfg())
     path = tmp_path / 'ckpt.pth.tar'
-    task.save_checkpoint(str(path), 1, best_joint=0.1, best_full=0.2, best_missing=0.3, best_joint_epoch=1, val_full={'dice': 0.2}, val_missing={'dice': 0.3}, joint_dice=0.25)
+    task.save_checkpoint(str(path), 1, best_joint=0.1, best_full=0.2, best_joint_epoch=1, val_full={'dice': 0.2}, joint_dice=0.25)
     ckpt = torch.load(path, map_location='cpu')
     saved_config = dict(ckpt['config'])
     saved_config.pop('checkpoint_dir', None)

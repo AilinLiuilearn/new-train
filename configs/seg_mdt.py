@@ -53,14 +53,11 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--mixed_precision', type=str2bool, default=True)
         p.add_argument('--ema_enabled', type=str2bool, default=False)
         p.add_argument('--ema_decay', type=float, default=0.999)
-        p.add_argument('--ema_start_epoch', type=int, default=0)
+        p.add_argument('--ema_start_epoch', type=int, default=3)
         p.add_argument('--ema_decay_warmup', type=str2bool, default=True)
         p.add_argument('--grad_clip', type=float, default=5.0)
         p.add_argument('--early_stop_patience', type=int, default=10)
         p.add_argument('--random_state', type=int, default=2023)
-        p.add_argument('--train_pet_drop_prob', type=float, default=0.0)
-        p.add_argument('--missing_loss_weight', type=float, default=1.0)
-        p.add_argument('--train_batch_mode', type=str, default='alternating', choices=('alternating', 'mixed', 'full'))
         return p
 
     @staticmethod
@@ -69,7 +66,6 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--loss_smooth', type=float, default=1.0)
         p.add_argument('--bce_weight', type=float, default=1.0)
         p.add_argument('--dice_weight', type=float, default=1.0)
-        p.add_argument('--boundary_loss_weight', type=float, default=0.0)
         return p
 
     @classmethod

@@ -61,63 +61,11 @@ class DualSharedAddPETCTBaseline(nn.Module):
         out['aux'] = {}
         return out
 
-    def _fuse_features(self, ct_feats, pet_feats, state):
-        """Unified fusion entry: per-scale AddFusion of CT and PET."""
-        return self.fusion(ct_feats, pet_feats, state)
-
-    def _forward_full(self, ct, pet, target_size):
-        ct_feats = self._encode_ct(ct)
-        pet_feats = self._encode_pet(pet)
-        state = torch.ones(ct.shape[0], dtype=torch.long, device=ct.device)
-        fused_feats = self._fuse_features(ct_feats, pet_feats, state)
-        return self._decode(fused_feats, target_size)
-
-    def _forward_missing(self, ct, pet, target_size):
-        # Preserve the baseline contract: real PET is still encoded, then the
-        # Missing rows are zeroed before fusion (encode-then-zero).
-        ct_feats = self._encode_ct(ct)
-        pet_feats_real = self._encode_pet(pet)
-        pet_feats_masked = [torch.zeros_like(feat) for feat in pet_feats_real]
-        state = torch.zeros(ct.shape[0], dtype=torch.long, device=ct.device)
-        fused_feats = self._fuse_features(ct_feats, pet_feats_masked, state)
-        return self._decode(fused_feats, target_size)
-
-    def _forward_auto(self, ct, pet, pet_available, target_size):
-        ct_feats = self._encode_ct(ct)
-        pet_feats_real = self._encode_pet(pet)
-        # Strict validation on the RAW state: length-B 0/1 integers or bools.
-        # Never .long() first: that would silently truncate 0.5 -> 0.
-        raw = torch.as_tensor(pet_available, device=ct.device)
-        if raw.numel() != ct.shape[0]:
-            raise ValueError('pet_available must contain one state per sample')
-        if raw.dtype == torch.bool:
-            pet_available = raw.long().view(-1)
-        elif raw.dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
-            if not torch.all((raw == 0) | (raw == 1)):
-                raise ValueError('pet_available values must be 0 or 1')
-            pet_available = raw.long().view(-1)
-        else:
-            raise ValueError('pet_available must be 0/1 integers or bools, no silent float truncation')
-        pet_feats_masked = []
-        for feat in pet_feats_real:
-            availability_mask = pet_available.to(device=feat.device, dtype=feat.dtype).view(-1, 1, 1, 1)
-            pet_feats_masked.append(feat * availability_mask)
-        fused_feats = self._fuse_features(ct_feats, pet_feats_masked, pet_available)
-        out = self._decode(fused_feats, target_size)
-        out['pet_available'] = pet_available.detach().cpu()
-        out['num_full'] = int(pet_available.eq(1).sum())
-        out['num_missing'] = int(pet_available.eq(0).sum())
-        return out
-
-    def forward(self, ct, pet, pet_available=None, target_size=None, forward_mode='auto'):
+    def forward(self, ct, pet, target_size=None):
+        """Full-modal forward only: CT+PET -> aligned -> per-scale add -> decode."""
         if target_size is None:
             target_size = ct.shape[-2:]
-        if forward_mode == 'full':
-            return self._forward_full(ct, pet, target_size)
-        if forward_mode == 'missing':
-            return self._forward_missing(ct, pet, target_size)
-        if forward_mode == 'auto':
-            if pet_available is None:
-                pet_available = torch.ones(ct.shape[0], device=ct.device, dtype=torch.long)
-            return self._forward_auto(ct, pet, pet_available, target_size)
-        raise ValueError(f'Unsupported forward_mode={forward_mode!r}')
+        ct_feats = self._encode_ct(ct)
+        pet_feats = self._encode_pet(pet)
+        fused_feats = self.fusion(ct_feats, pet_feats)
+        return self._decode(fused_feats, target_size)

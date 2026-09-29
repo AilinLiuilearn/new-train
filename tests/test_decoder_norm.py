@@ -3,8 +3,7 @@
 
 - Default (bn) keeps the baseline exactly: BatchNorm layers present, no new
   keys, strict state_dict compatibility with old checkpoints.
-- group replaces every decoder BatchNorm with per-sample GroupNorm, so Full
-  and Missing rows no longer couple through batch statistics.
+- group replaces every decoder BatchNorm with per-sample GroupNorm.
 """
 import torch
 
