@@ -1,143 +1,73 @@
 # -*- coding: utf-8 -*-
-import argparse
-import csv
-import json
-import os
-from collections import defaultdict
+"""Evaluate a saved checkpoint on the test set at all missing rates.
 
-import numpy as np
+  --mode dual     loads the dual model and routes per-sample state
+                  (Full and Missing come from the SAME checkpoint).
+  --mode ct_only  loads the CT-only model; results are PET-invariant.
+  --use_ema       evaluates the EMA weights instead of raw.
+
+Both experiments share the same seeded patient-level missing assignments,
+so their operating points are directly comparable. Output:
+  final_test_metrics.csv / .json + final_missing_case_assignments.json
+"""
+import argparse
+import os
+
 import torch
 
 from configs.seg_mdt import SegMDTConfig
 from configs.base import str2bool
-from models.build_mdt_seg import build_mdt_seg_teacher
+from models.build_mdt_seg import build_ct_only_model, build_dual_model
 from tasks.mdt_seg import MDTSegTeacher
-from utils.metrics_seg import SegmentationMetricsCIPA
-
-
-def _group_by_case(records):
-    grouped = defaultdict(list)
-    for r in records:
-        grouped[r['case_id']].append(r)
-    return grouped
-
-
-@torch.inference_mode()
-def _run_full_test(task, loader, case_mask):
-    metric = SegmentationMetricsCIPA()
-    total_loss = []
-    total_case_ids = set()
-    missing_case_ids = set()
-    slice_count = 0
-    for batch in loader:
-        ct = batch['ct'].to(task.device, non_blocking=True)
-        pet = batch['pet'].to(task.device, non_blocking=True)
-        mask = batch['mask'].to(task.device, non_blocking=True).float()
-        case_ids = list(batch['case_id'])
-        total_case_ids.update(case_ids)
-        pet_available = torch.tensor([0 if case_mask.get(cid, 1) else 1 for cid in case_ids], device=task.device, dtype=torch.long)
-        missing_case_ids.update([cid for cid in case_ids if case_mask.get(cid, 1) == 1])
-        outputs = task.model(ct, pet, pet_available=pet_available, forward_mode='auto')
-        logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-        loss, _ = task.criterion(logits, mask)
-        metric.update(logits, mask)
-        total_loss.append(float(loss))
-        slice_count += len(case_ids)
-    out = metric.compute()
-    out['loss'] = float(np.mean(total_loss)) if total_loss else 0.0
-    out['missing_case_count'] = len(missing_case_ids)
-    out['total_case_count'] = len(total_case_ids)
-    out['slice_count'] = slice_count
-    return out
-
-
-def _build_case_mask(case_ids, missing_rate, seed):
-    rng = np.random.default_rng(seed)
-    perm = list(rng.permutation(len(case_ids)))
-    cut = int(round(float(missing_rate) * len(case_ids)))
-    missing = {case_ids[idx] for idx in perm[:cut]}
-    return {cid: (1 if cid in missing else 0) for cid in case_ids}
+from utils.run_common import eval_missing_rates
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--checkpoint_dir', type=str, required=True)
+    p.add_argument('--checkpoint', type=str, required=True)
+    p.add_argument('--mode', type=str, required=True, choices=('dual', 'ct_only'))
     p.add_argument('--root', type=str, default='/root/autodl-tmp/data/PCLT20K')
     p.add_argument('--random_state', type=int, default=2023)
     p.add_argument('--use_ema', type=str2bool, default=False)
+    p.add_argument('--output_dir', type=str, default=None)
     args = p.parse_args()
 
-    ckpt = torch.load(os.path.join(args.checkpoint_dir, 'ckpt.best_joint.pth.tar'), map_location='cpu')
+    ckpt = MDTSegTeacher.load_state_dicts(args.checkpoint)
     saved_config = dict(ckpt['config'])
     saved_config.pop('checkpoint_dir', None)
     saved_config['root'] = args.root
     saved_config['random_state'] = args.random_state
     saved_config['ct_pretrained_path'] = None
     saved_config['pet_pretrained_path'] = None
+    saved_config['pretrained'] = False
     cfg = SegMDTConfig(args=saved_config)
 
-    task = MDTSegTeacher(build_mdt_seg_teacher(cfg), cfg)
+    ct_only = args.mode == 'ct_only'
+    builder = build_ct_only_model if ct_only else build_dual_model
+    task = MDTSegTeacher(builder(cfg), cfg)
     state_dict = ckpt['model']
     if args.use_ema:
         if ckpt.get('model_ema') is None:
             raise SystemExit('--use_ema requested but the checkpoint has no model_ema')
         state_dict = ckpt['model_ema']
-        print('[eval_joint_baseline] using EMA weights for evaluation')
+        print('[eval] using EMA weights for evaluation')
     else:
-        print('[eval_joint_baseline] using raw model weights for evaluation')
+        print('[eval] using raw model weights for evaluation')
     task.model.load_state_dict(state_dict, strict=True)
     task.model.eval()
 
     from datasets.pclt20k_seg import get_pclt20k_loaders_cipa_aligned
     _, _, test_loader = get_pclt20k_loaders_cipa_aligned(
-        cfg.root,
-        cfg.image_size_2d,
-        cfg.batch_size,
-        cfg.num_workers,
-        cfg.random_state,
-        cfg.pin_memory,
-        'none',
-        cfg.norm_mode,
-        cfg.train_split_file,
-        cfg.val_split_file,
-        cfg.test_split_file,
-        checkpoint_dir=cfg.checkpoint_dir,
+        cfg.root, cfg.image_size_2d, cfg.batch_size, cfg.num_workers,
+        cfg.random_state, cfg.pin_memory, 'none', cfg.norm_mode,
+        cfg.train_split_file, cfg.val_split_file, cfg.test_split_file,
+        checkpoint_dir=cfg.checkpoint_dir, ct_only=ct_only,
     )
-
-    all_case_ids = []
-    for batch in test_loader:
-        all_case_ids.extend(list(batch['case_id']))
-    all_case_ids = sorted(set(all_case_ids))
-
-    rates = [0.0, 0.25, 0.5, 0.75, 1.0]
-    results = []
-    assignments = {}
-    for rate in rates:
-        case_mask = _build_case_mask(all_case_ids, rate, int(args.random_state))
-        assignments[str(rate)] = case_mask
-        out = _run_full_test(task, test_loader, case_mask)
-        results.append({
-            'missing_rate': rate,
-            'dice': out['dice'],
-            'iou': out['iou'],
-            'acc': out['acc'],
-            'acc_pixel': out['acc_pixel'],
-            'hd95': out['hd95'],
-            'loss': out['loss'],
-            'missing_case_count': out['missing_case_count'],
-            'total_case_count': out['total_case_count'],
-            'slice_count': out['slice_count'],
-        })
-
-    csv_path = os.path.join(args.checkpoint_dir, 'final_test_metrics.csv')
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=list(results[0].keys()))
-        writer.writeheader()
-        writer.writerows(results)
-    with open(os.path.join(args.checkpoint_dir, 'final_test_metrics.json'), 'w') as f:
-        json.dump(results, f, indent=2)
-    with open(os.path.join(args.checkpoint_dir, 'final_missing_case_assignments.json'), 'w') as f:
-        json.dump(assignments, f, indent=2)
+    output_dir = args.output_dir or os.path.dirname(os.path.abspath(args.checkpoint))
+    weights_tag = 'ema' if args.use_ema else 'raw'
+    eval_missing_rates(task, task.model, test_loader, int(args.random_state),
+                       output_dir, 'final_test', weights_tag=weights_tag,
+                       ct_only=ct_only)
     print('done')
 
 

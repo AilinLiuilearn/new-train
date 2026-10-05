@@ -7,9 +7,8 @@ import pytest
 import torch
 
 from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
-from run_mdt_seg import build_balanced_pet_available
+from utils.run_common import build_balanced_pet_available
 from tasks.mdt_seg import MDTSegTeacher
-from utils.seg_losses import BCEDiceLoss
 
 
 def _make_cfg(**kwargs):
@@ -17,9 +16,6 @@ def _make_cfg(**kwargs):
         'learning_rate': 1e-4,
         'weight_decay': 1e-4,
         'mixed_precision': False,
-        'loss_smooth': 1.0,
-        'bce_weight': 1.0,
-        'dice_weight': 1.0,
         'random_state': 2023,
         'train_batch_mode': 'mixed',
     }
@@ -30,7 +26,7 @@ def _make_cfg(**kwargs):
 def _make_task(batch_size=16, size=64):
     torch.manual_seed(0)
     cfg = _make_cfg()
-    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(use_deep_supervision=False)}, cfg)
+    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(use_deep_supervision=False, ct_pretrained_path=None, pet_pretrained_path=None, pretrained=False)}, cfg)
     task.global_batch_step = 0
     return task
 
@@ -94,20 +90,19 @@ def test_mixed_loss_equals_half_full_plus_half_missing():
     task.model.eval()
     batch = _make_batch(16)
     state = build_balanced_pet_available(16, 3, 2023, task.device)
-    total, _, _, stats = task.train_step_mixed(batch, pet_available=state, missing_loss_weight=1.0)
+    total, _, _, stats = task.train_step_mixed(batch, pet_available=state)
     expected = 0.5 * stats['loss_full'] + 0.5 * stats['loss_missing']
     assert torch.allclose(stats['loss_total'], expected, atol=1e-6)
 
 
-def test_mixed_loss_respects_missing_loss_weight():
+def test_mixed_loss_is_fixed_half_half():
     task = _make_task()
     task.model.eval()
     batch = _make_batch(16)
     state = build_balanced_pet_available(16, 3, 2023, task.device)
-    _, _, _, stats = task.train_step_mixed(batch, pet_available=state, missing_loss_weight=3.0)
-    assert stats['full_weight'] == pytest.approx(0.25)
-    assert stats['missing_weight'] == pytest.approx(0.75)
-    expected = 0.25 * stats['loss_full'] + 0.75 * stats['loss_missing']
+    _, _, _, stats = task.train_step_mixed(batch, pet_available=state)
+    assert 'full_weight' not in stats and 'missing_weight' not in stats
+    expected = 0.5 * stats['loss_full'] + 0.5 * stats['loss_missing']
     assert torch.allclose(stats['loss_total'], expected, atol=1e-6)
 
 
@@ -255,30 +250,16 @@ def test_mixed_loop_single_optimizer_and_scheduler_step(monkeypatch):
     assert task.global_batch_step == 3
 
 
-def test_checkpoint_roundtrip_records_mode_and_step(tmp_path):
+def test_checkpoint_roundtrip_records_scores_and_step(tmp_path):
     task = _make_task()
     task.global_batch_step = 123
     path = str(tmp_path / 'ckpt.last.pth.tar')
-    task.save_checkpoint(path, 2, best_joint=0.1, best_full=0.2, best_missing=0.3, best_joint_epoch=1, val_full={'dice': 0.2}, val_missing={'dice': 0.3}, joint_dice=0.25)
+    task.save_checkpoint(path, 2, best=0.4, best_epoch=2, val={'joint_dice': 0.4})
     ckpt = torch.load(path, map_location='cpu')
-    assert ckpt['train_batch_mode'] == 'mixed'
+    assert ckpt['best'] == 0.4 and ckpt['best_epoch'] == 2
+    assert ckpt['val']['joint_dice'] == 0.4
     assert ckpt['global_batch_step'] == 123
-    task.global_batch_step = 0
-    torch.save(ckpt, path)
-    ckpt2 = torch.load(path, map_location='cpu')
-    task.global_batch_step = ckpt2['global_batch_step']
-    assert task.global_batch_step == 123
-
-
-def test_mixed_and_alternating_checkpoint_mode_recorded(tmp_path):
-    cfg = _make_cfg(train_batch_mode='alternating')
-    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(use_deep_supervision=False)}, cfg)
-    path = str(tmp_path / 'ckpt.alt.pth.tar')
-    task.save_checkpoint(path, 1)
-    ckpt = torch.load(path, map_location='cpu')
-    assert ckpt['train_batch_mode'] == 'alternating'
-
-
+    assert ckpt['eval_weights'] in ('raw', 'ema')
 def test_train_logger_header_order_and_strict_columns(tmp_path):
     from utils.train_logger import append_epoch_log, init_train_log
     log = str(tmp_path / 'train_log.csv')

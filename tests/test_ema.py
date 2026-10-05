@@ -9,7 +9,7 @@ from tasks.mdt_seg import MDTSegTeacher
 
 def _cfg(**over):
     base = dict(learning_rate=1e-4, weight_decay=1e-4, mixed_precision=False,
-                loss_smooth=1.0, bce_weight=1.0, dice_weight=1.0, random_state=2023,
+                random_state=2023,
                 ema_enabled=True, ema_decay=0.9, ema_decay_warmup=False, ema_start_epoch=0)
     base.update(over)
     return type('C', (), base)()
@@ -44,7 +44,7 @@ def test_ema_warmup_ramps_decay():
 
 
 def test_ema_disabled_teacher_has_no_ema():
-    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None)},
+    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None, pretrained=False)},
                          _cfg(ema_enabled=False))
     assert task.ema is None
     assert task.eval_model() is task.model
@@ -52,7 +52,7 @@ def test_ema_disabled_teacher_has_no_ema():
 
 def test_ema_enabled_teacher_uses_ema_for_eval():
     torch.manual_seed(0)
-    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None)},
+    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None, pretrained=False)},
                          _cfg(ema_enabled=True, ema_decay=0.9, ema_warmup=False))
     assert task.ema is not None
     assert task.eval_model() is task.ema.model
@@ -71,7 +71,7 @@ def test_ema_enabled_teacher_uses_ema_for_eval():
 
 def test_ema_eval_runs_and_checkpoint_roundtrips():
     torch.manual_seed(0)
-    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None)},
+    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None, pretrained=False)},
                          _cfg(ema_enabled=True))
     batch = _batch()
     state = torch.tensor([1, 1, 0, 0], dtype=torch.long)
@@ -92,14 +92,14 @@ def test_ema_eval_runs_and_checkpoint_roundtrips():
     assert ckpt['model_ema'] is not None
     assert ckpt['ema_updates'] >= 1
     # EMA weights load strictly back into a fresh model.
-    fresh = DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None)
+    fresh = DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None, pretrained=False)
     msg = fresh.load_state_dict(ckpt['model_ema'], strict=True)
     assert not msg.missing_keys and not msg.unexpected_keys
 
 
 def test_ema_start_epoch_delays_activation():
     torch.manual_seed(0)
-    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None)},
+    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None, pretrained=False)},
                          _cfg(ema_enabled=True, ema_start_epoch=3))
     assert task.ema is not None
     assert task.ema_active is False
@@ -127,7 +127,7 @@ def test_ema_warmup_epochs_do_not_pollute_ema():
     """After the delay the EMA is hard-synced, so it never blends the stale
     pre-warmup initialization into the average."""
     torch.manual_seed(0)
-    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None)},
+    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None, pretrained=False)},
                          _cfg(ema_enabled=True, ema_decay=0.9, ema_decay_warmup=False, ema_start_epoch=2))
     # Move the live weights a lot during warmup (EMA must ignore this).
     with torch.no_grad():
@@ -144,7 +144,7 @@ def test_ema_warmup_epochs_do_not_pollute_ema():
 
 def test_ema_params_frozen_and_outside_optimizer():
     torch.manual_seed(0)
-    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None)},
+    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None, pretrained=False)},
                          _cfg(ema_enabled=True, ema_decay_warmup=False))
     for p in task.ema.model.parameters():
         assert p.requires_grad is False
@@ -155,7 +155,7 @@ def test_ema_params_frozen_and_outside_optimizer():
 
 
 def test_optimizer_step_helper_success_and_overflow_skip():
-    from run_mdt_seg import _optimizer_step_succeeded
+    from utils.run_common import optimizer_step_succeeded as _optimizer_step_succeeded
 
     class _Scaler:
         def __init__(self, enabled, scales):

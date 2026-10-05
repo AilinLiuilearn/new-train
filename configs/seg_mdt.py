@@ -10,7 +10,7 @@ class SegMDTConfig(ConfigBase):
         p = argparse.ArgumentParser('Data', add_help=False)
         p.add_argument('--root', type=str, default='/root/autodl-tmp/data/PCLT20K')
         p.add_argument('--train_split_file', type=str, default='train_original.txt')
-        p.add_argument('--val_split_file', type=str, default='test.txt')
+        p.add_argument('--val_split_file', type=str, default='val.txt')
         p.add_argument('--test_split_file', type=str, default='test.txt')
         p.add_argument('--image_size_2d', type=int, default=512)
         p.add_argument('--num_workers', type=int, default=4)
@@ -22,16 +22,19 @@ class SegMDTConfig(ConfigBase):
     @staticmethod
     def model_parser():
         p = argparse.ArgumentParser('Model', add_help=False)
-        p.add_argument('--model_arch', type=str, default='dual_shared_add_baseline', choices=('dual_shared_add_baseline',))
+        p.add_argument('--model_arch', type=str, default='dual_shared_add_baseline',
+                       choices=('dual_shared_add_baseline',))
         p.add_argument('--ct_backbone', type=str, default='convnextv2_nano')
         p.add_argument('--pet_backbone', type=str, default='mit_b1')
-        p.add_argument('--ct_pretrained_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano')
-        p.add_argument('--pet_pretrained_path', type=str, default='/root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1')
+        p.add_argument('--ct_pretrained_path', type=str,
+                       default='/root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano')
+        p.add_argument('--pet_pretrained_path', type=str,
+                       default='/root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1')
         p.add_argument('--decoder_channels', type=int, nargs=4, default=[512, 256, 128, 64])
         p.add_argument('--use_deep_supervision', type=str2bool, default=False)
         p.add_argument('--deep_supervision', type=str2bool, default=False)
-        p.add_argument('--joint_full_weight', type=float, default=0.5)
-        p.add_argument('--joint_missing_weight', type=float, default=0.5)
+        p.add_argument('--pretrained', type=str2bool, default=True,
+                       help='Set False for smoke tests that opt out of pretrained weights.')
         p.add_argument('--enable_gradient_diagnostics', type=str2bool, default=False)
         p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
         p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
@@ -45,7 +48,6 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--accumulation_steps', type=int, default=1)
         p.add_argument('--optimizer', type=str, default='adamw', choices=('adamw', 'sgd'))
         p.add_argument('--learning_rate', type=float, default=8e-5)
-        p.add_argument('--decoder_lr', type=float, default=8e-5)
         p.add_argument('--weight_decay', type=float, default=1e-4)
         p.add_argument('--cosine_warmup', type=int, default=3)
         p.add_argument('--cosine_min_lr', type=float, default=1e-6)
@@ -57,30 +59,23 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--ema_decay_warmup', type=str2bool, default=True)
         p.add_argument('--grad_clip', type=float, default=5.0)
         p.add_argument('--early_stop_patience', type=int, default=10)
-        p.add_argument('--validation_frequency', type=int, default=1)
         p.add_argument('--random_state', type=int, default=2023)
-        p.add_argument('--final_test_missing_rates', type=float, nargs='+', default=[0.0, 0.25, 0.5, 0.75, 1.0])
-        p.add_argument('--train_pet_drop_prob', type=float, default=0.0)
-        p.add_argument('--missing_loss_weight', type=float, default=1.0)
-        p.add_argument('--train_batch_mode', type=str, default='alternating', choices=('alternating', 'mixed', 'full'))
-        p.add_argument('--vis_every_epoch', type=str2bool, default=False)
-        p.add_argument('--eval_full_pet', type=str2bool, default=True)
-        p.add_argument('--eval_fixed_missing_pet', type=str2bool, default=True)
-        p.add_argument('--eval_random_missing_pet', type=str2bool, default=False)
+        p.add_argument('--final_test_missing_rates', type=float, nargs='+',
+                       default=[0.0, 0.25, 0.5, 0.75, 1.0])
+        p.add_argument('--train_batch_mode', type=str, default='mixed',
+                       choices=('alternating', 'mixed', 'full'),
+                       help='Compat only: run_mdt_seg.py forwards mixed, rejects the rest.')
         return p
 
     @staticmethod
     def task_specific_parser():
         p = argparse.ArgumentParser('Task', add_help=False)
-        p.add_argument('--loss_smooth', type=float, default=1.0)
-        p.add_argument('--bce_weight', type=float, default=1.0)
-        p.add_argument('--dice_weight', type=float, default=1.0)
-        p.add_argument('--boundary_loss_weight', type=float, default=0.0)
         return p
 
     @classmethod
     def parse_arguments(cls):
-        parents = [cls.ddp_parser(), cls.data_parser(), cls.model_parser(), cls.train_parser(), cls.logging_parser(), cls.task_specific_parser()]
+        parents = [cls.ddp_parser(), cls.data_parser(), cls.model_parser(),
+                   cls.train_parser(), cls.logging_parser(), cls.task_specific_parser()]
         parser = argparse.ArgumentParser(add_help=True, parents=parents)
         config = cls()
         parser.parse_args(namespace=config)
