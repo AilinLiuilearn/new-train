@@ -7,9 +7,9 @@ No PET encoder is instantiated, no PET file is read, no fusion is used.
 import torch
 import torch.nn as nn
 
-from models.backbones import create_feature_backbone, load_local_weights_safe
-from models.channel_align import StageChannelAlign
-from models.group_unet_decoder import UNetStyleDecoder
+from models.components.backbones import create_feature_backbone, load_local_weights_safe
+from models.components.channel_align import StageChannelAlign
+from models.components.group_unet_decoder import UNetStyleDecoder
 
 
 DECODER_INPUT_CHANNELS = (64, 128, 320, 512)

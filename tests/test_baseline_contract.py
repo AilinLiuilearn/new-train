@@ -12,10 +12,10 @@ import pytest
 import torch
 import torch.nn as nn
 
-from models.add_fusion import AddFusion
+from models.components.add_fusion import AddFusion
 from models.ct_only_baseline import CTOnlySegmentationModel
 from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
-from models.group_unet_decoder import UNetStyleDecoder
+from models.components.group_unet_decoder import UNetStyleDecoder
 from tasks.mdt_seg import MDTSegTeacher
 from utils.optimization import get_cosine_scheduler
 from utils.run_common import build_balanced_pet_available
