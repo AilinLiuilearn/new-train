@@ -153,6 +153,30 @@ def test_zero_init_matches_add_baseline():
             assert torch.allclose(a, b, atol=1e-5, rtol=1e-4), mode
 
 
+def test_auto_under_amp_mixed_dtype_does_not_raise():
+    """AMP autocast leaves CT (BN tail, fp32) and PET (fp16) in different
+    dtypes; the multiscale wrapper must align PET to the CT dtype instead of
+    raising. Exercised in add mode so the assertion targets the alignment
+    itself, not fp16 attention kernels (attention stays fp32 internally)."""
+    from models.spatial_bidirectional_fusion import MultiScaleSpatialBidirectionalFusion
+    torch.manual_seed(0)
+    module = MultiScaleSpatialBidirectionalFusion(mode='add', use_checkpoint=False)
+    ct = [torch.randn(2, ch, 8, 8) for ch in (64, 128, 320, 512)]
+    pet = [torch.randn(2, ch, 8, 8, dtype=torch.float16) for ch in (64, 128, 320, 512)]
+    fused = module(ct, pet)
+    assert len(fused) == 4
+    for f, c, p in zip(fused, ct, pet):
+        assert f.dtype == torch.float32
+        assert torch.allclose(f, c + p.float(), atol=1e-3)
+    # Full-model autocast smoke (no-dtype-split guarantee on CPU, but must run).
+    _, spatial = _make_pair()
+    spatial.train()
+    with torch.autocast(device_type='cpu', enabled=True):
+        out = spatial(torch.randn(4, 1, 32, 32), pet=torch.randn(4, 1, 32, 32),
+                      pet_available=torch.tensor([1, 1, 0, 0]), forward_mode='auto')
+    assert torch.isfinite(out['logits'].float()).all()
+
+
 def test_missing_path_calls_neither_pet_encoder_nor_fusion():
     _, spatial = _make_pair()
     calls = {'pet': 0, 'fusion': 0}

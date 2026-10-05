@@ -317,8 +317,14 @@ class MultiScaleSpatialBidirectionalFusion(nn.Module):
             if p is not None:
                 if not isinstance(p, Tensor) or p.ndim != 4 or not p.is_floating_point():
                     raise ValueError(f"Invalid PET tensor at scale {i}")
-                if p.shape[:2] != c.shape[:2] or p.device != c.device or p.dtype != c.dtype:
-                    raise ValueError(f"PET batch/channels/device/dtype mismatch at scale {i}")
+                if p.shape[:2] != c.shape[:2] or p.device != c.device:
+                    raise ValueError(f"PET batch/channels/device mismatch at scale {i}")
+                if p.dtype != c.dtype:
+                    # AMP autocast can leave CT (BatchNorm tail, fp32) and PET
+                    # (fp16) in different dtypes. Align PET to the CT dtype
+                    # once here instead of relying on per-op promotion; the
+                    # block itself keeps attention math in fp32 internally.
+                    p = p.to(dtype=c.dtype)
                 if min(p.shape) < 1:
                     raise ValueError(f"Empty PET tensor at scale {i}")
                 if p.shape[-2:] != c.shape[-2:]:
