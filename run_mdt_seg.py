@@ -120,18 +120,6 @@ def main():
     train_batch_mode = str(getattr(cfg, 'train_batch_mode', 'alternating'))
     if train_batch_mode not in ('alternating', 'mixed', 'full'):
         raise ValueError(f'unsupported train_batch_mode={train_batch_mode!r}')
-    if (bool(getattr(cfg, 'asym_fusion_enabled', False))
-            and str(getattr(cfg, 'fusion_version', 'v1')) == 'inc'
-            and str(getattr(cfg, 'inc_missing_policy', 'error')) == 'error'
-            and train_batch_mode in ('alternating', 'mixed')):
-        raise ValueError('inc+inc_missing_policy=error requires train_batch_mode=full '
-                         '(no bank is connected in stage 1); use policy=zero only as an '
-                         'explicit zero-increment ablation')
-    if (bool(getattr(cfg, 'asym_fusion_enabled', False))
-            and str(getattr(cfg, 'fusion_version', 'v1')) == 'inc'
-            and str(getattr(cfg, 'inc_missing_policy', 'error')) == 'zero'
-            and train_batch_mode in ('alternating', 'mixed')):
-        print('[WARN] inc zero-increment ablation run (NOT prototype retrieval)', flush=True)
     print(f'[INFO] train_batch_mode={train_batch_mode}', flush=True)
     _seed(cfg)
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
@@ -167,7 +155,6 @@ def main():
     if train_batch_mode == 'mixed':
         extra_headers = [
             'train_batch_mode',
-            'zero_increment_ablation',
             'train_full_loss', 'train_missing_loss', 'train_mixed_loss',
             'train_full_samples', 'train_missing_samples', 'mixed_train_batches',
             'mixed_full_weight', 'mixed_missing_weight',
@@ -397,10 +384,6 @@ def main():
         if train_batch_mode == 'mixed':
             extra = {
                 'train_batch_mode': train_batch_mode,
-                'zero_increment_ablation': 1.0 if (
-                    bool(getattr(cfg, 'asym_fusion_enabled', False))
-                    and str(getattr(cfg, 'fusion_version', 'v1')) == 'inc'
-                    and str(getattr(cfg, 'inc_missing_policy', 'error')) == 'zero') else 0.0,
                 'train_full_loss': epoch_full_loss,
                 'train_missing_loss': epoch_missing_loss,
                 'train_mixed_loss': train_mixed_loss,

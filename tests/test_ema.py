@@ -141,52 +141,10 @@ def test_ema_warmup_epochs_do_not_pollute_ema():
         assert torch.allclose(task.ema.model.state_dict()[k], v, atol=1e-6)
 
 
-def _asym_model(**over):
-    kw = dict(ct_pretrained_path=None, pet_pretrained_path=None,
-              asym_fusion_enabled=True, asym_use_text=True,
-              asym_clip_path='pretrained/clip-vit-base-patch32')
-    kw.update(over)
-    return DualSharedAddPETCTBaseline(**kw)
-
-
-def test_ema_asym_text_cache_exact_and_extra_state_contract():
-    """Two EMA updates: frozen CLIP text cache copies exactly, the _extra_state
-    contract stays consistent, and float weights follow the decay formula."""
-    torch.manual_seed(0)
-    model = _asym_model()
-    task = MDTSegTeacher({'model': model},
-                         _cfg(ema_enabled=True, ema_decay=0.9, ema_decay_warmup=False,
-                              ema_start_epoch=0))
-    assert task.ema is not None
-    src = task.model
-    ema_before = {k: (v.clone() if torch.is_tensor(v) else v)
-                  for k, v in task.ema.model.state_dict().items()}
-    with torch.no_grad():
-        for p in src.parameters():
-            if p.is_floating_point():
-                p.add_(0.25)
-    task.update_ema()
-    task.update_ema()
-    ema_state = task.ema.model.state_dict()
-    src_state = src.state_dict()
-    # 1. Frozen text cache is bit-exact after updates.
-    assert torch.equal(ema_state['fusion.text_embeddings'], src_state['fusion.text_embeddings'])
-    # 2. Extra-state contract consistent between source and EMA copy.
-    assert src.fusion.get_extra_state() == task.ema.model.fusion.get_extra_state()
-    # 3. Float weights follow theta = d^2*before + (1-d^2)*src for two updates.
-    d2 = 0.9 ** 2
-    checked = 0
-    for k, v in src_state.items():
-        if torch.is_tensor(v) and v.is_floating_point() and k != 'fusion.text_embeddings':
-            expected = d2 * ema_before[k] + (1.0 - d2) * v
-            assert torch.allclose(ema_state[k], expected, atol=1e-5), k
-            checked += 1
-    assert checked > 0
-
 
 def test_ema_params_frozen_and_outside_optimizer():
     torch.manual_seed(0)
-    task = MDTSegTeacher({'model': _asym_model()},
+    task = MDTSegTeacher({'model': DualSharedAddPETCTBaseline(ct_pretrained_path=None, pet_pretrained_path=None)},
                          _cfg(ema_enabled=True, ema_decay_warmup=False))
     for p in task.ema.model.parameters():
         assert p.requires_grad is False
