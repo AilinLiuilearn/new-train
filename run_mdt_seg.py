@@ -16,7 +16,7 @@ def main():
     cfg = SegMDTConfig.parse_arguments()
     mode = str(getattr(cfg, 'train_batch_mode', 'alternating'))
     if mode != 'mixed':
-        raise ValueError(
+                    raise ValueError(
             f'run_mdt_seg.py no longer supports train_batch_mode={mode!r}: '
             'alternating/full whole-batch switching was removed. '
             'Run the Full/Missing mixed baseline with --train_batch_mode mixed, '

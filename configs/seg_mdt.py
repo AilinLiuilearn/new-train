@@ -12,6 +12,9 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--train_split_file', type=str, default='train_original.txt')
         p.add_argument('--val_split_file', type=str, default='val.txt')
         p.add_argument('--test_split_file', type=str, default='test.txt')
+        p.add_argument('--allow_val_equals_test', type=str2bool, default=False,
+                       help='Explicit opt-in to reuse test.txt as val. Prints a loud '
+                            'warning: model selection then happens on the test set.')
         p.add_argument('--image_size_2d', type=int, default=512)
         p.add_argument('--num_workers', type=int, default=4)
         p.add_argument('--pin_memory', type=str2bool, default=True)

@@ -61,7 +61,8 @@ def main():
         cfg.root, cfg.image_size_2d, cfg.batch_size, cfg.num_workers,
         cfg.random_state, cfg.pin_memory, 'none', cfg.norm_mode,
         cfg.train_split_file, cfg.val_split_file, cfg.test_split_file,
-        checkpoint_dir=cfg.checkpoint_dir, ct_only=ct_only,
+        checkpoint_dir=cfg.checkpoint_dir,
+        allow_val_equals_test=bool(getattr(cfg, 'allow_val_equals_test', False)), ct_only=ct_only,
     )
     output_dir = args.output_dir or os.path.dirname(os.path.abspath(args.checkpoint))
     weights_tag = 'ema' if args.use_ema else 'raw'

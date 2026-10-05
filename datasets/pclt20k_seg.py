@@ -150,7 +150,7 @@ def _split_summary(records):
     return {'case_count': len(by_case), 'slice_count': len(records)}
 
 
-def _check_patient_disjoint(train_records, val_records, test_records):
+def _check_patient_disjoint(train_records, val_records, test_records, allow_val_equals_test=False):
     def cases(recs):
         return {r['case_id'] for r in recs}
     train_cases, val_cases, test_cases = cases(train_records), cases(val_records), cases(test_records)
@@ -159,7 +159,7 @@ def _check_patient_disjoint(train_records, val_records, test_records):
         problems.append(f'train overlaps val on {len(train_cases & val_cases)} case(s)')
     if train_cases & test_cases:
         problems.append(f'train overlaps test on {len(train_cases & test_cases)} case(s)')
-    if val_cases & test_cases:
+    if val_cases & test_cases and not allow_val_equals_test:
         problems.append(f'val overlaps test on {len(val_cases & test_cases)} case(s)')
     if problems:
         raise ValueError('patient-level disjointness violated: ' + '; '.join(problems))
@@ -170,18 +170,23 @@ def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_wor
                                      random_state=2023, pin_memory=True, aug_mode='cipa',
                                      norm_mode='cipa', train_split_file='train.txt',
                                      val_split_file='val.txt', test_split_file='test.txt',
-                                     checkpoint_dir=None, ct_only=False):
+                                     checkpoint_dir=None, ct_only=False,
+                                     allow_val_equals_test=False):
     train_ids = _read_list(os.path.join(root, train_split_file))
     val_ids = _read_list(os.path.join(root, val_split_file))
     test_ids = _read_list(os.path.join(root, test_split_file))
     if train_ids is None or val_ids is None or test_ids is None:
         raise FileNotFoundError(root)
-    # The user must provide a real, disjoint validation split. test.txt is not
-    # silently reused as val: if val is missing we report the condition.
-    if val_split_file == test_split_file:
+    # test.txt is never silently reused as val. Only an explicit user opt-in
+    # (--allow_val_equals_test) permits it, with a loud leakage warning.
+    if val_split_file == test_split_file and not allow_val_equals_test:
         raise ValueError(
             'val_split_file and test_split_file are the same; a formal run needs a '
-            'patient-disjoint validation set. Provide a distinct val split file.')
+            'patient-disjoint validation set. Provide a distinct val split file, or '
+            'pass --allow_val_equals_test True to explicitly reuse the test set as val.')
+    if val_split_file == test_split_file:
+        print('[WARN] val reuses the test split: model selection happens on the test '
+              'set, final test metrics will be optimistically biased.', flush=True)
     train_records = _records_from_ids(root, train_ids, ct_only=ct_only)
     val_records = _records_from_ids(root, val_ids, ct_only=ct_only)
     test_records = _records_from_ids(root, test_ids, ct_only=ct_only)
@@ -193,7 +198,9 @@ def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_wor
                 raise FileNotFoundError(f'{name} split contains missing CT/mask files: {r}')
             if not ct_only and not os.path.isfile(r['pet_path']):
                 raise FileNotFoundError(f'{name} split contains missing PET file: {r}')
-    train_cases, val_cases, test_cases = _check_patient_disjoint(train_records, val_records, test_records)
+    train_cases, val_cases, test_cases = _check_patient_disjoint(
+        train_records, val_records, test_records,
+        allow_val_equals_test=bool(allow_val_equals_test and val_split_file == test_split_file))
     split_summary = {
         'train': {**_split_summary(train_records), 'case_ids': sorted(train_cases)},
         'val': {**_split_summary(val_records), 'case_ids': sorted(val_cases)},
