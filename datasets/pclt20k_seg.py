@@ -88,10 +88,21 @@ class PCLT20KSegDataset(Dataset):
                 pet = _resize_gray(pet, self.image_size)
         if self.train and self.aug_mode == 'cipa':
             if pet is None:
-                image, mask = randomShiftScaleRotate(ct, mask)
-                image, mask = randomHorizontalFlip(image, mask)
-                image, mask = randomcrop(image, mask)
-                ct = image
+                # Augmentation helpers assume a 3D (H,W,C) image and cv2 drops
+                # the trailing dim for single-channel data, so re-expand to
+                # (H,W,1) after every op and flatten once at the end.
+                def _as3d(a):
+                    a = np.ascontiguousarray(a)
+                    return a[:, :, None] if a.ndim == 2 else a
+                image, mask_3d = _as3d(ct), _as3d(mask)
+                image, mask_3d = randomShiftScaleRotate(image, mask_3d)
+                image, mask_3d = _as3d(image), _as3d(mask_3d)
+                image, mask_3d = randomHorizontalFlip(image, mask_3d)
+                image, mask_3d = _as3d(image), _as3d(mask_3d)
+                image, mask_3d = randomcrop(image, mask_3d)
+                image, mask_3d = _as3d(image), _as3d(mask_3d)
+                ct = np.ascontiguousarray(image)[:, :, 0]
+                mask = np.ascontiguousarray(mask_3d)[:, :, 0]
             else:
                 image = np.stack([ct, pet], axis=-1)
                 image, mask = randomShiftScaleRotate(image, mask)
