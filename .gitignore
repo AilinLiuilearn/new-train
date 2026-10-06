@@ -1,9 +1,5 @@
 __pycache__/
-*.py[cod]
+*.pyc
 .pytest_cache/
-checkpoints_new/
-outputs/
-wandb/
-pretrained/
-
-.ipynb_checkpoints/
+pytest-of-root/
+tmp*/
