@@ -93,6 +93,48 @@ def compute_hd95_pair(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
             return _hd95_numpy_fallback(pred_bin, gt_bin)
 
 
+HD95_PROTOCOL_VERSION = 'v2-symmetric-edt95'
+
+
+def compute_hd95_pair_v2(pred_bin: np.ndarray, gt_bin: np.ndarray):
+    """Unified HD95 protocol (version tag ``HD95_PROTOCOL_VERSION``).
+
+    Rules, identical for every backend:
+    - per-sample 2D, pixel units (after any resizing), percentile 95 over
+      concatenated bidirectional boundary distances, connectivity 1;
+    - both empty -> 0.0; exactly one empty -> image diagonal (explicit,
+      symmetric — never an invented center pixel);
+    - backend is recorded, never silently downgraded: medpy when importable,
+      else scipy boundary distance transform; missing dependency raises.
+    Returns ``(value, backend)``.
+    """
+    pred = np.asarray(pred_bin).astype(bool)
+    gt = np.asarray(gt_bin).astype(bool)
+    if pred.sum() == 0 and gt.sum() == 0:
+        return 0.0, 'empty-both'
+    if pred.sum() == 0 or gt.sum() == 0:
+        return float(np.sqrt(pred.shape[0] ** 2 + pred.shape[1] ** 2)), 'empty-one-side'
+    try:
+        from medpy.metric.binary import hd95 as medpy_hd95
+        return float(medpy_hd95(pred.astype(np.uint8), gt.astype(np.uint8))), 'medpy'
+    except Exception:
+        pass
+    try:
+        from scipy.ndimage import binary_erosion, distance_transform_edt
+    except Exception as e:
+        raise RuntimeError('HD95 v2 needs medpy or scipy; neither is available') from e
+
+    def _border(m):
+        return m & ~binary_erosion(m)
+
+    bp, bg = _border(pred), _border(gt)
+    if not bp.any() or not bg.any():
+        return float(np.sqrt(pred.shape[0] ** 2 + pred.shape[1] ** 2)), 'scipy-degenerate'
+    d = np.concatenate([distance_transform_edt(~gt)[bp].ravel(),
+                        distance_transform_edt(~pred)[bg].ravel()])
+    return float(np.percentile(d, 95)), 'scipy'
+
+
 def _compute_metrics_from_counts(tp, fp, fn, tn):
     denom_iou = tp + fp + fn
     denom_dice = 2 * tp + fp + fn
@@ -208,6 +250,8 @@ class SegmentationMetricsCIPA(torch.nn.Module):
         self.fn = 0.0
         self.tn = 0.0
         self.hd95_list = []
+        # Unified protocol version tag; per-sample computation stays v1 here.
+        self.hd95_protocol = HD95_PROTOCOL_VERSION
 
     @torch.no_grad()
     def update(self, pred_logits, target):
@@ -219,7 +263,7 @@ class SegmentationMetricsCIPA(torch.nn.Module):
             target = torch.nn.functional.interpolate(
                 target.unsqueeze(1).float(), size=pred_logits.shape[-2:], mode='nearest'
             ).squeeze(1)
-        pred = torch.sigmoid(pred_logits)
+        pred = torch.sigmoid(pred_logits.float())
         pred_bin = (pred > self.threshold).float()
         target = target.float()
         pred_flat = pred_bin.reshape(-1)

@@ -23,6 +23,7 @@ def build_local_contrast_fusion_model(cfg):
         'window': int(_get(cfg, 'fusion_window', 5)),
         'chunk_rows': int(_get(cfg, 'fusion_chunk_rows', 16)),
         'checkpoint_chunks': bool(_get(cfg, 'fusion_checkpoint_chunks', True)),
+        'position_bias_beta': float(_get(cfg, 'fusion_position_bias_beta', 0.0)),
     })
     model = DualSharedLocalContrastFusionModel(
         ct_backbone=_get(cfg, 'ct_backbone', 'convnextv2_nano'),
@@ -35,6 +36,7 @@ def build_local_contrast_fusion_model(cfg):
         use_deep_supervision=bool(_get(cfg, 'use_deep_supervision', False)
                                   or _get(cfg, 'deep_supervision', False)),
         pretrained=bool(_get(cfg, 'pretrained', True)),
+        check_finite=bool(_get(cfg, 'check_finite', True)),
         fusion_kwargs=fusion_kwargs,
     )
     fusion_params = sum(p.numel() for p in model.fusion.parameters())

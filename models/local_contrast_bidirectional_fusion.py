@@ -84,7 +84,7 @@ class _ContrastDescriptor(nn.Module):
 
 class _LocalExchange(nn.Module):
     def __init__(self, dim: int, heads: int, window: int, chunk_rows: int,
-                 checkpoint_chunks: bool):
+                 checkpoint_chunks: bool, position_bias_beta: float = 0.0):
         super().__init__()
         self.dim, self.heads = dim, heads
         self.window, self.radius = window, window // 2
@@ -93,16 +93,59 @@ class _LocalExchange(nn.Module):
         self.key = nn.Conv2d(dim, dim, 1)
         self.value = nn.Conv2d(dim, dim, 1)
         self.relative_bias = nn.Parameter(torch.zeros(heads, window * window))
+        if position_bias_beta:
+            if window == 1:
+                pass
+            else:
+                coords = torch.arange(window) - window // 2
+                dist2 = (coords[:, None] ** 2 + coords[None, :] ** 2).reshape(-1)
+                init = (-float(position_bias_beta) * dist2 / float(self.radius ** 2))
+                with torch.no_grad():
+                    self.relative_bias.copy_(init.expand(heads, -1))
+        # Bounded analytic-mask cache: geometry only, plain tensors (never
+        # parameters/buffers, never checkpointed, never in state_dict).
+        self._mask_cache: dict = {}
+        self._mask_cache_limit = 8
+
+    def _allowed_mask(self, h: int, w: int, start: int, end: int,
+                        device: torch.device) -> Tensor:
+        """Analytic out-of-image mask for one row chunk, exactly matching
+        unfold(valid_padded)[k, n]: candidate (ky,kx) of query (y,x) is valid
+        iff the source position stays inside the unpadded image."""
+        key = (h, w, start, end, self.window, str(device))
+        cached = self._mask_cache.get(key)
+        if cached is not None:
+            return cached
+        r = self.radius
+        ys = torch.arange(start, end, device=device)
+        xs = torch.arange(w, device=device)
+        off = torch.arange(-r, r + 1, device=device)
+        ok_y = (ys[:, None] + off[None, :] >= 0) & (ys[:, None] + off[None, :] < h)
+        ok_x = (xs[:, None] + off[None, :] >= 0) & (xs[:, None] + off[None, :] < w)
+        ky, kx = torch.meshgrid(torch.arange(self.window, device=device),
+                                torch.arange(self.window, device=device), indexing='ij')
+        # (rows, K): candidate (ky,kx) of query (y,x) valid iff the source
+        # position stays inside the unpadded image; K is row-major ky*W+kx,
+        # matching unfold layout.
+        qy = ok_y[:, ky.reshape(-1)]
+        qx = ok_x[:, kx.reshape(-1)]
+        allowed = (qy[:, :, None] & qx.t()[None, :, :])
+        # allowed: (rows, K, W) -> (K, rows*W) to match unfold layout.
+        allowed = allowed.permute(1, 0, 2).reshape(self.window ** 2, -1)
+        if len(self._mask_cache) >= self._mask_cache_limit:
+            self._mask_cache.pop(next(iter(self._mask_cache)))
+        self._mask_cache[key] = allowed
+        return allowed
 
     def _chunk(self, query: Tensor, key: Tensor, value: Tensor,
-               valid: Tensor, bias: Tensor) -> Tensor:
+               allowed: Tensor, bias: Tensor) -> Tensor:
         b, d, rows, w = query.shape
         n, dh, k = rows * w, d // self.heads, self.window ** 2
         q = query.reshape(b, self.heads, dh, n)
         # Stripe already has the full halo; no additional unfold padding.
         keys = F.unfold(key, self.window).reshape(b, self.heads, dh, k, n)
         values = F.unfold(value, self.window).reshape(b, self.heads, dh, k, n)
-        allowed = F.unfold(valid, self.window).reshape(1, 1, k, n).bool()
+        allowed = allowed.reshape(1, 1, k, n).bool()
         with _fp32_context(query):
             scores = torch.einsum('bhdn,bhdkn->bhkn', q.float(), keys.float()) / math.sqrt(dh)
             scores = scores + bias.float()[None, :, :, None]
@@ -118,13 +161,12 @@ class _LocalExchange(nn.Module):
         b, _, h, w = q.shape
         r = self.radius
         k, v = F.pad(k, (r, r, r, r)), F.pad(v, (r, r, r, r))
-        valid = F.pad(q.new_ones(1, 1, h, w), (r, r, r, r))
         chunks = []
         for start in range(0, h, self.chunk_rows):
             end = min(start + self.chunk_rows, h)
+            allowed = self._allowed_mask(h, w, start, end, q.device)
             args = (q[:, :, start:end], k[:, :, start:end + 2*r],
-                    v[:, :, start:end + 2*r], valid[:, :, start:end + 2*r],
-                    self.relative_bias)
+                    v[:, :, start:end + 2*r], allowed, self.relative_bias)
             if self.checkpoint_chunks and self.training and torch.is_grad_enabled():
                 out = checkpoint(self._chunk, *args, use_reentrant=False)
             else:
@@ -177,17 +219,18 @@ class LocalContrastBidirectionalFusion(nn.Module):
     """
     def __init__(self, channels: int, dim: int = 32, heads: int = 4,
                  window: int = 5, chunk_rows: int = 16,
-                 checkpoint_chunks: bool = True):
+                 checkpoint_chunks: bool = True, position_bias_beta: float = 0.0):
         super().__init__()
         if channels < 1 or dim < 8 or heads < 1 or dim % heads:
             raise ValueError('channels>0, dim>=8 and dim divisible by heads required')
         if window < 1 or window % 2 != 1 or chunk_rows < 1:
             raise ValueError('window must be positive odd; chunk_rows must be positive')
         self.channels = channels
+        self.position_bias_beta = float(position_bias_beta)
         self.ct_project = nn.Sequential(nn.GroupNorm(_groups(channels), channels), nn.Conv2d(channels, dim, 1))
         self.pet_project = nn.Sequential(nn.GroupNorm(_groups(channels), channels), nn.Conv2d(channels, dim, 1))
         self.ct_contrast, self.pet_contrast = _ContrastDescriptor(dim), _ContrastDescriptor(dim)
-        args = (dim, heads, window, chunk_rows, checkpoint_chunks)
+        args = (dim, heads, window, chunk_rows, checkpoint_chunks, float(position_bias_beta))
         self.ct_local, self.pet_local = _LocalExchange(*args), _LocalExchange(*args)
         self.ct_local_state, self.pet_local_state = nn.Conv2d(dim, dim, 1), nn.Conv2d(dim, dim, 1)
         self.ct_global, self.pet_global = _GlobalChannelExchange(dim), _GlobalChannelExchange(dim)
@@ -226,13 +269,16 @@ class LocalContrastFusionPyramid(nn.Module):
     """
     def __init__(self, channels: Sequence[int] = (64, 128, 320, 512),
                  dim: int = 32, heads: int = 4, window: int = 5,
-                 chunk_rows: int = 16, checkpoint_chunks: bool = True):
+                 chunk_rows: int = 16, checkpoint_chunks: bool = True,
+                 position_bias_beta: float = 0.0):
         super().__init__()
         self.channels = tuple(channels)
         if len(self.channels) != 4:
             raise ValueError('Exactly four scales required')
+        self.position_bias_beta = float(position_bias_beta)
         self.scales = nn.ModuleList([
-            LocalContrastBidirectionalFusion(c, dim, heads, window, chunk_rows, checkpoint_chunks)
+            LocalContrastBidirectionalFusion(c, dim, heads, window, chunk_rows,
+                                             checkpoint_chunks, position_bias_beta)
             for c in self.channels])
 
     def _validate_ct(self, ct: Sequence[Tensor]) -> None:

@@ -158,8 +158,14 @@ class MDTSegTeacher:
         return total_loss, logits, outputs, stats
 
     @torch.no_grad()
-    def evaluate(self, loader, eval_mode='full', tag='val', model=None):
-        """eval_mode: 'full' | 'missing' | 'ct'. Missing passes pet=None."""
+    def evaluate(self, loader, eval_mode='full', tag='val', model=None, eval_amp=False):
+        """eval_mode: 'full' | 'missing' | 'ct'. Missing passes pet=None.
+
+        eval_amp defaults to False, preserving the FP32 protocol; pass True
+        to run the forward under AMP autocast (logits/softmax stay FP32
+        inside attention by module contract; metrics cast to float)."""
+        import torch as _torch
+        from contextlib import nullcontext as _nullcontext
         active = model if model is not None else self.model
         was_training = self.model.training
         active.eval()
@@ -168,21 +174,25 @@ class MDTSegTeacher:
         total_loss = 0.0
         sample_count = 0
         self.metrics.reset()
+        amp_ctx = (_torch.autocast(device_type=self.device, enabled=True)
+                   if eval_amp and self.device == 'cuda'
+                   else _nullcontext())
         for batch in loader:
             ct = batch['ct'].to(self.device, non_blocking=True)
             mask = batch['mask'].to(self.device, non_blocking=True).float()
             batch_size = ct.shape[0]
-            if eval_mode == 'full':
-                pet = batch['pet'].to(self.device, non_blocking=True)
-                outputs = active(ct, pet=pet, forward_mode='full')
-            elif eval_mode == 'missing':
-                outputs = active(ct, pet=None, forward_mode='missing')
-            elif eval_mode == 'ct':
-                outputs = active(ct)
-            else:
-                raise ValueError(f'Unsupported eval_mode={eval_mode!r}')
-            logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-            loss, _ = self.criterion(logits, mask)
+            with _torch.no_grad(), amp_ctx:
+                if eval_mode == 'full':
+                    pet = batch['pet'].to(self.device, non_blocking=True)
+                    outputs = active(ct, pet=pet, forward_mode='full')
+                elif eval_mode == 'missing':
+                    outputs = active(ct, pet=None, forward_mode='missing')
+                elif eval_mode == 'ct':
+                    outputs = active(ct)
+                else:
+                    raise ValueError(f'Unsupported eval_mode={eval_mode!r}')
+                logits = outputs['logits'] if isinstance(outputs, dict) else outputs
+                loss, _ = self.criterion(logits.float(), mask)
             self.metrics.update(logits, mask)
             total_loss += float(loss) * batch_size
             sample_count += batch_size

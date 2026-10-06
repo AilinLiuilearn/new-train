@@ -51,9 +51,14 @@ class DualSharedAddPETCTBaseline(nn.Module):
                  ct_pretrained_path=None, pet_pretrained_path=None,
                  in_channels=3, out_channels=1,
                  decoder_channels=(512, 256, 128, 64),
-                 use_deep_supervision=False, pretrained=True):
+                 use_deep_supervision=False, pretrained=True,
+                 check_finite=True):
         super().__init__()
         self.use_deep_supervision = bool(use_deep_supervision)
+        # Intermediate NaN/Inf checks (encoder/align/fused tensors) can be
+        # disabled for speed; the logits check in _decode always stays on.
+        # Default True preserves the original behavior exactly.
+        self.check_finite = bool(check_finite)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
         self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
         load_local_weights_safe(self.enc_ct, ct_pretrained_path,
@@ -67,20 +72,24 @@ class DualSharedAddPETCTBaseline(nn.Module):
             list(DECODER_INPUT_CHANNELS), decoder_channels=decoder_channels,
             out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
 
+    def _maybe_check_finite(self, name, xs):
+        if self.check_finite:
+            _check_finite(name, xs)
+
     @staticmethod
     def _to_3ch(x):
         return x.repeat(1, 3, 1, 1) if x.shape[1] == 1 else x
 
     def _encode_ct(self, ct):
         feats = self.enc_ct(self._to_3ch(ct))
-        _check_finite('ct_feats', feats)
+        self._maybe_check_finite('ct_feats', feats)
         aligned = self.ct_align(feats)
-        _check_finite('aligned_ct', aligned)
+        self._maybe_check_finite('aligned_ct', aligned)
         return aligned
 
     def _encode_pet(self, pet):
         feats = self.enc_pet(self._to_3ch(pet))
-        _check_finite('pet_feats', feats)
+        self._maybe_check_finite('pet_feats', feats)
         return feats
 
     def _decode(self, fused_feats, target_size):
@@ -103,7 +112,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         _ = pet
         ct_feats = self._encode_ct(ct)
         fused = [c + torch.zeros_like(c) for c in ct_feats]
-        _check_finite('fused_feats', fused)
+        self._maybe_check_finite('fused_feats', fused)
         return self._decode(fused, target_size)
 
     def _forward_auto(self, ct, pet, pet_available, target_size):
@@ -123,7 +132,7 @@ class DualSharedAddPETCTBaseline(nn.Module):
         if num_full > 0:
             fused = [base.index_copy(0, full_idx, f.to(dtype=base.dtype))
                      for base, f in zip(fused, fused_full)]
-        _check_finite('fused_feats', fused)
+        self._maybe_check_finite('fused_feats', fused)
         out = self._decode(fused, target_size)
         out['pet_available'] = state.detach().cpu()
         out['num_full'] = num_full

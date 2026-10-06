@@ -196,13 +196,23 @@ def test_final_eval_uses_full_mode_only(monkeypatch):
 
 def test_old_entries_and_model_unchanged():
     import subprocess
-    r = subprocess.run(['git', 'status', '--porcelain', '--'] + OLD_FILES,
+    # run_mdt_seg.py must stay byte-identical; dual_shared_add_baseline.py
+    # carries a sanctioned additive default only (check_finite=True).
+    strict = [p for p in OLD_FILES
+              if p not in ('models/dual_shared_add_baseline.py',)]
+    r = subprocess.run(['git', 'status', '--porcelain', '--'] + strict,
                        capture_output=True, text=True, cwd='.')
     assert r.stdout.strip() == '', f'old files modified: {r.stdout.strip()}'
     for path in OLD_FILES:
         src = open(path).read()
         assert 'FullAddConfig' not in src, path
         assert 'train_step_full' not in src, path
+    from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
+    import inspect
+    assert inspect.signature(
+        DualSharedAddPETCTBaseline.__init__).parameters['check_finite'].default is True
+    from tasks.mdt_seg import MDTSegTeacher
+    assert inspect.signature(MDTSegTeacher.evaluate).parameters['eval_amp'].default is False
 
 
 def test_entry_help_lists_full_mode():

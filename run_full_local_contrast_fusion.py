@@ -27,6 +27,7 @@ from models.dual_shared_local_contrast_fusion import MODEL_ARCH
 from models.local_contrast_bidirectional_fusion import LocalContrastFusionPyramid
 from run_full_add_baseline import train_step_full
 from tasks.mdt_seg import MDTSegTeacher
+from utils.metrics_seg import HD95_PROTOCOL_VERSION
 from utils.optimization import get_cosine_scheduler
 from utils.run_common import (count_parameters, module_grad_norm,
                               optimizer_step_succeeded, seed_everything)
@@ -43,6 +44,12 @@ class FullLocalContrastFusionConfig(SegMDTConfig):
             if action.dest == 'train_batch_mode':
                 action.default = 'full'
                 action.choices = ('full',)
+        p.add_argument('--grad_log_interval', type=int, default=100,
+                       help='Compute module grad-norm diagnostics every N steps; '
+                            'other steps log empty values, clipping/step/EMA unchanged.')
+        p.add_argument('--eval_amp', type=str2bool, default=False,
+                       help='Run validation/final-test forward under AMP autocast; '
+                            'default False preserves the FP32 protocol.')
         return p
 
     @staticmethod
@@ -57,6 +64,12 @@ class FullLocalContrastFusionConfig(SegMDTConfig):
         p.add_argument('--fusion_window', type=int, default=5)
         p.add_argument('--fusion_chunk_rows', type=int, default=16)
         p.add_argument('--fusion_checkpoint_chunks', type=str2bool, default=True)
+        p.add_argument('--fusion_position_bias_beta', type=float, default=0.0,
+                       help='Spatial-distance init for relative_bias: '
+                            '-beta*(dy^2+dx^2)/radius^2; 0.0 reproduces old init.')
+        p.add_argument('--check_finite', type=str2bool, default=True,
+                       help='Intermediate NaN/Inf checks; logits/loss/update '
+                            'checks always stay on.')
         return p
 
     @classmethod
@@ -142,6 +155,7 @@ def main():
         'val_full_acc_pixel', 'val_full_hd95',
         'best_full', 'best_full_epoch',
         'grad_enc_ct', 'grad_enc_pet', 'grad_ct_align', 'grad_fusion', 'grad_decoder',
+        'grad_sampled_steps',
         'ema_enabled', 'ema_updates', 'skipped_updates',
         'epoch_time',
     ]
@@ -153,6 +167,11 @@ def main():
     no_improve = 0
     patience = int(cfg.early_stop_patience)
     amp_enabled = bool(cfg.mixed_precision)
+    eval_amp = bool(cfg.eval_amp)
+    grad_log_interval = max(1, int(cfg.grad_log_interval))
+    print(f'[INFO] eval_precision={"amp" if eval_amp else "fp32"} '
+          f'grad_log_interval={grad_log_interval} (sampled grad norms; '
+          f'clipping/step/EMA unchanged)', flush=True)
     global_batch_step = 0
     paths = _checkpoint_paths(cfg.checkpoint_dir)
 
@@ -177,11 +196,13 @@ def main():
                 task.scaler.unscale_(task.optimizer)
             else:
                 loss.backward()
-            grads['enc_ct'].append(module_grad_norm(task.model.enc_ct))
-            grads['enc_pet'].append(module_grad_norm(task.model.enc_pet))
-            grads['ct_align'].append(module_grad_norm(task.model.ct_align))
-            grads['fusion'].append(module_grad_norm(task.model.fusion))
-            grads['decoder'].append(module_grad_norm(task.model.decoder))
+            log_grads = (global_batch_step % grad_log_interval == 0)
+            if log_grads:
+                grads['enc_ct'].append(module_grad_norm(task.model.enc_ct))
+                grads['enc_pet'].append(module_grad_norm(task.model.enc_pet))
+                grads['ct_align'].append(module_grad_norm(task.model.ct_align))
+                grads['fusion'].append(module_grad_norm(task.model.fusion))
+                grads['decoder'].append(module_grad_norm(task.model.decoder))
             total_grad_norm = (torch.nn.utils.clip_grad_norm_(
                 task.trainable_parameters(), float(cfg.grad_clip))
                 if float(cfg.grad_clip) > 0 else 0.0)
@@ -202,7 +223,8 @@ def main():
             task.global_batch_step = global_batch_step
 
         val_full = task.evaluate(val_loader, eval_mode='full', tag='val_full',
-                                 model=task.eval_model())
+                                 model=task.eval_model(), eval_amp=eval_amp)
+        val_full['eval_precision'] = 'amp' if eval_amp else 'fp32'
         improved = val_full['dice'] > best_full
         if improved:
             best_full = val_full['dice']
@@ -235,11 +257,12 @@ def main():
                 'val_full_hd95': val_full['hd95'],
                 'best_full': best_full,
                 'best_full_epoch': best_full_epoch,
-                'grad_enc_ct': float(np.mean(grads['enc_ct'])) if grads['enc_ct'] else 0.0,
-                'grad_enc_pet': float(np.mean(grads['enc_pet'])) if grads['enc_pet'] else 0.0,
-                'grad_ct_align': float(np.mean(grads['ct_align'])) if grads['ct_align'] else 0.0,
-                'grad_fusion': float(np.mean(grads['fusion'])) if grads['fusion'] else 0.0,
-                'grad_decoder': float(np.mean(grads['decoder'])) if grads['decoder'] else 0.0,
+                'grad_enc_ct': float(np.mean(grads['enc_ct'])) if grads['enc_ct'] else '',
+                'grad_enc_pet': float(np.mean(grads['enc_pet'])) if grads['enc_pet'] else '',
+                'grad_ct_align': float(np.mean(grads['ct_align'])) if grads['ct_align'] else '',
+                'grad_fusion': float(np.mean(grads['fusion'])) if grads['fusion'] else '',
+                'grad_decoder': float(np.mean(grads['decoder'])) if grads['decoder'] else '',
+                'grad_sampled_steps': float(len(grads['fusion'])),
                 'ema_enabled': 1.0 if task.ema is not None else 0.0,
                 'ema_updates': float(task.ema.updates) if task.ema is not None else 0.0,
                 'skipped_updates': float(skipped_update_count),
@@ -270,7 +293,7 @@ def main():
     print(f'[FINAL] evaluating best_full checkpoint at epoch {ckpt["best_epoch"]} '
           f'with weights={weights_tag} (recorded={recorded})', flush=True)
     test_full = task.evaluate(test_loader, eval_mode='full', tag='test_full',
-                              model=eval_model)
+                              model=eval_model, eval_amp=eval_amp)
     result = {
         'experiment_type': 'full_local_contrast_fusion',
         'dice': float(test_full['dice']),
@@ -278,6 +301,8 @@ def main():
         'hd95': float(test_full['hd95']),
         'loss': float(test_full['total_loss']),
         'weights': weights_tag,
+        'eval_precision': 'amp' if eval_amp else 'fp32',
+        'hd95_protocol': HD95_PROTOCOL_VERSION,
         'best_epoch': ckpt['best_epoch'],
         'checkpoint': os.path.abspath(paths['best_full']),
     }

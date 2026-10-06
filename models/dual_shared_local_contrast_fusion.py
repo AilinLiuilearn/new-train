@@ -27,6 +27,7 @@ DEFAULT_FUSION_KWARGS = dict(
     window=5,
     chunk_rows=16,
     checkpoint_chunks=True,
+    position_bias_beta=0.0,
 )
 
 

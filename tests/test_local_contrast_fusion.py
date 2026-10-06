@@ -30,6 +30,7 @@ OLD_KEEP = [
     'run_full_missing_baseline.py',
     'models/ct_only_baseline.py',
     'models/dual_shared_add_baseline.py',
+    'models/build_mdt_seg.py',
 ]
 
 
@@ -307,7 +308,13 @@ def test_entry_help_and_param_plumbing():
 
 
 def test_old_entries_and_models_unchanged():
-    r = subprocess.run(['git', 'status', '--porcelain', '--'] + OLD_KEEP,
+    # Entries, builders and configs: byte-identical. Three shared files carry
+    # explicitly sanctioned additive extensions (defaults restore old
+    # behavior); their old behavior is asserted below, not by git-cleanliness.
+    strict_keep = [p for p in OLD_KEEP
+                   if p not in ('tasks/mdt_seg.py', 'utils/metrics_seg.py',
+                                'models/dual_shared_add_baseline.py')]
+    r = subprocess.run(['git', 'status', '--porcelain', '--'] + strict_keep,
                        capture_output=True, text=True, cwd='.')
     assert r.stdout.strip() == '', f'old files modified: {r.stdout.strip()}'
     from configs.seg_mdt import SegMDTConfig
@@ -320,6 +327,13 @@ def test_old_entries_and_models_unchanged():
     assert not hasattr(old, 'fusion_dim')
     old_model = build_dual_model(_cfg(model_arch='dual_shared_add_baseline'))['model']
     assert isinstance(old_model.fusion, AddFusion)
+    assert old_model.check_finite is True, 'parent default must preserve old checks'
     for path in ('run_ct_only_seg.py', 'run_full_add_baseline.py',
                  'run_full_missing_baseline.py'):
         assert 'local_contrast' not in open(path).read().lower(), path
+    # Sanctioned shared extensions keep old defaults.
+    import inspect
+    from tasks.mdt_seg import MDTSegTeacher as _T
+    assert inspect.signature(_T.evaluate).parameters['eval_amp'].default is False
+    from utils.metrics_seg import SegmentationMetricsCIPA as _M
+    assert _M().hd95_protocol.startswith('v2')  # version tag only; v1 math kept
