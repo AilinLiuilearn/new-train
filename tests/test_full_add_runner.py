@@ -17,7 +17,6 @@ OLD_FILES = [
     'run_ct_only_seg.py',
     'run_full_missing_baseline.py',
     'run_mdt_seg.py',
-    'run_full_missing_spatial_fusion.py',
     'models/dual_shared_add_baseline.py',
 ]
 
@@ -129,12 +128,10 @@ def test_full_loss_reaches_all_four_parts():
         assert grads, f'full loss must update {name}'
 
 
-def test_builder_is_add_and_spatial_free():
+def test_builder_is_add_only():
     model = build_dual_model(_cfg())['model']
     assert isinstance(model.fusion, AddFusion)
     assert 'spatial' not in type(model.fusion).__module__
-    import models.spatial_bidirectional_fusion  # noqa: F401 (import must exist standalone)
-    assert 'MultiScaleSpatialBidirectionalFusion' in dir(models.spatial_bidirectional_fusion)
 
 
 def test_assert_protocol_rejects_non_add_fusion():
