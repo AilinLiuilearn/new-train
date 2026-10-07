@@ -24,6 +24,7 @@ def build_local_contrast_fusion_model(cfg):
         'chunk_rows': int(_get(cfg, 'fusion_chunk_rows', 16)),
         'checkpoint_chunks': bool(_get(cfg, 'fusion_checkpoint_chunks', True)),
         'position_bias_beta': float(_get(cfg, 'fusion_position_bias_beta', 0.0)),
+        'descriptor_type': str(_get(cfg, 'fusion_descriptor_type', 'contrast')),
     })
     model = DualSharedLocalContrastFusionModel(
         ct_backbone=_get(cfg, 'ct_backbone', 'convnextv2_nano'),
@@ -40,7 +41,10 @@ def build_local_contrast_fusion_model(cfg):
         fusion_kwargs=fusion_kwargs,
     )
     fusion_params = sum(p.numel() for p in model.fusion.parameters())
+    fixed_buffers = sum(b.numel() for b in model.fusion.buffers())
     total_params = sum(p.numel() for p in model.parameters())
     print(f'[local_contrast_fusion] fusion_class={type(model.fusion).__name__} '
-          f'fusion_params={fusion_params} params_total={total_params}', flush=True)
+          f'descriptor_type={model.fusion.descriptor_type} '
+          f'fusion_params={fusion_params} fixed_buffers={fixed_buffers} '
+          f'params_total={total_params}', flush=True)
     return {'model': model}

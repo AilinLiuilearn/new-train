@@ -39,6 +39,11 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+if __package__:
+    from .gaussian_response_descriptor import GaussianResponseDescriptor
+else:
+    from gaussian_response_descriptor import GaussianResponseDescriptor
+
 __all__ = ['LocalContrastBidirectionalFusion', 'LocalContrastFusionPyramid']
 
 
@@ -80,6 +85,14 @@ class _ContrastDescriptor(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return x + self.mix(F.gelu(self.norm(self.near(x) + self.far(x))))
+
+
+def _build_descriptor(dim: int, descriptor_type: str) -> nn.Module:
+    if descriptor_type == 'contrast':
+        return _ContrastDescriptor(dim)
+    if descriptor_type in GaussianResponseDescriptor.TYPES:
+        return GaussianResponseDescriptor(dim, descriptor_type=descriptor_type)
+    raise ValueError(f'Unknown descriptor_type: {descriptor_type!r}')
 
 
 class _LocalExchange(nn.Module):
@@ -219,7 +232,8 @@ class LocalContrastBidirectionalFusion(nn.Module):
     """
     def __init__(self, channels: int, dim: int = 32, heads: int = 4,
                  window: int = 5, chunk_rows: int = 16,
-                 checkpoint_chunks: bool = True, position_bias_beta: float = 0.0):
+                 checkpoint_chunks: bool = True, position_bias_beta: float = 0.0,
+                 descriptor_type: str = 'contrast'):
         super().__init__()
         if channels < 1 or dim < 8 or heads < 1 or dim % heads:
             raise ValueError('channels>0, dim>=8 and dim divisible by heads required')
@@ -227,9 +241,11 @@ class LocalContrastBidirectionalFusion(nn.Module):
             raise ValueError('window must be positive odd; chunk_rows must be positive')
         self.channels = channels
         self.position_bias_beta = float(position_bias_beta)
+        self.descriptor_type = descriptor_type
         self.ct_project = nn.Sequential(nn.GroupNorm(_groups(channels), channels), nn.Conv2d(channels, dim, 1))
         self.pet_project = nn.Sequential(nn.GroupNorm(_groups(channels), channels), nn.Conv2d(channels, dim, 1))
-        self.ct_contrast, self.pet_contrast = _ContrastDescriptor(dim), _ContrastDescriptor(dim)
+        self.ct_contrast = _build_descriptor(dim, descriptor_type)
+        self.pet_contrast = _build_descriptor(dim, descriptor_type)
         args = (dim, heads, window, chunk_rows, checkpoint_chunks, float(position_bias_beta))
         self.ct_local, self.pet_local = _LocalExchange(*args), _LocalExchange(*args)
         self.ct_local_state, self.pet_local_state = nn.Conv2d(dim, dim, 1), nn.Conv2d(dim, dim, 1)
@@ -270,15 +286,18 @@ class LocalContrastFusionPyramid(nn.Module):
     def __init__(self, channels: Sequence[int] = (64, 128, 320, 512),
                  dim: int = 32, heads: int = 4, window: int = 5,
                  chunk_rows: int = 16, checkpoint_chunks: bool = True,
-                 position_bias_beta: float = 0.0):
+                 position_bias_beta: float = 0.0,
+                 descriptor_type: str = 'contrast'):
         super().__init__()
         self.channels = tuple(channels)
         if len(self.channels) != 4:
             raise ValueError('Exactly four scales required')
         self.position_bias_beta = float(position_bias_beta)
+        self.descriptor_type = descriptor_type
         self.scales = nn.ModuleList([
             LocalContrastBidirectionalFusion(c, dim, heads, window, chunk_rows,
-                                             checkpoint_chunks, position_bias_beta)
+                                             checkpoint_chunks, position_bias_beta,
+                                             descriptor_type)
             for c in self.channels])
 
     def _validate_ct(self, ct: Sequence[Tensor]) -> None:

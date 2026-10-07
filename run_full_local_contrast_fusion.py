@@ -24,6 +24,7 @@ from configs.base import str2bool
 from configs.seg_mdt import SegMDTConfig
 from models.build_local_contrast_fusion import build_local_contrast_fusion_model
 from models.dual_shared_local_contrast_fusion import MODEL_ARCH
+from models.gaussian_response_descriptor import sync_fixed_gaussian_buffers
 from models.local_contrast_bidirectional_fusion import LocalContrastFusionPyramid
 from run_full_add_baseline import train_step_full
 from tasks.mdt_seg import MDTSegTeacher
@@ -67,6 +68,9 @@ class FullLocalContrastFusionConfig(SegMDTConfig):
         p.add_argument('--fusion_position_bias_beta', type=float, default=0.0,
                        help='Spatial-distance init for relative_bias: '
                             '-beta*(dy^2+dx^2)/radius^2; 0.0 reproduces old init.')
+        p.add_argument('--fusion_descriptor_type', type=str, default='contrast',
+                       choices=('contrast', 'rasfe_fixed', 'rasfe_learnable'),
+                       help='Descriptor used by both modalities at all four scales.')
         p.add_argument('--check_finite', type=str2bool, default=True,
                        help='Intermediate NaN/Inf checks; logits/loss/update '
                             'checks always stay on.')
@@ -106,6 +110,32 @@ def _assert_fusion_protocol(cfg, model):
         raise RuntimeError(
             'full_local_contrast_fusion requires LocalContrastFusionPyramid, '
             f'got {type(model.fusion).__name__}')
+    requested = str(cfg.fusion_descriptor_type)
+    if model.fusion.descriptor_type != requested:
+        raise RuntimeError(
+            f'Fusion descriptor mismatch: model={model.fusion.descriptor_type!r}, '
+            f'config={requested!r}')
+    for i, block in enumerate(model.fusion.scales):
+        if block.descriptor_type != requested:
+            raise RuntimeError(
+                f'Scale {i} descriptor mismatch: {block.descriptor_type!r} '
+                f'!= {requested!r}')
+
+
+def _assert_checkpoint_descriptor_type(ckpt, requested_type):
+    valid = ('contrast', 'rasfe_fixed', 'rasfe_learnable')
+    if requested_type not in valid:
+        raise ValueError(f'Unknown requested descriptor: {requested_type!r}')
+    saved_cfg = ckpt.get('config', {})
+    if not isinstance(saved_cfg, dict):
+        raise TypeError('Checkpoint config must be a dict')
+    saved_type = saved_cfg.get('fusion_descriptor_type', 'contrast')
+    if saved_type not in valid:
+        raise ValueError(f'Unknown checkpoint descriptor: {saved_type!r}')
+    if saved_type != requested_type:
+        raise ValueError(
+            f'Descriptor mismatch: checkpoint={saved_type!r}, '
+            f'requested={requested_type!r}; do not cross-load fusion checkpoints')
 
 
 def _checkpoint_paths(checkpoint_dir):
@@ -211,6 +241,8 @@ def main():
             if optimizer_step_succeeded(task):
                 task.scheduler.step()
                 task.update_ema()
+                if cfg.fusion_descriptor_type == 'rasfe_fixed' and task.ema is not None:
+                    sync_fixed_gaussian_buffers(task.ema.model, task.model)
             else:
                 skipped_update_count += 1
             if (batch_idx + 1) % 100 == 0:
@@ -279,6 +311,7 @@ def main():
     if not os.path.isfile(paths['best_full']):
         raise RuntimeError('best_full checkpoint was not created')
     ckpt = MDTSegTeacher.load_state_dicts(paths['best_full'])
+    _assert_checkpoint_descriptor_type(ckpt, cfg.fusion_descriptor_type)
     recorded = ckpt.get('eval_weights', 'raw')
     use_ema = (task.ema is not None and recorded == 'ema'
                and ckpt.get('model_ema') is not None)
@@ -303,6 +336,7 @@ def main():
         'weights': weights_tag,
         'eval_precision': 'amp' if eval_amp else 'fp32',
         'hd95_protocol': HD95_PROTOCOL_VERSION,
+        'descriptor_type': str(cfg.fusion_descriptor_type),
         'best_epoch': ckpt['best_epoch'],
         'checkpoint': os.path.abspath(paths['best_full']),
     }

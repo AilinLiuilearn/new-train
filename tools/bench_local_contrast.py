@@ -71,6 +71,9 @@ def main():
     ap.add_argument('--chunk-rows', type=int, default=16)
     ap.add_argument('--checkpoint', action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument('--amp', action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument('--descriptor-type', default='contrast',
+                    choices=('contrast', 'rasfe_fixed', 'rasfe_learnable'))
+    ap.add_argument('--position-bias-beta', type=float, default=0.0)
     ap.add_argument('--out', default='bench_local_contrast.json')
     args = ap.parse_args()
 
@@ -84,10 +87,14 @@ def main():
         'chunk_rows': args.chunk_rows,
         'checkpoint': args.checkpoint,
         'amp': args.amp,
+        'descriptor_type': args.descriptor_type,
+        'position_bias_beta': args.position_bias_beta,
     }
 
     module = LocalContrastFusionPyramid(
-        chunk_rows=args.chunk_rows, checkpoint_chunks=args.checkpoint).to(device)
+        chunk_rows=args.chunk_rows, checkpoint_chunks=args.checkpoint,
+        position_bias_beta=args.position_bias_beta,
+        descriptor_type=args.descriptor_type).to(device)
     ct = [torch.randn(args.batch_size, c, s, s, device=device) for c, s in zip(CHANNELS, SIZES)]
     pet = [torch.randn_like(t) for t in ct]
 
@@ -109,15 +116,27 @@ def main():
     report['fusion_params'] = sum(p.numel() for p in module.parameters())
 
     model = DualSharedLocalContrastFusionModel(
-        ct_pretrained_path=None, pet_pretrained_path=None, pretrained=False).to(device)
+        ct_pretrained_path=None, pet_pretrained_path=None, pretrained=False,
+        fusion_kwargs={'descriptor_type': args.descriptor_type,
+                       'position_bias_beta': args.position_bias_beta}).to(device)
     model.eval()
     ct_img = torch.randn(args.batch_size, 1, 512, 512, device=device)
     pet_img = torch.randn(args.batch_size, 1, 512, 512, device=device)
-    amp_ctx = (torch.autocast(device_type='cuda', enabled=True)
-               if (args.amp and device == 'cuda') else torch.no_grad().__class__())
+    # NOTE (fixed 2026-10-07): amp_ctx was previously constructed but never
+    # entered, so model_fwd always timed FP32 even with --amp. Now the
+    # autocast context is actually applied; report['amp'] reflects reality.
+    # The old 195ms model_fwd number was FP32, not AMP.
+    use_amp = bool(args.amp and device == 'cuda')
     with torch.no_grad():
-        report['model_fwd'] = _timed(
-            lambda: model(ct_img, pet=pet_img, forward_mode='full'), args.repeats, device)
+        if use_amp:
+            with torch.autocast(device_type='cuda', enabled=True):
+                report['model_fwd'] = _timed(
+                    lambda: model(ct_img, pet=pet_img, forward_mode='full'),
+                    args.repeats, device)
+        else:
+            report['model_fwd'] = _timed(
+                lambda: model(ct_img, pet=pet_img, forward_mode='full'), args.repeats, device)
+    report['model_fwd_precision'] = 'amp' if use_amp else 'fp32'
 
     model.train()
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4)

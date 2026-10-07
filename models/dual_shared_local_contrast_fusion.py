@@ -28,6 +28,7 @@ DEFAULT_FUSION_KWARGS = dict(
     chunk_rows=16,
     checkpoint_chunks=True,
     position_bias_beta=0.0,
+    descriptor_type='contrast',
 )
 
 
