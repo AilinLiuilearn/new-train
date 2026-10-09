@@ -3,3 +3,5 @@ __pycache__/
 .pytest_cache/
 pytest-of-root/
 tmp*/
+pretrained/
+checkpoints_new/
