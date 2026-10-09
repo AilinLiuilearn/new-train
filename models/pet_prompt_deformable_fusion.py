@@ -305,11 +305,13 @@ class MultiScalePETPromptDeformableFusion(nn.Module):
 
 
 def export_soft_prompts(diagnostics, output_dir, prefix='sample', sample_index=0,
-                        ct_image=None, pet_image=None, mask=None):
+                        ct_image=None, pet_image=None, mask=None, scale_indices=None):
     """Save exact maps in NPZ and fixed-range PNG panels. NumPy/Pillow only on export.
     Images are display-normalized; prompts ALWAYS use [0,1], changes [-1,1].
     Optional mask is display-only and NEVER used to compute prompts/predictions.
     Caller should obtain diagnostics under eval + no_grad from raw or EMA model.
+    scale_indices optionally labels each entry with its true scale number
+    (e.g. exporting a single scale [2]); default keeps the legacy 1..N labels.
     """
     import json
     import numpy as np
@@ -318,8 +320,12 @@ def export_soft_prompts(diagnostics, output_dir, prefix='sample', sample_index=0
     if not prefix or Path(prefix).name != prefix:
         raise ValueError('prefix must be a plain filename component')
     diagnostics = [diagnostics] if isinstance(diagnostics, dict) else diagnostics
+    if scale_indices is None:
+        scale_indices = list(range(1, len(diagnostics) + 1))
+    if len(scale_indices) != len(diagnostics):
+        raise ValueError('scale_indices must match the number of diagnostics entries')
     saved = []
-    for scale, maps in enumerate(diagnostics, 1):
+    for scale, maps in zip(scale_indices, diagnostics):
         data = {k: v[sample_index].detach().float().cpu().numpy() for k, v in maps.items()}
         npz = directory/f'{prefix}_s{scale}.npz'
         np.savez_compressed(npz, **data)

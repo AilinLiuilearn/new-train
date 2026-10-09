@@ -147,7 +147,8 @@ def visualize_model(model, loader, device, cfg, prefix):
             for scale in cfg.visualize_scales:
                 export_soft_prompts(maps[scale-1], os.path.join(cfg.checkpoint_dir,'soft_prompts'),
                     prefix=f'{prefix}_sample{i}_scale{scale}', sample_index=i,
-                    ct_image=first['ct'][:n], pet_image=first['pet'][:n], mask=first.get('mask'))
+                    ct_image=first['ct'][:n], pet_image=first['pet'][:n], mask=first.get('mask'),
+                    scale_indices=[scale])
     finally:
         model.train(was_training)
 
