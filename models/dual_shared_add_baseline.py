@@ -62,6 +62,8 @@ class DualSharedAddPETCTBaseline(nn.Module):
                                 name='PET_Encoder', required=bool(pretrained))
         ct_channels = list(self.enc_ct.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, list(DECODER_INPUT_CHANNELS))
+        pet_channels = list(self.enc_pet.feature_info.channels())
+        self.pet_align = StageChannelAlign(pet_channels, list(DECODER_INPUT_CHANNELS))
         self.fusion = AddFusion()
         self.decoder = UNetStyleDecoder(
             list(DECODER_INPUT_CHANNELS), decoder_channels=decoder_channels,
@@ -81,7 +83,9 @@ class DualSharedAddPETCTBaseline(nn.Module):
     def _encode_pet(self, pet):
         feats = self.enc_pet(self._to_3ch(pet))
         _check_finite('pet_feats', feats)
-        return feats
+        aligned = self.pet_align(feats)
+        _check_finite('aligned_pet', aligned)
+        return aligned
 
     def _decode(self, fused_feats, target_size):
         out = self.decoder(fused_feats, target_size)
