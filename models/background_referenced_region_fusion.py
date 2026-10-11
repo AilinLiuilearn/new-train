@@ -22,7 +22,11 @@ Implemented equations, separately at every scale:
   d = cos(qCT,uCA) - cos(qCT,uCB)
   pPET = sigmoid(zPET); pCTPET = sigmoid(zPET + eta*d)
   delta = pCTPET - pPET
-  message = delta * (weighted_PET_A - weighted_PET_B)
+  message = delta * (weighted_PET_A - weighted_PET_B)   [contrast_only, legacy]
+  message = corrected * PET_value + delta * (weighted_PET_A - weighted_PET_B)
+                                                             [local_support]
+  where corrected is the CT-corrected PET evidence posterior (NOT GT), and
+  padded window positions are masked out of both terms.
   fused = CT + PET + zero_initialized_projection(overlap_average(message))
 
 Contracts:
@@ -108,6 +112,7 @@ class FusionConfig:
     region_stride: int = 4
     window_chunk: int = 256
     evidence_pool: str = 'signed_peak'
+    message_mode: str = 'contrast_only'
     bg_kernels: Tuple[int, ...] = (9, 17)
     bg_hole: int = 5
     bg_ring_channels: int = 4
@@ -134,6 +139,8 @@ class FusionConfig:
             raise ValueError('chunk and background dimensions must be positive')
         if self.evidence_pool not in ('signed_peak', 'area'):
             raise ValueError('evidence_pool must be signed_peak or area')
+        if self.message_mode not in ('contrast_only', 'local_support'):
+            raise ValueError('message_mode must be contrast_only or local_support')
         if self.bg_hole < 1 or self.bg_hole % 2 == 0 or not self.bg_kernels:
             raise ValueError('bg_hole must be positive odd; need >=1 kernel')
         if any(k % 2 == 0 or k <= self.bg_hole for k in self.bg_kernels):
@@ -352,7 +359,16 @@ class RegionLocalCorrection(nn.Module):
             corrected = (z + eta * comparison).sigmoid()
             delta = (corrected - prior) * valid
             pet_contrast = (v * (wa - wb)[:, None]).sum(-1, keepdim=True)
-            message = delta[:, None] * pet_contrast
+            contrast_message = delta[:, None] * pet_contrast
+            if cfg.message_mode == 'contrast_only':
+                message = contrast_message
+            elif cfg.message_mode == 'local_support':
+                # corrected is the learned posterior, not GT; valid masks padding.
+                support = corrected * valid.to(corrected.dtype)
+                support_message = support[:, None] * v
+                message = support_message + contrast_message
+            else:
+                raise ValueError(f'unknown message_mode={cfg.message_mode!r}')
             # These maps are routing descriptors, not foreground probabilities.
             diagnostic = torch.stack((prior * valid, corrected * valid, delta,
                                       comparison, usable.float()), dim=1)

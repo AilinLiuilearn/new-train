@@ -44,6 +44,14 @@ class FullBackgroundReferencedConfig(FullAddConfig):
     """Full-only; the new arch plus background-loss / visualization options."""
 
     @staticmethod
+    def train_parser():
+        p = FullAddConfig.train_parser()
+        for action in p._actions:
+            if action.dest == 'hd95_mode':
+                action.default = 'surface'
+        return p
+
+    @staticmethod
     def model_parser():
         p = SegMDTConfig.model_parser()
         for action in p._actions:
@@ -74,6 +82,9 @@ class FullBackgroundReferencedConfig(FullAddConfig):
         p.add_argument('--brlc_checkpoint_windows', type=str2bool, default=True)
         p.add_argument('--brlc_checkpoint_background', type=str2bool, default=True)
         p.add_argument('--brlc_validate_values', type=str2bool, default=True)
+        p.add_argument('--brlc_message_mode', type=str, default='local_support',
+                       choices=('contrast_only', 'local_support'))
+        p.add_argument('--brlc_grad_log_interval', type=int, default=100)
         return p
 
 
@@ -129,9 +140,12 @@ def _assert_checkpoint_fusion(cfg, ckpt):
         raise ValueError('Checkpoint model_arch mismatch: refusing cross-model load')
     saved_fusion = saved.get('fusion', {})
     live_fusion = getattr(cfg, 'fusion', None)
-    if isinstance(saved_fusion, dict) and isinstance(live_fusion, dict) \
-            and saved_fusion != live_fusion:
-        raise ValueError('Checkpoint fusion config mismatch: refusing cross-config load')
+    if isinstance(saved_fusion, dict) and isinstance(live_fusion, dict):
+        # Old checkpoints predate message_mode; interpret them as contrast_only.
+        filled = dict(saved_fusion)
+        filled.setdefault('message_mode', 'contrast_only')
+        if filled != live_fusion:
+            raise ValueError('Checkpoint fusion config mismatch: refusing cross-config load')
 
 
 def _checkpoint_paths(checkpoint_dir):
@@ -174,6 +188,8 @@ def main():
     print('[INFO] background supervision region = all non-foreground pixels '
           '(no independent tissue ROI in this dataset; black canvas included)',
           flush=True)
+    print(f'[INFO] message_mode={cfg.brlc_message_mode} '
+          f'hd95_mode={cfg.hd95_mode} hd95_unit=pixel', flush=True)
 
     train_loader, val_loader, test_loader = _loaders(cfg)
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)} '
@@ -185,6 +201,8 @@ def main():
     cfg.fusion = fusion_cfg
     with open(os.path.join(cfg.checkpoint_dir, 'fusion_config.json'), 'w') as f:
         json.dump(fusion_cfg, f, indent=2)
+    with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
+        json.dump(vars(cfg), f, indent=2, default=str)
     total_params, trainable_params = count_parameters(task.model)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
     if task.ema is not None:
@@ -204,9 +222,11 @@ def main():
         'train_samples', 'train_batches',
         'val_full_loss', 'val_full_dice', 'val_full_iou', 'val_full_acc',
         'val_full_acc_pixel', 'val_full_hd95',
+        'val_hd95_mode', 'val_hd95_unit', 'val_hd95_empty_policy',
+        'val_gt_positive_count', 'val_missed_positive_count', 'val_hd95_sample_count',
         'best_full', 'best_full_epoch',
         'grad_enc_ct', 'grad_enc_pet', 'grad_ct_align', 'grad_pet_align',
-        'grad_fusion', 'grad_decoder',
+        'grad_fusion', 'grad_decoder', 'grad_sampled_steps',
         'ema_enabled', 'ema_updates', 'skipped_updates',
         'epoch_time',
     ]
@@ -245,12 +265,14 @@ def main():
                 task.scaler.unscale_(task.optimizer)
             else:
                 loss.backward()
-            grads['enc_ct'].append(module_grad_norm(task.model.enc_ct))
-            grads['enc_pet'].append(module_grad_norm(task.model.enc_pet))
-            grads['ct_align'].append(module_grad_norm(task.model.ct_align))
-            grads['pet_align'].append(module_grad_norm(task.model.pet_align))
-            grads['fusion'].append(module_grad_norm(task.model.fusion))
-            grads['decoder'].append(module_grad_norm(task.model.decoder))
+            grad_interval = int(getattr(cfg, 'brlc_grad_log_interval', 1) or 0)
+            if grad_interval > 0 and (batch_idx + 1) % grad_interval == 0:
+                grads['enc_ct'].append(module_grad_norm(task.model.enc_ct))
+                grads['enc_pet'].append(module_grad_norm(task.model.enc_pet))
+                grads['ct_align'].append(module_grad_norm(task.model.ct_align))
+                grads['pet_align'].append(module_grad_norm(task.model.pet_align))
+                grads['fusion'].append(module_grad_norm(task.model.fusion))
+                grads['decoder'].append(module_grad_norm(task.model.decoder))
             total_grad_norm = (torch.nn.utils.clip_grad_norm_(
                 task.trainable_parameters(), float(cfg.grad_clip))
                 if float(cfg.grad_clip) > 0 else 0.0)
@@ -291,6 +313,9 @@ def main():
                             os.path.join(cfg.checkpoint_dir, 'brlc_vis',
                                          f'epoch{epoch:03d}_{task.eval_weights_tag()}.png'))
 
+        def _grad_mean(key):
+            return float(np.mean(grads[key])) if grads[key] else float('nan')
+
         train_total = train_total_sum / max(1, train_sample_count)
         train_seg = train_seg_sum / max(1, train_sample_count)
         train_bg = train_bg_sum / max(1, train_sample_count)
@@ -313,14 +338,23 @@ def main():
                 'val_full_acc': val_full['acc'],
                 'val_full_acc_pixel': val_full.get('acc_pixel', 0.0),
                 'val_full_hd95': val_full['hd95'],
+                'val_hd95_mode': str(cfg.hd95_mode),
+                'val_hd95_unit': 'pixel',
+                'val_hd95_empty_policy': ('both-empty=0; one-empty=grid-diagonal-penalty'
+                                          if str(cfg.hd95_mode) == 'surface'
+                                          else 'legacy-center-pixel-fallback'),
+                'val_gt_positive_count': int(val_full.get('gt_positive_count', 0)),
+                'val_missed_positive_count': int(val_full.get('missed_positive_count', 0)),
+                'val_hd95_sample_count': int(val_full.get('hd95_sample_count', 0)),
                 'best_full': best_full,
                 'best_full_epoch': best_full_epoch,
-                'grad_enc_ct': float(np.mean(grads['enc_ct'])) if grads['enc_ct'] else 0.0,
-                'grad_enc_pet': float(np.mean(grads['enc_pet'])) if grads['enc_pet'] else 0.0,
-                'grad_ct_align': float(np.mean(grads['ct_align'])) if grads['ct_align'] else 0.0,
-                'grad_pet_align': float(np.mean(grads['pet_align'])) if grads['pet_align'] else 0.0,
-                'grad_fusion': float(np.mean(grads['fusion'])) if grads['fusion'] else 0.0,
-                'grad_decoder': float(np.mean(grads['decoder'])) if grads['decoder'] else 0.0,
+                'grad_enc_ct': _grad_mean('enc_ct'),
+                'grad_enc_pet': _grad_mean('enc_pet'),
+                'grad_ct_align': _grad_mean('ct_align'),
+                'grad_pet_align': _grad_mean('pet_align'),
+                'grad_fusion': _grad_mean('fusion'),
+                'grad_decoder': _grad_mean('decoder'),
+                'grad_sampled_steps': float(len(grads['fusion'])),
                 'ema_enabled': 1.0 if task.ema is not None else 0.0,
                 'ema_updates': float(task.ema.updates) if task.ema is not None else 0.0,
                 'skipped_updates': float(skipped_update_count),
@@ -361,6 +395,17 @@ def main():
         'dice': float(test_full['dice']),
         'iou': float(test_full['iou']),
         'hd95': float(test_full['hd95']),
+        'hd95_mode': str(cfg.hd95_mode),
+        'hd95_unit': 'pixel',
+        'hd95_empty_policy': ('both-empty=0; one-empty=grid-diagonal-penalty'
+                              if str(cfg.hd95_mode) == 'surface'
+                              else 'legacy-center-pixel-fallback'),
+        'hd95_note': ('legacy and surface HD95 are different definitions; '
+                      'do not compare them as model improvement'),
+        'gt_positive_count': int(test_full.get('gt_positive_count', 0)),
+        'missed_positive_count': int(test_full.get('missed_positive_count', 0)),
+        'hd95_sample_count': int(test_full.get('hd95_sample_count', 0)),
+        'message_mode': str(cfg.brlc_message_mode),
         'loss': float(test_full['total_loss']),
         'weights': weights_tag,
         'best_epoch': ckpt['best_epoch'],

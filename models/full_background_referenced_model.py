@@ -107,6 +107,7 @@ def build_full_background_referenced_model(cfg):
         'eta_max': float(_get('brlc_eta_max', 4.0)),
         'prior_logit_limit': float(_get('brlc_prior_logit_limit', 6.0)),
         'loo_min_mass': float(_get('brlc_loo_min_mass', 1e-4)),
+        'message_mode': str(_get('brlc_message_mode', 'contrast_only')),
         'checkpoint_windows': bool(_get('brlc_checkpoint_windows', True)),
         'checkpoint_background': bool(_get('brlc_checkpoint_background', True)),
         'validate_values': bool(_get('brlc_validate_values', True)),
