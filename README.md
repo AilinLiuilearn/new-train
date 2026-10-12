@@ -1,6 +1,6 @@
 # Clean segmentation baselines
 
-Branch: `exp/clean-group-baseline`. Two independent, runnable baselines that
+Branch: `exp/aligned-add-baseline`. Three independent, runnable baselines that
 share config / loss / metrics / logging / EMA code (no duplicated utilities).
 
 ## A. CT-only — `run_ct_only_seg.py`
@@ -15,7 +15,7 @@ share config / loss / metrics / logging / EMA code (no duplicated utilities).
 - CT `convnextv2_nano` + PET `mit_b1`, same align spec as CT-only.
 - Every batch is exact-half Full/Missing (`build_balanced_pet_available`,
   reproducible per step). Each sample takes exactly one state per batch.
-- Full: `aligned_CT + PET` → shared decoder. Missing: `aligned_CT + zeros` →
+- Full: `aligned_CT + aligned_PET` → shared decoder. Missing: `aligned_CT + zeros` →
   same decoder; Missing rows' PET is never encoded (`pet=None` allowed).
 - `loss = 0.5 * full_subset + 0.5 * missing_subset`, one backward/step.
 - Val runs whole-set Full and Missing; `Joint = 0.5*(Full+Missing)` Dice.
@@ -25,11 +25,23 @@ share config / loss / metrics / logging / EMA code (no duplicated utilities).
 `run_mdt_seg.py` is a compatibility shim: it prints the forwarding rule and
 delegates `--train_batch_mode mixed` to the mixed runner; other modes raise.
 
+## C. Full-only add — `run_full_add_baseline.py`
+
+- CT `convnextv2_nano` and PET `mit_b1`, with separate channel alignment.
+- All samples use both modalities: `aligned_CT + aligned_PET` → shared decoder.
+- Best by val Full Dice; final test uses this checkpoint and its recorded
+  raw/EMA weight choice. No experimental fusion or background loss is enabled.
+
 ## Run
 
 ```bash
 # CT-only (formal: real splits + pretrained; needs a disjoint val split)
 python3 run_ct_only_seg.py --root /root/autodl-tmp/data/PCLT20K \
+  --train_split_file train_original.txt --val_split_file <your_val>.txt \
+  --test_split_file test.txt --checkpoint_root <out> --epochs 60 --batch_size 16
+
+# Full-only add (stage-one baseline)
+python3 run_full_add_baseline.py --root /root/autodl-tmp/data/PCLT20K \
   --train_split_file train_original.txt --val_split_file <your_val>.txt \
   --test_split_file test.txt --checkpoint_root <out> --epochs 60 --batch_size 16
 
@@ -40,8 +52,10 @@ python3 run_full_missing_baseline.py --root /root/autodl-tmp/data/PCLT20K \
 
 # Evaluate a checkpoint at missing rates 0/0.25/0.5/0.75/1 (same seeded
 # patient assignments for both experiments)
-python3 eval_joint_baseline.py --checkpoint <ckpt> --mode dual --use_ema True
-python3 eval_joint_baseline.py --checkpoint <ckpt> --mode ct_only
+python3 eval_joint_baseline.py --checkpoint <ckpt> --mode dual --use_ema True \
+  --hd95_mode cipa_official --output_dir <new_eval_dir>
+python3 eval_joint_baseline.py --checkpoint <ckpt> --mode ct_only \
+  --hd95_mode cipa_official --output_dir <new_eval_dir>
 ```
 
 Notes:
@@ -50,13 +64,31 @@ Notes:
   enforced patient-disjoint (the shipped `val.txt` overlaps train cases, so
   provide an explicit disjoint val split — the loader reports the condition
   instead of silently re-splitting).
-- Both runners auto-run the missing-rate final eval from the best checkpoint
+- The CT-only and Full/Missing runners auto-run the missing-rate final eval from the best checkpoint
   and record whether `raw` or `ema` weights were used.
 - Formal runs require local pretrained weights (`--ct_pretrained_path`,
   `--pet_pretrained_path`); missing/unparseable/zero-match paths raise.
   `--pretrained False` opts out explicitly for smoke tests only.
 - Results land only in the run's own `checkpoint_dir`; existing experiment
   outputs are never touched.
+
+## Evaluation protocol
+
+- Training defaults to `--hd95_mode cipa_official`; final evaluation uses
+  the same selected mode and threshold. Final result files record mode and unit.
+- Dice/IoU accumulate pixel counts over the dataset; HD95 is the mean of
+  per-slice MedPy HD95 in pixels, without physical voxel spacing.
+- `cipa_official` follows CIPA `pred.py` at commit
+  `5c90d86ba1331e8043a92b8e732aa36234c548dc`: 512×512 masks, threshold 0.5,
+  both-empty = 0, empty prediction with positive GT = insert a center pixel
+  on a copy for HD95 only. Dice and missed-case counts keep the original mask.
+- MedPy is required (`pip install MedPy`); no silent approximate fallback.
+  Empty GT with nonempty prediction raises, since the official script does
+  not define a working score for that case.
+- Standalone evaluation honors a checkpoint's saved metric mode unless
+  `--hd95_mode` overrides it; absent saved mode defaults to `cipa_official`.
+  Re-evaluate old checkpoints with the explicit flag above for comparison;
+  historical `legacy`/`surface` scores do not change automatically.
 
 ## Smoke (no data/weights needed)
 
@@ -68,16 +100,16 @@ python3 -m pytest tests/test_baseline_contract.py tests/test_ema.py \
 
 ## Future fusion seam
 
-Only the Full path calls `AddFusion` (`models/add_fusion.py`). A new fusion
+Only the Full path calls `AddFusion` (`models/components/add_fusion.py`). A new fusion
 module replaces that call; Missing keeps feeding `aligned_CT` to the same
 decoder. No fusion/prototype/retrieval/text code is wired in this round.
 
 ## Changed files
 
-- `models/backbones.py` (new): timm/HF encoders, strict offline loading.
-- `models/channel_align.py` (new): `StageChannelAlign` moved unchanged.
-- `models/group_unet_decoder.py` (new): GroupNorm decoder moved + finite check.
-- `models/add_fusion.py` (new): strict per-scale add (4 scales, channels,
+- `models/components/backbones.py` (new): timm/HF encoders, strict offline loading.
+- `models/components/channel_align.py` (new): `StageChannelAlign` moved unchanged.
+- `models/components/group_unet_decoder.py` (new): GroupNorm decoder moved + finite check.
+- `models/components/add_fusion.py` (new): strict per-scale add (4 scales, channels,
   finite; no NaN masking).
 - `models/ct_only_baseline.py` (new): `CTOnlySegmentationModel`.
 - `models/dual_shared_add_baseline.py`: rewritten auto (Full-only PET encode,

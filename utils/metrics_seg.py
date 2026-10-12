@@ -142,11 +142,11 @@ def hd95_cipa_official_pair(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
     work = pred.copy()
     if work.sum() == 0:
         work[256, 256] = True
+        # Official pred.py does not catch errors in its center-pixel branch.
+        return float(medpy_hd95(work.astype(np.uint8), gt.astype(np.uint8)))
     try:
         return float(medpy_hd95(work.astype(np.uint8), gt.astype(np.uint8)))
     except Exception:
-        if work.sum() == 0 or gt.sum() == 0:
-            raise
         h, w = work.shape[-2], work.shape[-1]
         return float(np.sqrt(h ** 2 + w ** 2))
 

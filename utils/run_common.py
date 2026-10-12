@@ -94,7 +94,9 @@ def run_missing_rate_eval(task, model, loader, case_mask, tag='test', ct_only=Fa
     PET-invariant by construction); otherwise routes per-sample state.
     """
     from utils.metrics_seg import SegmentationMetricsCIPA
-    metric = SegmentationMetricsCIPA()
+    # Use the exact evaluation protocol already selected by the training task.
+    metric = SegmentationMetricsCIPA(
+        threshold=task.metrics.threshold, hd95_mode=task.metrics.hd95_mode)
     total_loss = []
     total_case_ids = set()
     missing_case_ids = set()
@@ -131,6 +133,8 @@ def run_missing_rate_eval(task, model, loader, case_mask, tag='test', ct_only=Fa
     out['total_case_count'] = len(total_case_ids)
     out['slice_count'] = slice_count
     out['tag'] = tag
+    out['hd95_mode'] = metric.hd95_mode
+    out['hd95_unit'] = 'pixel'
     return out
 
 
@@ -163,6 +167,8 @@ def eval_missing_rates(task, model, loader, seed, checkpoint_dir, stem,
             'acc': out['acc'],
             'acc_pixel': out['acc_pixel'],
             'hd95': out['hd95'],
+            'hd95_mode': out['hd95_mode'],
+            'hd95_unit': out['hd95_unit'],
             'loss': out['loss'],
             'missing_case_count': out['missing_case_count'],
             'total_case_count': out['total_case_count'],

@@ -270,6 +270,8 @@ def main():
         'dice': float(test_full['dice']),
         'iou': float(test_full['iou']),
         'hd95': float(test_full['hd95']),
+        'hd95_mode': task.metrics.hd95_mode,
+        'hd95_unit': 'pixel',
         'loss': float(test_full['total_loss']),
         'weights': weights_tag,
         'best_epoch': ckpt['best_epoch'],
