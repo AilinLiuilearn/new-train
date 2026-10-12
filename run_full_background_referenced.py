@@ -44,14 +44,6 @@ class FullBackgroundReferencedConfig(FullAddConfig):
     """Full-only; the new arch plus background-loss / visualization options."""
 
     @staticmethod
-    def train_parser():
-        p = FullAddConfig.train_parser()
-        for action in p._actions:
-            if action.dest == 'hd95_mode':
-                action.default = 'surface'
-        return p
-
-    @staticmethod
     def model_parser():
         p = SegMDTConfig.model_parser()
         for action in p._actions:
@@ -340,9 +332,11 @@ def main():
                 'val_full_hd95': val_full['hd95'],
                 'val_hd95_mode': str(cfg.hd95_mode),
                 'val_hd95_unit': 'pixel',
-                'val_hd95_empty_policy': ('both-empty=0; one-empty=grid-diagonal-penalty'
-                                          if str(cfg.hd95_mode) == 'surface'
-                                          else 'legacy-center-pixel-fallback'),
+                'val_hd95_empty_policy': {
+                    'cipa_official': 'both-empty=0; pred-empty-gt-positive=center-pixel-then-medpy',
+                    'surface': 'both-empty=0; one-empty=grid-diagonal-penalty',
+                    'legacy': 'legacy-center-pixel-fallback'}.get(
+                        str(cfg.hd95_mode), 'unknown-hd95-mode'),
                 'val_gt_positive_count': int(val_full.get('gt_positive_count', 0)),
                 'val_missed_positive_count': int(val_full.get('missed_positive_count', 0)),
                 'val_hd95_sample_count': int(val_full.get('hd95_sample_count', 0)),
@@ -397,9 +391,11 @@ def main():
         'hd95': float(test_full['hd95']),
         'hd95_mode': str(cfg.hd95_mode),
         'hd95_unit': 'pixel',
-        'hd95_empty_policy': ('both-empty=0; one-empty=grid-diagonal-penalty'
-                              if str(cfg.hd95_mode) == 'surface'
-                              else 'legacy-center-pixel-fallback'),
+        'hd95_empty_policy': {
+            'cipa_official': 'both-empty=0; pred-empty-gt-positive=center-pixel-then-medpy',
+            'surface': 'both-empty=0; one-empty=grid-diagonal-penalty',
+            'legacy': 'legacy-center-pixel-fallback'}.get(
+                str(cfg.hd95_mode), 'unknown-hd95-mode'),
         'hd95_note': ('legacy and surface HD95 are different definitions; '
                       'do not compare them as model improvement'),
         'gt_positive_count': int(test_full.get('gt_positive_count', 0)),

@@ -4,7 +4,8 @@
 - IoU / Dice / Sensitivity / Specificity / Precision / F1
 - Acc：与 CIPA 一致 mean(TP/(TP+FN), TN/(TN+FP))，即 (Sens+Spec)/2，避免像素 Acc 虚高 ~98%
 - Acc_pixel：像素准确率 (TP+TN)/全部，仅作参考
-- HD95：逐图计算后取平均；优先 medpy，否则 scipy 边界距离近似
+- HD95：逐图计算后取平均；legacy 优先 medpy 否则近似，surface 用表面定义，
+  cipa_official 对齐 CIPA 官方 pred.py（MedPy 必选）
 """
 
 import numpy as np
@@ -113,9 +114,48 @@ def hd95_surface_pair(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
     return float(np.percentile(distances, 95))
 
 
+def hd95_cipa_official_pair(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
+    """CIPA official pred.py HD95 (512x512 uint8-equivalent binary maps).
+
+    - Inputs must be same-shape 2D binary arrays; they are never modified
+      (the center-pixel fallback acts on an internal copy).
+    - Both empty: 0.0.
+    - GT nonempty, pred empty: copy pred, set [256,256]=1, then MedPy hd95.
+    - GT empty, pred nonempty: the official script has no working branch for
+      this case (MedPy raises on empty GT); raise explicitly instead of
+      inventing a new scoring rule.
+    - Both nonempty: MedPy hd95; on failure fall back to sqrt(H**2+W**2).
+    MedPy is mandatory; missing MedPy raises instead of switching backends.
+    No voxelspacing is passed; connectivity stays at the MedPy default (1).
+    """
+    from medpy.metric.binary import hd95 as medpy_hd95
+    pred = np.asarray(pred_bin, dtype=bool)
+    gt = np.asarray(gt_bin, dtype=bool)
+    if pred.ndim != 2 or gt.ndim != 2 or pred.shape != gt.shape \
+            or pred.shape != (512, 512):
+        raise ValueError('cipa_official HD95 requires same-shape 2D 512x512 binary arrays')
+    if pred.sum() == 0 and gt.sum() == 0:
+        return 0.0
+    if gt.sum() == 0:
+        raise ValueError('cipa_official HD95 has no defined branch for empty GT '
+                         'with nonempty prediction; refusing to invent a score')
+    work = pred.copy()
+    if work.sum() == 0:
+        work[256, 256] = True
+    try:
+        return float(medpy_hd95(work.astype(np.uint8), gt.astype(np.uint8)))
+    except Exception:
+        if work.sum() == 0 or gt.sum() == 0:
+            raise
+        h, w = work.shape[-2], work.shape[-1]
+        return float(np.sqrt(h ** 2 + w ** 2))
+
+
 def compute_hd95_pair(pred_bin: np.ndarray, gt_bin: np.ndarray,
                       hd95_mode: str = 'legacy') -> float:
-    """单张 2D 二值图 HD95；legacy 保持历史口径，surface 使用表面定义。"""
+    """单张 2D 二值图 HD95；legacy 保持历史口径，surface 使用表面定义，cipa_official 对齐 CIPA 官方 pred.py。"""
+    if hd95_mode == 'cipa_official':
+        return hd95_cipa_official_pair(pred_bin, gt_bin)
     if hd95_mode == 'surface':
         return hd95_surface_pair(pred_bin, gt_bin)
     if hd95_mode != 'legacy':
@@ -238,7 +278,7 @@ class SegmentationMetricsCIPA(torch.nn.Module):
 
     def __init__(self, threshold=0.5, hd95_mode='legacy'):
         super().__init__()
-        if hd95_mode not in ('legacy', 'surface'):
+        if hd95_mode not in ('legacy', 'surface', 'cipa_official'):
             raise ValueError(f'unknown hd95_mode={hd95_mode!r}')
         self.threshold = threshold
         self.hd95_mode = hd95_mode
