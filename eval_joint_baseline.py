@@ -22,6 +22,15 @@ from tasks.mdt_seg import MDTSegTeacher
 from utils.run_common import eval_missing_rates
 
 
+def _select_builder(cfg, ct_only):
+    if ct_only:
+        return build_ct_only_model
+    if getattr(cfg, 'fusion_type', 'AddFusion') == 'MAFIAddFusion':
+        from models.full_mafi_add_model import build_full_mafi_add_model
+        return build_full_mafi_add_model
+    return build_dual_model
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--checkpoint', type=str, required=True)
@@ -51,7 +60,7 @@ def main():
     cfg = SegMDTConfig(args=saved_config)
 
     ct_only = args.mode == 'ct_only'
-    builder = build_ct_only_model if ct_only else build_dual_model
+    builder = _select_builder(cfg, ct_only)
     task = MDTSegTeacher(builder(cfg), cfg)
     state_dict = ckpt['model']
     if args.use_ema:

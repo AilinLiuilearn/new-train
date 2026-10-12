@@ -1,6 +1,6 @@
 # Clean segmentation baselines
 
-Branch: `exp/aligned-add-baseline`. Three independent, runnable baselines that
+Branch: `exp/full-mafi-add`. Three independent, runnable baselines plus a MAFI candidate that
 share config / loss / metrics / logging / EMA code (no duplicated utilities).
 
 ## A. CT-only — `run_ct_only_seg.py`
@@ -135,3 +135,61 @@ decoder. No fusion/prototype/retrieval/text code is wired in this round.
 - Deleted unused: `models/petct_text_region_fusion.py`,
   `tests/test_dcim_wiring.py`, `tools/smoke_dcim_full.py`.
 - `tests/`: updated to the new API + added the §八 contract checks.
+
+
+## D. Full-only MAFI+Add candidate — `run_full_mafi_add.py`
+
+Source: [EG-CMFNet official code](https://github.com/masurq/EG-CMFNet/blob/eed0ad865eea8b0dc0e18db1da11afc062a36b52/models/new_model/modules.py),
+TGRS 2026, DOI `10.1109/TGRS.2026.3680719`.
+
+- Four independent MAFI blocks after CT/PET alignment, then AddFusion and
+  the unchanged decoder. No encoder-stage feedback, LFF or edge branch from
+  the full source network is transplanted; this tests MAFI+Add in our framework.
+- CCA/CSA retain mean, maximum and sample standard deviation, the exact
+  CT-first sequential order, and source convolution initialization.
+  Gamma is unconstrained and zero-initialized (16 scalars total); step-0
+  output equals Add. Ratio=16 and kernel=7 at every scale: 97,448 new parameters.
+- `--mafi_enabled False` builds the original Add architecture; original
+  baseline files/entry points remain available. No auxiliary loss is added.
+- The same AdamW, scheduler, data split, normalization, EMA policy and HD95
+  selection apply. The source SHA is recorded in configs and final results.
+  Fusion gradient norm is sampled once per 100 batches.
+- New checkpoints rebuild MAFI for strict raw/EMA loading. The shared
+  evaluator selects the builder from saved `fusion_type`; a MAFI checkpoint
+  cannot load into the Add architecture or CT-only model.
+- This runner trains Full only, without a memory bank. In inherited Missing
+  routing PET and MAFI are bypassed; missing robustness is not trained here.
+
+Use the same settings as the Add control, changing only entry/hash:
+
+```bash
+python3 run_full_mafi_add.py \
+  --hash full-mafi-add-aligned-imagenet-s2023 \
+  --root /root/autodl-tmp/data/PCLT20K \
+  --train_split_file train_original.txt --val_split_file <your_val>.txt \
+  --test_split_file test.txt --image_size_2d 512 --batch_size 16 \
+  --norm_mode imagenet --aug_mode cipa --random_state 2023 \
+  --ema_enabled True --hd95_mode cipa_official --epochs 60
+
+# Add control: own hash, same data/training settings.
+python3 run_full_mafi_add.py \
+  --hash full-mafi-disabled-aligned-imagenet-s2023 --mafi_enabled False \
+  --root /root/autodl-tmp/data/PCLT20K \
+  --train_split_file train_original.txt --val_split_file <your_val>.txt \
+  --test_split_file test.txt --image_size_2d 512 --batch_size 16 \
+  --norm_mode imagenet --aug_mode cipa --random_state 2023 \
+  --ema_enabled True --hd95_mode cipa_official --epochs 60
+```
+
+Existing local pretrained paths are reused. Supply a disjoint validation
+split. Install MedPy for official HD95. EMA/imagenet above are explicit run
+arguments, not changes to shared baseline defaults.
+
+Lightweight checks, with no dataset/download/real encoder execution:
+
+```bash
+python3 -m unittest discover -s tests -p 'test_mafi_add.py' -v
+```
+
+Tests use small fake encoders to exercise actual model routing, optimizer,
+EMA and checkpoint plumbing. They do not measure GPU runtime or accuracy.
