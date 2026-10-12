@@ -10,6 +10,7 @@ import torch
 from test_pet_correction_memory import FakeEncoder
 from tasks.mdt_seg import MDTSegTeacher
 from run_joint_pet_correction import main
+from models.pet_correction_model import PETCorrectionModel
 
 
 class TinyLoader(list):
@@ -30,12 +31,19 @@ class RunnerSmoke(unittest.TestCase):
             args=['run_joint_pet_correction.py','--checkpoint_root',tmp,'--hash','contract',
                   '--pretrained','False','--epochs','2','--batch_size','4','--mixed_precision','False',
                   '--hd95_mode','surface','--decoder_channels','8','8','8','8','--num_workers','0',
-                  '--ema_start_epoch','0','--memory_warmup_epochs','0','--retrieval_start_epoch','1',
+                  '--ema_start_epoch','0',
                   '--memory_capacity','16','--memory_key_dim','4','--memory_min_entries','1',
                   '--memory_topk','2','--memory_query_chunk','16']
+            source_calls=[]
+            original_candidates=PETCorrectionModel.make_candidates
+            def trace_candidates(source,*a,**kw):
+                source_calls.append((int(source.memory_step),bool(source.retrieval_active)))
+                return original_candidates(source,*a,**kw)
             with patch('sys.argv',args),patch('run_joint_pet_correction._loaders',return_value=loaders),\
+                 patch.object(PETCorrectionModel,'make_candidates',new=trace_candidates),\
                  patch('models.dual_shared_add_baseline.create_feature_backbone',lambda *a,**k:FakeEncoder()):
                 main()
+            self.assertEqual(source_calls,[(0,False),(1,False),(2,True),(3,True)])
             root=os.path.join(tmp,'MDT','contract')
             last=os.path.join(root,'ckpt.last.pth.tar')
             best=os.path.join(root,'ckpt.best_joint.pth.tar')
@@ -45,6 +53,8 @@ class RunnerSmoke(unittest.TestCase):
             self.assertEqual(int(ckpt['model']['memory_step']),4)
             self.assertTrue(ckpt['model']['retrieval_active'])
             self.assertEqual(ckpt['config']['norm_mode'],'imagenet')
+            self.assertEqual(ckpt['config']['memory_warmup_epochs'],0)
+            self.assertEqual(ckpt['config']['retrieval_start_epoch'],2)
             self.assertEqual(ckpt['eval_weights'],'ema')
             with open(os.path.join(root,'final_test_metrics.json')) as f:
                 result=json.load(f)

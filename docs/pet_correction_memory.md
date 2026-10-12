@@ -96,12 +96,19 @@ No-case metadata is represented by group -1. All evaluation memory is train-only
 
 ## Lifecycle and checkpoint protocol
 
-Epochs 1..5: supervised joint training, no collection or retrieval.
-Epoch 6: collect qualifying Full tokens. Epoch >=7: permit retrieval, but each
+Epoch 1: supervised joint training and collection of qualifying Full tokens,
+no retrieval. Epoch >=2: continue collection and permit retrieval, but each
 query still requires >=16 eligible/non-self/non-expired entries. Empty banks do
 not fabricate knowledge. Best selection uses 0.5*(Full Dice+Missing Dice), from
 one checkpoint for both states. HD95 remains `cipa_official` with MedPy required.
 No metric implementation is changed.
+
+Defaults: `memory_warmup_epochs=0`, `retrieval_start_epoch=2`. Collection starts
+when epoch > warmup; retrieval permission starts when epoch >= start. The first
+epoch is an admission attempt, not a guarantee that 16 good entries will exist.
+EMA activation remains epoch 4: collection/query source is raw eval-mode in
+epochs 1..3, then the EMA model. Active processes retain their parsed settings.
+Resume an older 5/7 run with its original flags; this change applies to new runs.
 
 Checkpoints include optimizer, scheduler, scaler, RNG, global batch step, queue
 payloads/pointers/ages, activation flag and EMA source. Resume in the same run
@@ -143,6 +150,7 @@ python run_joint_pet_correction.py \
   --image_size_2d 512 --batch_size 16 \
   --norm_mode imagenet --aug_mode cipa \
   --full_ratio 0.7 --full_loss_weight 0.7 --missing_loss_weight 0.3 \
+  --memory_warmup_epochs 0 --retrieval_start_epoch 2 \
   --ema_enabled True --ema_decay 0.999 \
   --hd95_mode cipa_official --random_state 2023 --epochs 60
 ```
