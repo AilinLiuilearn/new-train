@@ -76,6 +76,14 @@ from Full rows only, under no_grad. This costs extra source encoder/probe passes
 it is a stabilizer, not teacher-matching supervision. EMA-off uses the raw model
 in temporary eval mode for coherent paired collection/querying.
 
+Source collection/query forwards use an isolated no-grad autocast context with
+weight caching OFF and preserved CPU/CUDA RNG. In affected PyTorch versions,
+no-grad raw-source forwards inside the training autocast scope otherwise cache
+detached casts and disconnect main encoder/decoder gradients. Memory sampling
+also must not consume the DropPath/dropout RNG used by the training forward.
+First batch of each epoch checks representative encoder/alignment/decoder kernel
+gradients; missing core gradients raise before any optimizer/memory update.
+
 At Missing inference, CT alone generates queries. Cosine TopK=4, temperature=.1,
 query blocks of 256; never allocate B*H*W*queue dense attention. Readout is
 softmax(similarity)*reliability weighted signed Values. A CT-conditioned
@@ -197,3 +205,12 @@ Actual ConvNeXtV2-Nano + MiT-B1 passed a CPU 128x128 synthetic optimization step
 and Missing forward, generating 10 candidate tokens. Syntax/diff checks passed.
 No PCLT20K data, local pretrained files or CUDA device were available here;
 512x512 GPU memory and real-data accuracy/official HD95 were not measured.
+
+AMP regression follow-up: reproduced disconnected main kernels with early raw
+source collection under CPU bfloat16 autocast in PyTorch 2.5.1 (old implementation).
+The corrected source boundary passes the regression: with retrieval disabled,
+collection ON/OFF yields identical training logits, loss, CT-kernel gradients and
+RNG, while collection still produces candidates. Full 10-test suite passed on
+PyTorch 2.14.1; compatibility regression also passed on 2.5.1. No user GPU logs
+of parameter gradients were available, so on-device confirmation uses the new
+first-batch guard and runtime-version log.

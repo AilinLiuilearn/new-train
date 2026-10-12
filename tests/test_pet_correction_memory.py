@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from models.pet_correction_memory import PairedCorrectionMemory, CorrectionRetriever, audit_regions
 from models.pet_correction_model import PETCorrectionModel
 from tasks.pet_correction import CorrectionEMA, build_ratio_state, stable_ids
+from tasks.pet_correction import PETCorrectionTask
+from configs.pet_correction import PETCorrectionConfig
 
 
 class FakeEncoder(nn.Module):
@@ -168,6 +170,41 @@ class Contracts(unittest.TestCase):
         ema.model(torch.randn(1,3,32,32), forward_mode='missing', sample_ids=torch.tensor([2]))
         for k,v in before.items():
             self.assertTrue(torch.equal(v, ema.model.state_dict()[k]), k)
+
+    def test_early_collection_preserves_amp_gradients_rng_and_training_forward(self):
+        """Collection-only must not freeze cached AMP weights or perturb DropPath."""
+        with patch('sys.argv',['x','--batch_size','4','--pretrained','False',
+                              '--mixed_precision','False','--hd95_mode','legacy']):
+            cfg=PETCorrectionConfig.parse_arguments()
+        cfg.ema_enabled=False; cfg.memory_gain_margin=0.; cfg.memory_min_support=.5
+        cfg.memory_max_negative_fraction=1.
+        batch={'ct':torch.randn(4,3,32,32),'pet':torch.randn(4,3,32,32),
+               'mask':torch.zeros(4,1,32,32),'image_id':['a','b','c','d']}
+        batch['mask'][:,:,8:20,8:20]=1
+        initial=copy.deepcopy(model().state_dict())
+        original_forward=FakeEncoder.forward
+        def stochastic_forward(enc,x):
+            return [F.dropout(f,p=.2,training=enc.training) for f in original_forward(enc,x)]
+        results=[]
+        for warmup in (5,0):
+            c=copy.copy(cfg); c.memory_warmup_epochs=warmup
+            m=model(); m.load_state_dict(initial)
+            task=PETCorrectionTask({'model':m},c); task.model.train(); task.begin_epoch(1)
+            torch.manual_seed(2023)
+            with patch.object(FakeEncoder,'forward',new=stochastic_forward),\
+                 torch.autocast('cpu',dtype=torch.bfloat16,cache_enabled=True):
+                loss,logits,_,stats=task.train_step_mixed(batch,torch.tensor([1,1,0,0]))
+            loss.backward()
+            for param in (m.enc_ct.conv.weight,m.enc_pet.conv.weight,m.decoder.proj4[0].weight,
+                          m.ct_align.proj[0][0].weight,m.pet_align.proj[0][0].weight):
+                self.assertIsNotNone(param.grad,'Early no_grad source forward poisoned AMP cache')
+                self.assertTrue(torch.isfinite(param.grad).all())
+            self.assertTrue(m.training)
+            results.append((loss.detach(),logits.detach(),m.enc_ct.conv.weight.grad.clone(),torch.get_rng_state()))
+            if warmup==0:
+                self.assertGreater(stats['candidate_tokens'],0,'Fixture must exercise random token sampling')
+        for a,b in zip(results[0],results[1]):
+            self.assertTrue(torch.equal(a,b),'Collection-only changed training outputs/gradients/RNG')
 
 
 if __name__ == '__main__':

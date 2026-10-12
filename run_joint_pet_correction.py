@@ -16,7 +16,7 @@ import torch
 
 from configs.pet_correction import PETCorrectionConfig
 from models.pet_correction_model import build_correction_model
-from tasks.pet_correction import PETCorrectionTask, batch_ids, build_ratio_state
+from tasks.pet_correction import PETCorrectionTask, batch_ids, build_ratio_state, assert_core_gradients
 from tasks.mdt_seg import MDTSegTeacher
 from utils.optimization import get_cosine_scheduler
 from utils.run_common import count_parameters, optimizer_step_succeeded, seed_everything
@@ -166,8 +166,11 @@ def main():
         initialize_from_add(task,cfg.init_checkpoint)
     print(f'[MODEL] params={count_parameters(task.model)} Full=AddFusion '
           f'slice_ratio={cfg.full_ratio:.3f} main_weights={cfg.full_loss_weight}/{cfg.missing_loss_weight}',flush=True)
+    print(f'[RUNTIME] torch={torch.__version__} device={task.device} '
+          f'amp={bool(cfg.mixed_precision and task.device.type=="cuda")}',flush=True)
     print('[MEMORY] source=EMA when active; sample self-exclusion=True '
-          f'group_exclusion={cfg.memory_exclude_group}; train-only; no distillation',flush=True)
+          f'group_exclusion={cfg.memory_exclude_group}; train-only; no distillation; '
+          f'warmup_epochs={cfg.memory_warmup_epochs} retrieval_start_epoch={cfg.retrieval_start_epoch}',flush=True)
     headers=['train_full_loss','train_missing_loss','train_ct_aux_loss','train_scale_loss',
              'train_full_samples','train_missing_samples','positive_fraction','negative_fraction',
              'candidate_tokens','val_full_dice','val_missing_dice','val_full_hd95','val_missing_hd95',
@@ -199,6 +202,9 @@ def main():
                 task.scaler.scale(loss).backward(); task.scaler.unscale_(task.optimizer)
             else:
                 loss.backward()
+            if steps==0:
+                checked=assert_core_gradients(task.model)
+                print('[GRAD CHECK] connected='+','.join(checked),flush=True)
             if cfg.grad_clip>0:
                 gn=torch.nn.utils.clip_grad_norm_(task.trainable_parameters(),cfg.grad_clip)
             else:
@@ -225,7 +231,11 @@ def main():
             if steps%100==0:
                 print(f'[BATCH {steps}] loss={float(loss.detach()):.4f} '
                       f'Full/Missing={stats["num_full"]}/{stats["num_missing"]} '
-                      f'accepted={stats["candidate_tokens"]}',flush=True)
+                      f'accepted={stats["candidate_tokens"]} '
+                      f'full_loss={float(stats["loss_full"]):.4f} '
+                      f'missing_loss={float(stats["loss_missing"]):.4f} '
+                      f'ct_aux_loss={float(stats["loss_ct_aux"]):.4f} '
+                      f'scale_loss={float(stats["loss_scale"]):.4f}',flush=True)
         vf=task.evaluate(val,'full'); vm=task.evaluate(val,'missing')
         joint=.5*(vf['dice']+vm['dice'])
         if joint>best:

@@ -7,6 +7,7 @@ SAR-Net reference: synchronized paired entries, momentum source, top-k lookup.
 """
 import copy
 import hashlib
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -16,6 +17,44 @@ from tasks.mdt_seg import MDTSegTeacher
 from utils.ema import ModelEMA
 from utils.metrics_seg import SegmentationMetricsCIPA
 from models.pet_correction_memory import audit_regions
+
+
+@contextmanager
+def isolated_source_forward(device):
+    """No-grad bank reads must not poison the surrounding training AMP cache.
+
+In affected PyTorch versions a no-grad forward on the ONLINE model can cache
+detached low-precision weights, reused by the later grad-enabled forward in
+the SAME outer autocast context. Disable caching only for the source pass,
+retain its current autocast precision, and isolate token-sampling RNG so
+collection-only does not change the main model's DropPath/dropout trajectory.
+"""
+    try:
+        enabled=torch.is_autocast_enabled(device.type)
+    except TypeError:  # older PyTorch API
+        enabled=torch.is_autocast_enabled() if device.type=='cuda' else torch.is_autocast_cpu_enabled()
+    try:
+        dtype=torch.get_autocast_dtype(device.type)
+    except AttributeError:
+        dtype=torch.get_autocast_gpu_dtype() if device.type=='cuda' else torch.get_autocast_cpu_dtype()
+    devices=[device.index if device.index is not None else torch.cuda.current_device()] if device.type=='cuda' else []
+    with torch.random.fork_rng(devices=devices), torch.no_grad(), \
+         torch.autocast(device_type=device.type,enabled=enabled,dtype=dtype,cache_enabled=False):
+        yield
+
+
+def assert_core_gradients(model):
+    """Cheap first-batch guard against silently disconnected encoder/decoder kernels."""
+    checked=[]
+    for name in ('enc_ct','enc_pet','ct_align','pet_align','decoder'):
+        item=next(((n,p) for n,p in getattr(model,name).named_parameters()
+                   if p.requires_grad and p.ndim>=2),None)
+        if item is None or item[1].grad is None:
+            parameter='no trainable kernel' if item is None else item[0]
+            raise RuntimeError(f'Core gradient disconnected: {name}.{parameter}. '
+                               'Optimizer and memory were not updated; check source/autocast isolation.')
+        checked.append(name)
+    return checked
 
 
 def stable_ids(names,device='cpu'):
@@ -109,14 +148,16 @@ class PETCorrectionTask(MDTSegTeacher):
             source=self.eval_model()
             previous=source.training
             source.eval()
-            with torch.no_grad():
-                # Queries and candidate CT keys share this source encoder.
-                queries=source._encode_ct(ct)
-                if collecting:
-                    self.pending=source.make_candidates(queries,pet.index_select(0,fi),fi,y,sid,gid,
-                        cfg.memory_gain_margin,cfg.memory_min_support,cfg.memory_max_negative_fraction,
-                        cfg.memory_tokens_per_full)
-            source.train(previous)
+            try:
+                with isolated_source_forward(ct.device):
+                    # Queries and candidate CT keys share this source encoder.
+                    queries=source._encode_ct(ct)
+                    if collecting:
+                        self.pending=source.make_candidates(queries,pet.index_select(0,fi),fi,y,sid,gid,
+                            cfg.memory_gain_margin,cfg.memory_min_support,cfg.memory_max_negative_fraction,
+                            cfg.memory_tokens_per_full)
+            finally:
+                source.train(previous)
         out=self.model(ct,pet,state,sample_ids=sid,group_ids=gid,query_features=queries,
                        training_details=True)
         lf,_=self.criterion(out['logits'][fi].float(),y[fi])
