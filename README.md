@@ -1,7 +1,54 @@
 # Clean segmentation baselines
 
-Branch: `exp/full-mafi-add`. Three independent, runnable baselines plus a MAFI candidate that
+Branch: `exp/full-mafi-add`. Independent baselines, weighted-add and MAFI candidates that
 share config / loss / metrics / logging / EMA code (no duplicated utilities).
+
+
+## Current experiment: Full-only unconstrained weighted addition
+
+Entry: `run_full_weighted_add.py`. Model: `models/full_weighted_add_model.py`.
+Module: `models/weighted_add_fusion.py`.
+
+Four scales share the same form `F_s = alpha_s * CT_s + beta_s * PET_s`.
+The eight coefficients initialize to 1 and learn directly from BCE+Dice;
+there is no sigmoid, softmax, clipping or sign/range constraint. Negative
+weights are allowed. They are global per-scale coefficients, not local
+confidence scores or interpretable modality-contribution percentages.
+
+This entry trains Full only, with real CT/PET, and uses neither MAFI nor
+deep supervision. Shared encoders/alignment/decoder, loss, optimizer,
+scheduler, EMA and HD95 are unchanged. Coefficients are registered before
+optimizer and EMA construction. The log records all eight raw-model
+coefficients each epoch; final JSON records the actual selected raw/EMA
+model's coefficients. Final testing and standalone evaluation rebuild
+`WeightedAddFusion` before strict state loading.
+
+The MAFI and fixed-Add entry points remain independently available. New
+weighted checkpoints cannot be loaded as fixed Add or CT-only checkpoints.
+`--weighted_fusion_enabled False` disables the eight parameters and builds
+the exact original Add architecture.
+
+Run with the same settings as your fixed-Add reference:
+
+```bash
+python3 run_full_weighted_add.py \
+  --hash full-weighted-add-unconstrained-imagenet-s2023 \
+  --root /root/autodl-tmp/data/PCLT20K \
+  --train_split_file train_original.txt --val_split_file YOUR_VAL.txt \
+  --test_split_file test.txt --image_size_2d 512 --batch_size 16 \
+  --norm_mode imagenet --aug_mode cipa --random_state 2023 \
+  --ema_enabled True --ema_decay 0.999 --hd95_mode cipa_official --epochs 60
+```
+
+Replace `YOUR_VAL.txt` with your existing patient-disjoint validation split.
+Existing pretrained paths are reused. MedPy is required for official HD95.
+No dataset split, shared parser default or historical output is changed.
+
+Lightweight CPU contracts (fake encoders, no real data/MedPy computation):
+
+```bash
+python3 -m unittest discover -s tests -p 'test_weighted_add.py' -v
+```
 
 ## A. CT-only — `run_ct_only_seg.py`
 

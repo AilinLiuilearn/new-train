@@ -25,6 +25,9 @@ from utils.run_common import eval_missing_rates
 def _select_builder(cfg, ct_only):
     if ct_only:
         return build_ct_only_model
+    if getattr(cfg, 'fusion_type', 'AddFusion') == 'WeightedAddFusion':
+        from models.full_weighted_add_model import build_full_weighted_add_model
+        return build_full_weighted_add_model
     if getattr(cfg, 'fusion_type', 'AddFusion') == 'MAFIAddFusion':
         from models.full_mafi_add_model import build_full_mafi_add_model
         return build_full_mafi_add_model
