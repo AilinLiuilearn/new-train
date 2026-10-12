@@ -135,3 +135,13 @@ decoder. No fusion/prototype/retrieval/text code is wired in this round.
 - Deleted unused: `models/petct_text_region_fusion.py`,
   `tests/test_dcim_wiring.py`, `tools/smoke_dcim_full.py`.
 - `tests/`: updated to the new API + added the §八 contract checks.
+
+## Joint PET correction-memory experiment
+
+`run_joint_pet_correction.py` is a separate entry for slice-level 70% Full /
+30% Missing joint training, pure AddFusion, GT-audited local decoder deltas,
+paired correction queues and a CT auxiliary decoder. It requires no independent
+Full-only first stage. Existing baseline model/training/evaluation files are
+unchanged. Full/Missing validation uses one checkpoint and the existing CIPA HD95.
+
+See [design, reference provenance and exact commands](docs/pet_correction_memory.md).
