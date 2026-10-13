@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from models.pet_correction_memory import PairedCorrectionMemory, CorrectionRetriever, audit_regions
 from models.pet_correction_model import PETCorrectionModel
-from tasks.pet_correction import CorrectionEMA, build_ratio_state, stable_ids
+from tasks.pet_correction import CorrectionEMA, build_ratio_state, stable_ids, is_memory_buffer
 from tasks.pet_correction import PETCorrectionTask
 from configs.pet_correction import PETCorrectionConfig
 
@@ -176,7 +176,8 @@ class Contracts(unittest.TestCase):
         with patch('sys.argv',['x','--batch_size','4','--pretrained','False',
                               '--mixed_precision','False','--hd95_mode','legacy']):
             cfg=PETCorrectionConfig.parse_arguments()
-        cfg.ema_enabled=False; cfg.memory_gain_margin=0.; cfg.memory_min_support=.5
+        cfg.ema_enabled=False; cfg.bank_ema_enabled=False
+        cfg.memory_gain_margin=0.; cfg.memory_min_support=.5
         cfg.memory_max_negative_fraction=1.
         batch={'ct':torch.randn(4,3,32,32),'pet':torch.randn(4,3,32,32),
                'mask':torch.zeros(4,1,32,32),'image_id':['a','b','c','d']}
@@ -205,6 +206,49 @@ class Contracts(unittest.TestCase):
                 self.assertGreater(stats['candidate_tokens'],0,'Fixture must exercise random token sampling')
         for a,b in zip(results[0],results[1]):
             self.assertTrue(torch.equal(a,b),'Collection-only changed training outputs/gradients/RNG')
+
+    def test_bank_ema_starts_immediately_without_activating_evaluation_ema(self):
+        with patch('sys.argv',['x','--pretrained','False','--mixed_precision','False',
+                              '--hd95_mode','legacy']):
+            cfg=PETCorrectionConfig.parse_arguments()
+        task=PETCorrectionTask({'model':model()},cfg)
+        task.begin_epoch(1)
+        self.assertTrue(task.bank_ema_active)
+        self.assertFalse(task.ema_active)
+        self.assertIs(task.memory_source_model(),task.bank_ema.model)
+        self.assertIs(task.eval_model(),task.model)
+        before=task.bank_ema.model.enc_ct.conv.weight.clone()
+        with torch.no_grad():
+            task.model.enc_ct.conv.weight.add_(1.)
+        task.after_successful_step()
+        self.assertEqual(task.bank_ema.updates,1)
+        self.assertEqual(task.ema.updates,0)
+        self.assertTrue(torch.allclose(task.bank_ema.model.enc_ct.conv.weight,before+1-2/11))
+        bank_before=copy.deepcopy(task.bank_ema.model.state_dict())
+        task.begin_epoch(4)
+        self.assertTrue(task.ema_active)
+        self.assertIs(task.eval_model(),task.ema.model)
+        self.assertIsNot(task.eval_model(),task.memory_source_model())
+        self.assertEqual(task.bank_ema.updates,1)
+        for k,v in bank_before.items():
+            if not is_memory_buffer(k):
+                self.assertTrue(torch.equal(v,task.bank_ema.model.state_dict()[k]),k)
+
+    def test_missing_evaluation_queries_bank_encoder_not_evaluation_encoder(self):
+        with patch('sys.argv',['x','--pretrained','False','--mixed_precision','False',
+                              '--hd95_mode','surface']):
+            cfg=PETCorrectionConfig.parse_arguments()
+        task=PETCorrectionTask({'model':model()},cfg)
+        task.begin_epoch(4)
+        batch={'ct':torch.randn(1,3,32,32),'mask':torch.ones(1,1,32,32),'image_id':['v']}
+        source=task.memory_source_model()
+        with patch.object(source,'_encode_ct',wraps=source._encode_ct) as encode,\
+             patch.object(task.eval_model(),'forward',wraps=task.eval_model().forward) as forward:
+            task.evaluate([batch],'missing')
+            self.assertEqual(encode.call_count,1)
+            self.assertIsNotNone(forward.call_args.kwargs['query_features'])
+        self.assertEqual(source.enc_pet.calls,0)
+        self.assertEqual(task.eval_model().enc_pet.calls,0)
 
 
 if __name__ == '__main__':

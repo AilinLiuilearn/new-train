@@ -31,7 +31,7 @@ class RunnerSmoke(unittest.TestCase):
             args=['run_joint_pet_correction.py','--checkpoint_root',tmp,'--hash','contract',
                   '--pretrained','False','--epochs','2','--batch_size','4','--mixed_precision','False',
                   '--hd95_mode','surface','--decoder_channels','8','8','8','8','--num_workers','0',
-                  '--ema_start_epoch','0',
+                  '--ema_start_epoch','3','--bank_ema_start_epoch','0',
                   '--memory_capacity','16','--memory_key_dim','4','--memory_min_entries','1',
                   '--memory_topk','2','--memory_query_chunk','16']
             source_calls=[]
@@ -55,7 +55,12 @@ class RunnerSmoke(unittest.TestCase):
             self.assertEqual(ckpt['config']['norm_mode'],'imagenet')
             self.assertEqual(ckpt['config']['memory_warmup_epochs'],0)
             self.assertEqual(ckpt['config']['retrieval_start_epoch'],2)
-            self.assertEqual(ckpt['eval_weights'],'ema')
+            self.assertEqual(ckpt['eval_weights'],'raw')
+            self.assertEqual(ckpt['ema_updates'],0)
+            self.assertEqual(ckpt['bank_ema_updates'],4)
+            self.assertTrue(ckpt['bank_ema_active'])
+            self.assertEqual(ckpt['config']['ema_start_epoch'],3)
+            self.assertEqual(ckpt['config']['bank_ema_start_epoch'],0)
             with open(os.path.join(root,'final_test_metrics.json')) as f:
                 result=json.load(f)
             self.assertIn('memory_entries',result)
@@ -67,6 +72,10 @@ class RunnerSmoke(unittest.TestCase):
                  patch('run_joint_pet_correction._loaders',return_value=loaders),\
                  patch('models.dual_shared_add_baseline.create_feature_backbone',lambda *a,**k:FakeEncoder()):
                 main()
+            resumed=MDTSegTeacher.load_state_dicts(last)
+            self.assertEqual(resumed['bank_ema_updates'],ckpt['bank_ema_updates'])
+            for k,v in ckpt['model_bank_ema'].items():
+                self.assertTrue(torch.equal(v,resumed['model_bank_ema'][k]),k)
             with patch('sys.argv',['run_joint_pet_correction.py','--eval_checkpoint',best,
                                   '--checkpoint_root',tmp,'--hash','eval']),\
                  patch('run_joint_pet_correction._loaders',return_value=loaders),\
@@ -81,6 +90,7 @@ class RunnerSmoke(unittest.TestCase):
             skipped=MDTSegTeacher.load_state_dicts(os.path.join(tmp,'MDT','skip','ckpt.last.pth.tar'))
             self.assertEqual(int(skipped['model']['memory_step']),0)
             self.assertEqual(skipped['ema_updates'],0)
+            self.assertEqual(skipped['bank_ema_updates'],0)
             for k,v in skipped['model'].items():
                 if k.endswith('.memory.valid'):
                     self.assertFalse(v.any())

@@ -70,11 +70,26 @@ avoids old projection coordinates becoming incompatible as the projection
 learns. Source encoder/decoder drift is limited by momentum sourcing and FIFO
 with a 128-successful-update TTL, not claimed to be eliminated.
 
-With EMA active, its eval-mode CT encoder generates BOTH training queries and
-bank source descriptors. Its PET encoder and controlled decoder produce values
-from Full rows only, under no_grad. This costs extra source encoder/probe passes;
-it is a stabilizer, not teacher-matching supervision. EMA-off uses the raw model
-in temporary eval mode for coherent paired collection/querying.
+Bank collection has an independent momentum model, separate from evaluation
+EMA. Defaults: bank_ema_enabled=True, bank_ema_start_epoch=0,
+bank_ema_decay=.999, bank_ema_decay_warmup=True. It copies online weights at
+initialization and updates from the first successful optimization step. It
+produces both training CT queries and bank descriptors; its PET encoder and
+controlled decoder produce Values from Full rows only, under no_grad. Missing
+validation/inference also uses this bank encoder for queries, while segmentation
+uses separately selected raw/evaluation-EMA weights.
+
+Evaluation EMA retains its original schedule: activate after epoch 3 (used in
+epoch 4), original decay/warmup/reset behavior. Its activation never resets bank
+EMA. Disabling evaluation EMA does not disable bank EMA. Bank EMA exists only
+when both memory_enabled and bank_ema_enabled are True; otherwise source queries
+and collection use the online model temporarily in eval mode. Optional bank
+start follows the same convention: 0=immediate, N=activate when epoch>N.
+
+This adds one frozen model replica (no additional trainable parameters), plus
+checkpoint/device-memory cost. Existing source encoder/probe passes remain;
+Missing inference needs an extra bank CT encoder pass when source differs from
+the segmenter. It never uses missing-sample PET, GT, or queue writes.
 
 Source collection/query forwards use an isolated no-grad autocast context with
 weight caching OFF and preserved CPU/CUDA RNG. In affected PyTorch versions,
@@ -93,8 +108,8 @@ the next upsampling. No available entry or zero readout gives exact identity.
 Missing rows never enter a PET encoder. Full inference reads no queue. Ordinary
 forward never writes memory. Only successful optimizer updates commit detached
 candidates, after the batch has queried the old bank. Skipped AMP steps discard
-candidates and do not age/write/update EMA. EMA queue buffers are copied exactly,
-never averaged; raw/EMA checkpoints contain synchronized paired queues.
+candidates and do not age/write/update EMA. Both EMA models copy queue buffers exactly,
+never average them; online/bank/evaluation checkpoints synchronize paired queues.
 
 Slice identity uses stable BLAKE2b hashes of dataset image_id, unchanged under
 augmentation and across processes. Same-slice exclusion is mandatory in training.
@@ -114,19 +129,22 @@ No metric implementation is changed.
 Defaults: `memory_warmup_epochs=0`, `retrieval_start_epoch=2`. Collection starts
 when epoch > warmup; retrieval permission starts when epoch >= start. The first
 epoch is an admission attempt, not a guarantee that 16 good entries will exist.
-EMA activation remains epoch 4: collection/query source is raw eval-mode in
-epochs 1..3, then the EMA model. Active processes retain their parsed settings.
-Resume an older 5/7 run with its original flags; this change applies to new runs.
+Bank EMA is active from initialization; evaluation EMA still starts in epoch 4.
+CSV records bank_ema_updates/bank_ema_active separately from ema_updates, which
+continues to mean evaluation EMA updates. Active processes retain parsed settings.
+Use a fresh hash for the new independent-source protocol. Old single-source
+checkpoints can be reevaluated under their saved protocol but are not silently
+resumed as new independent-source training.
 
 Checkpoints include optimizer, scheduler, scaler, RNG, global batch step, queue
-payloads/pointers/ages, activation flag and EMA source. Resume in the same run
+payloads/pointers/ages, activation flag and both independent EMA sources. Resume in the same run
 directory with the original training settings. Per-epoch loader/augmentation
 seeds make the epoch-boundary resume reproducible. If best Joint predates active
 memory, final output explicitly reports it; do not claim retrieval gain.
 
 Default additional trainable parameters (excluding original encoders/decoder):
 CT auxiliary decoder 3,464,897; new stage heads 899; retrieval/adapters 556,208;
-total **4,022,004**. Queue buffers ~15.7 MiB per raw/EMA model at default settings.
+total **4,022,004**. Queue buffers ~15.7 MiB per online/bank/evaluation model at default settings.
 
 ## Reference provenance
 
@@ -150,7 +168,7 @@ total **4,022,004**. Queue buffers ~15.7 MiB per raw/EMA model at default settin
 
 ```bash
 python run_joint_pet_correction.py \
-  --hash joint-pet-correction-add-r70-imagenet-s2023 \
+  --hash joint-pet-correction-bankema-e1-r70-imagenet-s2023 \
   --root /root/autodl-tmp/data/PCLT20K \
   --train_split_file train_original.txt \
   --val_split_file test.txt --test_split_file test.txt \
@@ -159,7 +177,8 @@ python run_joint_pet_correction.py \
   --norm_mode imagenet --aug_mode cipa \
   --full_ratio 0.7 --full_loss_weight 0.7 --missing_loss_weight 0.3 \
   --memory_warmup_epochs 0 --retrieval_start_epoch 2 \
-  --ema_enabled True --ema_decay 0.999 \
+  --bank_ema_enabled True --bank_ema_start_epoch 0 --bank_ema_decay 0.999 \
+  --ema_enabled True --ema_start_epoch 3 --ema_decay 0.999 \
   --hd95_mode cipa_official --random_state 2023 --epochs 60
 ```
 
@@ -214,3 +233,9 @@ RNG, while collection still produces candidates. Full 10-test suite passed on
 PyTorch 2.14.1; compatibility regression also passed on 2.5.1. No user GPU logs
 of parameter gradients were available, so on-device confirmation uses the new
 first-batch guard and runtime-version log.
+
+Independent bank EMA follow-up: 12 CPU contracts passed on PyTorch 2.5.1,
+including bank activation from epoch one with evaluation EMA still delayed,
+independent update counts, bank query sourcing at Missing evaluation, exact
+checkpoint restore, skipped-step behavior, and the original raw-source AMP/RNG
+regression. No new real-data training or GPU measurements were performed.

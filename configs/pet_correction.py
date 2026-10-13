@@ -35,6 +35,12 @@ class PETCorrectionConfig(SegMDTConfig):
         p.add_argument('--scale_loss_weight',type=float,default=.1)
         p.add_argument('--negative_region_weight',type=float,default=.5)
         p.add_argument('--memory_enabled',type=str2bool,default=True)
+        p.add_argument('--bank_ema_enabled',type=str2bool,default=True,
+                       help='Independent momentum source for bank writes/CT queries; not evaluation EMA.')
+        p.add_argument('--bank_ema_start_epoch',type=int,default=0,
+                       help='0 enables bank EMA immediately; N activates it after N epochs.')
+        p.add_argument('--bank_ema_decay',type=float,default=.999)
+        p.add_argument('--bank_ema_decay_warmup',type=str2bool,default=True)
         p.add_argument('--region_calibration',type=str2bool,default=True)
         p.add_argument('--memory_warmup_epochs',type=int,default=0)
         p.add_argument('--retrieval_start_epoch',type=int,default=2)
@@ -80,4 +86,6 @@ class PETCorrectionConfig(SegMDTConfig):
             raise ValueError('Invalid support/negative-fraction threshold')
         if cfg.memory_gain_margin<0 or cfg.memory_tokens_per_full<1:
             raise ValueError('Invalid gain margin/token quota')
+        if cfg.bank_ema_start_epoch<0 or not 0<=cfg.bank_ema_decay<1:
+            raise ValueError('Invalid bank EMA start epoch/decay')
         return cfg

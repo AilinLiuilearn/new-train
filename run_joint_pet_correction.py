@@ -1,7 +1,7 @@
 """Independent entry: 70/30 slice-level Full/Missing, audited correction memory.
 
 No Full-only first stage is required. Original baseline runners are untouched.
-Checkpoints include all queues, source EMA, optimizer/scaler/RNG states.
+Checkpoints include all queues, separate bank/evaluation EMA, optimizer/scaler/RNG states.
   python run_joint_pet_correction.py --help
   python run_joint_pet_correction.py --eval_checkpoint <best_joint>
 """
@@ -35,6 +35,7 @@ def load_training_state(task,path):
             'memory_enabled','region_calibration','memory_min_entries','memory_gain_margin',
             'memory_min_support','memory_max_negative_fraction','memory_tokens_per_full',
             'memory_temperature','memory_topk','ema_decay','ema_start_epoch','ema_decay_warmup',
+            'bank_ema_enabled','bank_ema_start_epoch','bank_ema_decay','bank_ema_decay_warmup',
             'random_state','batch_size','image_size_2d','aug_mode','train_split_file',
             'val_split_file','test_split_file','hash')
     for key in fields:
@@ -45,6 +46,7 @@ def load_training_state(task,path):
         task.ema.model.load_state_dict(ckpt['model_ema'],strict=True)
         task.ema.updates=int(ckpt.get('ema_updates',0))
         task.ema_active=ckpt.get('eval_weights')=='ema'
+    task.restore_bank_ema(ckpt,required=True)
     task.optimizer.load_state_dict(ckpt['optimizer'])
     if ckpt.get('scheduler') is not None:
         task.scheduler.load_state_dict(ckpt['scheduler'])
@@ -69,6 +71,8 @@ def initialize_from_add(task,path):
     task.model.ct_aux_decoder.load_state_dict(task.model.decoder.state_dict(),strict=True)
     if task.ema is not None:
         task.ema.reset(task.model)
+    if task.bank_ema is not None:
+        task.bank_ema.reset(task.model)
 
 
 def final_eval(task,loader,checkpoint,path):
@@ -79,6 +83,7 @@ def final_eval(task,loader,checkpoint,path):
         raise ValueError('Selected EMA checkpoint has no EMA state')
     # No dependency on pretrained files after a checkpoint exists.
     task.model.load_state_dict(state,strict=True)
+    task.restore_bank_ema(ckpt,required=True)
     task.model.eval()
     full=task.evaluate(loader,'full',model=task.model)
     missing=task.evaluate(loader,'missing',model=task.model)
@@ -89,6 +94,8 @@ def final_eval(task,loader,checkpoint,path):
             'joint_dice':.5*(full['dice']+missing['dice']),
             'hd95_mode':task.metrics.hd95_mode,'missing_unit':'slice',
             'memory_source':'training-only paired local tokens',
+            'bank_ema_active':task.bank_ema_active,
+            'bank_ema_updates':task.bank_ema.updates if task.bank_ema is not None else 0,
             'retrieval_active':bool(task.model.retrieval_active),
             'memory_entries':[int(r.memory.allowed(-1,-1,int(task.model.memory_step)).sum())
                               for r in task.model.retrievers]}
@@ -136,6 +143,12 @@ def main():
         eval_path=os.path.abspath(cfg.eval_checkpoint)
         ckpt=MDTSegTeacher.load_state_dicts(eval_path)
         saved=dict(ckpt['config']); saved.pop('checkpoint_dir',None)
+        # Old single-source checkpoints remain reevaluable under their original
+        # query behavior; do not silently invent an independent trained source.
+        saved.setdefault('bank_ema_enabled',False)
+        saved.setdefault('bank_ema_start_epoch',0)
+        saved.setdefault('bank_ema_decay',.999)
+        saved.setdefault('bank_ema_decay_warmup',True)
         # Eval takes shape/normalization/source settings from the checkpoint.
         saved.update(root=cfg.root,pretrained=False,ct_pretrained_path=None,pet_pretrained_path=None,
                      checkpoint_root=cfg.checkpoint_root,hash=cfg.hash)
@@ -168,13 +181,17 @@ def main():
           f'slice_ratio={cfg.full_ratio:.3f} main_weights={cfg.full_loss_weight}/{cfg.missing_loss_weight}',flush=True)
     print(f'[RUNTIME] torch={torch.__version__} device={task.device} '
           f'amp={bool(cfg.mixed_precision and task.device.type=="cuda")}',flush=True)
-    print('[MEMORY] source=EMA when active; sample self-exclusion=True '
+    print('[MEMORY] source=independent bank EMA when active; sample self-exclusion=True '
           f'group_exclusion={cfg.memory_exclude_group}; train-only; no distillation; '
           f'warmup_epochs={cfg.memory_warmup_epochs} retrieval_start_epoch={cfg.retrieval_start_epoch}',flush=True)
+    print(f'[EMA] bank_enabled={cfg.bank_ema_enabled} bank_start_epoch={cfg.bank_ema_start_epoch} '
+          f'bank_decay={cfg.bank_ema_decay}; eval_enabled={cfg.ema_enabled} '
+          f'eval_start_epoch={cfg.ema_start_epoch} eval_decay={cfg.ema_decay}',flush=True)
     headers=['train_full_loss','train_missing_loss','train_ct_aux_loss','train_scale_loss',
              'train_full_samples','train_missing_samples','positive_fraction','negative_fraction',
              'candidate_tokens','val_full_dice','val_missing_dice','val_full_hd95','val_missing_hd95',
-             'best_joint','best_joint_epoch','ema_updates','skipped_updates','epoch_time',
+             'best_joint','best_joint_epoch','ema_updates','bank_ema_updates','bank_ema_active',
+             'skipped_updates','epoch_time',
              'hd95_mode','retrieval_active']+[f'memory_s{i+1}_entries' for i in range(4)]
     log=os.path.join(cfg.checkpoint_dir,'train_log.csv')
     if not cfg.resume or not os.path.isfile(log):
@@ -253,6 +270,8 @@ def main():
                'val_missing_dice':vm['dice'],'val_full_hd95':vf['hd95'],'val_missing_hd95':vm['hd95'],
                'best_joint':best,'best_joint_epoch':best_epoch,
                'ema_updates':task.ema.updates if task.ema else 0,'skipped_updates':skipped,
+               'bank_ema_updates':task.bank_ema.updates if task.bank_ema else 0,
+               'bank_ema_active':int(task.bank_ema_active),
                'epoch_time':time.time()-t,'hd95_mode':cfg.hd95_mode,
                'retrieval_active':int(task.model.retrieval_active),
                **{f'memory_s{i+1}_entries':int(r.memory.allowed(-1,-1,int(task.model.memory_step)).sum())

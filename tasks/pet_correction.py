@@ -7,6 +7,8 @@ SAR-Net reference: synchronized paired entries, momentum source, top-k lookup.
 """
 import copy
 import hashlib
+import os
+import random
 from contextlib import contextmanager
 
 import numpy as np
@@ -121,15 +123,44 @@ class PETCorrectionTask(MDTSegTeacher):
             self.ema=CorrectionEMA(self.model,decay=config.ema_decay,
                                   warmup=config.ema_decay_warmup,device=self.device)
             self.ema_active=self.ema_start_epoch<=0
+        # Bank momentum has its OWN schedule. Evaluation EMA remains inherited
+        # from the baseline (normally activates after three warmup epochs).
+        self.bank_ema=None
+        self.bank_ema_start_epoch=int(getattr(config,'bank_ema_start_epoch',0))
+        self.bank_ema_active=False
+        if config.memory_enabled and getattr(config,'bank_ema_enabled',True):
+            self.bank_ema=CorrectionEMA(self.model,decay=getattr(config,'bank_ema_decay',.999),
+                warmup=getattr(config,'bank_ema_decay_warmup',True),device=self.device)
+            self.bank_ema_active=self.bank_ema_start_epoch<=0
         self.epoch=0; self.pending=[None]*4
+
+    def memory_source_model(self):
+        return self.bank_ema.model if self.bank_ema_active else self.model
+
+    def restore_bank_ema(self,checkpoint,required=False):
+        state=checkpoint.get('model_bank_ema')
+        if state is None:
+            if required and self.bank_ema is not None:
+                raise ValueError('Checkpoint has no independent bank EMA; start a new run')
+            return
+        if self.bank_ema is None:
+            raise ValueError('Checkpoint bank EMA requires bank_ema_enabled=True and memory_enabled=True')
+        self.bank_ema.model.load_state_dict(state,strict=True)
+        self.bank_ema.updates=int(checkpoint['bank_ema_updates'])
+        self.bank_ema_active=bool(checkpoint['bank_ema_active'])
 
     def begin_epoch(self,epoch):
         super().begin_epoch(epoch)
         self.epoch=int(epoch)
+        if self.bank_ema is not None and not self.bank_ema_active and epoch>self.bank_ema_start_epoch:
+            self.bank_ema.reset(self.model)
+            self.bank_ema_active=True
         active=bool(self.config.memory_enabled and epoch>=self.config.retrieval_start_epoch)
         self.model.retrieval_active.fill_(active)
         if self.ema is not None:
             self.ema.sync_memory(self.model)
+        if self.bank_ema is not None:
+            self.bank_ema.sync_memory(self.model)
 
     def train_step_mixed(self,batch,pet_available):
         cfg=self.config
@@ -145,7 +176,7 @@ class PETCorrectionTask(MDTSegTeacher):
         querying=bool(self.model.retrieval_active)
         self.pending=[None]*4; queries=None
         if collecting or querying:
-            source=self.eval_model()
+            source=self.memory_source_model()
             previous=source.training
             source.eval()
             try:
@@ -197,15 +228,46 @@ class PETCorrectionTask(MDTSegTeacher):
         self.model.memory_step.fill_(step)
         # Update stable source only after a real optimizer update.
         self.update_ema()
+        if self.bank_ema_active:
+            self.bank_ema.update(self.model)
         self.model.commit_candidates(self.pending,step)
         self.pending=[None]*4
         if self.ema is not None:
             self.ema.sync_memory(self.model)
+        if self.bank_ema is not None:
+            self.bank_ema.sync_memory(self.model)
+
+    def save_checkpoint(self,path,epoch,best=None,best_epoch=None,val=None):
+        # Same baseline checkpoint contract plus the independent bank source;
+        # one write, no save/reload/rewrite of large checkpoints.
+        os.makedirs(os.path.dirname(path),exist_ok=True)
+        payload={
+            'epoch':epoch,'global_batch_step':self.global_batch_step,
+            'model':self.model.state_dict(),
+            'model_ema':self.ema.state_dict() if self.ema is not None else None,
+            'ema_updates':self.ema.updates if self.ema is not None else 0,
+            'model_bank_ema':self.bank_ema.state_dict() if self.bank_ema is not None else None,
+            'bank_ema_updates':self.bank_ema.updates if self.bank_ema is not None else 0,
+            'bank_ema_active':self.bank_ema_active,
+            'optimizer':self.optimizer.state_dict(),
+            'scheduler':None if self.scheduler is None else self.scheduler.state_dict(),
+            'scaler':self.scaler.state_dict(),'best':best,'best_epoch':best_epoch,'val':val,
+            'eval_weights':self.eval_weights_tag(),
+            'random_state':getattr(self.config,'random_state',None),
+            'seed':getattr(self.config,'random_state',None),'config':vars(self.config),
+            'random_state_python':random.getstate(),'random_state_numpy':np.random.get_state(),
+            'random_state_torch':torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            payload['random_state_cuda']=torch.cuda.get_rng_state_all()
+        torch.save(payload,path)
 
     @torch.no_grad()
     def evaluate(self,loader,eval_mode='full',tag='val',model=None):
         active=self.eval_model() if model is None else model
         previous=active.training; active.eval()
+        source=self.memory_source_model()
+        source_previous=source.training; source.eval()
         metric=SegmentationMetricsCIPA(threshold=self.metrics.threshold,hd95_mode=self.metrics.hd95_mode)
         total,count=0.,0
         try:
@@ -216,12 +278,19 @@ class PETCorrectionTask(MDTSegTeacher):
                     logits=active.ct_aux_decoder(active._encode_ct(ct),ct.shape[-2:])['logits']
                 elif eval_mode in ('full','missing'):
                     pet=batch['pet'].to(self.device) if eval_mode=='full' else None
-                    logits=active(ct,pet,forward_mode=eval_mode,sample_ids=sid,group_ids=gid)['logits']
+                    queries=None
+                    if eval_mode=='missing' and bool(active.retrieval_active) and source is not active:
+                        # The segmenter may use delayed evaluation EMA, while
+                        # keys/queries consistently use the bank momentum encoder.
+                        queries=source._encode_ct(ct)
+                    logits=active(ct,pet,forward_mode=eval_mode,sample_ids=sid,group_ids=gid,
+                                  query_features=queries)['logits']
                 else:
                     raise ValueError('Unsupported correction evaluation mode')
                 loss,_=self.criterion(logits.float(),y)
                 metric.update(logits,y); total+=float(loss)*ct.shape[0]; count+=ct.shape[0]
         finally:
+            source.train(source_previous)
             active.train(previous)
         return {**metric.compute(),'total_loss':total/max(1,count),'eval_mode':eval_mode,
                 'weights':self.eval_weights_tag(),'tag':tag}
