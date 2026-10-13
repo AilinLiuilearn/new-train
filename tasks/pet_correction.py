@@ -133,6 +133,7 @@ class PETCorrectionTask(MDTSegTeacher):
                 warmup=getattr(config,'bank_ema_decay_warmup',True),device=self.device)
             self.bank_ema_active=self.bank_ema_start_epoch<=0
         self.epoch=0; self.pending=[None]*4
+        self.last_committed_counts=[0]*4
 
     def memory_source_model(self):
         return self.bank_ema.model if self.bank_ema_active else self.model
@@ -162,7 +163,7 @@ class PETCorrectionTask(MDTSegTeacher):
         if self.bank_ema is not None:
             self.bank_ema.sync_memory(self.model)
 
-    def train_step_mixed(self,batch,pet_available):
+    def train_step_mixed(self,batch,pet_available,collect_diagnostics=None):
         cfg=self.config
         ct=batch['ct'].to(self.device,non_blocking=True)
         pet=batch['pet'].to(self.device,non_blocking=True)
@@ -175,6 +176,10 @@ class PETCorrectionTask(MDTSegTeacher):
         collecting=cfg.memory_enabled and self.epoch>cfg.memory_warmup_epochs
         querying=bool(self.model.retrieval_active)
         self.pending=[None]*4; queries=None
+        diagnose=bool(getattr(cfg,'memory_diagnostics',True) and
+            (self.global_batch_step==0 or (self.global_batch_step+1)%getattr(cfg,'memory_log_every',100)==0))
+        if collect_diagnostics is not None:
+            diagnose=bool(collect_diagnostics)
         if collecting or querying:
             source=self.memory_source_model()
             previous=source.training
@@ -190,10 +195,12 @@ class PETCorrectionTask(MDTSegTeacher):
             finally:
                 source.train(previous)
         out=self.model(ct,pet,state,sample_ids=sid,group_ids=gid,query_features=queries,
-                       training_details=True)
+                       training_details=True,return_diagnostics=diagnose)
         lf,_=self.criterion(out['logits'][fi].float(),y[fi])
         lm,_=self.criterion(out['logits'][mi].float(),y[mi])
-        lc,_=self.criterion(out['ct_aux_logits'].float(),y)
+        lc=lf.new_zeros(())
+        if getattr(cfg,'ct_aux_enabled',False):
+            lc,_=self.criterion(out['ct_aux_logits'].float(),y)
         scales=[]; neg_fraction=[]; pos_fraction=[]
         for s,(zr,zp) in enumerate(zip(out['reference_logits'],out['plus_logits'])):
             zr=F.interpolate(zr.float(),size=y.shape[-2:],mode='bilinear',align_corners=False)
@@ -220,10 +227,19 @@ class PETCorrectionTask(MDTSegTeacher):
                'positive_fraction':torch.stack(pos_fraction).mean().detach(),
                'negative_fraction':torch.stack(neg_fraction).mean().detach(),
                'candidate_tokens':sum(0 if p is None else p[0].shape[0] for p in self.pending)}
+        if diagnose:
+            candidates={}
+            for s,p in enumerate(self.pending):
+                candidates[s]={'tokens':0} if p is None else {
+                    'tokens':p[0].shape[0],'source_rel':p[2].mean(),
+                    'foreground_fraction':p[5].float().mean(),'source_gain':p[6].mean(),
+                    'value_rms':p[1].float().square().mean().sqrt()}
+            stats['diagnostics']={'candidates':candidates,'retrieval':out['retrieval_diagnostics']}
         return loss,out['logits'],out,stats
 
     @torch.no_grad()
     def after_successful_step(self):
+        self.last_committed_counts=[0 if p is None else p[0].shape[0] for p in self.pending]
         step=int(self.model.memory_step)+1
         self.model.memory_step.fill_(step)
         # Update stable source only after a real optimizer update.
@@ -236,6 +252,7 @@ class PETCorrectionTask(MDTSegTeacher):
             self.ema.sync_memory(self.model)
         if self.bank_ema is not None:
             self.bank_ema.sync_memory(self.model)
+        return self.last_committed_counts
 
     def save_checkpoint(self,path,epoch,best=None,best_epoch=None,val=None):
         # Same baseline checkpoint contract plus the independent bank source;
@@ -275,6 +292,8 @@ class PETCorrectionTask(MDTSegTeacher):
                 ct=batch['ct'].to(self.device); y=batch['mask'].to(self.device).float()
                 sid,gid=batch_ids(batch,self.device)
                 if eval_mode=='ct':
+                    if active.ct_aux_decoder is None:
+                        raise ValueError('CT auxiliary decoder is disabled; use Missing with retrieval_override=False for the main CT-only path')
                     logits=active.ct_aux_decoder(active._encode_ct(ct),ct.shape[-2:])['logits']
                 elif eval_mode in ('full','missing'):
                     pet=batch['pet'].to(self.device) if eval_mode=='full' else None

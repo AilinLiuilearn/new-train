@@ -1,5 +1,7 @@
 """Scientific contracts: no PET leakage, conditional deltas, no self-copy, EMA queues."""
 import copy
+import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -28,9 +30,10 @@ class FakeEncoder(nn.Module):
         return [F.adaptive_avg_pool2d(self.conv(x), (n, n)) for n in (16, 8, 4, 2)]
 
 
-def model():
+def model(ct_aux_enabled=False):
     with patch('models.dual_shared_add_baseline.create_feature_backbone', lambda *a, **k: FakeEncoder()):
         return PETCorrectionModel(pretrained=False, decoder_channels=(8, 8, 8, 8),
+                                  ct_aux_enabled=ct_aux_enabled,
                                   memory_capacity=16, key_dim=4, topk=2, query_chunk=7,
                                   memory_min_entries=1, memory_max_age=10)
 
@@ -135,7 +138,7 @@ class Contracts(unittest.TestCase):
             self.assertEqual(m.enc_pet.rows[-1], 2)
 
     def test_conditional_deltas_and_all_scale_backward(self):
-        m = model().train()
+        m = model(ct_aux_enabled=True).train()
         ct, pet = torch.randn(3, 3, 32, 32), torch.randn(3, 3, 32, 32)
         out = m(ct, pet, torch.tensor([1,1,0]), training_details=True)
         cf, ff = out['ct_full'], out['fused_full']
@@ -249,6 +252,87 @@ class Contracts(unittest.TestCase):
             self.assertIsNotNone(forward.call_args.kwargs['query_features'])
         self.assertEqual(source.enc_pet.calls,0)
         self.assertEqual(task.eval_model().enc_pet.calls,0)
+
+    def test_optional_ct_aux_disabled_and_old_queue_metadata_unknown(self):
+        m=model().train()
+        self.assertIsNone(m.ct_aux_decoder)
+        self.assertFalse(any(k.startswith('ct_aux_decoder.') for k in m.state_dict()))
+        out=m(torch.randn(3,3,32,32),torch.randn(3,3,32,32),torch.tensor([1,1,0]),
+              training_details=True)
+        self.assertNotIn('ct_aux_logits',out)
+        self.assertEqual(len(out['reference_logits']),4)
+        b=PairedCorrectionMemory(4,2,2)
+        b.enqueue(torch.ones(1,2),torch.ones(1,2),torch.ones(1),torch.tensor([1]),torch.tensor([-1]),
+                  step=1,foreground=torch.tensor([True]),source_gain=torch.tensor([.2]))
+        old={k:v for k,v in b.state_dict().items() if k not in ('foreground','source_gain','audit_known')}
+        restored=PairedCorrectionMemory(4,2,2);restored.load_state_dict(old,strict=True)
+        self.assertTrue(torch.equal(b.values,restored.values))
+        self.assertFalse(restored.audit_known.any())
+
+    def test_retrieval_diagnostics_are_real_detached_and_do_not_change_gradients(self):
+        r=CorrectionRetriever(2,2,capacity=4,key_dim=2,topk=2,min_entries=1,query_chunk=1)
+        with torch.no_grad():
+            r.key_projection.weight.copy_(torch.eye(2))
+            r.output.weight.copy_(torch.eye(2).view(2,2,1,1))
+        r.memory.enqueue(torch.tensor([[1.,0.],[0.,1.]]),torch.tensor([[1.,2.],[-2.,1.]]),
+            torch.tensor([.2,.8]),torch.tensor([1,2]),torch.tensor([-1,-1]),step=1,
+            foreground=torch.tensor([True,False]),source_gain=torch.tensor([.4,.2]))
+        h=torch.randn(1,2,1,1,requires_grad=True)
+        q=torch.tensor([[[[.8]],[[.6]]]],requires_grad=True)
+        first,_=r(h,q,torch.tensor([3]),torch.tensor([-1]),1)
+        first.sum().backward(); original_grad=r.output.weight.grad.clone()
+        r.zero_grad(); h.grad=None; q.grad=None
+        second,hit,info=r(h,q,torch.tensor([3]),torch.tensor([-1]),1,
+                          return_diagnostics=True,return_maps=True)
+        self.assertTrue(torch.equal(first,second));second.sum().backward()
+        self.assertTrue(torch.equal(original_grad,r.output.weight.grad))
+        expected=(torch.tensor([.8,.6])/.1).softmax(0)
+        self.assertAlmostEqual(float(info['top1_cos']),.8,places=5)
+        self.assertAlmostEqual(float(info['source_rel']),float((expected*torch.tensor([.2,.8])).sum()),places=5)
+        self.assertAlmostEqual(float(info['known_fg_mass']),float(expected[0]),places=5)
+        self.assertEqual(float(info['coverage']),1.)
+        self.assertTrue(all(not value.requires_grad for value in info['maps'].values()))
+        self.assertGreater(float(info['correction_rms']),0)
+        r.memory.foreground.logical_not_();r.memory.source_gain.add_(100.)
+        third,_=r(h,q,torch.tensor([3]),torch.tensor([-1]),1)
+        self.assertTrue(torch.equal(second,third),'Diagnostic GT metadata affected retrieval')
+
+    def test_visualization_exports_actual_maps_without_mutating_models_or_rng(self):
+        from utils.pet_correction_diagnostics import visualize_memory
+        import numpy as np
+        with patch('sys.argv',['x','--pretrained','False','--mixed_precision','False',
+                              '--hd95_mode','surface','--memory_vis_samples','1']):
+            cfg=PETCorrectionConfig.parse_arguments()
+        task=PETCorrectionTask({'model':model()},cfg)
+        for r in task.model.retrievers:
+            r.memory.enqueue(torch.ones(2,r.memory.raw_keys.shape[1]),torch.ones(2,8),
+                torch.tensor([.7,.8]),torch.tensor([1,2]),torch.tensor([-1,-1]),step=1,
+                foreground=torch.tensor([True,False]),source_gain=torch.tensor([.2,.3]))
+            with torch.no_grad():
+                r.output.weight.copy_(torch.eye(8).view(8,8,1,1))
+        task.model.memory_step.fill_(1);task.begin_epoch(2);task.model.train()
+        gt=torch.zeros(1,1,32,32);gt[:,:,8:20,8:20]=1
+        batch={'ct':torch.randn(1,3,32,32),'pet':torch.randn(1,3,32,32),'mask':gt,'image_id':['v']}
+        models=(task.model,task.bank_ema.model,task.ema.model)
+        before=[copy.deepcopy(m.state_dict()) for m in models]
+        rng=torch.get_rng_state().clone()
+        with tempfile.TemporaryDirectory() as tmp:
+            paths=visualize_memory(task,[batch],tmp,2)
+            self.assertEqual(len(paths),4)
+            self.assertTrue(all(os.path.isfile(p) for p in paths))
+            maps=np.load(next(p for p in paths if p.endswith('.npz')))
+            self.assertIn('s1_query_source_rel',maps)
+            self.assertIn('s1_source_gain',maps)
+            self.assertGreater(maps['s1_query_correction_rms'].mean(),0)
+            # Local synthetic QA preview only, not a research result.
+            import shutil
+            shutil.copyfile(next(p for p in paths if p.endswith('_retrieval.png')),
+                            '/tmp/pet_correction_retrieval_smoke.png')
+        self.assertTrue(task.model.training)
+        self.assertTrue(torch.equal(rng,torch.get_rng_state()))
+        for m,original in zip(models,before):
+            for k,v in original.items():
+                self.assertTrue(torch.equal(v,m.state_dict()[k]),k)
 
 
 if __name__ == '__main__':

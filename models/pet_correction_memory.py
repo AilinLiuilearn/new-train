@@ -83,9 +83,22 @@ class PairedCorrectionMemory(nn.Module):
         self.register_buffer('written_at', torch.full((capacity,),-1,dtype=torch.long))
         self.register_buffer('valid', torch.zeros(capacity,dtype=torch.bool))
         self.register_buffer('write_ptr', torch.zeros((),dtype=torch.long))
+        # Training-GT-derived metadata ONLY for diagnostics. Never used in
+        # matching, admission at query time, or correction weights.
+        self.register_buffer('foreground',torch.zeros(capacity,dtype=torch.bool))
+        self.register_buffer('source_gain',torch.zeros(capacity))
+        self.register_buffer('audit_known',torch.zeros(capacity,dtype=torch.bool))
+
+    def _load_from_state_dict(self,state_dict,prefix,*args,**kwargs):
+        # Old queues contain no audit metadata: mark it unknown rather than
+        # fabricating foreground/gain measurements; original retrieval is unchanged.
+        for name in ('foreground','source_gain','audit_known'):
+            state_dict.setdefault(prefix+name,torch.zeros_like(getattr(self,name)))
+        super()._load_from_state_dict(state_dict,prefix,*args,**kwargs)
 
     @torch.no_grad()
-    def enqueue(self, keys, values, reliability, sample_ids, group_ids, step):
+    def enqueue(self, keys, values, reliability, sample_ids, group_ids, step,
+                foreground=None,source_gain=None):
         n=keys.shape[0]
         if not n:
             return
@@ -95,6 +108,9 @@ class PairedCorrectionMemory(nn.Module):
             raise ValueError('queue metadata shape mismatch')
         if not all(torch.isfinite(x).all() for x in (keys,values,reliability)):
             raise ValueError('non-finite memory candidate')
+        known=foreground is not None and source_gain is not None
+        if known and (foreground.shape!=(n,) or source_gain.shape!=(n,) or not torch.isfinite(source_gain).all()):
+            raise ValueError('invalid diagnostic metadata')
         # Keep the latest capacity candidates, preserving paired indices.
         n=min(n,self.capacity)
         keys,values,reliability,sample_ids,group_ids = [x.detach()[-n:].to(self.raw_keys.device)
@@ -107,6 +123,9 @@ class PairedCorrectionMemory(nn.Module):
         self.group_ids[indices]=group_ids.long()
         self.written_at[indices]=int(step)
         self.valid[indices]=True
+        self.foreground[indices]=foreground.detach()[-n:].to(self.raw_keys.device).bool() if known else False
+        self.source_gain[indices]=source_gain.detach()[-n:].to(self.raw_keys.device).float() if known else 0.
+        self.audit_known[indices]=known
         self.write_ptr.copy_((self.write_ptr+n)%self.capacity)
 
     def allowed(self, sample_id, group_id, step, exclude_group=False):
@@ -135,39 +154,88 @@ class CorrectionRetriever(nn.Module):
         self.output=nn.Conv2d(decoder_channels,decoder_channels,1,bias=False)
         nn.init.zeros_(self.output.weight)
 
-    def forward(self, h, ct_query, sample_ids, group_ids, step):
+    def forward(self, h, ct_query, sample_ids, group_ids, step,
+                return_diagnostics=False,return_maps=False):
+        return_diagnostics=bool(return_diagnostics or return_maps)
         if ct_query.shape[-2:] != h.shape[-2:]:
             ct_query=F.interpolate(ct_query,size=h.shape[-2:],mode='bilinear',align_corners=False)
         reads=[]; hits=[]
+        diagnostic_maps={name:[] for name in ('top1_cos','source_rel','attention_entropy',
+                                             'known_fg_mass','metadata_known_mass')}
+        available=[]
         # Float32 similarity/normalization even inside AMP. Block queries, never
         # allocate a B*H*W*capacity dense attention tensor.
         with torch.autocast(device_type=h.device.type,enabled=False):
             for b in range(h.shape[0]):
                 allowed=self.memory.allowed(sample_ids[b],group_ids[b],step,self.exclude_group)
                 n=int(allowed.sum())
+                available.append(n)
                 if n < self.min_entries:
                     reads.append(torch.zeros_like(h[b],dtype=torch.float32))
                     hits.append(torch.zeros((1,*h.shape[-2:]),device=h.device,dtype=torch.bool))
+                    if return_diagnostics:
+                        for name in diagnostic_maps:
+                            diagnostic_maps[name].append(torch.zeros((1,*h.shape[-2:]),device=h.device))
                     continue
                 keys=F.normalize(self.key_projection(self.memory.raw_keys[allowed].detach().float()),dim=-1,eps=1e-6)
                 vals=self.memory.values[allowed].detach().float()
                 rel=self.memory.reliability[allowed].detach().float()
+                if return_diagnostics:
+                    known=self.memory.audit_known[allowed].float()
+                    fg=self.memory.foreground[allowed].float()*known
                 queries=ct_query[b].flatten(1).T.float()
                 pieces=[]
+                dp={name:[] for name in diagnostic_maps}
                 for qraw in queries.split(self.query_chunk):
                     q=F.normalize(self.key_projection(qraw),dim=-1,eps=1e-6)
                     score,index=(q @ keys.T).topk(min(self.topk,n),dim=1)
-                    a=(score/self.temperature).softmax(dim=1)*rel[index]
+                    attention=(score/self.temperature).softmax(dim=1)
+                    a=attention*rel[index]
                     pieces.append((a.unsqueeze(-1)*vals[index]).sum(dim=1))
+                    if return_diagnostics:
+                        with torch.no_grad():
+                            ap=attention.detach()
+                            dp['top1_cos'].append(score[:,0].detach())
+                            dp['source_rel'].append((ap*rel[index]).sum(1))
+                            entropy=-(ap*ap.clamp_min(1e-12).log()).sum(1)
+                            dp['attention_entropy'].append(entropy/math.log(ap.shape[1]) if ap.shape[1]>1 else entropy*0)
+                            dp['known_fg_mass'].append((ap*fg[index]).sum(1))
+                            dp['metadata_known_mass'].append((ap*known[index]).sum(1))
                 reads.append(torch.cat(pieces).T.reshape_as(h[b]))
                 hits.append(torch.ones((1,*h.shape[-2:]),device=h.device,dtype=torch.bool))
+                if return_diagnostics:
+                    for name in diagnostic_maps:
+                        diagnostic_maps[name].append(torch.cat(dp[name]).reshape(1,*h.shape[-2:]))
         r=torch.stack(reads).to(h.dtype)
         hit=torch.stack(hits)
-        if not hit.any():
-            return h,hit
+        has_hit=any(n>=self.min_entries for n in available)
+        if not has_hit:
+            correction=torch.zeros_like(h)
+        else:
+            correction=self.output(r*(1+self.context(h)))*hit.to(h.dtype)
         # Value-dependent adaptation: no correction at all when R is zero.
-        correction=self.output(r*(1+self.context(h)))
-        return h+correction*hit.to(h.dtype),hit
+        result=h+correction
+        if not return_diagnostics:
+            return result,hit
+        with torch.no_grad():
+            maps={name:torch.stack(parts).detach() for name,parts in diagnostic_maps.items()}
+            maps['coverage']=hit.detach().float()
+            maps['read_rms']=r.detach().float().square().mean(1,keepdim=True).sqrt()
+            maps['correction_rms']=correction.detach().float().square().mean(1,keepdim=True).sqrt()
+            hrms=h.detach().float().square().mean(1,keepdim=True).sqrt()
+            maps['correction_ratio']=maps['correction_rms']/hrms.clamp_min(1e-8)
+            count=hit.sum().clamp_min(1)
+            info={name:(value*hit).sum()/count for name,value in maps.items()
+                  if name not in ('coverage','correction_ratio')}
+            if not has_hit:
+                for name in ('top1_cos','source_rel','attention_entropy','known_fg_mass','metadata_known_mass'):
+                    info[name]=None  # unavailable is not a measured zero match/reliability
+            info['coverage']=hit.float().mean()
+            info['correction_ratio']=correction.detach().float().square().mean().sqrt()/h.detach().float().square().mean().sqrt().clamp_min(1e-8)
+            info['available_mean']=torch.tensor(available,device=h.device,dtype=torch.float32).mean()
+            if return_maps:
+                info['maps']=maps
+        return result,hit,info
 
 
 @torch.no_grad()
@@ -195,7 +263,8 @@ largest/saturated gain. No negative-region or GT-mask payload enters memory.
         if chosen.numel():
             n=chosen.numel()
             rows.append((ct[b].flatten(1).T[chosen],delta[b].flatten(1).T[chosen],weights[chosen],
-                         sample_ids[b].expand(n),group_ids[b].expand(n)))
+                         sample_ids[b].expand(n),group_ids[b].expand(n),fg[chosen],
+                         audit['gain'][b].flatten()[chosen]))
     if not rows:
         return None
-    return tuple(torch.cat([r[i] for r in rows]).detach() for i in range(5))
+    return tuple(torch.cat([r[i] for r in rows]).detach() for i in range(7))

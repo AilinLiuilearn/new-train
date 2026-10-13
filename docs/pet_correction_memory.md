@@ -12,7 +12,10 @@ pretraining is required. Local encoder pretrained weights remain enabled.
 - Slice-level Full/Missing sampling: default 0.7/0.3. For B=16, deterministic
   11/5 and 12/4 allocations yield 112 Full rows per 160 rows over ten batches.
 - Main group-mean losses have independent weights 0.7/0.3 (no double weighting).
-- Independent supervised CT auxiliary decoder, all rows, default weight 0.1.
+- Optional CT auxiliary decoder, OFF by default (`ct_aux_enabled=False`): it is
+  not instantiated or evaluated and its loss is zero. Enable explicitly with
+  `--ct_aux_enabled True --ct_aux_weight 0.1`. CT encoder and shared-decoder
+  reference/probes remain necessary for memory auditing.
 - Four shared stage readouts (S1 reuses the final seg_head; three new heads), reference/conditional-PET segmentation
   supervision averaged over scales, default weight 0.1.
 - No distillation, PET reconstruction or K-means loss.
@@ -62,7 +65,10 @@ No harmful-value bank is created. Masks/admission decisions are detached.
 
 Four FIFO queues, 2048 entries each by default. Each entry stores a raw CT
 descriptor, decoder delta Value, reliability, stable slice ID, optional source
-group ID, write step and validity. No GT mask or image is stored.
+group ID, write step and validity. Additional training-audit metadata records
+  foreground-cell overlap, source gain and whether this metadata is known; these
+  are ONLY used for diagnostics, never query matching or correction weights.
+  No GT image/mask payload is stored. Old queues load with metadata marked unknown.
 
 The physical CT key is kept **before** its learned 32-D projection; query and
 bank keys are reprojected using the SAME live projection at read time. This
@@ -143,8 +149,8 @@ seeds make the epoch-boundary resume reproducible. If best Joint predates active
 memory, final output explicitly reports it; do not claim retrieval gain.
 
 Default additional trainable parameters (excluding original encoders/decoder):
-CT auxiliary decoder 3,464,897; new stage heads 899; retrieval/adapters 556,208;
-total **4,022,004**. Queue buffers ~15.7 MiB per online/bank/evaluation model at default settings.
+new stage heads 899; retrieval/adapters 556,208; total **557,107**. Optional CT
+auxiliary decoder adds 3,464,897 when enabled (total then 4,022,004). Queue buffers ~15.7 MiB per online/bank/evaluation model at default settings.
 
 ## Reference provenance
 
@@ -177,6 +183,9 @@ python run_joint_pet_correction.py \
   --norm_mode imagenet --aug_mode cipa \
   --full_ratio 0.7 --full_loss_weight 0.7 --missing_loss_weight 0.3 \
   --memory_warmup_epochs 0 --retrieval_start_epoch 2 \
+  --ct_aux_enabled False \
+  --memory_diagnostics True --memory_log_every 100 \
+  --memory_visualize True --memory_vis_every_epochs 5 --memory_vis_samples 2 \
   --bank_ema_enabled True --bank_ema_start_epoch 0 --bank_ema_decay 0.999 \
   --ema_enabled True --ema_start_epoch 3 --ema_decay 0.999 \
   --hd95_mode cipa_official --random_state 2023 --epochs 60
@@ -239,3 +248,71 @@ including bank activation from epoch one with evaluation EMA still delayed,
 independent update counts, bank query sourcing at Missing evaluation, exact
 checkpoint restore, skipped-step behavior, and the original raw-source AMP/RNG
 regression. No new real-data training or GPU measurements were performed.
+
+## Sparse diagnostics and optional visualization
+
+The baseline fusion, audits, reliability formula, queue capacity/TTL, Top-K and
+correction adapter are unchanged. No similarity rejection threshold is added.
+The optional independent CT auxiliary decoder is disabled structurally by
+DEFAULT; shared-decoder CT reference predictions are not disabled.
+
+`memory_diagnostics=True` logs the first batch and every 100 batches of each
+epoch by default, plus an epoch-end queue snapshot. This does not run extra
+validation. Detailed records are saved in `memory_diagnostics.jsonl`, while
+per-stage source reliability, foreground-cell fraction, gain and age enter
+`train_log.csv`. Unknown/unavailable measurements are n/a/null, not fake zeros.
+Batch candidate counts are distinguished from committed counts; an AMP-skipped
+step commits zero entries. `candidate_tokens` in CSV remains a per-batch mean,
+while `committed_tokens` is the total number written across scales in the epoch.
+
+BANK logs: usable counts (TTL-filtered), unique slice counts, source reliability
+mean/p10/p90, fraction of known source cells containing any GT foreground,
+source gain, Value RMS and age in successful optimizer updates. READ logs:
+availability coverage, actual top-1 cosine, attention-weighted source reliability,
+normalized Top-K entropy, attention mass on known foreground source entries,
+and actual adapter correction RMS relative to current-feature RMS. These are
+measured from the real retrieval forward, not extra predictions or guessed
+confidence scores. Coverage means enough entries, not a correct match. Source
+reliability is not a calibrated probability that the query correction is useful.
+
+`memory_visualize=False` by default. Enable to process only the first
+`memory_vis_samples=2` fixed validation slices at epochs 1, 2, then every 5
+epochs (adjustable); never revalidate the whole dataset. Each slice generates:
+
+- `_predictions.png`: CT/PET/GT, Full probability, Missing retrieval OFF/ON
+  using the same main segmenter, and signed probability change.
+- `_source_audit.png`: four-scale controlled-reference/plus predictions,
+  original GT-based gain reduced to cells, eligibility and source reliability.
+  These validation GT audits are diagnostic only, never queue writes.
+- `_retrieval.png`: actual query coverage, cosine, retrieved source reliability,
+  attention entropy, known foreground-source attention mass and correction RMS.
+- `_maps.npz`: exact numeric maps at their native feature resolution, plus
+  original-resolution GT/predictions; `_metadata.json` records settings/status.
+
+Outputs: `checkpoints_new/MDT/<hash>/memory_visualizations/epoch_XXX/`.
+GT contours are always drawn at original resolution; feature maps are enlarged
+for display rather than shrinking away tiny lesions. Confidence/cosine maps use
+fixed scales; gain/RMS color ranges are shown in color bars. The latter colors
+should not be compared between epochs without consulting their numeric scales.
+Missing inference never consumes GT/PET; source audits and PET images are
+separate visualization-only operations. Model/bank states, RNG and loader
+seed-generator state are restored; the tool writes no queue and does not affect
+checkpoint selection. Matplotlib is imported only when visualization is enabled.
+
+Source foreground/gain metadata from old checkpoints is marked unknown, never
+fabricated. Old checkpoints retain their saved CT auxiliary architecture for
+reevaluation. Resume requires the same architecture; start a fresh hash to
+switch auxiliary off. Optional switches only affecting diagnostics can be
+changed without changing model weights. Example checkpoint visualization:
+
+```bash
+python run_joint_pet_correction.py --eval_checkpoint PATH \
+  --root /root/autodl-tmp/data/PCLT20K --hash correction-inspect \
+  --memory_visualize True --memory_vis_samples 2
+```
+
+Verification: 15 CPU contracts pass on PyTorch 2.5.1, including auxiliary-off
+architecture, actual diagnostic weights/gradient invariance, legacy metadata
+loading, synthetic PNG/NPZ generation without state/RNG changes, JSONL/CSV,
+checkpoint save/resume/evaluation and source AMP isolation. Synthetic plots are
+functional checks, not PCLT20K evidence. No new full-data/GPU training performed.

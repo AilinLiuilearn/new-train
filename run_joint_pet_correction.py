@@ -6,6 +6,7 @@ Checkpoints include all queues, separate bank/evaluation EMA, optimizer/scaler/R
   python run_joint_pet_correction.py --eval_checkpoint <best_joint>
 """
 import copy
+import importlib.util
 import json
 import os
 import random
@@ -21,6 +22,7 @@ from tasks.mdt_seg import MDTSegTeacher
 from utils.optimization import get_cosine_scheduler
 from utils.run_common import count_parameters, optimizer_step_succeeded, seed_everything
 from utils.train_logger import append_epoch_log, init_train_log
+from utils.pet_correction_diagnostics import report_memory, queue_snapshot, visualize_memory
 from run_full_missing_baseline import _loaders
 
 
@@ -31,7 +33,7 @@ def load_training_state(task,path):
     fields=('full_ratio','full_loss_weight','missing_loss_weight','decoder_channels',
             'memory_capacity','memory_key_dim','memory_exclude_group','memory_max_age',
             'memory_warmup_epochs','retrieval_start_epoch','norm_mode','ema_enabled',
-            'epochs','learning_rate','ct_aux_weight','scale_loss_weight','negative_region_weight',
+            'epochs','learning_rate','ct_aux_enabled','ct_aux_weight','scale_loss_weight','negative_region_weight',
             'memory_enabled','region_calibration','memory_min_entries','memory_gain_margin',
             'memory_min_support','memory_max_negative_fraction','memory_tokens_per_full',
             'memory_temperature','memory_topk','ema_decay','ema_start_epoch','ema_decay_warmup',
@@ -39,7 +41,8 @@ def load_training_state(task,path):
             'random_state','batch_size','image_size_2d','aug_mode','train_split_file',
             'val_split_file','test_split_file','hash')
     for key in fields:
-        if saved.get(key)!=getattr(task.config,key):
+        previous=saved.get(key,True if key=='ct_aux_enabled' else None)
+        if previous!=getattr(task.config,key):
             raise ValueError(f'Resume config mismatch for {key}; use the original run settings')
     task.model.load_state_dict(ckpt['model'],strict=True)
     if task.ema is not None and ckpt.get('model_ema') is not None:
@@ -68,7 +71,8 @@ def initialize_from_add(task,path):
     if set(state)!=expected:
         raise ValueError('init_checkpoint must be the aligned pure-add baseline, no silent partial load')
     task.model.load_state_dict(state,strict=False)
-    task.model.ct_aux_decoder.load_state_dict(task.model.decoder.state_dict(),strict=True)
+    if task.model.ct_aux_decoder is not None:
+        task.model.ct_aux_decoder.load_state_dict(task.model.decoder.state_dict(),strict=True)
     if task.ema is not None:
         task.ema.reset(task.model)
     if task.bank_ema is not None:
@@ -83,6 +87,10 @@ def final_eval(task,loader,checkpoint,path):
         raise ValueError('Selected EMA checkpoint has no EMA state')
     # No dependency on pretrained files after a checkpoint exists.
     task.model.load_state_dict(state,strict=True)
+    if task.ema is not None:
+        task.ema_active=use_ema
+        if use_ema:
+            task.ema.model.load_state_dict(state,strict=True)
     task.restore_bank_ema(ckpt,required=True)
     task.model.eval()
     full=task.evaluate(loader,'full',model=task.model)
@@ -122,7 +130,10 @@ def smoke(cfg):
     loss,_,_,stats=task.train_step_mixed(batch,torch.tensor([1,0],device=task.device))
     loss.backward(); task.optimizer.step(); task.after_successful_step()
     for name in ('enc_ct','enc_pet','ct_align','pet_align','decoder','ct_aux_decoder','stage_heads'):
-        grads=[p.grad for p in getattr(task.model,name).parameters() if p.grad is not None]
+        module=getattr(task.model,name)
+        if module is None:
+            continue
+        grads=[p.grad for p in module.parameters() if p.grad is not None]
         if not grads or not all(torch.isfinite(g).all() for g in grads):
             raise RuntimeError(f'Smoke gradient failure: {name}')
     task.model.eval()
@@ -137,6 +148,8 @@ def smoke(cfg):
 
 def main():
     cfg=PETCorrectionConfig.parse_arguments()
+    if cfg.memory_visualize and importlib.util.find_spec('matplotlib') is None:
+        raise RuntimeError('Visualization requires matplotlib: install it or set --memory_visualize False')
     if cfg.smoke:
         seed_everything(cfg.random_state); smoke(cfg); return
     if cfg.eval_checkpoint:
@@ -149,6 +162,11 @@ def main():
         saved.setdefault('bank_ema_start_epoch',0)
         saved.setdefault('bank_ema_decay',.999)
         saved.setdefault('bank_ema_decay_warmup',True)
+        saved.setdefault('ct_aux_enabled',True)
+        # Diagnostic flags may be changed for reevaluation without changing weights.
+        for key in ('memory_diagnostics','memory_log_every','memory_visualize',
+                    'memory_vis_every_epochs','memory_vis_samples'):
+            saved[key]=getattr(cfg,key)
         # Eval takes shape/normalization/source settings from the checkpoint.
         saved.update(root=cfg.root,pretrained=False,ct_pretrained_path=None,pet_pretrained_path=None,
                      checkpoint_root=cfg.checkpoint_root,hash=cfg.hash)
@@ -157,6 +175,9 @@ def main():
         _,_,test=_loaders(cfg)
         final_eval(task,test,eval_path,
                    os.path.join(cfg.checkpoint_dir,'reeval_test.json'))
+        if cfg.memory_visualize:
+            files=visualize_memory(task,test,os.path.join(cfg.checkpoint_dir,'memory_visualizations'),int(ckpt['epoch']))
+            print(f'[VIS] saved={len(files)} files under {cfg.checkpoint_dir}/memory_visualizations',flush=True)
         return
     seed_everything(cfg.random_state)
     if cfg.resume and cfg.init_checkpoint:
@@ -187,13 +208,24 @@ def main():
     print(f'[EMA] bank_enabled={cfg.bank_ema_enabled} bank_start_epoch={cfg.bank_ema_start_epoch} '
           f'bank_decay={cfg.bank_ema_decay}; eval_enabled={cfg.ema_enabled} '
           f'eval_start_epoch={cfg.ema_start_epoch} eval_decay={cfg.ema_decay}',flush=True)
+    print(f'[AUX] ct_aux_enabled={cfg.ct_aux_enabled} '
+          f'effective_weight={cfg.ct_aux_weight if cfg.ct_aux_enabled else 0.}; '
+          'CT encoder and shared-decoder audit reference stay active',flush=True)
+    print(f'[DIAG] enabled={cfg.memory_diagnostics} log_every={cfg.memory_log_every} '
+          f'visualize={cfg.memory_visualize}; source reliability != query correctness; '
+          'coverage != correct match',flush=True)
     headers=['train_full_loss','train_missing_loss','train_ct_aux_loss','train_scale_loss',
              'train_full_samples','train_missing_samples','positive_fraction','negative_fraction',
-             'candidate_tokens','val_full_dice','val_missing_dice','val_full_hd95','val_missing_hd95',
+             'candidate_tokens','committed_tokens','val_full_dice','val_missing_dice','val_full_hd95','val_missing_hd95',
              'best_joint','best_joint_epoch','ema_updates','bank_ema_updates','bank_ema_active',
              'skipped_updates','epoch_time',
              'hd95_mode','retrieval_active']+[f'memory_s{i+1}_entries' for i in range(4)]
+    for s in range(4):
+        headers.extend(f'memory_s{s+1}_{key}' for key in ('source_rel_mean','foreground_fraction','source_gain','age_mean'))
     log=os.path.join(cfg.checkpoint_dir,'train_log.csv')
+    diagnostic_log=os.path.join(cfg.checkpoint_dir,'memory_diagnostics.jsonl')
+    if not cfg.resume:
+        open(diagnostic_log,'w').close()
     if not cfg.resume or not os.path.isfile(log):
         init_train_log(log,headers)
     last=os.path.join(cfg.checkpoint_dir,'ckpt.last.pth.tar')
@@ -208,13 +240,15 @@ def main():
         sums={k:0. for k in ('loss_full','loss_missing','loss_ct_aux','loss_scale',
                              'positive_fraction','negative_fraction','candidate_tokens')}
         total=norm=0.; nf=nm=skipped=steps=0
+        epoch_committed=[0]*4
         for batch in train:
             state=build_ratio_state(batch['ct'].shape[0],task.global_batch_step,
                                     cfg.random_state,cfg.full_ratio,task.device)
             task.optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=task.device.type,
                                  enabled=bool(cfg.mixed_precision and task.device.type=='cuda')):
-                loss,_,_,stats=task.train_step_mixed(batch,state)
+                loss,_,_,stats=task.train_step_mixed(batch,state,collect_diagnostics=bool(
+                    cfg.memory_diagnostics and (steps==0 or (steps+1)%cfg.memory_log_every==0)))
             if task.scaler.is_enabled():
                 task.scaler.scale(loss).backward(); task.scaler.unscale_(task.optimizer)
             else:
@@ -229,6 +263,7 @@ def main():
                 gn=torch.stack(norms).norm() if norms else torch.tensor(0.,device=task.device)
             # One scalar check, not hundreds of per-parameter CUDA synchronizations.
             finite_grad=bool(torch.isfinite(gn))
+            committed=[0]*4
             if not finite_grad:
                 task.pending=[None]*4
                 if task.scaler.is_enabled():
@@ -237,22 +272,25 @@ def main():
                 else:
                     raise RuntimeError('Non-finite unscaled gradients; optimizer/memory were not updated')
             elif optimizer_step_succeeded(task):
-                task.scheduler.step(); task.after_successful_step()
+                task.scheduler.step(); committed=task.after_successful_step()
             else:
                 task.pending=[None]*4; skipped+=1
             nf+=stats['num_full']; nm+=stats['num_missing']
+            epoch_committed=[a+b for a,b in zip(epoch_committed,committed)]
             for k in sums:
                 factor=stats['num_full'] if k=='loss_full' else stats['num_missing'] if k=='loss_missing' else 1
                 sums[k]+=float(stats[k])*factor
             total+=float(loss.detach()); norm+=float(gn); steps+=1; task.global_batch_step+=1
-            if steps%100==0:
+            if steps%cfg.memory_log_every==0 or steps==1:
                 print(f'[BATCH {steps}] loss={float(loss.detach()):.4f} '
                       f'Full/Missing={stats["num_full"]}/{stats["num_missing"]} '
-                      f'accepted={stats["candidate_tokens"]} '
+                      f'candidates={stats["candidate_tokens"]} committed={sum(committed)} '
                       f'full_loss={float(stats["loss_full"]):.4f} '
                       f'missing_loss={float(stats["loss_missing"]):.4f} '
                       f'ct_aux_loss={float(stats["loss_ct_aux"]):.4f} '
                       f'scale_loss={float(stats["loss_scale"]):.4f}',flush=True)
+            if cfg.memory_diagnostics and 'diagnostics' in stats:
+                report_memory(task,stats['diagnostics'],diagnostic_log,epoch,steps,committed)
         vf=task.evaluate(val,'full'); vm=task.evaluate(val,'missing')
         joint=.5*(vf['dice']+vm['dice'])
         if joint>best:
@@ -261,12 +299,15 @@ def main():
         else:
             no_improve+=1
         task.save_checkpoint(last,epoch,best,best_epoch,{'full':vf,'missing':vm})
+        snapshot=queue_snapshot(task.model) if cfg.memory_diagnostics else None
+        if cfg.memory_diagnostics:
+            report_memory(task,None,diagnostic_log,epoch,'epoch_end',epoch_committed)
         avg={k:v/max(1,nf if k=='loss_full' else nm if k=='loss_missing' else steps) for k,v in sums.items()}
         extra={'train_full_loss':avg['loss_full'],'train_missing_loss':avg['loss_missing'],
                'train_ct_aux_loss':avg['loss_ct_aux'],'train_scale_loss':avg['loss_scale'],
                'train_full_samples':nf,'train_missing_samples':nm,
                'positive_fraction':avg['positive_fraction'],'negative_fraction':avg['negative_fraction'],
-               'candidate_tokens':avg['candidate_tokens'],'val_full_dice':vf['dice'],
+               'candidate_tokens':avg['candidate_tokens'],'committed_tokens':sum(epoch_committed),'val_full_dice':vf['dice'],
                'val_missing_dice':vm['dice'],'val_full_hd95':vf['hd95'],'val_missing_hd95':vm['hd95'],
                'best_joint':best,'best_joint_epoch':best_epoch,
                'ema_updates':task.ema.updates if task.ema else 0,'skipped_updates':skipped,
@@ -276,11 +317,18 @@ def main():
                'retrieval_active':int(task.model.retrieval_active),
                **{f'memory_s{i+1}_entries':int(r.memory.allowed(-1,-1,int(task.model.memory_step)).sum())
                   for i,r in enumerate(task.model.retrievers)}}
+        for s in range(4):
+            q={} if snapshot is None else snapshot[s]
+            extra.update({f'memory_s{s+1}_{key}':q.get(key) if q.get(key) is not None else 'n/a'
+                for key in ('source_rel_mean','foreground_fraction','source_gain','age_mean')})
         metrics={k:.5*(vf[k]+vm[k]) for k in ('total_loss','dice','iou','acc','acc_pixel','hd95')}
         append_epoch_log(log,epoch,total/max(1,steps),metrics,task.optimizer.param_groups[0]['lr'],
                          norm/max(1,steps),extra)
         print(f'[EPOCH {epoch}] Full={vf["dice"]:.4f} Missing={vm["dice"]:.4f} Joint={joint:.4f} '
               f'HD95={vf["hd95"]:.3f}/{vm["hd95"]:.3f} active={bool(task.model.retrieval_active)}',flush=True)
+        if cfg.memory_visualize and (epoch in (1,2) or epoch%cfg.memory_vis_every_epochs==0):
+            files=visualize_memory(task,val,os.path.join(cfg.checkpoint_dir,'memory_visualizations'),epoch)
+            print(f'[VIS] saved={len(files)} files under {cfg.checkpoint_dir}/memory_visualizations/epoch_{epoch:03d}',flush=True)
         # Do not stop before memory has had a chance to train.
         if epoch>=cfg.retrieval_start_epoch+3 and no_improve>=cfg.early_stop_patience:
             break

@@ -32,6 +32,8 @@ class PETCorrectionConfig(SegMDTConfig):
         p.add_argument('--full_loss_weight',type=float,default=.7)
         p.add_argument('--missing_loss_weight',type=float,default=.3)
         p.add_argument('--ct_aux_weight',type=float,default=.1)
+        p.add_argument('--ct_aux_enabled',type=str2bool,default=False,
+                       help='Optional independent CT-only decoder/supervision; OFF does not remove the CT encoder or audit reference.')
         p.add_argument('--scale_loss_weight',type=float,default=.1)
         p.add_argument('--negative_region_weight',type=float,default=.5)
         p.add_argument('--memory_enabled',type=str2bool,default=True)
@@ -57,6 +59,13 @@ class PETCorrectionConfig(SegMDTConfig):
         p.add_argument('--memory_max_negative_fraction',type=float,default=.1)
         p.add_argument('--memory_exclude_group',type=str2bool,default=False,
                        help='Enable only after confirming filename group meaning.')
+        p.add_argument('--memory_diagnostics',type=str2bool,default=True)
+        p.add_argument('--memory_log_every',type=int,default=100,
+                       help='Sparse batch diagnostics, not extra validation passes.')
+        p.add_argument('--memory_visualize',type=str2bool,default=False)
+        p.add_argument('--memory_vis_every_epochs',type=int,default=5,
+                       help='Also visualize epochs 1/2; only a few fixed validation slices.')
+        p.add_argument('--memory_vis_samples',type=int,default=2)
         p.add_argument('--resume',type=str,default=None)
         p.add_argument('--init_checkpoint',type=str,default=None,
                        help='Optional aligned-add checkpoint; not required for joint training.')
@@ -88,4 +97,6 @@ class PETCorrectionConfig(SegMDTConfig):
             raise ValueError('Invalid gain margin/token quota')
         if cfg.bank_ema_start_epoch<0 or not 0<=cfg.bank_ema_decay<1:
             raise ValueError('Invalid bank EMA start epoch/decay')
+        if min(cfg.memory_log_every,cfg.memory_vis_every_epochs,cfg.memory_vis_samples)<1:
+            raise ValueError('Diagnostic/visualization intervals and sample count must be positive')
         return cfg

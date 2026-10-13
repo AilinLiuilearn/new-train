@@ -19,12 +19,12 @@ from models.pet_correction_memory import CorrectionRetriever, audit_regions, sel
 class PETCorrectionModel(DualSharedAddPETCTBaseline):
     def __init__(self, memory_capacity=2048, key_dim=32, topk=4, query_chunk=256,
                  memory_min_entries=16, memory_max_age=128, exclude_group=False,
-                 temperature=.1, decoder_channels=(512,256,128,64), **kwargs):
+                 temperature=.1, decoder_channels=(512,256,128,64), ct_aux_enabled=False, **kwargs):
         if kwargs.get('use_deep_supervision',False):
             raise ValueError('Use the correction stage heads, not baseline deep supervision')
         super().__init__(decoder_channels=decoder_channels, **kwargs)
         self.decoder_value_channels=tuple(reversed(decoder_channels))
-        self.ct_aux_decoder=copy.deepcopy(self.decoder)
+        self.ct_aux_decoder=copy.deepcopy(self.decoder) if ct_aux_enabled else None
         # S1 uses the real final classifier; only S2..S4 need new readouts.
         # Do not alias seg_head in ModuleList: EMA would update aliased state twice.
         self.stage_heads=nn.ModuleList([nn.Conv2d(c,1,1) for c in self.decoder_value_channels[1:]])
@@ -46,12 +46,17 @@ class PETCorrectionModel(DualSharedAddPETCTBaseline):
         upstream=F.interpolate(previous,size=skip.shape[-2:],mode='bilinear',align_corners=False)
         return getattr(self.decoder,f'fuse{s+1}')(torch.cat([upstream,skip],dim=1))
 
-    def decode_features(self, projected, query=None, sample_ids=None, group_ids=None):
+    def decode_features(self, projected, query=None, sample_ids=None, group_ids=None,
+                        diagnostics=None, return_maps=False):
         hs=[None]*4
         for s in (3,2,1,0):
             h=self.decode_stage(s,projected[s],None if s==3 else hs[s+1])
             if query is not None and bool(self.retrieval_active):
-                h,_=self.retrievers[s](h,query[s],sample_ids,group_ids,int(self.memory_step))
+                if diagnostics is None:
+                    h,_=self.retrievers[s](h,query[s],sample_ids,group_ids,int(self.memory_step))
+                else:
+                    h,_,diagnostics[s]=self.retrievers[s](h,query[s],sample_ids,group_ids,
+                        int(self.memory_step),return_diagnostics=True,return_maps=return_maps)
             hs[s]=h
         return hs
 
@@ -97,11 +102,13 @@ class PETCorrectionModel(DualSharedAddPETCTBaseline):
             raise RuntimeError('Memory writes are forbidden in evaluation')
         for r,payload in zip(self.retrievers,candidates):
             if payload is not None:
-                r.memory.enqueue(*payload,step=step)
+                metadata={} if len(payload)==5 else dict(foreground=payload[5],source_gain=payload[6])
+                r.memory.enqueue(*payload[:5],step=step,**metadata)
         self.memory_step.fill_(step)
 
     def forward(self, ct, pet=None, pet_available=None, target_size=None, forward_mode='auto',
-                sample_ids=None, group_ids=None, query_features=None, training_details=False):
+                sample_ids=None, group_ids=None, query_features=None, training_details=False,
+                return_diagnostics=False, return_maps=False, retrieval_override=None):
         b=ct.shape[0]; target_size=ct.shape[-2:] if target_size is None else target_size
         if forward_mode=='full':
             state=torch.ones(b,device=ct.device,dtype=torch.long)
@@ -127,6 +134,7 @@ class PETCorrectionModel(DualSharedAddPETCTBaseline):
         projected=self.project(cf)
         logits=ct.new_zeros((b,1,*target_size))
         details={}
+        retrieval_diagnostics={} if return_diagnostics or return_maps else None
         if fi.numel():
             if pet is None or pet.shape[0]!=b:
                 raise ValueError('Full rows require a batch-aligned real PET tensor')
@@ -142,15 +150,18 @@ class PETCorrectionModel(DualSharedAddPETCTBaseline):
             if len(q)!=4 or any(x.shape[0]!=b for x in q):
                 raise ValueError('query feature batch/scale mismatch')
             missing_h=self.decode_features([x.index_select(0,mi) for x in projected],
-                      query=[x.index_select(0,mi) for x in q],
-                      sample_ids=sample_ids[mi],group_ids=group_ids[mi])
+                      query=None if retrieval_override is False else [x.index_select(0,mi) for x in q],
+                      sample_ids=sample_ids[mi],group_ids=group_ids[mi],
+                      diagnostics=retrieval_diagnostics,return_maps=return_maps)
             logits=logits.index_copy(0,mi,self.logits(missing_h,target_size).to(logits.dtype))
         if not torch.isfinite(logits).all():
             raise RuntimeError('Non-finite correction-model logits')
         out={'logits':logits,'pred':logits,'aux':{},'full_index':fi,'missing_index':mi,
              'num_full':fi.numel(),'num_missing':mi.numel(),**details}
-        if training_details:
+        if training_details and self.ct_aux_decoder is not None:
             out['ct_aux_logits']=self.ct_aux_decoder(cf,target_size)['logits']
+        if retrieval_diagnostics is not None:
+            out['retrieval_diagnostics']=retrieval_diagnostics
         return out
 
 
@@ -159,6 +170,7 @@ def build_correction_model(cfg):
         ct_backbone=cfg.ct_backbone,pet_backbone=cfg.pet_backbone,
         ct_pretrained_path=cfg.ct_pretrained_path,pet_pretrained_path=cfg.pet_pretrained_path,
         pretrained=cfg.pretrained,decoder_channels=tuple(cfg.decoder_channels),
+        ct_aux_enabled=getattr(cfg,'ct_aux_enabled',False),
         memory_capacity=cfg.memory_capacity,key_dim=cfg.memory_key_dim,topk=cfg.memory_topk,
         query_chunk=cfg.memory_query_chunk,memory_min_entries=cfg.memory_min_entries,
         memory_max_age=cfg.memory_max_age,exclude_group=cfg.memory_exclude_group,

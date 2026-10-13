@@ -61,6 +61,12 @@ class RunnerSmoke(unittest.TestCase):
             self.assertTrue(ckpt['bank_ema_active'])
             self.assertEqual(ckpt['config']['ema_start_epoch'],3)
             self.assertEqual(ckpt['config']['bank_ema_start_epoch'],0)
+            self.assertFalse(ckpt['config']['ct_aux_enabled'])
+            self.assertFalse(any(k.startswith('ct_aux_decoder.') for k in ckpt['model']))
+            with open(os.path.join(root,'memory_diagnostics.jsonl')) as f:
+                records=[json.loads(line) for line in f]
+            self.assertTrue(records)
+            self.assertIn('source_rel_mean',records[-1]['queue']['0'])
             with open(os.path.join(root,'final_test_metrics.json')) as f:
                 result=json.load(f)
             self.assertIn('memory_entries',result)
@@ -82,7 +88,7 @@ class RunnerSmoke(unittest.TestCase):
                  patch('models.dual_shared_add_baseline.create_feature_backbone',lambda *a,**k:FakeEncoder()):
                 main()
             self.assertTrue(os.path.isfile(os.path.join(tmp,'MDT','eval','reeval_test.json')))
-            with patch('sys.argv',args+['--hash','skip','--epochs','1']),\
+            with patch('sys.argv',args+['--hash','skip','--epochs','1','--memory_diagnostics','False']),\
                  patch('run_joint_pet_correction._loaders',return_value=loaders),\
                  patch('run_joint_pet_correction.optimizer_step_succeeded',return_value=False),\
                  patch('models.dual_shared_add_baseline.create_feature_backbone',lambda *a,**k:FakeEncoder()):
