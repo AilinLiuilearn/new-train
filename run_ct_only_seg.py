@@ -16,8 +16,7 @@ from configs.seg_mdt import SegMDTConfig
 from models.build_mdt_seg import build_ct_only_model
 from tasks.mdt_seg import MDTSegTeacher
 from utils.optimization import get_cosine_scheduler
-from utils.run_common import (build_balanced_pet_available, count_parameters,
-                              eval_missing_rates, module_grad_norm,
+from utils.run_common import (count_parameters, module_grad_norm,
                               optimizer_step_succeeded, seed_everything)
 from utils.train_logger import append_epoch_log, init_train_log
 
@@ -48,10 +47,40 @@ def _checkpoint_paths(checkpoint_dir):
     }
 
 
+def final_eval_ct(task, loader, checkpoint, output_path):
+    """One CT-only evaluation using the exact weights used for model selection."""
+    ckpt = MDTSegTeacher.load_state_dicts(checkpoint)
+    tag = ckpt.get('eval_weights')
+    if tag not in ('raw', 'ema'):
+        raise ValueError('CT checkpoint must record eval_weights=raw or ema')
+    state = ckpt.get('model_ema') if tag == 'ema' else ckpt.get('model')
+    if state is None:
+        raise ValueError(f'CT checkpoint has no selected {tag} weights')
+    # Reuse the allocated model; no extra pretrained load or model replica.
+    task.model.load_state_dict(state, strict=True)
+    task.model.eval()
+    score = task.evaluate(loader, eval_mode='ct', tag='final_test_ct', model=task.model)
+    result = {
+        'experiment_type': 'ct_only_reference', 'epoch': int(ckpt['epoch']),
+        'weights': tag, 'checkpoint': os.path.abspath(checkpoint),
+        'ct_backbone': task.config.ct_backbone,
+        'norm_mode': task.config.norm_mode,
+        'hd95_mode': task.metrics.hd95_mode,
+        'val_split_file': task.config.val_split_file,
+        'test_split_file': task.config.test_split_file,
+        **{k: float(score[k]) for k in ('dice', 'iou', 'hd95', 'total_loss')},
+    }
+    with open(output_path, 'w') as f:
+        json.dump(result, f, indent=2)
+    print('[FINAL CT]', json.dumps(result), flush=True)
+    return result
+
+
 def main():
     print('[INFO] starting CT-only baseline (all CT slices, fixed protocol)', flush=True)
     cfg = SegMDTConfig.parse_arguments()
     _assert_ct_only_protocol(cfg)
+    cfg.experiment_type = 'ct_only_reference'
     seed_everything(cfg.random_state)
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
@@ -83,7 +112,7 @@ def main():
         'best_ct', 'best_ct_epoch',
         'grad_enc_ct', 'grad_ct_align', 'grad_decoder',
         'ema_enabled', 'ema_updates', 'skipped_updates',
-        'epoch_time',
+        'epoch_time', 'eval_weights',
     ]
     init_train_log(os.path.join(cfg.checkpoint_dir, 'train_log.csv'),
                    extra_headers=extra_headers)
@@ -176,9 +205,11 @@ def main():
                 'ema_updates': float(task.ema.updates) if task.ema is not None else 0.0,
                 'skipped_updates': float(skipped_update_count),
                 'epoch_time': time.time() - epoch_start,
+                'eval_weights': task.eval_weights_tag(),
             },
         )
         print(f'[EPOCH {epoch}] val_ct_dice={val_ct["dice"]:.4f} best_ct={best_ct:.4f} '
+              f'HD95={val_ct["hd95"]:.3f} weights={task.eval_weights_tag()} '
               f'lr={task.optimizer.param_groups[0]["lr"]:.8f}', flush=True)
         if no_improve >= patience:
             print(f'[EARLY STOP] no improvement for {patience} epochs', flush=True)
@@ -186,15 +217,8 @@ def main():
 
     if not os.path.isfile(paths['best_ct']):
         raise RuntimeError('best CT-only checkpoint was not created')
-    ckpt = MDTSegTeacher.load_state_dicts(paths['best_ct'])
-    use_ema = task.ema is not None and ckpt.get('model_ema') is not None
-    weights_tag = 'ema' if use_ema else 'raw'
-    eval_model = build_ct_only_model(cfg)['model'].to(task.device)
-    eval_model.load_state_dict(ckpt['model_ema'] if use_ema else ckpt['model'], strict=True)
-    eval_model.eval()
-    eval_missing_rates(task, eval_model, test_loader, cfg.random_state,
-                       cfg.checkpoint_dir, 'final_test_ct',
-                       rates=list(cfg.final_test_missing_rates), weights_tag=weights_tag)
+    final_eval_ct(task, test_loader, paths['best_ct'],
+                  os.path.join(cfg.checkpoint_dir, 'final_test_ct.json'))
     print('done', flush=True)
 
 
