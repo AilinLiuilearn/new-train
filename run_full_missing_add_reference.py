@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Independent Full/Missing 50/50 Add reference entry point.
+"""Independent Full/Missing Add reference, with configurable sampling/weights.
 
 Fixed to the mixed protocol:
 - even batch_size >= 2, DataLoader drop_last=True;
-- each batch is exact-half Full (1) / Missing (0), reshuffled per step
-  reproducibly via build_balanced_pet_available;
-- loss = 0.5 * full_subset + 0.5 * missing_subset, one backward/step;
+- defaults remain exact-half Full (1) / Missing (0), reshuffled per step;
+- non-half ratios use cumulative integer allocation (B16/r0.7: 11 or12 Full);
+- loss weights are explicit and independent of the sample ratio;
 - val selection by Joint = 0.5 * full_dice + 0.5 * missing_dice;
 - final Full/Missing/Joint all come from the same best_joint checkpoint.
 
@@ -13,8 +13,10 @@ Shared config/bbox_loss/metrics/logging/EMA with run_ct_only_seg; this is a
 separate entry point, not a duplicated copy of the common implementation.
 """
 import json
+import math
 import os
 import time
+from fractions import Fraction
 
 import numpy as np
 import torch
@@ -40,7 +42,50 @@ class MixedAddReferenceConfig(SegMDTConfig):
                 action.choices = ('mixed',)
             if action.dest == 'final_test_missing_rates':
                 action.default = [0.0, 1.0]
+        p.add_argument('--full_ratio', type=float, default=0.5,
+                       help='Fraction of Full training slices; Missing=1-full_ratio.')
+        p.add_argument('--full_loss_weight', type=float, default=0.5)
+        p.add_argument('--missing_loss_weight', type=float, default=0.5)
         return p
+
+
+def validate_ratio_config(cfg):
+    b = int(cfg.batch_size)
+    ratio = float(cfg.full_ratio)
+    if not math.isfinite(ratio) or not 0.0 < ratio < 1.0:
+        raise ValueError('full_ratio must be finite and strictly between 0 and 1')
+    if not 1.0 <= ratio*b <= b-1.0:
+        raise ValueError('Requested ratio must keep both subsets nonempty in every batch')
+    weights = (float(cfg.full_loss_weight), float(cfg.missing_loss_weight))
+    if not all(math.isfinite(w) and w > 0 for w in weights):
+        raise ValueError('Both loss weights must be positive and finite')
+    if not math.isclose(sum(weights),1.0,rel_tol=0.0,abs_tol=1e-6):
+        raise ValueError('full_loss_weight + missing_loss_weight must equal 1')
+
+
+def build_reference_pet_available(batch_size, global_batch_step, random_state,
+                                  device, full_ratio=0.5):
+    """Keep the old half assignment exactly; other ratios conserve total quota.
+
+    Cumulative Full count after N batches differs from ratio*B*N by <1 slice.
+    No sampling RNG is added to the global torch RNG stream.
+    """
+    b, step = int(batch_size), int(global_batch_step)
+    ratio = float(full_ratio)
+    if b < 2 or b % 2 or step < 0:
+        raise ValueError('Requires even batch_size >=2 and nonnegative global step')
+    if not math.isfinite(ratio) or not 1.0 <= ratio*b <= b-1.0:
+        raise ValueError('Ratio must permit both Full and Missing in every batch')
+    if ratio == 0.5:
+        return build_balanced_pet_available(b,step,random_state,device)
+    quota = Fraction(str(ratio)) * b
+    n_full = (((step+1)*quota.numerator)//quota.denominator
+              - (step*quota.numerator)//quota.denominator)
+    state = torch.cat((torch.ones(n_full,dtype=torch.long),
+                       torch.zeros(b-n_full,dtype=torch.long)))
+    generator = torch.Generator(device='cpu')
+    generator.manual_seed(int(random_state)+step*1000003)
+    return state[torch.randperm(b,generator=generator)].to(device)
 
 
 def load_reference_weights(model, checkpoint):
@@ -88,6 +133,7 @@ def main():
     cfg = MixedAddReferenceConfig.parse_arguments()
     cfg.experiment_type = 'full_missing_add_reference'
     cfg.fusion_type = 'AddFusion'
+    validate_ratio_config(cfg)
     if list(cfg.final_test_missing_rates) != [0.0,1.0]:
         raise ValueError('This reference evaluates Full and Missing only: rates 0 and 1')
     seed_everything(cfg.random_state)
@@ -103,7 +149,9 @@ def main():
     task = MDTSegTeacher(build_dual_model(cfg), cfg)
     if not isinstance(task.model.fusion, AddFusion):
         raise RuntimeError('Reference must use original AddFusion')
-    print('[PROTOCOL] Full/Missing=0.5/0.5 per batch; loss_weights=0.5/0.5; '
+    print(f'[PROTOCOL] Full/Missing={cfg.full_ratio:.3f}/{1-cfg.full_ratio:.3f}; '
+          f'loss_weights={cfg.full_loss_weight:.3f}/{cfg.missing_loss_weight:.3f}; '
+          'Joint selection weights=0.5/0.5; '
           'Full=aligned_CT+aligned_PET; Missing=aligned_CT; '
           'no GFRM, no retrieval, no compensation, no extra loss', flush=True)
     total_params, trainable_params = count_parameters(task.model)
@@ -123,6 +171,7 @@ def main():
     extra_headers = [
         'train_full_loss', 'train_missing_loss', 'train_mixed_loss',
         'train_full_samples', 'train_missing_samples', 'mixed_train_batches',
+        'requested_full_ratio', 'actual_full_ratio', 'full_loss_weight', 'missing_loss_weight',
         'val_full_loss', 'val_full_dice', 'val_full_iou', 'val_full_acc',
         'val_full_acc_pixel', 'val_full_hd95',
         'val_missing_loss', 'val_missing_dice', 'val_missing_iou', 'val_missing_acc',
@@ -161,12 +210,16 @@ def main():
                 raise ValueError(
                     f'mixed mode requires fixed batch size {int(cfg.batch_size)} '
                     f'(drop_last=True), got {actual_batch_size}')
-            pet_available = build_balanced_pet_available(
+            pet_available = build_reference_pet_available(
                 int(cfg.batch_size), global_batch_step, cfg.random_state, task.device,
+                full_ratio=cfg.full_ratio,
             )
             task.optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available()):
-                loss, _, _, train_stats = task.train_step_mixed(batch, pet_available=pet_available)
+                loss, _, _, train_stats = task.train_step_mixed(
+                    batch, pet_available=pet_available,
+                    full_loss_weight=cfg.full_loss_weight,
+                    missing_loss_weight=cfg.missing_loss_weight)
             if task.scaler.is_enabled():
                 task.scaler.scale(loss).backward()
                 task.scaler.unscale_(task.optimizer)
@@ -247,6 +300,10 @@ def main():
                 'train_mixed_loss': train_mixed_loss,
                 'train_full_samples': float(full_sample_count),
                 'train_missing_samples': float(missing_sample_count),
+                'requested_full_ratio': cfg.full_ratio,
+                'actual_full_ratio': full_sample_count / max(1,full_sample_count+missing_sample_count),
+                'full_loss_weight': cfg.full_loss_weight,
+                'missing_loss_weight': cfg.missing_loss_weight,
                 'mixed_train_batches': float(mixed_n),
                 'val_full_loss': val_full['total_loss'],
                 'val_full_dice': val_full['dice'],
@@ -275,6 +332,7 @@ def main():
             },
         )
         print(f'[EPOCH {epoch}] full_dice={val_full["dice"]:.4f} '
+              f'train_full_fraction={full_sample_count/max(1,full_sample_count+missing_sample_count):.4f} '
               f'missing_dice={val_missing["dice"]:.4f} joint_dice={joint_dice:.4f} '
               f'full_hd95={val_full["hd95"]:.4f} missing_hd95={val_missing["hd95"]:.4f} '
               f'weights={task.eval_weights_tag()} best_joint={best_joint:.4f} '

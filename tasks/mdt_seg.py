@@ -9,6 +9,7 @@
 - Non-finite logits/loss raise with their location instead of being masked.
 """
 import json
+import math
 import os
 import random
 
@@ -110,8 +111,13 @@ class MDTSegTeacher:
         }
         return loss, logits, outputs, stats
 
-    def train_step_mixed(self, batch, pet_available):
-        """Mixed step: exact-half batch, 0.5*full + 0.5*missing, one backward."""
+    def train_step_mixed(self, batch, pet_available, *, full_loss_weight=0.5,
+                         missing_loss_weight=0.5):
+        """Mixed step; explicit subset-mean loss weights, default unchanged 50/50."""
+        wf, wm = float(full_loss_weight), float(missing_loss_weight)
+        if (not all(math.isfinite(w) and w > 0 for w in (wf,wm))
+                or not math.isclose(wf+wm,1.0,rel_tol=0.0,abs_tol=1e-6)):
+            raise ValueError('Positive finite Full/Missing loss weights must sum to 1')
         ct = batch['ct'].to(self.device, non_blocking=True)
         pet = batch['pet'].to(self.device, non_blocking=True)
         mask = batch['mask'].to(self.device, non_blocking=True).float()
@@ -142,7 +148,7 @@ class MDTSegTeacher:
             raise RuntimeError('[NaN/Inf] logits at train_step_mixed')
         full_loss, full_stats = self.criterion(logits[full_index], mask[full_index])
         missing_loss, missing_stats = self.criterion(logits[missing_index], mask[missing_index])
-        total_loss = 0.5 * full_loss + 0.5 * missing_loss
+        total_loss = wf * full_loss + wm * missing_loss
         if not torch.isfinite(total_loss).all():
             raise RuntimeError('[NaN/Inf] loss at train_step_mixed')
         stats = {
