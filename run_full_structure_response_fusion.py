@@ -24,13 +24,17 @@ from utils.structure_response_visualization import log_fusion,visualize_fusion
 def core_gradient_check(model):
     names=['enc_ct','enc_pet','ct_align','pet_align','decoder']
     for name in names:
-        p=next(p for p in getattr(model,name).parameters() if p.requires_grad and p.ndim>=2)
+        if name in ('ct_align','pet_align') and isinstance(getattr(model,name),torch.nn.Identity):
+            continue
+        params=[p for p in getattr(model,name).parameters() if p.requires_grad and p.ndim>=2]
+        if not params:raise RuntimeError(f'No trainable core parameters: {name}')
+        p=params[0]
         if p.grad is None:raise RuntimeError(f'Disconnected core gradient: {name}')
     if isinstance(model.fusion,StructureResponseFusion):
         for s,stage in enumerate(model.fusion.stages):
             for name in ('ct_output','pet_output'):
                 if getattr(stage,name).weight.grad is None:raise RuntimeError(f'Disconnected S{s+1}.{name}')
-    print('[GRAD CHECK] encoders/alignments/decoder and enabled residual outputs connected',flush=True)
+    print('[GRAD CHECK] encoders/decoder, trainable alignments and enabled residual outputs connected',flush=True)
 
 
 def train_step(task,batch,diagnose=False):
@@ -46,6 +50,7 @@ def restore(task,path):
             'epochs','batch_size','random_state','learning_rate','weight_decay','ema_enabled','ema_decay',
             'ema_start_epoch','ema_decay_warmup','train_split_file','val_split_file','test_split_file','hash',
             'image_size_2d','hd95_mode','ct_backbone','pet_backbone','cosine_warmup','cosine_min_lr','lr_flat_ratio','grad_clip')
+    fields += tuple(k for k in ('model_arch','encoder_pair','channel_alignment') if hasattr(task.config,k))
     for key in fields:
         if ckpt['config'].get(key)!=getattr(task.config,key):raise ValueError(f'Resume config mismatch: {key}')
     task.model.load_state_dict(ckpt['model'],strict=True)
@@ -70,45 +75,50 @@ def final_eval(task,loader,path):
         task.ema_active=tag=='ema'
         if tag=='ema':task.ema.model.load_state_dict(ckpt['model_ema'],strict=True)
     score=task.evaluate(loader,eval_mode='full',model=task.model)
-    result={'experiment_type':'full_structure_response','weights':tag,'epoch':ckpt['epoch'],
+    result={'experiment_type':getattr(task.config,'experiment_type','full_structure_response'),'weights':tag,'epoch':ckpt['epoch'],
             'fusion_enabled':task.config.fusion_enabled,'hd95_mode':task.metrics.hd95_mode,
+            'ct_backbone':task.config.ct_backbone,'pet_backbone':task.config.pet_backbone,
+            'channel_alignment':getattr(task.config,'channel_alignment','learned'),
             'checkpoint':os.path.abspath(path),**{k:score[k] for k in ('dice','iou','hd95','total_loss')}}
     with open(os.path.join(task.config.checkpoint_dir,'final_test_full.json'),'w') as f:json.dump(result,f,indent=2)
     print('[FINAL FULL]',json.dumps(result),flush=True)
     return int(ckpt['epoch']),tag
 
 
-def smoke(cfg):
+def smoke(cfg,model_builder=None):
+    model_builder=build_structure_model if model_builder is None else model_builder
     cfg=copy.copy(cfg);cfg.pretrained=False;cfg.mixed_precision=False;cfg.ema_enabled=False
-    task=FullStructureTask(build_structure_model(cfg),cfg);task.model.train()
+    task=FullStructureTask(model_builder(cfg),cfg);task.model.train()
     batch={'ct':torch.randn(2,3,64,64),'pet':torch.randn(2,3,64,64),'mask':torch.ones(2,1,64,64)}
     loss,_,_=train_step(task,batch,True);loss.backward();core_gradient_check(task.model)
     task.optimizer.step();print(f'[SMOKE PASS] loss={float(loss.detach()):.4f} device={task.device} '
                                f'params={count_parameters(task.model)}',flush=True)
 
 
-def main():
-    cfg=FullStructureConfig.parse_arguments()
+def main(config_class=None,model_builder=None,experiment_type='full_structure_response'):
+    config_class=FullStructureConfig if config_class is None else config_class
+    model_builder=build_structure_model if model_builder is None else model_builder
+    cfg=config_class.parse_arguments()
     if cfg.fusion_visualize and importlib.util.find_spec('matplotlib') is None:
         raise RuntimeError('Visualization requires matplotlib; install it or --fusion_visualize False')
-    if cfg.smoke:seed_everything(cfg.random_state);smoke(cfg);return
+    if cfg.smoke:seed_everything(cfg.random_state);smoke(cfg,model_builder);return
     if not torch.cuda.is_available() and not cfg.allow_cpu:
         raise RuntimeError('CUDA is unavailable: check nvidia-smi and torch.cuda.is_available before training. Explicit CPU tests use --allow_cpu True.')
     if cfg.eval_checkpoint:
         eval_path=os.path.abspath(cfg.eval_checkpoint)
         ckpt=MDTSegTeacher.load_state_dicts(eval_path)
         saved=dict(ckpt['config']);saved.pop('checkpoint_dir',None)
-        if saved.get('model_arch')!='full_structure_response':raise ValueError('Expected this experiment checkpoint')
+        if saved.get('model_arch')!=cfg.model_arch:raise ValueError('Expected this experiment checkpoint')
         saved.update(root=cfg.root,pretrained=False,ct_pretrained_path=None,pet_pretrained_path=None,
                      hash=cfg.hash,checkpoint_root=cfg.checkpoint_root,
                      fusion_visualize=cfg.fusion_visualize,fusion_vis_samples=cfg.fusion_vis_samples)
-        cfg=FullStructureConfig(args=saved);task=FullStructureTask(build_structure_model(cfg),cfg)
+        cfg=config_class(args=saved);task=FullStructureTask(model_builder(cfg),cfg)
         _,_,test=_loaders(cfg);epoch,tag=final_eval(task,test,eval_path)
         if cfg.fusion_visualize:
             files=visualize_fusion(task.model,test,cfg,task.device,epoch,tag);print(f'[VIS] saved {len(files)} files',flush=True)
         return
-    cfg.experiment_type='full_structure_response';cfg.pet_missing_rate=0.;seed_everything(cfg.random_state)
-    train,val,test=_loaders(cfg);task=FullStructureTask(build_structure_model(cfg),cfg)
+    cfg.experiment_type=experiment_type;cfg.pet_missing_rate=0.;seed_everything(cfg.random_state)
+    train,val,test=_loaders(cfg);task=FullStructureTask(model_builder(cfg),cfg)
     task.scheduler=get_cosine_scheduler(task.optimizer,epochs=cfg.epochs,warmup_steps=cfg.cosine_warmup*len(train),
         min_lr=cfg.cosine_min_lr,steps_per_epoch=len(train),flat_ratio=cfg.lr_flat_ratio)
     best,best_epoch,start=-1.,0,1
@@ -118,8 +128,14 @@ def main():
     total,trainable=count_parameters(task.model);fusion_params=sum(p.numel() for p in task.model.fusion.parameters())
     print(f'[MODEL] Full-only; params={total}/{trainable} fusion_params={fusion_params} fusion_enabled={cfg.fusion_enabled}',flush=True)
     print(f'[RUNTIME] torch={torch.__version__} device={task.device} AMP={bool(task.scaler.is_enabled())} workers={cfg.num_workers}',flush=True)
-    print(f'[DESIGN] channels=64/128/320/512 internal=32/64/160/256 heads={cfg.fusion_heads} '
-          f'SAE={cfg.sae_expansion} fixed_Scharr=True PETcontrast=3/5/7 residual_outputs=zero_init; no memory/missing/extra loss',flush=True)
+    channels=tuple(getattr(task.model,'encoder_channels',(64,128,320,512)))
+    print(f'[ENCODERS] CT={cfg.ct_backbone} PET={cfg.pet_backbone} independent_weights=True '
+          f'alignment={getattr(cfg,"channel_alignment","learned")} channels={channels}',flush=True)
+    if cfg.fusion_enabled:
+        print(f'[DESIGN] internal={tuple(c//2 for c in channels)} heads={cfg.fusion_heads} '
+              f'SAE={cfg.sae_expansion} fixed_Scharr=True PETcontrast=3/5/7 residual_outputs=zero_init; no memory/missing/extra loss',flush=True)
+    else:
+        print('[DESIGN] native/aligned CT + PET -> original GroupNorm decoder; pure Add, no memory/missing/extra loss',flush=True)
     print(f'[EMA] enabled={cfg.ema_enabled} start_epoch={cfg.ema_start_epoch} decay={cfg.ema_decay}; '
           f'[DIAG] every={cfg.fusion_log_every} visualize={cfg.fusion_visualize}',flush=True)
     headers=['train_samples','train_batches','best_full','best_full_epoch','ema_updates','skipped_updates',
