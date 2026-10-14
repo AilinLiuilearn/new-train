@@ -1,5 +1,9 @@
 # Clean segmentation baselines
 
+Full-only AMDANet fusion experiment: see [AMDANET_FUSION.md](AMDANET_FUSION.md)
+for pinned author source, the explicit CT+PET residual adaptation, paired
+comparison commands, checkpoint evaluation and verification.
+
 Branch: `exp/aligned-add-baseline`. Three independent, runnable baselines that
 share config / loss / metrics / logging / EMA code (no duplicated utilities).
 

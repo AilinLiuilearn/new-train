@@ -82,15 +82,16 @@ def _loaders(cfg):
     )
 
 
-def _assert_full_add_protocol(cfg, model):
+def _assert_full_add_protocol(cfg, model, expected_fusion=AddFusion):
     assert str(cfg.train_batch_mode) == 'full'
     assert cfg.accumulation_steps == 1
     assert bool(cfg.use_deep_supervision) is False
     assert bool(cfg.deep_supervision) is False
     assert str(cfg.optimizer).lower() == 'adamw'
-    if not isinstance(model.fusion, AddFusion):
+    if not isinstance(model.fusion, expected_fusion):
         raise RuntimeError(
-            f'full_add_baseline requires AddFusion, got {type(model.fusion).__name__}')
+            f'Full runner requires {expected_fusion.__name__}, '
+            f'got {type(model.fusion).__name__}')
 
 
 def _checkpoint_paths(checkpoint_dir):
@@ -100,12 +101,13 @@ def _checkpoint_paths(checkpoint_dir):
     }
 
 
-def main():
-    print('[INFO] starting Full-only CT+PET Add baseline', flush=True)
-    cfg = FullAddConfig.parse_arguments()
-    cfg.experiment_type = 'full_add_baseline'
+def main(config_cls=FullAddConfig, model_builder=build_dual_model,
+         expected_fusion=AddFusion, experiment_type='full_add_baseline'):
+    print(f'[INFO] starting Full-only CT+PET {expected_fusion.__name__}', flush=True)
+    cfg = config_cls.parse_arguments()
+    cfg.experiment_type = experiment_type
     cfg.train_batch_mode = 'full'
-    cfg.fusion_type = 'AddFusion'
+    cfg.fusion_type = expected_fusion.__name__
     cfg.pet_missing_rate = 0.0
     seed_everything(cfg.random_state)
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
@@ -116,8 +118,8 @@ def main():
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)} '
           f'test_batches={len(test_loader)}', flush=True)
 
-    task = MDTSegTeacher(build_dual_model(cfg), cfg)
-    _assert_full_add_protocol(cfg, task.model)
+    task = MDTSegTeacher(model_builder(cfg), cfg)
+    _assert_full_add_protocol(cfg, task.model, expected_fusion=expected_fusion)
     total_params, trainable_params = count_parameters(task.model)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
     if task.ema is not None:
@@ -254,9 +256,9 @@ def main():
     use_ema = (task.ema is not None and recorded == 'ema'
                and ckpt.get('model_ema') is not None)
     weights_tag = 'ema' if use_ema else 'raw'
-    eval_model = build_dual_model(cfg)['model'].to(task.device)
-    if not isinstance(eval_model.fusion, AddFusion):
-        raise RuntimeError('final test must rebuild the Add model, '
+    eval_model = model_builder(cfg)['model'].to(task.device)
+    if not isinstance(eval_model.fusion, expected_fusion):
+        raise RuntimeError(f'final test must rebuild {expected_fusion.__name__}, '
                            f'got {type(eval_model.fusion).__name__}')
     eval_model.load_state_dict(ckpt['model_ema'] if use_ema else ckpt['model'],
                                strict=True)
@@ -266,7 +268,9 @@ def main():
     test_full = task.evaluate(test_loader, eval_mode='full', tag='test_full',
                               model=eval_model)
     result = {
-        'experiment_type': 'full_add_baseline',
+        'experiment_type': experiment_type,
+        'fusion_type': expected_fusion.__name__,
+        'model_arch': cfg.model_arch,
         'dice': float(test_full['dice']),
         'iou': float(test_full['iou']),
         'hd95': float(test_full['hd95']),
