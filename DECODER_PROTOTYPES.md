@@ -187,6 +187,14 @@ Output: `train_log.csv`, `prototype_log.jsonl`, `ckpt.last.pth.tar`,
 `prototype_log.jsonl` reports validity/candidate/update counts per scale/branch;
 check these before attributing any change to a library that never activated.
 
+Progress is flushed to the terminal: setup/loader counts, epoch start and
+first-batch arrival, first forward completion, training batches 1/N and every
+20 batches (and the last), validation first/periodic/last batches, and checkpoint
+save stages. Use `--log_interval 10` to print more often. ETA is a running
+wall-clock average, not a CUDA kernel benchmark. CSV/prototype JSONL records
+remain epoch-based. Updating files does not change an already-running process;
+the new logging takes effect on its next start/resume.
+
 ## Validation and source attribution
 
 ```bash

@@ -394,7 +394,22 @@ def test_final_eval_keeps_task_official_mode():
     assert result['slice_count'] == 2
 
 
-def test_epoch_runner_final_selection_and_resume_match_uninterrupted(tmp_path, monkeypatch):
+def test_validation_progress_reports_completed_batches_without_changing_memory(capsys):
+    task = PrototypeSegTask({'model': model()}, cfg(log_interval=1))
+    populate(task.model)
+    before = copy.deepcopy(task.model.prototype.state_dict())
+    result = task.evaluate([batch(), batch()], eval_mode='missing', tag='validation_progress')
+    output = capsys.readouterr().out
+    assert '[validation_progress] start mode=missing batches=2' in output
+    assert '[validation_progress] batch 1/2' in output
+    assert '[validation_progress] batch 2/2' in output
+    assert '[validation_progress] complete Dice=' in output
+    assert 0 <= result['dice'] <= 1
+    assert task.model.training  # Parent training-mode restoration is preserved.
+    assert all(torch.equal(v, task.model.prototype.state_dict()[k]) for k, v in before.items())
+
+
+def test_epoch_runner_final_selection_and_resume_match_uninterrupted(tmp_path, monkeypatch, capsys):
     import sys
     from torch.utils.data import DataLoader
     import run_decoder_prototype_add as runner
@@ -444,3 +459,9 @@ def test_epoch_runner_final_selection_and_resume_match_uninterrupted(tmp_path, m
     for key, value in reference['model_ema'].items():
         assert torch.equal(value, resumed['model_ema'][key]), key
     assert (tmp_path / 'MDT/resumed/final_test_metrics.json').exists()
+    output = capsys.readouterr().out
+    for expected in ('[setup] train_batches=', 'waiting for first batch...',
+                     'first forward complete;', '[train epoch 1] batch 1/1',
+                     '[val_full epoch 1] batch 1/1', '[val_missing epoch 1] batch 1/1',
+                     '[checkpoint epoch 1] saving last...', '[final] evaluating best epoch'):
+        assert expected in output

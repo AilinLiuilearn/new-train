@@ -111,6 +111,11 @@ python eval_decoder_prototype_add.py \
 训练时检查 `prototype_log.jsonl` 的逐尺度有效标记、候选数和更新次数，
 确认两类库实际激活，而不是仅凭最终 Dice 判断原型已经生效。
 
+终端会打印数据加载阶段、epoch 开始、首批加载和首次前向完成，并默认每
+20 个 batch 输出损失、学习率、原型有效状态、耗时及 ETA；验证和 checkpoint
+保存也有阶段提示。可用 `--log_interval 10` 调整频率。CSV/原型 JSONL 仍按
+epoch 写入。已有训练进程不会自动加载新日志代码，下次启动/恢复后才生效。
+
 ## 已完成的验证与边界
 
 - 原型合同测试包含零初始化基线等价、Full 旁路、PET 隔离、行顺序、

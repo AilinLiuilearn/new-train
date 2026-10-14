@@ -45,11 +45,15 @@ class PrototypeConfig(SegMDTConfig):
         p.add_argument('--prototype_min_gain', type=float, default=.01)
         p.add_argument('--prototype_ct_aux_weight', type=float, default=.1)
         p.add_argument('--resume', type=str, default=None)
+        p.add_argument('--log_interval', type=int, default=20,
+                       help='Print training/validation progress every N batches, plus first/last.')
         return p
 
 
 def main():
     cfg = PrototypeConfig.parse_arguments()
+    if cfg.log_interval < 1:
+        raise ValueError('log_interval must be positive')
     if cfg.train_batch_mode != 'mixed' or cfg.optimizer != 'adamw':
         raise ValueError('prototype experiment requires --train_batch_mode mixed --optimizer adamw')
     cfg.experiment_type = 'decoder_dual_prototype_add'
@@ -62,15 +66,22 @@ def main():
             rate < 0 or rate > 1 for rate in cfg.final_test_missing_rates):
         raise ValueError('final_test_missing_rates must be in [0,1] and include 0 and 1 for Joint')
     seed_everything(cfg.random_state)
+    print('[setup] checking data splits and building loaders...', flush=True)
     train_loader, val_loader, test_loader = _loaders(cfg)
     _assert_mixed(cfg, train_loader)
     cfg.steps_per_epoch = len(train_loader)
+    print(f'[setup] train_batches={len(train_loader)} val_batches={len(val_loader)} '
+          f'test_batches={len(test_loader)} batch_size={cfg.batch_size} '
+          f'num_workers={cfg.num_workers}', flush=True)
     # Restore complete checkpoint weights without needing original pretrained files.
     build_cfg = copy.deepcopy(cfg)
     if cfg.resume:
         build_cfg.pretrained = False
         build_cfg.ct_pretrained_path = build_cfg.pet_pretrained_path = None
     task = PrototypeSegTask(build_prototype_model(build_cfg), cfg)
+    print(f'[setup] device={task.device} AMP={bool(cfg.mixed_precision) and task.device.type == "cuda"} '
+          f'prototype_warmup_steps={cfg.prototype_warmup_steps} '
+          f'log_interval={cfg.log_interval}', flush=True)
     task.loader_generators = {name: loader.generator for name, loader in
                               (('train', train_loader), ('val', val_loader), ('test', test_loader))
                               if getattr(loader, 'generator', None) is not None}
@@ -113,7 +124,11 @@ def main():
         sums = dict(full=0., missing=0., ct=0., total=0., grad=0.)
         batches, samples, skipped = 0, 0, 0
         begin = time.time()
+        print(f'[epoch {epoch}/{cfg.epochs}] train start; waiting for first batch...', flush=True)
         for batch in train_loader:
+            if batches == 0:
+                print(f'[epoch {epoch}] first batch loaded in {time.time() - begin:.1f}s; '
+                      'starting forward/backward...', flush=True)
             if batch['ct'].shape[0] != cfg.batch_size:
                 raise ValueError('expected fixed full-size batches with drop_last=True')
             state = build_balanced_pet_available(cfg.batch_size, task.global_batch_step,
@@ -122,6 +137,8 @@ def main():
             with torch.autocast(device_type=task.device.type,
                                 enabled=bool(cfg.mixed_precision) and task.device.type == 'cuda'):
                 loss, _, _, stats = task.train_step_mixed(batch, state)
+            if batches == 0:
+                print(f'[epoch {epoch}] first forward complete; backward/optimizer start...', flush=True)
             if task.scaler.is_enabled():
                 task.scaler.scale(loss).backward()
                 task.scaler.unscale_(task.optimizer)
@@ -149,11 +166,25 @@ def main():
             batches += 1
             samples += cfg.batch_size // 2
             task.global_batch_step += 1
+            if batches == 1 or batches % cfg.log_interval == 0 or batches == len(train_loader):
+                elapsed = time.time() - begin
+                remaining = elapsed / batches * (len(train_loader) - batches)
+                sv_now = sum(bool(s.spatial_bank.valid) for s in task.model.prototype.scales)
+                cv_now = sum(bool(s.channel_bank.valid) for s in task.model.prototype.scales)
+                print(f'[train epoch {epoch}] batch {batches}/{len(train_loader)} '
+                      f'loss={float(stats["loss_total"]):.4f} '
+                      f'Full={float(stats["loss_full"]):.4f} '
+                      f'Missing={float(stats["loss_missing"]):.4f} '
+                      f'CTaux={float(stats["loss_ct_aux"]):.4f} '
+                      f'lr={task.optimizer.param_groups[0]["lr"]:.3e} '
+                      f'spatial_valid={sv_now}/4 channel_valid={cv_now}/4 '
+                      f'elapsed={elapsed:.0f}s ETA={remaining:.0f}s skipped={skipped}', flush=True)
         if batches == 0:
             raise ValueError('training loader has no complete mixed batch')
+        print(f'[epoch {epoch}] train complete in {time.time() - begin:.1f}s; validation start', flush=True)
         active = task.eval_model()
-        full = task.evaluate(val_loader, eval_mode='full', model=active)
-        missing = task.evaluate(val_loader, eval_mode='missing', model=active)
+        full = task.evaluate(val_loader, eval_mode='full', tag=f'val_full epoch {epoch}', model=active)
+        missing = task.evaluate(val_loader, eval_mode='missing', tag=f'val_missing epoch {epoch}', model=active)
         joint = .5 * (full['dice'] + missing['dice'])
         improved = joint > best
         if improved:
@@ -162,8 +193,11 @@ def main():
             task.no_improve += 1
         val = {'full': full, 'missing': missing, 'joint_dice': joint}
         if improved:
+            print(f'[checkpoint epoch {epoch}] saving best_joint...', flush=True)
             task.save_checkpoint(paths['best_joint'], epoch, best, best_epoch, val)
+        print(f'[checkpoint epoch {epoch}] saving last...', flush=True)
         task.save_checkpoint(paths['last'], epoch, best, best_epoch, val)
+        print(f'[checkpoint epoch {epoch}] save complete', flush=True)
         diag = task.model.prototype.diagnostics()
         with open(os.path.join(cfg.checkpoint_dir, 'prototype_log.jsonl'), 'a') as f:
             f.write(json.dumps(dict(epoch=epoch, **diag)) + '\n')
@@ -193,6 +227,8 @@ def main():
     state = ckpt['model_ema'] if weights_tag == 'ema' else ckpt['model']
     task.model.load_state_dict(state, strict=True)
     task.model.eval()
+    print(f'[final] evaluating best epoch {ckpt["best_epoch"]}, weights={weights_tag}, '
+          f'missing_rates={cfg.final_test_missing_rates}', flush=True)
     eval_missing_rates(task, task.model, test_loader, cfg.random_state, cfg.checkpoint_dir,
                        'final_test', rates=list(cfg.final_test_missing_rates), weights_tag=weights_tag)
 

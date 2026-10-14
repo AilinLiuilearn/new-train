@@ -1,6 +1,7 @@
 """Prototype experiment task; baseline task remains unchanged."""
 import os
 import random
+import time
 
 import numpy as np
 import torch
@@ -63,6 +64,29 @@ class PrototypeSegTask(MDTSegTeacher):
         pending, self._pending_candidates = self._pending_candidates, None
         if succeeded and pending is not None:
             self.model.prototype.commit(pending)
+
+    def evaluate(self, loader, eval_mode='full', tag='val', model=None):
+        """Keep parent metrics/dataflow; report completed evaluation batches."""
+        interval = int(getattr(self.config, 'log_interval', 20))
+        if interval < 1:
+            raise ValueError('log_interval must be positive')
+        total = len(loader) if hasattr(loader, '__len__') else None
+        start = time.time()
+        print(f'[{tag}] start mode={eval_mode} batches={total if total is not None else "?"}; '
+              'waiting for first batch...', flush=True)
+
+        def progress_batches():
+            for index, batch in enumerate(loader, 1):
+                yield batch
+                # Parent has completed forward, loss and metrics by now.
+                if index == 1 or index % interval == 0 or index == total:
+                    print(f'[{tag}] batch {index}/{total if total is not None else "?"} '
+                          f'elapsed={time.time() - start:.0f}s', flush=True)
+
+        result = super().evaluate(progress_batches(), eval_mode=eval_mode, tag=tag, model=model)
+        print(f'[{tag}] complete Dice={result["dice"]:.4f} HD95={result["hd95"]:.4f} '
+              f'elapsed={time.time() - start:.1f}s', flush=True)
+        return result
 
     def update_ema(self):
         decay = super().update_ema()
