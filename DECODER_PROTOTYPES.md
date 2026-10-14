@@ -1,11 +1,12 @@
 # Decoder spatial/channel prototypes on the 50% mixed Add baseline
 
-Base: `exp/clean-group-baseline`, commit
-`549b933` (`Add gitignore for test artifacts`). Experiment branch:
+Aligned baseline: `exp/aligned-add-baseline`, commit `663f978`.
+Experiment branch:
 `exp/decoder-dual-prototype-add`.
 
-The original baseline models, decoder, training task and runners are unchanged.
-Two pre-existing tests now use the repository's checkpoint loader, which
+The aligned baseline's PET/CT alignment and official HD95 evaluation are
+preserved. Input normalization defaults to ImageNet in config and loaders.
+Two pre-existing tests use the repository's checkpoint loader, which
 explicitly supports checkpoint RNG metadata under recent PyTorch.
 
 ## Exact experimental scope
@@ -14,7 +15,9 @@ explicitly supports checkpoint RNG metadata under recent PyTorch.
   seeded per-step assignment, even batch size, and `drop_last=True`.
 - CT: ConvNeXtV2-Nano. PET: MiT-B1. Existing pretrained loading and data
   augmentation/normalization are reused without downloads or fallback encoders.
-- Full fusion is **only AddFusion**: aligned CT + real PET. No MAFI, Mamba,
+- Full fusion is **only AddFusion**: aligned CT + aligned real PET. Both
+  modalities have independent Conv1x1 + BatchNorm + ReLU adapters at all scales.
+  No MAFI, Mamba,
   text encoder, learned fusion block, PET reconstruction or distillation loss.
 - CT is encoded once for the whole mixed batch. PET is encoded only for
   Full rows. Missing works with `pet=None`; even NaNs in Missing PET rows
@@ -121,13 +124,23 @@ python run_decoder_prototype_add.py \
   --ct_backbone convnextv2_nano --pet_backbone mit_b1 \
   --ct_pretrained_path /root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano \
   --pet_pretrained_path /root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1 \
-  --aug_mode cipa --norm_mode cipa --random_state 2023
+  --aug_mode cipa --norm_mode imagenet --hd95_mode cipa_official --random_state 2023
 ```
 
 Keep the same optimizer/LR/EMA settings as your matched baseline; the command
 above inherits them. Model EMA remains off by default, as on the source branch.
 For EMA comparisons, explicitly use the same `--ema_enabled true` on both runs.
 CUDA batch-16 memory consumption has not been measured in this environment.
+
+`cipa` augmentation is independent of ImageNet input normalization.
+Validation and final test inherit the same `cipa_official` HD95 mode, which
+requires MedPy (`pip install MedPy`) and 512x512 masks. Dice/IoU keep the
+aligned baseline's global pixel-count accumulation at sigmoid threshold 0.5.
+HD95 follows its official center-pixel fallback without changing Dice masks;
+empty GT with nonempty prediction raises as in the source baseline.
+Small synthetic runner tests explicitly use `legacy`; this is not the formal
+training default. Checkpoints predating PET alignment are not architecture-
+compatible and should not be resumed for the corrected experiment.
 
 Minimal ablations, using the same command/splits/seed:
 
@@ -182,7 +195,7 @@ copying, and interrupted-epoch-boundary resume versus uninterrupted training.
 The smoke uses real encoders, random weights, synthetic inputs and populated
 memories; it is not a patient-data training experiment.
 
-Default model: 32,602,325 parameters, of which 546,756 belong to the prototype
+Default model: 32,989,397 parameters, of which 546,756 belong to the prototype
 module. No patient training data, pretrained checkpoints or CUDA device are
 available here; clinical accuracy and RTX 3090 AMP/memory behavior are unverified.
 

@@ -117,7 +117,8 @@ class PrototypeSegTask(MDTSegTeacher):
                      'learning_rate', 'weight_decay', 'epochs', 'cosine_warmup',
                      'cosine_min_lr', 'lr_flat_ratio', 'random_state', 'steps_per_epoch',
                      'train_split_file', 'val_split_file', 'test_split_file',
-                     'image_size_2d', 'aug_mode', 'norm_mode', 'mixed_precision', 'num_workers'})
+                     'image_size_2d', 'aug_mode', 'norm_mode', 'hd95_mode',
+                     'mixed_precision', 'num_workers'})
         for key in keys:
             a, b = old.get(key), current.get(key)
             if key == 'decoder_channels' and a is not None and b is not None:

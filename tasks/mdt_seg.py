@@ -50,7 +50,8 @@ class MDTSegTeacher:
         self.scaler = torch.cuda.amp.GradScaler(enabled=bool(config.mixed_precision))
         self.global_batch_step = 0
         self.criterion = BCEDiceLoss()
-        self.metrics = SegmentationMetricsCIPA()
+        self.metrics = SegmentationMetricsCIPA(
+            hd95_mode=getattr(config, 'hd95_mode', 'legacy'))
         self.ema = None
         self.ema_active = False
         self.ema_start_epoch = int(getattr(config, 'ema_start_epoch', 0))

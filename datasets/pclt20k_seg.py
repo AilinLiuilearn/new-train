@@ -41,13 +41,15 @@ def _resize_gray(img, size, nearest=False):
     return np.array(Image.fromarray(img).resize((size, size), mode))
 
 
-def _normalize_ch(x, mode='cipa'):
+def _normalize_ch(x, mode='imagenet'):
     x = x.astype(np.float32) / 255.0
     x = x[None, ...]
     rgb = np.repeat(x, 3, axis=0)
     if mode == 'cipa':
         return rgb * 3.2 - 1.6
-    return (rgb - IMAGENET_MEAN) / IMAGENET_STD
+    if mode == 'imagenet':
+        return (rgb - IMAGENET_MEAN) / IMAGENET_STD
+    raise ValueError(f'unsupported norm_mode={mode!r}')
 
 
 class PCLT20KSegDataset(Dataset):
@@ -179,7 +181,7 @@ def _check_patient_disjoint(train_records, val_records, test_records, allow_val_
 
 def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_workers=4,
                                      random_state=2023, pin_memory=True, aug_mode='cipa',
-                                     norm_mode='cipa', train_split_file='train.txt',
+                                     norm_mode='imagenet', train_split_file='train.txt',
                                      val_split_file='val.txt', test_split_file='test.txt',
                                      checkpoint_dir=None, ct_only=False,
                                      allow_val_equals_test=False):

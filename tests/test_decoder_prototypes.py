@@ -272,6 +272,94 @@ def test_memory_contents_affect_reads_and_only_full_rows_are_collected():
     assert all(not x.requires_grad for x in knowledge['reference_features'])
 
 
+def test_protocol_defaults_and_imagenet_normalization(monkeypatch):
+    import inspect
+    import sys
+    import numpy as np
+    from configs.seg_mdt import SegMDTConfig
+    from run_decoder_prototype_add import PrototypeConfig
+    from datasets.pclt20k_seg import _normalize_ch, get_pclt20k_loaders_cipa_aligned
+    monkeypatch.setattr(sys, 'argv', ['train'])
+    for config in (SegMDTConfig.parse_arguments(), PrototypeConfig.parse_arguments()):
+        assert config.norm_mode == 'imagenet'
+        assert config.hd95_mode == 'cipa_official'
+    assert inspect.signature(get_pclt20k_loaders_cipa_aligned).parameters['norm_mode'].default == 'imagenet'
+    gray = np.array([[0, 127], [128, 255]], dtype=np.uint8)
+    expected = (np.repeat(gray[None].astype(np.float32) / 255., 3, axis=0)
+                - np.array([.485, .456, .406], dtype=np.float32)[:, None, None])
+    expected /= np.array([.229, .224, .225], dtype=np.float32)[:, None, None]
+    assert np.allclose(_normalize_ch(gray), expected)
+    assert np.array_equal(_normalize_ch(gray), _normalize_ch(gray, 'imagenet'))
+    with pytest.raises(ValueError):
+        _normalize_ch(gray, 'unknown')
+
+
+def test_both_aligners_precede_pure_add_and_pet_alignment_is_missing_isolated():
+    from models.components.channel_align import StageChannelAlign
+    m = model().train()
+    assert isinstance(m.ct_align, StageChannelAlign)
+    assert isinstance(m.pet_align, StageChannelAlign)
+    for align in (m.ct_align, m.pet_align):
+        assert [layer[0].out_channels for layer in align.proj] == [64, 128, 320, 512]
+        assert all(isinstance(layer[1], nn.BatchNorm2d) and isinstance(layer[2], nn.ReLU)
+                   for layer in align.proj)
+    captured = {}
+    def capture(_module, inputs, output):
+        c, p = inputs
+        captured['count'] = c[0].shape[0]
+        assert all(torch.equal(a + b, f) for a, b, f in zip(c, p, output))
+    handle = m.fusion.register_forward_hook(capture)
+    b = batch()
+    out = m(b['ct'], pet=b['pet'], pet_available=torch.tensor([1, 0, 1, 0]))
+    out['logits'][[0, 2]].square().mean().backward()
+    assert captured['count'] == 2
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in m.pet_align.parameters())
+    handle.remove()
+    m.zero_grad(set_to_none=True)
+    buffers = copy.deepcopy(m.pet_align.state_dict())
+    m(b['ct'], forward_mode='missing')['logits'].square().mean().backward()
+    assert all(p.grad is None for p in m.pet_align.parameters())
+    assert all(torch.equal(v, m.pet_align.state_dict()[k]) for k, v in buffers.items())
+
+
+def test_cipa_official_hd95_policy_does_not_modify_dice_masks():
+    import numpy as np
+    from medpy.metric.binary import hd95
+    from utils.metrics_seg import hd95_cipa_official_pair, SegmentationMetricsCIPA
+    a = np.zeros((512, 512), dtype=bool)
+    b = a.copy()
+    a[10, 10], b[13, 14] = True, True
+    saved_a, saved_b = a.copy(), b.copy()
+    assert hd95_cipa_official_pair(a, b) == hd95(a, b) == 5.
+    assert np.array_equal(a, saved_a) and np.array_equal(b, saved_b)
+    empty = np.zeros_like(a)
+    assert hd95_cipa_official_pair(empty, empty) == 0.
+    work = empty.copy(); work[256, 256] = True
+    assert hd95_cipa_official_pair(empty, b) == hd95(work, b)
+    assert not empty.any()
+    with pytest.raises(ValueError, match='empty GT'):
+        hd95_cipa_official_pair(a, empty)
+    with pytest.raises(ValueError, match='512'):
+        hd95_cipa_official_pair(a[:32, :32], b[:32, :32])
+    metric = SegmentationMetricsCIPA(hd95_mode='cipa_official')
+    metric.update(torch.full((1, 1, 512, 512), -100.), torch.tensor(b)[None, None])
+    assert metric.compute()['dice'] == 0.
+    assert metric.compute()['missed_positive_count'] == 1
+    assert metric.tp == metric.fp == 0 and metric.fn == 1
+
+
+def test_final_eval_keeps_task_official_mode():
+    from utils.run_common import run_missing_rate_eval
+    task = PrototypeSegTask({'model': model()}, cfg(hd95_mode='cipa_official'))
+    assert task.metrics.hd95_mode == 'cipa_official'
+    b = dict(ct=torch.randn(2, 1, 512, 512), pet=torch.randn(2, 1, 512, 512),
+             mask=torch.ones(2, 1, 512, 512), case_id=['a', 'b'])
+    result = run_missing_rate_eval(task, task.model, [b], {'a': 0, 'b': 1})
+    assert result['hd95_mode'] == 'cipa_official'
+    assert result['hd95_unit'] == 'pixel'
+    assert result['slice_count'] == 2
+
+
 def test_epoch_runner_final_selection_and_resume_match_uninterrupted(tmp_path, monkeypatch):
     import sys
     from torch.utils.data import DataLoader
@@ -286,6 +374,7 @@ def test_epoch_runner_final_selection_and_resume_match_uninterrupted(tmp_path, m
 
     monkeypatch.setattr(runner, '_loaders', loaders)
     common = ['run', '--epochs', '2', '--batch_size', '4', '--num_workers', '0',
+              '--hd95_mode', 'legacy',  # 32x32 synthetic data; formal default stays official.
               '--pretrained', 'false', '--mixed_precision', 'false', '--ema_enabled', 'true',
               '--ema_start_epoch', '1', '--decoder_channels', '32', '24', '16', '8',
               '--prototype_dim', '4', '--prototype_clusters', '2', '--prototype_capacity', '16',

@@ -30,11 +30,19 @@ def main():
     p.add_argument('--random_state', type=int, default=2023)
     p.add_argument('--use_ema', type=str2bool, default=False)
     p.add_argument('--output_dir', type=str, default=None)
+    p.add_argument('--hd95_mode', choices=('cipa_official', 'legacy', 'surface'),
+                   default=None, help='Override checkpoint metric mode; otherwise '
+                   'use its saved mode, or cipa_official if absent.')
     args = p.parse_args()
 
     ckpt = MDTSegTeacher.load_state_dicts(args.checkpoint)
     saved_config = dict(ckpt['config'])
     saved_config.pop('checkpoint_dir', None)
+    checkpoint_hd95_mode = saved_config.get('hd95_mode')
+    saved_config['hd95_mode'] = (args.hd95_mode or checkpoint_hd95_mode
+                                 or 'cipa_official')
+    print(f'[eval] checkpoint_hd95_mode={checkpoint_hd95_mode or "unspecified"} '
+          f'evaluation_hd95_mode={saved_config["hd95_mode"]} unit=pixel')
     saved_config['root'] = args.root
     saved_config['random_state'] = args.random_state
     saved_config['ct_pretrained_path'] = None
@@ -65,6 +73,7 @@ def main():
         allow_val_equals_test=bool(getattr(cfg, 'allow_val_equals_test', False)), ct_only=ct_only,
     )
     output_dir = args.output_dir or os.path.dirname(os.path.abspath(args.checkpoint))
+    os.makedirs(output_dir, exist_ok=True)
     weights_tag = 'ema' if args.use_ema else 'raw'
     eval_missing_rates(task, task.model, test_loader, int(args.random_state),
                        output_dir, 'final_test', weights_tag=weights_tag,

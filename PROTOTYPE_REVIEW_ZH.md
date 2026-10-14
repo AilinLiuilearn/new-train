@@ -1,6 +1,6 @@
 # 双原型校正实验：实现与审查说明
 
-本分支从 `exp/clean-group-baseline` 的 `549b933` 建立。
+本分支保留 `exp/aligned-add-baseline` 的 `663f978` 对齐基线。
 目标是只验证原型知识设计：每个 batch 严格 50% Full、50% Missing；
 Full 保持 CT+PET 简单相加。没有引入此前讨论的复杂融合模块。
 
@@ -16,13 +16,16 @@ Full 保持 CT+PET 简单相加。没有引入此前讨论的复杂融合模块�
 | `tests/test_decoder_prototypes.py` | 原型、数据隔离、梯度、恢复和完整入口的合同测试 |
 | `tests/smoke_decoder_prototype.py` | 真实双编码器的无数据合成检查 |
 
-原基线的模型、训练任务、解码器和训练入口均未修改。原有两个测试中的
+已合入该基线的双模态对齐和官方 HD95 实现，并统一默认 ImageNet 输入归一化。
+GroupNorm 解码器和简单相加融合保持原样。原有两个测试中的
 checkpoint 读取改为调用仓库已有的加载函数，以兼容新版 PyTorch 的加载默认值。
 
 ## 已固定的实现细节
 
 1. 原型从 **Full 行的解码表征**提取，按解码层独立维护；默认通道从深到浅为
    512/256/128/64。Missing 当前解码表征生成 Q，原型生成 K/V。
+   Full 的 CT 和 PET 均独立经过 Conv1x1 + BatchNorm + ReLU 后再相加；
+   Missing 不运行 PET 编码器或 PET 对齐层。
 2. 空间库存储收益区域的局部 Full 描述；通道库存储相同收益区域内有符号的
    `Gram(Full)-Gram(CT对照)`。没有增加单独的 CT 检索键。
 3. 压缩采用每尺度固定、可复现、随 checkpoint 保存的正交基，默认 32 维。
@@ -73,11 +76,19 @@ python run_decoder_prototype_add.py \
   --image_size_2d 512 --batch_size 16 --epochs 60 \
   --ct_pretrained_path /root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano \
   --pet_pretrained_path /root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1 \
-  --aug_mode cipa --norm_mode cipa --random_state 2023
+  --aug_mode cipa --norm_mode imagenet --hd95_mode cipa_official --random_state 2023
 ```
 
 学习率、EMA、增强和划分应与对照组保持一致；来源分支默认关闭模型 EMA，
 本入口保留这个默认值，需要时显式加入 `--ema_enabled true`。
+
+三个基线约束已经固定：默认 ImageNet 归一化、双路对齐后相加、
+验证与最终测试都使用同一 `cipa_official` HD95 口径。数据增强仍是 `cipa`，
+它与输入归一化是不同设置。请安装 `MedPy`；官方 HD95 要求 512×512 掩码。
+Dice/IoU 沿用基线的 sigmoid 0.5 阈值和全数据像素计数；HD95 的中心点补救
+只作用于内部副本，不改变 Dice 或漏检计数。旧版缺少 PET 对齐层的 checkpoint
+与修正后结构不兼容，正式实验应重新训练。小尺寸合成入口测试显式使用 legacy，
+不代表正式训练改变默认评价口径。
 
 同样参数、同一 `--hash` 下，额外加入以下参数恢复：
 
@@ -102,7 +113,7 @@ python eval_decoder_prototype_add.py \
   原型恢复、模型 EMA、读库有效性和连续/中断恢复一致性。
 - 真实 ConvNeXtV2-Nano + MiT-B1：64×64 合成输入完成前向、反向、参数更新；
   512×512 合成输入完成启用非零校正的前向和 Missing PET 隔离检查。
-- 默认新增可学习参数 546,756；模型总参数 32,602,325。
+- 默认新增可学习参数 546,756；模型总参数 32,989,397。
 - 未提供患者数据或本地预训练权重，未运行真实训练；环境无 CUDA，未验证
   RTX 3090 的 batch-16 显存和 CUDA AMP。CPU bfloat16 通过不能代替 CUDA 验证。
 

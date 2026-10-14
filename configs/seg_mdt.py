@@ -19,7 +19,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--num_workers', type=int, default=4)
         p.add_argument('--pin_memory', type=str2bool, default=True)
         p.add_argument('--aug_mode', type=str, default='cipa', choices=('cipa', 'light', 'none'))
-        p.add_argument('--norm_mode', type=str, default='cipa', choices=('imagenet', 'cipa'))
+        p.add_argument('--norm_mode', type=str, default='imagenet', choices=('imagenet', 'cipa'))
         return p
 
     @staticmethod
@@ -61,6 +61,8 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--ema_start_epoch', type=int, default=3)
         p.add_argument('--ema_decay_warmup', type=str2bool, default=True)
         p.add_argument('--grad_clip', type=float, default=5.0)
+        p.add_argument('--hd95_mode', type=str, default='cipa_official',
+                       choices=('legacy', 'surface', 'cipa_official'))
         p.add_argument('--early_stop_patience', type=int, default=10)
         p.add_argument('--random_state', type=int, default=2023)
         p.add_argument('--final_test_missing_rates', type=float, nargs='+',

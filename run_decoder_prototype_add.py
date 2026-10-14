@@ -51,7 +51,10 @@ def main():
         raise ValueError('prototype experiment requires --train_batch_mode mixed --optimizer adamw')
     cfg.experiment_type = 'decoder_dual_prototype_add'
     cfg.model_arch = 'prototype_add_model'
+    cfg.baseline_reference = 'exp/aligned-add-baseline@663f978'
     cfg.fusion_type, cfg.pet_missing_rate = 'AddFusion', .5
+    print(f'[protocol] norm_mode={cfg.norm_mode} hd95_mode={cfg.hd95_mode} '
+          'alignment=CT_and_PET_Conv1x1_BN_ReLU fusion=AddFusion', flush=True)
     if not {0., 1.}.issubset(cfg.final_test_missing_rates) or any(
             rate < 0 or rate > 1 for rate in cfg.final_test_missing_rates):
         raise ValueError('final_test_missing_rates must be in [0,1] and include 0 and 1 for Joint')
