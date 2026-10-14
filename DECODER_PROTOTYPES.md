@@ -85,10 +85,17 @@ and the two branches do not establish strict statistical disentanglement.
   Only later candidates enter the FIFO. Each library needs 24 candidates
   and at least K distinct descriptors before becoming valid; K defaults to 6.
 - Each bank has a 256-entry checkpointed ring buffer. Deterministic farthest
-  seeding + Euclidean K-means (up to 15 iterations), mild within-cluster
-  median/MAD filtering, one-to-one greedy center matching, then centroid EMA
+  seeding + Euclidean K-means (up to 15 iterations), all-member cluster means,
+  one-to-one greedy center matching, then centroid EMA
   (0.999). Refresh on initialization and every 20 successful steps with new
   candidates. Empty/collapsed updates leave the previous library unchanged.
+- Distance-based outlier trimming is **off by default**:
+  `--prototype_outlier_filter false`. The optional `true` setting restores
+  within-cluster median/MAD trimming for ablations. Benefit screening, finite
+  checks and empty/degenerate-cluster checks remain enabled in both modes.
+  Logs and checkpoints record the effective policy. Legacy saved configs
+  without the flag are interpreted as `true`; resuming with a different
+  policy raises rather than silently changing the experiment.
 - Collection is detached/no-grad and restricted to Full training rows. The task
   holds small pending descriptors; `after_optimizer_step(True)` commits them,
   `False` discards them on overflow. There are no writes inside model forward.
@@ -124,6 +131,7 @@ python run_decoder_prototype_add.py \
   --ct_backbone convnextv2_nano --pet_backbone mit_b1 \
   --ct_pretrained_path /root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano \
   --pet_pretrained_path /root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1 \
+  --prototype_outlier_filter false \
   --aug_mode cipa --norm_mode imagenet --hd95_mode cipa_official --random_state 2023
 ```
 

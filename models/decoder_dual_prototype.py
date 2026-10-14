@@ -25,7 +25,8 @@ EMA, using deterministic greedy minimum-distance matching.
 
     def __init__(self, clusters: int, dimension: int, capacity: int = 256,
                  min_candidates: int = 24, decay: float = .999,
-                 iterations: int = 15, outlier_mad: float = 3.):
+                 iterations: int = 15, outlier_mad: float = 3.,
+                 outlier_filter: bool = False):
         super().__init__()
         if not (1 < clusters <= min_candidates <= capacity) or dimension < 1:
             raise ValueError('require 1 < clusters <= min_candidates <= capacity and dimension > 0')
@@ -34,6 +35,7 @@ EMA, using deterministic greedy minimum-distance matching.
         self.clusters, self.dimension = int(clusters), int(dimension)
         self.capacity, self.min_candidates = int(capacity), int(min_candidates)
         self.decay, self.iterations, self.outlier_mad = float(decay), int(iterations), float(outlier_mad)
+        self.outlier_filter = bool(outlier_filter)
         self.register_buffer('centers', torch.zeros(clusters, dimension))
         self.register_buffer('pool', torch.zeros(capacity, dimension))
         self.register_buffer('size', torch.zeros((), dtype=torch.long))
@@ -100,17 +102,20 @@ EMA, using deterministic greedy minimum-distance matching.
                         updated[k] = x[distances.min(1).values.argmax()]
                 centers = updated
             assignment = self._distance(x, centers).argmin(1)
-            # Mild within-cluster filtering, never a global lesion rarity filter.
+            # Default: every cluster member contributes to its center.
+            # Optional MAD trimming is retained only for explicit ablations.
             for k in range(self.clusters):
                 members = x[assignment == k]
                 if members.shape[0] == 0:
                     # Do not mark a collapsed bank as a valid K-center library.
                     return False
-                distance = (members - centers[k]).square().sum(1).sqrt()
-                median = distance.median()
-                mad = (distance - median).abs().median()
-                keep = distance <= median + self.outlier_mad * 1.4826 * mad + 1e-6
-                centers[k] = members[keep].mean(0)
+                if self.outlier_filter:
+                    distance = (members - centers[k]).square().sum(1).sqrt()
+                    median = distance.median()
+                    mad = (distance - median).abs().median()
+                    keep = distance <= median + self.outlier_mad * 1.4826 * mad + 1e-6
+                    members = members[keep]
+                centers[k] = members.mean(0)
             if bool(self.valid):
                 distances = self._distance(self.centers.float(), centers)
                 ordered = torch.empty_like(centers)
@@ -163,7 +168,8 @@ channel centers [K,d*d]. Both final heads start at exactly zero.
                  capacity: int = 256, min_candidates: int = 24,
                  decay: float = .999, refresh_steps: int = 20,
                  spatial: bool = True, channel: bool = True,
-                 patch_size: int = 5, max_patches: int = 16, seed: int = 2023):
+                 patch_size: int = 5, max_patches: int = 16, seed: int = 2023,
+                 outlier_filter: bool = False):
         super().__init__()
         if not spatial and not channel:
             raise ValueError('at least one prototype branch must be enabled')
@@ -175,8 +181,10 @@ channel centers [K,d*d]. Both final heads start at exactly zero.
         gen = torch.Generator().manual_seed(int(seed))
         basis = torch.linalg.qr(torch.randn(channels, self.dim, generator=gen), mode='reduced').Q.T
         self.register_buffer('basis', basis.contiguous())
-        self.spatial_bank = EMACentroidBank(clusters, 3 * self.dim, capacity, min_candidates, decay)
-        self.channel_bank = EMACentroidBank(clusters, self.dim**2, capacity, min_candidates, decay)
+        self.spatial_bank = EMACentroidBank(clusters, 3 * self.dim, capacity, min_candidates,
+                                            decay, outlier_filter=outlier_filter)
+        self.channel_bank = EMACentroidBank(clusters, self.dim**2, capacity, min_candidates,
+                                            decay, outlier_filter=outlier_filter)
         d = self.dim
         self.spatial_norm = nn.LayerNorm(3 * d)
         self.spatial_q = nn.Linear(3 * d, d, bias=False)
@@ -298,14 +306,15 @@ class DecoderDualPrototype(nn.Module):
 
     def __init__(self, channels: Sequence[int], dim=32, clusters=6, capacity=256,
                  min_candidates=24, decay=.999, refresh_steps=20, warmup_steps=100,
-                 spatial=True, channel=True):
+                 spatial=True, channel=True, outlier_filter=False):
         super().__init__()
         if len(channels) != 4 or warmup_steps < 0:
             raise ValueError('require four decoder levels and nonnegative warmup')
         self.warmup_steps = int(warmup_steps)
         self.scales = nn.ModuleList(DecoderPrototypeScale(
             c, dim, clusters, capacity, min_candidates, decay, refresh_steps,
-            spatial, channel, seed=2023 + i) for i, c in enumerate(channels))
+            spatial, channel, seed=2023 + i, outlier_filter=outlier_filter)
+            for i, c in enumerate(channels))
         self.register_buffer('update_steps', torch.zeros((), dtype=torch.long))
 
     @torch.no_grad()
@@ -327,7 +336,8 @@ class DecoderDualPrototype(nn.Module):
                     bank.refresh()
 
     def diagnostics(self) -> dict:
-        stats = {'successful_steps': int(self.update_steps)}
+        stats = {'successful_steps': int(self.update_steps),
+                 'outlier_filter_enabled': self.scales[0].spatial_bank.outlier_filter}
         for i, scale in enumerate(self.scales):
             for label, bank in (('spatial', scale.spatial_bank), ('channel', scale.channel_bank)):
                 stats[f'd{4-i}_{label}_valid'] = bool(bank.valid)

@@ -149,6 +149,39 @@ def test_centroid_bank_euclidean_ema_filter_and_roundtrip():
         bank.add(torch.full((1, 2), float('nan')))
 
 
+def test_outlier_filter_defaults_off_and_off_uses_all_cluster_members():
+    values = torch.tensor([[0.], [.1], [.2], [.3], [5.], [100.], [100.1], [100.2], [100.3]])
+    unfiltered = EMACentroidBank(2, 1, capacity=16, min_candidates=9)
+    filtered = EMACentroidBank(2, 1, capacity=16, min_candidates=9, outlier_filter=True)
+    for bank in (unfiltered, filtered):
+        bank.add(values)
+        assert bank.refresh()
+    # The rare 5.0 descriptor stays in the left cluster's ordinary mean.
+    assert not unfiltered.outlier_filter
+    assert torch.allclose(unfiltered.centers.min(), values[:5].mean(), atol=1e-6)
+    assert torch.allclose(filtered.centers.min(), values[:4].mean(), atol=1e-6)
+    assert torch.equal(unfiltered.pool, filtered.pool)  # Trimming never mutates the FIFO.
+    for enabled in (False, True):
+        m = model(prototype_outlier_filter=enabled)
+        assert m.prototype.diagnostics()['outlier_filter_enabled'] is enabled
+        assert all(bank.outlier_filter is enabled for scale in m.prototype.scales
+                   for bank in (scale.spatial_bank, scale.channel_bank))
+
+
+def test_legacy_checkpoint_preserves_filter_policy_and_rejects_silent_change(tmp_path):
+    task = PrototypeSegTask({'model': model(prototype_outlier_filter=True)}, cfg())
+    path = str(tmp_path / 'legacy.pt')
+    task.save_checkpoint(path, 0, best=0., best_epoch=0)
+    legacy = task.load_state_dicts(path)
+    legacy['config'].pop('prototype_outlier_filter')
+    torch.save(legacy, path)
+    same = PrototypeSegTask({'model': model(prototype_outlier_filter=True)}, cfg())
+    same.resume(path)
+    changed = PrototypeSegTask({'model': model()}, cfg())
+    with pytest.raises(ValueError, match='prototype_outlier_filter'):
+        changed.resume(path)
+
+
 def test_gain_filter_and_signed_relations():
     scale = DecoderPrototypeScale(8, dim=4, clusters=2, capacity=16,
                                   min_candidates=2, refresh_steps=1)
@@ -283,6 +316,7 @@ def test_protocol_defaults_and_imagenet_normalization(monkeypatch):
     for config in (SegMDTConfig.parse_arguments(), PrototypeConfig.parse_arguments()):
         assert config.norm_mode == 'imagenet'
         assert config.hd95_mode == 'cipa_official'
+    assert PrototypeConfig.parse_arguments().prototype_outlier_filter is False
     assert inspect.signature(get_pclt20k_loaders_cipa_aligned).parameters['norm_mode'].default == 'imagenet'
     gray = np.array([[0, 127], [128, 255]], dtype=np.uint8)
     expected = (np.repeat(gray[None].astype(np.float32) / 255., 3, axis=0)

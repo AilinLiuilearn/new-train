@@ -8,7 +8,7 @@ Full 保持 CT+PET 简单相加。没有引入此前讨论的复杂融合模块�
 
 | 文件 | 职责 |
 | --- | --- |
-| `models/decoder_dual_prototype.py` | 收益筛选、空间/通道候选、欧氏聚类、离群过滤、中心 EMA、交叉注意力 |
+| `models/decoder_dual_prototype.py` | 收益筛选、空间/通道候选、欧氏聚类、可选离群过滤、中心 EMA、交叉注意力 |
 | `models/prototype_add_model.py` | Add 基线扩展，在解码器 D4/D3/D2/D1 接入 Missing 校正 |
 | `tasks/prototype_seg.py` | 精确半批损失、CT 对照监督、成功更新后建库、模型 EMA 同步和恢复 |
 | `run_decoder_prototype_add.py` | 独立混合训练入口、日志、最佳 Joint 选择、最终测试 |
@@ -35,6 +35,10 @@ checkpoint 读取改为调用仓库已有的加载函数，以兼容新版 PyTor
 6. 建库候选无梯度；优化器成功更新后才写入。AMP 溢出跳步丢弃候选。
 7. 默认前 100 个成功优化步骤不收集；每库至少 24 个候选、6 个不同中心后激活。
    缓冲区 256 条，初始化及每 20 步刷新。中心 EMA 默认 0.999，可配置。
+   特征距离离群过滤默认关闭：`--prototype_outlier_filter false`，每簇全部成员
+   参与求均值。收益筛选、非有限值检查和空簇检查仍保留。后续消融可显式设为
+   `true`。日志记录实际开关。旧 checkpoint 未保存此参数时按历史开启解释，
+   恢复训练时改变该策略会明确报错，避免静默改变实验。
 8. 模型 EMA 对网络参数正常平均，对已执行中心 EMA 的原型 buffer 直接复制，
    避免二次平均。原型、队列、有效标记和计数都能恢复。
 9. epoch 边界恢复包括优化器、调度器、AMP、混合分配步数、早停状态，以及
@@ -76,6 +80,7 @@ python run_decoder_prototype_add.py \
   --image_size_2d 512 --batch_size 16 --epochs 60 \
   --ct_pretrained_path /root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano \
   --pet_pretrained_path /root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1 \
+  --prototype_outlier_filter false \
   --aug_mode cipa --norm_mode imagenet --hd95_mode cipa_official --random_state 2023
 ```
 

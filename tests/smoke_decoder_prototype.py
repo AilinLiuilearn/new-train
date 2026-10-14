@@ -28,7 +28,8 @@ def main():
         prototype_enabled=True, prototype_dim=32, prototype_clusters=6,
         prototype_capacity=256, prototype_min_candidates=24, prototype_decay=.999,
         prototype_refresh_steps=20, prototype_warmup_steps=0, prototype_spatial=True,
-        prototype_channel=True, prototype_foreground_weight=2., prototype_background_weight=1.,
+        prototype_channel=True, prototype_outlier_filter=False,
+        prototype_foreground_weight=2., prototype_background_weight=1.,
         prototype_min_gain=.01, prototype_ct_aux_weight=.1, mixed_precision=False,
         learning_rate=1e-4, weight_decay=1e-4, ema_enabled=False))
     task = PrototypeSegTask(build_prototype_model(cfg), cfg)

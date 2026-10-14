@@ -18,6 +18,8 @@ class PrototypeSegTask(MDTSegTeacher):
         self._pending_candidates = None
         self.current_epoch, self.no_improve = 0, 0
         self.loader_generators = {}
+        # Persist the actual effective setting, including legacy configs.
+        self.config.prototype_outlier_filter = self.model.prototype.scales[0].spatial_bank.outlier_filter
 
     def begin_epoch(self, epoch):
         self.current_epoch = int(epoch)
@@ -110,7 +112,8 @@ class PrototypeSegTask(MDTSegTeacher):
             raise ValueError('resume requires a prototype checkpoint; baseline weights are a separate warm start')
         # Non-tensor settings affect the meaning of restored banks. Never
         # silently resume using a different projection/collection policy.
-        old, current = ckpt['config'], vars(self.config)
+        old, current = dict(ckpt['config']), vars(self.config)
+        old.setdefault('prototype_outlier_filter', True)  # Legacy checkpoints used MAD trimming.
         keys = {k for k in old.keys() | current.keys() if k.startswith('prototype_')}
         keys.update({'decoder_channels', 'ct_backbone', 'pet_backbone', 'batch_size',
                      'ema_enabled', 'ema_decay', 'ema_decay_warmup', 'ema_start_epoch',

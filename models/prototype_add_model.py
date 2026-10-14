@@ -21,7 +21,7 @@ class PrototypeAddModel(DualSharedAddPETCTBaseline):
                  prototype_refresh_steps=20, prototype_warmup_steps=100,
                  prototype_spatial=True, prototype_channel=True,
                  prototype_foreground_weight=2., prototype_background_weight=1.,
-                 prototype_min_gain=.01, **baseline_kwargs):
+                 prototype_min_gain=.01, prototype_outlier_filter=False, **baseline_kwargs):
         if baseline_kwargs.get('use_deep_supervision', False):
             raise ValueError('prototype experiment preserves baseline deep_supervision=False')
         super().__init__(**baseline_kwargs)
@@ -34,7 +34,8 @@ class PrototypeAddModel(DualSharedAddPETCTBaseline):
         self.prototype = DecoderDualPrototype(
             channels, prototype_dim, prototype_clusters, prototype_capacity,
             prototype_min_candidates, prototype_decay, prototype_refresh_steps,
-            prototype_warmup_steps, prototype_spatial, prototype_channel)
+            prototype_warmup_steps, prototype_spatial, prototype_channel,
+            outlier_filter=prototype_outlier_filter)
         self.prototype_enabled = bool(prototype_enabled)
         self.foreground_weight = float(prototype_foreground_weight)
         self.background_weight = float(prototype_background_weight)
@@ -144,9 +145,13 @@ def build_prototype_model(cfg):
              'refresh_steps', 'warmup_steps', 'spatial', 'channel',
              'foreground_weight', 'background_weight', 'min_gain')
     baseline.update({f'prototype_{name}': getattr(cfg, f'prototype_{name}') for name in names})
+    # New CLI configs explicitly default False. Old saved configs lack this
+    # field and used trimming, so preserve their evaluation/resume semantics.
+    baseline['prototype_outlier_filter'] = getattr(cfg, 'prototype_outlier_filter', True)
     model = PrototypeAddModel(**baseline)
     extra = sum(p.numel() for p in model.prototype.parameters())
     print(f'[prototype_add] fusion=AddFusion mixed_ratio=0.5 '
           f'decoder_levels=D4,D3,D2,D1 extra_parameters={extra} '
-          f'knowledge_enabled={model.prototype_enabled}', flush=True)
+          f'knowledge_enabled={model.prototype_enabled} '
+          f'outlier_filter={model.prototype.scales[0].spatial_bank.outlier_filter}', flush=True)
     return {'model': model}

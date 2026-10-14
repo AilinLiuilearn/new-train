@@ -30,6 +30,9 @@ class PrototypeConfig(SegMDTConfig):
         p.add_argument('--prototype_enabled', type=str2bool, default=True)
         p.add_argument('--prototype_spatial', type=str2bool, default=True)
         p.add_argument('--prototype_channel', type=str2bool, default=True)
+        p.add_argument('--prototype_outlier_filter', type=str2bool, default=False,
+                       help='Optional within-cluster distance/MAD trimming; off by default. '
+                            'Benefit screening, finite-value and empty-cluster checks remain enabled.')
         p.add_argument('--prototype_dim', type=int, default=32)
         p.add_argument('--prototype_clusters', type=int, default=6)
         p.add_argument('--prototype_capacity', type=int, default=256)
