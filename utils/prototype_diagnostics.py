@@ -23,7 +23,11 @@ BANK_FIELDS = CONTEXT + [
     'occupied_clusters', 'assignment_entropy_normalized', 'max_cluster_fraction',
     'mean_nearest_distance', 'mean_nearest_margin', 'mean_center_norm', 'min_center_distance',
     'read_sample_global_step', 'read_available', 'read_query_count',
-    'read_attention_entropy_normalized', 'read_correction_rms_ratio', 'read_spatial_gate_mean']
+    'read_attention_entropy_normalized', 'read_correction_rms_ratio', 'read_spatial_gate_mean',
+    'read_channel_gate_mean', 'read_q_norm_mean', 'read_k_norm_mean',
+    'read_logit_min', 'read_logit_max', 'read_logit_span_mean',
+    'read_total_correction_rms_ratio', 'channel_qk_norm', 'channel_logit_scale',
+    'local_correction', 'correction_alpha']
 CLUSTER_FIELDS = CONTEXT + [
     'scale', 'bank', 'enabled', 'valid', 'cluster_id', 'pool_count', 'pool_fraction',
     'mean_member_distance', 'center_norm', 'last_success_count',
@@ -110,7 +114,13 @@ class PrototypeCSVLogger:
             if os.path.isfile(path):
                 with open(path, newline='') as stream:
                     reader = csv.DictReader(stream)
-                    if reader.fieldnames != fields:
+                    # Additive read diagnostics can upgrade old CSVs in place;
+                    # missing historical values stay blank, never invented.
+                    legacy_bank_fields = BANK_FIELDS[:BANK_FIELDS.index('read_channel_gate_mean')]
+                    compatible = (reader.fieldnames == fields or
+                                  (filename == 'prototype_banks.csv'
+                                   and reader.fieldnames == legacy_bank_fields))
+                    if not compatible:
                         raise ValueError(f'prototype diagnostics schema mismatch: {path}')
                     # Remove snapshots from epochs interrupted before checkpoint.
                     rows = [row for row in reader if int(row['epoch']) < start_epoch]
@@ -157,6 +167,10 @@ class PrototypeCSVLogger:
                 if enabled and active and int(prototype.update_steps) <= prototype.warmup_steps:
                     row['status'] = 'warmup'
                 row.update(context, scale=level, bank=label,
+                           channel_qk_norm=scale.channel_qk_norm,
+                           channel_logit_scale=scale.channel_logit_scale,
+                           local_correction=scale.local_correction,
+                           correction_alpha=scale.correction_alpha,
                            generated_epoch=totals.get(f'{level}_{label}_generated', 0),
                            written_epoch=totals.get(f'{level}_{label}_written', 0),
                            spatial_fg_patches_epoch=totals.get(f'{level}_spatial_fg_patches', 0) if label == 'spatial' else None,
@@ -166,11 +180,16 @@ class PrototypeCSVLogger:
                     read = sampled['scales'][i].get(label, {})
                     row['read_sample_global_step'] = sampled['global_batch_step']
                     row['read_available'] = read.get('available', False)
+                    total_ratio = sampled['scales'][i].get('total_correction_rms_ratio')
+                    row['read_total_correction_rms_ratio'] = float(total_ratio) if total_ratio is not None else None
                     if read.get('available'):
                         row.update(read_query_count=read['query_count'],
                                    read_attention_entropy_normalized=float(read['attention_entropy']),
                                    read_correction_rms_ratio=float(read['correction_rms_ratio']),
-                                   read_spatial_gate_mean=float(read['gate_mean']) if 'gate_mean' in read else None)
+                                   read_spatial_gate_mean=float(read['gate_mean']) if label == 'spatial' and 'gate_mean' in read else None,
+                                   read_channel_gate_mean=float(read['gate_mean']) if label == 'channel' and 'gate_mean' in read else None)
+                        for name in ('q_norm_mean', 'k_norm_mean', 'logit_min', 'logit_max', 'logit_span_mean'):
+                            row[f'read_{name}'] = float(read[name]) if name in read else None
                         attention = read['attention_mean'].cpu().tolist()
                         top1 = read['top1_fraction'].cpu().tolist()
                         for k, cluster in enumerate(clusters):

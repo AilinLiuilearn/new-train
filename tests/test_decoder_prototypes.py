@@ -643,3 +643,173 @@ def test_channel_correction_diagnostic_matches_broadcast_residual_rms():
     stats = DecoderPrototypeScale._read_diagnostics(attention, correction, x, shift)
     expected = (correction + shift).square().mean().sqrt() / x.square().mean().sqrt()
     assert stats['correction_rms_ratio'] == pytest.approx(float(expected), rel=1e-6)
+
+
+def test_background_gain_in_same_downsample_cell_is_not_foreground():
+    scale = DecoderPrototypeScale(4, dim=2, clusters=2, capacity=8,
+                                  min_candidates=2, patch_size=1, max_patches=2)
+    full = torch.randn(1, 4, 2, 2)
+    foreground = torch.zeros(1, 1, 4, 4)
+    foreground[:, :, 0, 0] = 1
+    weight = torch.zeros_like(foreground)
+    weight[:, :, 1, 1] = 1  # Background gain, same area cell as FG.
+    stats = {}
+    spatial, channel = scale.candidates(full, full + .2, weight, foreground, stats)
+    assert spatial.shape[0] == channel.shape[0] == 1
+    assert stats['spatial_fg_patches'] == 0 and stats['spatial_bg_patches'] == 1
+    weight[:, :, 0, 0] = 1
+    scale.candidates(full, full + .2, weight, foreground, stats)
+    assert stats['spatial_fg_patches'] == 1 and stats['spatial_bg_patches'] == 0
+
+
+def test_foreground_priority_selects_actual_gain_not_adjacent_background():
+    scale = DecoderPrototypeScale(4, dim=2, clusters=2, capacity=8,
+                                  min_candidates=2, patch_size=1, max_patches=1)
+    full, reference = torch.randn(1, 4, 1, 2), torch.randn(1, 4, 1, 2)
+    foreground = torch.zeros(1, 1, 2, 4)
+    foreground[:, :, 0, 0] = foreground[:, :, 0, 2] = 1
+    weight = torch.zeros_like(foreground)
+    weight[:, :, 0, 1] = 10  # High BG gain near FG without gain.
+    weight[:, :, 0, 2] = 1   # Genuine FG gain in second cell.
+    spatial, _ = scale.candidates(full, reference, weight, foreground)
+    zf, z0 = scale._project(full), scale._project(reference)
+    rms = ((zf.square().mean() + z0.square().mean()) * .5 + 1e-6).sqrt()
+    expected = scale._local(zf / rms)[0, :, 0, 1]
+    assert torch.allclose(spatial[0], expected)
+
+
+def test_channel_cosine_score_resists_norm_saturation_and_tracks_query():
+    scale = DecoderPrototypeScale(4, dim=2, clusters=4, capacity=8, min_candidates=4)
+    q = torch.tensor([[1., 0.], [0., 1.]])
+    k = torch.tensor([[1., 0.], [0., 1.], [-1., 0.], [0., -1.]])
+    attention, logits = scale._channel_attention(q, k)
+    larger, _ = scale._channel_attention(q * 1e6, k * 1e4)
+    assert torch.allclose(attention, larger)
+    assert attention.argmax(-1).tolist() == [0, 1]
+    assert logits.min() == -2 and logits.max() == 2
+    assert float(attention.max()) <= torch.exp(torch.tensor(4.)).item() / (torch.exp(torch.tensor(4.)).item() + 3)
+    scale.channel_qk_norm = False
+    old, old_logits = scale._channel_attention(q, k)
+    assert torch.equal(old_logits, q @ k.T / (2 ** .5))
+    assert torch.equal(old, old_logits.softmax(-1))
+    zeros, zero_logits = scale._channel_attention(torch.zeros_like(q), torch.zeros_like(k))
+    assert torch.isfinite(zeros).all() and torch.isfinite(zero_logits).all()
+
+
+@pytest.mark.parametrize('spatial,channel', [(True, False), (False, True), (True, True)])
+def test_local_correction_bound_is_per_image_and_preserves_gradients(spatial, channel):
+    scale = DecoderPrototypeScale(8, dim=4, clusters=4, capacity=16, min_candidates=4,
+                                  spatial=spatial, channel=channel)
+    for bank in (scale.spatial_bank, scale.channel_bank):
+        bank.add(torch.randn(8, bank.dimension)); assert bank.refresh()
+    with torch.no_grad():
+        scale.spatial_out.weight.normal_(std=10.)
+        scale.channel_out.weight.normal_(std=10.)
+        scale.channel_out.bias.fill_(20.)
+    x = (torch.randn(3, 8, 5, 7) * torch.tensor([1e-4, 1., 100.])[:, None, None, None]).requires_grad_()
+    stats = {}
+    result = scale(x, diagnostics=stats)
+    ratio = (result - x).flatten(1).norm(dim=1) / x.flatten(1).norm(dim=1)
+    assert (ratio <= .1 * (spatial + channel) + 1e-6).all()
+    for label, enabled in [('spatial', spatial), ('channel', channel)]:
+        if enabled:
+            assert float(stats[label]['correction_rms_ratio']) <= .1 + 1e-6
+    result.square().mean().backward()
+    assert torch.isfinite(x.grad).all()
+    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in scale.parameters())
+    # A tiny/global absolute bias cannot create corrections from all-zero CT.
+    assert torch.equal(scale(torch.zeros_like(x)), torch.zeros_like(x))
+
+
+def test_relative_spatial_limiter_keeps_zero_head_trainable():
+    scale = DecoderPrototypeScale(8, dim=4, clusters=2, capacity=8, min_candidates=2,
+                                  channel=False)
+    scale.spatial_bank.add(torch.randn(8, 12)); assert scale.spatial_bank.refresh()
+    x = torch.randn(2, 8, 4, 4)
+    result = scale(x)
+    assert torch.equal(result, x)
+    result.square().mean().backward()
+    assert scale.spatial_out.weight.grad.abs().sum() > 0
+    assert torch.isfinite(scale.spatial_out.weight.grad).all()
+
+
+def test_legacy_config_rebuilds_strictly_and_new_mode_cannot_silently_resume(tmp_path):
+    from models.prototype_add_model import build_prototype_model
+    legacy_model = model(prototype_channel_qk_norm=False, prototype_local_correction=False)
+    task = PrototypeSegTask({'model': legacy_model}, cfg())
+    populate(legacy_model)
+    path = str(tmp_path / 'legacy.pt')
+    task.save_checkpoint(path, 1, best=.4, best_epoch=1)
+    ckpt = task.load_state_dicts(path)
+    for key in ('channel_qk_norm', 'channel_logit_scale', 'local_correction', 'correction_alpha'):
+        ckpt['config'].pop(f'prototype_{key}')
+    torch.save(ckpt, path)
+    saved = cfg(**dict(ct_backbone='convnextv2_nano', pet_backbone='mit_b1',
+        ct_pretrained_path=None, pet_pretrained_path=None, decoder_channels=(32, 24, 16, 8),
+        pretrained=False, use_deep_supervision=False, deep_supervision=False,
+        prototype_enabled=True, prototype_dim=4, prototype_clusters=2, prototype_capacity=16,
+        prototype_min_candidates=2, prototype_decay=.999, prototype_refresh_steps=1,
+        prototype_warmup_steps=0, prototype_spatial=True, prototype_channel=True,
+        prototype_foreground_weight=2., prototype_background_weight=1., prototype_min_gain=.01,
+        prototype_outlier_filter=False))
+    rebuilt = build_prototype_model(saved)['model'].eval()
+    rebuilt.load_state_dict(ckpt['model'], strict=True)
+    assert not rebuilt.prototype.scales[0].channel_qk_norm
+    assert not rebuilt.prototype.scales[0].local_correction
+    assert not any('channel_gate' in key for key in rebuilt.state_dict())
+    restored = PrototypeSegTask({'model': model(prototype_channel_qk_norm=False,
+                                              prototype_local_correction=False)}, cfg())
+    restored.resume(path)
+    new = PrototypeSegTask({'model': model()}, cfg())
+    with pytest.raises(ValueError, match='prototype_(local_correction|channel_qk_norm)'):
+        new.resume(path)
+
+
+def test_new_controls_are_cli_defaults_and_invalid_values_rejected(monkeypatch):
+    import sys
+    from run_decoder_prototype_add import PrototypeConfig
+    monkeypatch.setattr(sys, 'argv', ['run_decoder_prototype_add.py'])
+    config = PrototypeConfig.parse_arguments()
+    assert config.prototype_channel_qk_norm and config.prototype_local_correction
+    assert config.prototype_channel_logit_scale == 2. and config.prototype_correction_alpha == .1
+    for kwargs in ({'channel_logit_scale': 0.}, {'channel_logit_scale': float('inf')},
+                   {'correction_alpha': 0.}, {'correction_alpha': float('nan')}):
+        with pytest.raises(ValueError):
+            DecoderPrototypeScale(8, dim=4, clusters=2, min_candidates=2, **kwargs)
+
+
+def test_new_read_csv_fields_and_legacy_csv_upgrade(tmp_path):
+    import csv
+    from utils.prototype_diagnostics import PrototypeCSVLogger, BANK_FIELDS
+    task = PrototypeSegTask({'model': model()}, cfg())
+    populate(task.model)
+    for scale in task.model.prototype.scales:
+        with torch.no_grad():
+            scale.spatial_out.weight.normal_(std=.1)
+            scale.channel_out.weight.normal_(std=.1)
+    task.capture_prototype_reads = True
+    task.train_step_mixed(batch(), torch.tensor([1, 0, 1, 0]))
+    logger = PrototypeCSVLogger(str(tmp_path))
+    logger.snapshot(task, 1, 1, 'interval')
+    path = tmp_path / 'prototype_banks.csv'
+    with open(path, newline='') as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 8
+    for row in rows:
+        assert float(row['read_correction_rms_ratio']) <= .1 + 1e-6
+        assert float(row['read_total_correction_rms_ratio']) <= .2 + 1e-6
+        if row['bank'] == 'channel':
+            assert 0 <= float(row['read_channel_gate_mean']) <= 1
+            assert -2.000001 <= float(row['read_logit_min']) <= float(row['read_logit_max']) <= 2.000001
+            assert row['read_q_norm_mean'] and row['read_k_norm_mean']
+    # A genuine old CSV lacks all appended fields, but not existing ones.
+    legacy_fields = BANK_FIELDS[:BANK_FIELDS.index('read_channel_gate_mean')]
+    with open(path, 'w', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=legacy_fields, extrasaction='ignore')
+        writer.writeheader(); writer.writerows(rows)
+    PrototypeCSVLogger(str(tmp_path), start_epoch=2)
+    with open(path, newline='') as stream:
+        migrated = list(csv.DictReader(stream))
+    assert len(migrated) == 8
+    assert all(row['read_channel_gate_mean'] == '' for row in migrated)
+    assert [row['pool_size'] for row in migrated] == [row['pool_size'] for row in rows]

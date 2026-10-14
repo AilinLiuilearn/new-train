@@ -24,6 +24,9 @@ class PrototypeSegTask(MDTSegTeacher):
         self.prototype_read_stats = None
         # Persist the actual effective setting, including legacy configs.
         self.config.prototype_outlier_filter = self.model.prototype.scales[0].spatial_bank.outlier_filter
+        scale = self.model.prototype.scales[0]
+        for name in ('channel_qk_norm', 'channel_logit_scale', 'local_correction', 'correction_alpha'):
+            setattr(self.config, f'prototype_{name}', getattr(scale, name))
 
     def begin_epoch(self, epoch):
         self.current_epoch = int(epoch)
@@ -170,6 +173,10 @@ class PrototypeSegTask(MDTSegTeacher):
         # silently resume using a different projection/collection policy.
         old, current = dict(ckpt['config']), vars(self.config)
         old.setdefault('prototype_outlier_filter', True)  # Legacy checkpoints used MAD trimming.
+        old.setdefault('prototype_channel_qk_norm', False)
+        old.setdefault('prototype_channel_logit_scale', 2.)
+        old.setdefault('prototype_local_correction', False)
+        old.setdefault('prototype_correction_alpha', .1)
         keys = {k for k in old.keys() | current.keys() if k.startswith('prototype_')}
         keys.update({'decoder_channels', 'ct_backbone', 'pet_backbone', 'batch_size',
                      'ema_enabled', 'ema_decay', 'ema_decay_warmup', 'ema_start_epoch',

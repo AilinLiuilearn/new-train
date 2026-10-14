@@ -45,6 +45,15 @@ class PrototypeConfig(SegMDTConfig):
         p.add_argument('--prototype_background_weight', type=float, default=1.)
         p.add_argument('--prototype_min_gain', type=float, default=.01)
         p.add_argument('--prototype_ct_aux_weight', type=float, default=.1)
+        p.add_argument('--prototype_channel_qk_norm', type=str2bool, default=True,
+                       help='Normalize projected channel Q/K before cosine scoring.')
+        p.add_argument('--prototype_channel_logit_scale', type=float, default=2.,
+                       help='Fixed inverse temperature for normalized channel Q/K (no sqrt(d)).')
+        p.add_argument('--prototype_local_correction', type=str2bool, default=True,
+                       help='CT-conditioned soft channel gate and per-image relative RMS bounds '
+                            'for both correction branches; false retains previous injection.')
+        p.add_argument('--prototype_correction_alpha', type=float, default=.1,
+                       help='Per-branch relative RMS budget; sum of two branches <= 2*alpha.')
         p.add_argument('--resume', type=str, default=None)
         p.add_argument('--log_interval', type=int, default=100,
                        help='Print progress and save prototype CSV snapshots every N batches; '

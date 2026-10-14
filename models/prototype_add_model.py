@@ -21,7 +21,10 @@ class PrototypeAddModel(DualSharedAddPETCTBaseline):
                  prototype_refresh_steps=20, prototype_warmup_steps=100,
                  prototype_spatial=True, prototype_channel=True,
                  prototype_foreground_weight=2., prototype_background_weight=1.,
-                 prototype_min_gain=.01, prototype_outlier_filter=False, **baseline_kwargs):
+                 prototype_min_gain=.01, prototype_outlier_filter=False,
+                 prototype_channel_qk_norm=True, prototype_channel_logit_scale=2.,
+                 prototype_local_correction=True, prototype_correction_alpha=.1,
+                 **baseline_kwargs):
         if baseline_kwargs.get('use_deep_supervision', False):
             raise ValueError('prototype experiment preserves baseline deep_supervision=False')
         super().__init__(**baseline_kwargs)
@@ -35,7 +38,11 @@ class PrototypeAddModel(DualSharedAddPETCTBaseline):
             channels, prototype_dim, prototype_clusters, prototype_capacity,
             prototype_min_candidates, prototype_decay, prototype_refresh_steps,
             prototype_warmup_steps, prototype_spatial, prototype_channel,
-            outlier_filter=prototype_outlier_filter)
+            outlier_filter=prototype_outlier_filter,
+            channel_qk_norm=prototype_channel_qk_norm,
+            channel_logit_scale=prototype_channel_logit_scale,
+            local_correction=prototype_local_correction,
+            correction_alpha=prototype_correction_alpha)
         self.prototype_enabled = bool(prototype_enabled)
         self.foreground_weight = float(prototype_foreground_weight)
         self.background_weight = float(prototype_background_weight)
@@ -157,10 +164,18 @@ def build_prototype_model(cfg):
     # New CLI configs explicitly default False. Old saved configs lack this
     # field and used trimming, so preserve their evaluation/resume semantics.
     baseline['prototype_outlier_filter'] = getattr(cfg, 'prototype_outlier_filter', True)
+    # Saved pre-change configs must rebuild the previous architecture/scoring.
+    for name, legacy in (('channel_qk_norm', False), ('channel_logit_scale', 2.),
+                         ('local_correction', False), ('correction_alpha', .1)):
+        baseline[f'prototype_{name}'] = getattr(cfg, f'prototype_{name}', legacy)
     model = PrototypeAddModel(**baseline)
     extra = sum(p.numel() for p in model.prototype.parameters())
     print(f'[prototype_add] fusion=AddFusion mixed_ratio=0.5 '
           f'decoder_levels=D4,D3,D2,D1 extra_parameters={extra} '
           f'knowledge_enabled={model.prototype_enabled} '
-          f'outlier_filter={model.prototype.scales[0].spatial_bank.outlier_filter}', flush=True)
+          f'outlier_filter={model.prototype.scales[0].spatial_bank.outlier_filter} '
+          f'channel_qk_norm={model.prototype.scales[0].channel_qk_norm} '
+          f'channel_logit_scale={model.prototype.scales[0].channel_logit_scale} '
+          f'local_correction={model.prototype.scales[0].local_correction} '
+          f'correction_alpha={model.prototype.scales[0].correction_alpha}', flush=True)
     return {'model': model}

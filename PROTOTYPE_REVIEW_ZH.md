@@ -4,6 +4,80 @@
 目标是只验证原型知识设计：每个 batch 严格 50% Full、50% Missing；
 Full 保持 CT+PET 简单相加。没有引入此前讨论的复杂融合模块。
 
+## 2026-10-14：前景收益修正、检索防饱和与局部幅度控制
+
+沿用本分支的解码器双原型设计，没有新增 PET 重建路径或重建损失。
+Full 依然绕过原型，Missing 仅使用当前 CT 解码表征和训练集建成的库。
+每尺度仍为两个库；K、容量、收益阈值、刷新频率和中心 EMA 均未改变。
+
+1. **前景收益先相乘再降采样。** 空间候选的前景优先级改用
+   `Down((target >= 0.5) * gain)`，然后按 patch 汇总；不再使用
+   `Down(target) * Down(gain)`。这修正病灶旁背景收益被算为前景的错误。
+   空间描述符内容与通道 Gram 候选计算保持原样，未新增前景/背景子库。
+2. **通道 Q/K 在投影后 L2 归一化。** 新打分为
+   `softmax(s * normalize(Q) @ normalize(K).T)`，默认固定 `s=2`
+   （温度 `tau=0.5`），不再额外除以 `sqrt(d)`。仅通道检索采用此改动。
+   空间注意力保持原公式。`--prototype_channel_qk_norm false` 恢复旧通道打分。
+   该设置排除投影范数无限放大导致的饱和；不能保证不同样本必然选不同槽。
+3. **相对强度受限的局部校正。** `--prototype_local_correction true` 时，
+   通道分支采用 `Conv3x3([x, broadcast(read)]) -> sigmoid` 的单通道软空间门控，
+   `a,b` 仍仅由检索知识生成，输出头仍为零初始化。
+
+   `delta_c = alpha/2 * gate * (tanh(a)*x + RMS(x)*tanh(b))`。
+
+   `RMS(x)` 按每个样本的 C/H/W 计算并 detach。空间分支保留原有局部门控，
+   再对原始校正 `r` 做平滑限幅：
+   `delta_s = r * alpha*RMS(x)/(alpha*RMS(x)+RMS(r))`，幅度控制项 detach。
+   在 float32 校正计算中，每个分支逐样本 `RMS(delta)/RMS(x) <= alpha`，
+   默认 `alpha=0.1`；两分支之和至多 0.2。零输入不会被独立偏移激活。
+   此上限是**每层相对当前输入**，不是整网输出、边界距离或 HD95 的保证，
+   AMP 输出转换/相加可能有舍入误差。空间软门控也不等于已学到病灶边界。
+   `--prototype_local_correction false` 恢复原空间注入和全图通道仿射注入。
+
+两个实验开关可以独立使用；前景收益错误在所有设置中均已修正：
+
+| 实验 | Q/K 开关 | 局部校正开关 |
+| --- | --- | --- |
+| 修正收益后的原设计 | `false` | `false` |
+| 仅通道检索改动 | `true` | `false` |
+| 仅局部幅度控制 | `false` | `true` |
+| 本次组合版本（新训练默认） | `true` | `true` |
+
+`prototype_banks.csv` 新增通道门控均值、投影后归一化前 Q/K 范数、
+注意力 logit 的最小值/最大值/平均跨度、两分支总校正 RMS 比及实际开关。
+这些读库指标仍只在每 100 批和最后一批采样，不改变损失或检索。
+恢复旧 CSV 时只扩展字段，历史未测指标留空。
+
+**新版本用新的实验名从头训练，不把旧实验的优化器/原型库接到新结构上。**
+旧 checkpoint 的评估按缺失参数 `Q/K=false、local=false` 重建旧结构并严格加载。
+旧模式恢复训练须显式传入这两个 `false`；新收集的候选使用修正后的前景判定，
+因此不是历史有缺陷代码的逐步完全复现。改变开关、温度或 alpha 的恢复会报错。
+旧权重和实验结果保留在原实验目录和历史 Git 提交中。
+
+在原先完整训练命令基础上，换实验名并显式追加：
+
+```bash
+--hash add-mixed-dualproto-k4-qknorm-local-a010-s2023 \
+--prototype_channel_qk_norm true \
+--prototype_channel_logit_scale 2.0 \
+--prototype_local_correction true \
+--prototype_correction_alpha 0.1
+```
+
+继续保持 `--prototype_decay 0.999`、K=4、容量=256、刷新=20、warmup=100、
+CT 辅助损失=0.1、50% 混合批次、ImageNet 归一化与官方 HD95。
+组合改动可以直接测试整体效果，但不能从一次结果归因到其中某一项。
+
+本次验证：完整测试 **90 项通过**。新增覆盖病灶邻近背景收益误计、真实前景
+窗口优先级、Q/K 范数缩放不变性、不同查询的可区分读库、旧 dot-product
+打分、逐样本相对强度上限、零输入与零头梯度、旧配置严格加载/恢复拒绝、
+新增 CSV 字段与旧 CSV 扩展。诊断开启/关闭输出与梯度相等、Full 旁路、
+Missing PET 隔离、CPU bfloat16、连续/中断恢复等既有检查继续通过。
+另与原提交 `add8a76` 的校正实现直接比较：两个开关关闭时，三种分支组合
+的输出、输入梯度与参数梯度均逐元素一致（候选筛选错误修正不在此对比内）。
+真实编码器的 64×64 CPU 合成输入完成前向/反向/更新，512×512 完成启用
+非零新校正的前向与 PET 隔离；尚未进行真实数据 GPU 训练及性能验证。
+
 ## 代码位置
 
 | 文件 | 职责 |
@@ -72,7 +146,7 @@ CT 对照只对 Full 子集额外解码，不增加 CT 编码次数。这个额�
 
 ```bash
 python run_decoder_prototype_add.py \
-  --hash add-mixed-dualproto-k4-diag-s2023 \
+  --hash add-mixed-dualproto-k4-qknorm-local-a010-s2023 \
   --root /root/autodl-tmp/data/PCLT20K \
   --train_split_file train_original.txt \
   --val_split_file test.txt --test_split_file test.txt \
@@ -81,6 +155,9 @@ python run_decoder_prototype_add.py \
   --ct_pretrained_path /root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano \
   --pet_pretrained_path /root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1 \
   --prototype_clusters 4 --prototype_outlier_filter false --log_interval 100 \
+  --prototype_channel_qk_norm true --prototype_channel_logit_scale 2.0 \
+  --prototype_local_correction true --prototype_correction_alpha 0.1 \
+  --learning_rate 8e-5 --mixed_precision true --ema_enabled false \
   --aug_mode cipa --norm_mode imagenet --hd95_mode cipa_official --random_state 2023
 ```
 
@@ -98,14 +175,14 @@ Dice/IoU 沿用基线的 sigmoid 0.5 阈值和全数据像素计数；HD95 的�
 同样参数、同一 `--hash` 下，额外加入以下参数恢复：
 
 ```bash
---resume checkpoints_new/MDT/add-mixed-dualproto-k4-diag-s2023/ckpt.last.pth.tar
+--resume checkpoints_new/MDT/add-mixed-dualproto-k4-qknorm-local-a010-s2023/ckpt.last.pth.tar
 ```
 
 单独评估：
 
 ```bash
 python eval_decoder_prototype_add.py \
-  --checkpoint checkpoints_new/MDT/add-mixed-dualproto-k4-diag-s2023/ckpt.best_joint.pth.tar
+  --checkpoint checkpoints_new/MDT/add-mixed-dualproto-k4-qknorm-local-a010-s2023/ckpt.best_joint.pth.tar
 ```
 
 训练时检查 `prototype_log.jsonl` 的逐尺度有效标记、候选数和更新次数，
@@ -158,17 +235,19 @@ python eval_decoder_prototype_add.py \
 
 所有诊断都 detach，不进入损失、检索或候选筛选；不保存患者标识或特征张量，
 也不增加模型前向。池与中心的距离仅在快照时于 CPU 计算，复杂度为 N×K×D，
-不会构造 N×N 的样本矩阵；校正强度计算也避免额外构造完整通道残差特征图。
+不会构造 N×N 的样本矩阵。旧仿射路径的校正强度计算避免额外构造完整残差图；
+新局部门控路径直接对实际校正图计算强度。
 
-新 checkpoint 单独保存刷新诊断元数据，没有改变模型 tensor state_dict。
-旧 checkpoint 可以严格加载，缺失的尝试/失败/最近刷新元数据从恢复后重新累计，
+日志版本 `add8a76` 单独保存刷新诊断元数据，没有改变模型 tensor state_dict。
+本次局部门控模式新增 `channel_gate` 参数；旧 checkpoint 按旧模式严格加载。
+缺失的尝试/失败/最近刷新元数据从恢复后重新累计，
 历史 accepted/update tensor 计数仍保留；无法从 checkpoint 重建之前缺失的 CSV。
 恢复时清理 checkpoint 之后未完成轮次的诊断行，防止重复计算中断的半轮。
 已有进程不会热加载更改，需下次启动/恢复后生效。
 
 ## 已完成的验证与边界
 
-本次完整测试：80 项通过。新增覆盖手工收益/簇分布计数、EMA 实际移动量、
+日志版本 `add8a76` 完整测试：80 项通过。覆盖手工收益/簇分布计数、EMA 实际移动量、
 诊断只读与不消耗随机数、注意力统计开启前后的输出/梯度逐元素一致、
 不同日志频率下的连续/断点恢复一致、warmup/溢出跳过的写入统计、
 旧检查点兼容、CSV 快照与中断半轮清理、默认每 100 批的打印行为。

@@ -218,13 +218,23 @@ channel centers [K,d*d]. Both final heads start at exactly zero.
                  decay: float = .999, refresh_steps: int = 20,
                  spatial: bool = True, channel: bool = True,
                  patch_size: int = 5, max_patches: int = 16, seed: int = 2023,
-                 outlier_filter: bool = False):
+                 outlier_filter: bool = False, channel_qk_norm: bool = True,
+                 channel_logit_scale: float = 2., local_correction: bool = True,
+                 correction_alpha: float = .1):
         super().__init__()
         if not spatial and not channel:
             raise ValueError('at least one prototype branch must be enabled')
         if channels < 1 or dim < 1 or refresh_steps < 1 or patch_size < 1 or max_patches < 1:
             raise ValueError('invalid prototype dimensions or collection cadence')
         self.channels, self.dim = int(channels), min(int(dim), int(channels))
+        if not math.isfinite(channel_logit_scale) or channel_logit_scale <= 0:
+            raise ValueError('channel_logit_scale must be finite and positive')
+        if not math.isfinite(correction_alpha) or not 0 < correction_alpha <= 1:
+            raise ValueError('correction_alpha must be in (0,1]')
+        self.channel_qk_norm = bool(channel_qk_norm)
+        self.channel_logit_scale = float(channel_logit_scale)
+        self.local_correction = bool(local_correction)
+        self.correction_alpha = float(correction_alpha)
         self.spatial_enabled, self.channel_enabled = bool(spatial), bool(channel)
         self.refresh_steps, self.patch_size, self.max_patches = int(refresh_steps), int(patch_size), int(max_patches)
         gen = torch.Generator().manual_seed(int(seed))
@@ -247,6 +257,10 @@ channel centers [K,d*d]. Both final heads start at exactly zero.
         self.channel_k = nn.Linear(d*d, d, bias=False)
         self.channel_v = nn.Linear(d*d, d, bias=False)
         self.channel_out = nn.Linear(d, 2 * channels)
+        # Only the new mode adds parameters; legacy checkpoints load strictly
+        # with local_correction=False. The head still depends on memory alone.
+        if self.local_correction:
+            self.channel_gate = nn.Conv2d(channels + d, 1, 3, padding=1)
         nn.init.zeros_(self.spatial_out.weight)
         nn.init.zeros_(self.channel_out.weight)
         nn.init.zeros_(self.channel_out.bias)
@@ -292,9 +306,19 @@ channel centers [K,d*d]. Both final heads start at exactly zero.
                 wm = F.avg_pool2d(w, p, stride=p, ceil_mode=True, count_include_pad=False)
                 pooled = F.avg_pool2d(local * w, p, stride=p, ceil_mode=True,
                                       count_include_pad=False) / wm.clamp_min(1e-8)
-                fg = (F.interpolate(foreground.float(), size=full.shape[-2:], mode='area')
-                      if foreground is not None else torch.ones_like(w))
-                foreground_mass = F.avg_pool2d(fg * w, p, stride=p, ceil_mode=True,
+                # Multiply at the original gain-map resolution FIRST. Separate
+                # downsampling can turn adjacent background gain into FG gain.
+                if foreground is not None:
+                    fg = foreground.detach().float()
+                    if fg.ndim == 3:
+                        fg = fg[:, None]
+                    if fg.shape != weight.shape:
+                        raise ValueError('foreground must match the original gain-map shape')
+                    fg_gain = F.interpolate(fg.ge(.5).float() * weight.detach().float(),
+                                            size=full.shape[-2:], mode='area')
+                else:
+                    fg_gain = w
+                foreground_mass = F.avg_pool2d(fg_gain, p, stride=p, ceil_mode=True,
                                               count_include_pad=False)
                 for b in range(full.shape[0]):
                     score = wm[b, 0].flatten()
@@ -316,6 +340,37 @@ channel centers [K,d*d]. Both final heads start at exactly zero.
                 stats.update(spatial_generated=s.shape[0], channel_generated=relations.shape[0],
                              spatial_fg_patches=fg_count, spatial_bg_patches=bg_count)
             return s.detach(), relations.detach()
+
+    def _channel_attention(self, q: Tensor, k: Tensor) -> tuple[Tensor, Tensor]:
+        if self.channel_qk_norm:
+            # Normalize AFTER learned projections; fixed scale cannot grow
+            # with Q/K norms. No additional sqrt(d) division in cosine mode.
+            logits = self.channel_logit_scale * (F.normalize(q, dim=-1, eps=1e-8)
+                                                @ F.normalize(k, dim=-1, eps=1e-8).T)
+        else:
+            logits = q @ k.T / math.sqrt(self.dim)
+        return logits.softmax(-1), logits
+
+    @staticmethod
+    def _rms(x: Tensor) -> Tensor:
+        return x.float().square().mean((1, 2, 3), keepdim=True).sqrt()
+
+    def _limit_spatial(self, residual: Tensor, x: Tensor) -> Tensor:
+        # Smooth per-image bound, preserving initial head gradient. Detach the
+        # magnitude controller so the head cannot exploit its denominator.
+        budget = self.correction_alpha * self._rms(x).detach()
+        magnitude = self._rms(residual).detach()
+        factor = budget / (budget + magnitude).clamp_min(1e-12)
+        return residual * factor
+
+    @staticmethod
+    @torch.no_grad()
+    def _attention_diagnostics(q: Tensor, k: Tensor, logits: Tensor) -> dict:
+        return dict(q_norm_mean=q.detach().norm(dim=-1).mean(),
+                    k_norm_mean=k.detach().norm(dim=-1).mean(),
+                    logit_min=logits.detach().min(), logit_max=logits.detach().max(),
+                    logit_span_mean=(logits.detach().max(-1).values
+                                     - logits.detach().min(-1).values).mean())
 
     @staticmethod
     @torch.no_grad()
@@ -361,6 +416,8 @@ channel centers [K,d*d]. Both final heads start at exactly zero.
                 read = (attn @ v).transpose(1, 2).reshape(x.shape[0], self.dim, *x.shape[-2:])
                 gate = self.spatial_gate(torch.cat([x.float(), read], 1)).sigmoid()
                 spatial_residual = gate * self.spatial_out(read)
+                if self.local_correction:
+                    spatial_residual = self._limit_spatial(spatial_residual, x)
                 residual = residual + spatial_residual
                 if diagnostics is not None:
                     diagnostics['spatial'].update(self._read_diagnostics(attn, spatial_residual, x))
@@ -370,18 +427,36 @@ channel centers [K,d*d]. Both final heads start at exactly zero.
                 q = self.channel_q(self.channel_norm_q(stat))
                 memory = self.channel_norm_k(self.channel_bank.centers.detach())
                 k, v = self.channel_k(memory), self.channel_v(memory)
-                attn = (q @ k.T / math.sqrt(self.dim)).softmax(-1)
+                attn, logits = self._channel_attention(q, k)
                 read = attn @ v
                 # The correction head receives retrieved knowledge only;
                 # no CT-only adapter shortcut can bypass the memory read.
                 a, b = self.channel_out(read).chunk(2, 1)
-                # Bounded additive affine residual; not a new PET feature.
-                scale_residual = .25 * a.tanh()[:, :, None, None] * x.float()
-                shift_residual = .25 * b.tanh()[:, :, None, None]
-                residual = residual + scale_residual
-                residual = residual + shift_residual
+                if self.local_correction:
+                    context = read[:, :, None, None].expand(-1, -1, *x.shape[-2:])
+                    gate = self.channel_gate(torch.cat([x.float(), context], 1)).sigmoid()
+                    # Triangle inequality gives per-image RMS(delta)/RMS(x)
+                    # <= alpha; neither a global absolute shift nor hard mask.
+                    amplitude = self._rms(x).detach()
+                    channel_residual = (.5 * self.correction_alpha * gate *
+                                        (a.tanh()[:, :, None, None] * x.float()
+                                         + amplitude * b.tanh()[:, :, None, None]))
+                    residual = residual + channel_residual
+                else:
+                    # Exact previous affine design for controlled comparisons.
+                    scale_residual = .25 * a.tanh()[:, :, None, None] * x.float()
+                    shift_residual = .25 * b.tanh()[:, :, None, None]
+                    residual = residual + scale_residual + shift_residual
                 if diagnostics is not None:
-                    diagnostics['channel'].update(self._read_diagnostics(attn, scale_residual, x, shift_residual))
+                    if self.local_correction:
+                        diagnostics['channel'].update(self._read_diagnostics(attn, channel_residual, x))
+                        diagnostics['channel']['gate_mean'] = gate.detach().mean()
+                    else:
+                        diagnostics['channel'].update(self._read_diagnostics(attn, scale_residual, x, shift_residual))
+                    diagnostics['channel'].update(self._attention_diagnostics(q, k, logits))
+            if diagnostics is not None:
+                diagnostics['total_correction_rms_ratio'] = (residual.detach().norm()
+                                                            / x.detach().float().norm().clamp_min(1e-8))
             result = x + residual.to(x.dtype)
             if not torch.isfinite(result).all():
                 raise RuntimeError('nonfinite decoder prototype correction')
@@ -393,14 +468,18 @@ class DecoderDualPrototype(nn.Module):
 
     def __init__(self, channels: Sequence[int], dim=32, clusters=6, capacity=256,
                  min_candidates=24, decay=.999, refresh_steps=20, warmup_steps=100,
-                 spatial=True, channel=True, outlier_filter=False):
+                 spatial=True, channel=True, outlier_filter=False,
+                 channel_qk_norm=True, channel_logit_scale=2., local_correction=True,
+                 correction_alpha=.1):
         super().__init__()
         if len(channels) != 4 or warmup_steps < 0:
             raise ValueError('require four decoder levels and nonnegative warmup')
         self.warmup_steps = int(warmup_steps)
         self.scales = nn.ModuleList(DecoderPrototypeScale(
             c, dim, clusters, capacity, min_candidates, decay, refresh_steps,
-            spatial, channel, seed=2023 + i, outlier_filter=outlier_filter)
+            spatial, channel, seed=2023 + i, outlier_filter=outlier_filter,
+            channel_qk_norm=channel_qk_norm, channel_logit_scale=channel_logit_scale,
+            local_correction=local_correction, correction_alpha=correction_alpha)
             for i, c in enumerate(channels))
         self.register_buffer('update_steps', torch.zeros((), dtype=torch.long))
 
