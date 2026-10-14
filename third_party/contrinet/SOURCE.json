@@ -1,0 +1,23 @@
+{
+  "repository": "https://github.com/CSer-Tang-hao/ConTriNet_RGBT-SOD",
+  "commit": "9af315d4a93d897cf0b9abb11e194d1ed1072ff9",
+  "path": "models/ConTriNet.py",
+  "license": "MIT",
+  "archived_sha256": "8bae888de081c8560de84565797ab816a602c2c06f369884c2389132b5b40478",
+  "classes": {
+    "MFM_0": {
+      "lines": [
+        94,
+        165
+      ],
+      "sha256": "3f4444133b703ec43bde3dd22fc08fd1aad2aa1339267c5a19c087dd94867d8d"
+    },
+    "MFM": {
+      "lines": [
+        168,
+        256
+      ],
+      "sha256": "b1e3b893225e886fa2bccc1e860498fca7f732e9493a9361e4132ab7fa0b4baa"
+    }
+  }
+}

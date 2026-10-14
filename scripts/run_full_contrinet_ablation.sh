@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Match the existing CAINet comparison protocol; only fusion flags differ.
+set -euo pipefail
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+arm="${1:-cross}"
+if [[ $# -gt 0 ]]; then shift; fi
+case "$arm" in
+  add)     enabled=false; cross=false; mode=residual ;;
+  local)   enabled=true;  cross=false; mode=residual ;;
+  cross)   enabled=true;  cross=true;  mode=residual ;;
+  replace) enabled=true;  cross=true;  mode=replace ;;
+  *) echo 'Usage: bash scripts/run_full_contrinet_ablation.sh add|local|cross|replace [shared overrides]' >&2; exit 2 ;;
+esac
+python run_full_contrinet_fusion.py \
+  --hash "full-contrinet-${arm}-imagenet-ema-s2023" \
+  --mfm_enabled "$enabled" --mfm_cross_scale "$cross" --mfm_output_mode "$mode" \
+  --root /root/autodl-tmp/data/PCLT20K \
+  --train_split_file train_original.txt \
+  --val_split_file test.txt --test_split_file test.txt \
+  --allow_val_equals_test true \
+  --image_size_2d 512 --batch_size 16 --num_workers 4 --pin_memory true \
+  --aug_mode cipa --norm_mode imagenet --hd95_mode cipa_official \
+  --ct_backbone convnextv2_nano --pet_backbone mit_b1 \
+  --ct_pretrained_path /root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano \
+  --pet_pretrained_path /root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1 \
+  --pretrained true --epochs 60 --learning_rate 8e-5 --weight_decay 1e-4 \
+  --cosine_warmup 3 --cosine_min_lr 1e-6 --lr_flat_ratio 0.3 \
+  --mixed_precision true --ema_enabled true --ema_decay 0.999 \
+  --ema_start_epoch 3 --ema_decay_warmup true \
+  --grad_clip 5 --early_stop_patience 10 --random_state 2023 "$@"

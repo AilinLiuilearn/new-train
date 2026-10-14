@@ -135,3 +135,8 @@ decoder. No fusion/prototype/retrieval/text code is wired in this round.
 - Deleted unused: `models/petct_text_region_fusion.py`,
   `tests/test_dcim_wiring.py`, `tools/smoke_dcim_full.py`.
 - `tests/`: updated to the new API + added the §八 contract checks.
+
+
+## ConTriNet MFM Full-only experiment
+
+本分支新增官方 ConTriNet MFM 四尺度融合实验；来源、源码一致性验证、跨尺度接口与运行命令见 [README_CONTRINET.md](README_CONTRINET.md)。默认运行：`bash scripts/run_full_contrinet_ablation.sh cross`。
