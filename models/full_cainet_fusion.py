@@ -9,10 +9,11 @@ UPSTREAM_COMMIT = '4fff413041f1776ce1e588eb4763fe46fca2677a'
 
 
 class FullCAINetPETCT(DualSharedAddPETCTBaseline):
-    def __init__(self, cacr_enabled=True, gcm_enabled=True, **kwargs):
+    def __init__(self, cacr_enabled=True, gcm_enabled=True,
+                 cacr_stages=(1, 2, 3, 4), **kwargs):
         # All shared weights receive the exact baseline initialization first.
         super().__init__(**kwargs)
-        self.fusion = CAINetFusion(cacr_enabled, gcm_enabled)
+        self.fusion = CAINetFusion(cacr_enabled, gcm_enabled, cacr_stages)
 
     def forward(self, ct, pet=None, pet_available=None, target_size=None,
                 forward_mode='full'):
@@ -34,6 +35,7 @@ def build_full_cainet_model(cfg):
         raise ValueError('Explicit saved cacr_enabled/gcm_enabled flags are required')
     model = FullCAINetPETCT(
         cacr_enabled=cfg.cacr_enabled, gcm_enabled=cfg.gcm_enabled,
+        cacr_stages=getattr(cfg, 'cacr_stages', (1, 2, 3, 4)),
         ct_backbone=getattr(cfg, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=getattr(cfg, 'pet_backbone', 'mit_b1'),
         ct_pretrained_path=getattr(cfg, 'ct_pretrained_path', None),
@@ -43,7 +45,8 @@ def build_full_cainet_model(cfg):
         use_deep_supervision=bool(getattr(cfg, 'use_deep_supervision', False)
                                   or getattr(cfg, 'deep_supervision', False)),
         pretrained=bool(getattr(cfg, 'pretrained', True)))
-    print(f'[full_cainet] CACR={cfg.cacr_enabled} GCM={cfg.gcm_enabled} '
+    print(f'[full_cainet] CACR={cfg.cacr_enabled} stages={model.fusion.cacr_stages} '
+          f'GCM={cfg.gcm_enabled} '
           f'params_fusion={sum(p.numel() for p in model.fusion.parameters())} '
           f'params_total={sum(p.numel() for p in model.parameters())}', flush=True)
     return {'model': model}

@@ -32,12 +32,12 @@ CT ConvNeXtV2-Nano、PET MiT-B1 独立编码 → 原有各自 Conv1×1+BN+ReLU
 
 | 尺度 | 每模态通道 | 512 输入对应尺寸 | CACR 开启时 |
 |---|---:|---:|---|
-| S1 | 64 | 128×128 | 仍用 CT+PET |
+| S1 | 64 | 128×128 | Interv2(128) |
 | S2 | 128 | 64×64 | Interv2(256) |
 | S3 | 320 | 32×32 | Interv2(640) |
 | S4 | 512 | 16×16 | Interv2(1024) |
 
-高层融合逻辑：
+四个尺度均使用同样的融合逻辑：
 
 ```python
 joint = cat([ct_s, pet_s], dim=1)
@@ -71,13 +71,20 @@ CACR 的初始化完全保留作者默认行为，开启 CACR 的初始输出并
 | 脚本参数 | `--cacr_enabled` | `--gcm_enabled` | 融合新增参数 | 总参数 |
 |---|---|---|---:|---:|
 | add | false | false | 0 | 32,442,641 |
-| cacr | true | false | 2,380,800 | 34,823,441 |
+| cacr | true | false | 2,406,400 | 34,849,041 |
 | gcm | false | true | 835,584 | 33,278,225 |
-| both | true | true | 3,216,384 | 35,659,025 |
+| both | true | true | 3,241,984 | 35,684,625 |
 
 GCM 参数量包含外部投影。两个开关均关闭时直接调用原 `AddFusion`；相同种子下，
 整个模型的公共权重、state_dict 键和预测与原 baseline 严格一致。
 所有配置先完成原 baseline 初始化，再实例化融合模块。
+
+当前版本默认 CACR 覆盖 S1–S4；S1 的独立 `Interv2(128)` 新增 25,600 参数。
+这把作者主要用于高层的关系模块扩展到当前任务的浅层，类体保持原样，但扩展效果
+需要消融实验验证。GCM 的输入范围仍为 S2–S4，不把浅层细节强行并入全局上下文。
+新训练记录 `cacr_stages=[1,2,3,4]`，脚本 hash 加入 `s1s4`，区分此前三尺度版本。
+独立评估根据检查点保存的 `cacr_stages` 恢复；旧 `[2,3,4]` 检查点仍按原三尺度
+结构严格加载，不会被静默转换成四尺度。新四尺度实验应重新训练，不能直接当作旧模型续跑。
 
 训练仍是 Full-only，所有样本必须有真实 CT 和 PET；Missing 路径会在编码前报错。
 复用原 `run_full_add_baseline.py` 的训练/验证/最终测试循环，仅增加可注入的
@@ -116,7 +123,7 @@ bash scripts/run_full_cainet_ablation.sh both \
   --val_split_file val_disjoint.txt --allow_val_equals_test false \
   --ct_pretrained_path /your/convnextv2_nano \
   --pet_pretrained_path /your/mit-b1 \
-  --hash full-cainet-both-disjoint-s2023
+  --hash full-cainet-s1s4-both-disjoint-s2023
 ```
 
 也可直接运行 `python run_full_cainet_fusion.py` 并传入上述数据、权重、训练参数，
@@ -135,11 +142,11 @@ bash scripts/run_full_cainet_ablation.sh both \
 
 ```bash
 python eval_full_cainet_fusion.py \
-  --checkpoint checkpoints_new/MDT/full-cainet-both-imagenet-ema-s2023/ckpt.best_full.pth.tar \
-  --output_dir eval-cainet-both-s2023
+  --checkpoint checkpoints_new/MDT/full-cainet-s1s4-both-imagenet-ema-s2023/ckpt.best_full.pth.tar \
+  --output_dir eval-cainet-s1s4-both-s2023
 ```
 
-评估从检查点读取两个开关并严格加载权重，不允许静默恢复成其他组合。
+评估从检查点读取两个开关及 CACR 尺度并严格加载权重，不允许静默恢复成其他组合。
 默认沿用训练归一化、划分、HD95 模式和检查点选优时的 raw/EMA 选择；不再需要编码器
 预训练文件。可显式覆盖 `--root`、`--batch_size`、`--num_workers`、`--hd95_mode`、
 `--use_ema`。输出目录不能已有同名评估结果。此入口不接受 Add 原入口或 Missing 检查点。
@@ -171,10 +178,12 @@ GCM 零初始化等价与第二步非零梯度、原始模块组合计算、与 
 真实编码器/优化器接入、检查点开关恢复、Full-only 约束，以及四组各自完整的
 合成训练→选优→保存→重建→测试流程。合成测试分数不代表真实数据集性能。
 
-本次本地验证：全套 **80 项通过**（27 项新增、53 项继承）；新增测试也在未设置
-上述加载兼容环境变量时单独通过。覆盖 CPU bfloat16 autocast 下的关系块 FP32
+本次本地验证：全套 **84 项通过**（31 项融合专项、53 项继承）。
+覆盖 S1 模块实际执行、非零梯度及优化器更新，旧三尺度检查点原布局恢复，
+以及 CPU bfloat16 autocast 下的关系块 FP32
 执行、激活后的 EMA 检查点选择及显式 raw 覆盖、PET 内容敏感性和目录覆盖保护。
-四组配置均完成 CPU / batch 1 / 512×512 的真实双编码器前后向，输出都是
+新增 S1 后，CACR-only 和 CACR+GCM 配置均完成 CPU / batch 1 / 512×512 的
+真实双编码器前后向，输出都是
 `[1,1,512,512]`，loss 与所有可训练参数梯度有限。GCM 内层的第一步零梯度符合上述初始化设计。
 
 GPU AMP/batch-16 显存和真实 PET–CT Dice 提升需要在训练机器上验证。

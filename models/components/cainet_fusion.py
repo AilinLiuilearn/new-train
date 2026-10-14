@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """Switchable source CACR/GCM for aligned Full CT-PET features.
 
-CACR: native Interv2(cat(CT,PET)) at S2/S3/S4, then split and sum.
+CACR: native Interv2(cat(CT,PET)) at S1/S2/S3/S4, then split and sum.
 GCM: native CRRM on spatially aligned S2/S3/S4 joint features; project its
 128-channel output and add ONLY to S4. The necessary outer projection is
-zero initialized. S1 always uses Add. Both off is exactly the Add baseline.
+zero initialized. Both off is exactly the Add baseline.
 """
 from typing import Sequence
 
@@ -17,16 +17,22 @@ from models.components.cainet_source import Interv2, CRRM
 
 
 class CAINetFusion(nn.Module):
-    def __init__(self, cacr_enabled=True, gcm_enabled=True):
+    def __init__(self, cacr_enabled=True, gcm_enabled=True,
+                 cacr_stages=(1, 2, 3, 4)):
         super().__init__()
         if not isinstance(cacr_enabled, bool) or not isinstance(gcm_enabled, bool):
             raise ValueError('CACR/GCM flags must be bool values')
         self.cacr_enabled = cacr_enabled
         self.gcm_enabled = gcm_enabled
+        # Legacy three-scale layout is only needed to restore saved v1 runs.
+        self.cacr_stages = tuple(cacr_stages)
+        if self.cacr_stages not in ((1, 2, 3, 4), (2, 3, 4)):
+            raise ValueError('CACR stages must be (1,2,3,4), or legacy (2,3,4)')
         self.channels = (64, 128, 320, 512)
         self.add = AddFusion()
         if cacr_enabled:
-            self.cacr = nn.ModuleList([Interv2(2*c) for c in self.channels[1:]])
+            self.cacr = nn.ModuleList([
+                Interv2(2*self.channels[s-1]) for s in self.cacr_stages])
         if gcm_enabled:
             self.gcm = CRRM(2 * sum(self.channels[1:]))
             # Interface adapter only: retain upstream CRRM's fixed 128 output.
@@ -63,22 +69,22 @@ class CAINetFusion(nn.Module):
                 raise ValueError('All CT/PET features must share a floating dtype')
             if not torch.isfinite(c).all() or not torch.isfinite(p).all():
                 raise RuntimeError(f'[NaN/Inf] CAINet input S{i+1}')
-        fused = [ct_feats[0] + pet_feats[0]]
+        fused = []
         joint = []
-        for i in range(1, 4):
+        for i in range(4):
             pair = torch.cat((ct_feats[i], pet_feats[i]), dim=1)
-            if self.cacr_enabled:
-                pair = self._relation(self.cacr[i-1], pair)
+            if self.cacr_enabled and i+1 in self.cacr_stages:
+                pair = self._relation(self.cacr[self.cacr_stages.index(i+1)], pair)
             joint.append(pair)
             c, p = pair.chunk(2, dim=1)
             fused.append(c + p)
         if self.gcm_enabled:
             # S3 grid: 32x32 for 512x512 images. No change to original streams.
-            size = joint[1].shape[-2:]
+            size = joint[2].shape[-2:]
             context = torch.cat([
                 x if x.shape[-2:] == size else F.interpolate(
                     x, size=size, mode='bilinear', align_corners=False)
-                for x in reversed(joint)  # upstream fuse5/fuse4/fuse3 order
+                for x in reversed(joint[1:])  # upstream fuse5/fuse4/fuse3 order
             ], dim=1)
             global_context = self._relation(self.gcm, context)
             delta = self.gcm_to_s4(global_context)

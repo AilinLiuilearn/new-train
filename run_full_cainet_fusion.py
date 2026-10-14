@@ -16,7 +16,7 @@ class FullCAINetConfig(FullAddConfig):
                 action.default = 'full_cainet_fusion'
                 action.choices = ('full_cainet_fusion',)
         parser.add_argument('--cacr_enabled', type=str2bool, default=True,
-                            help='Author Interv2 on S2/S3/S4; S1 remains Add')
+                            help='Author Interv2 on all four stages S1/S2/S3/S4')
         parser.add_argument('--gcm_enabled', type=str2bool, default=True,
                             help='Author CRRM across S2/S3/S4, residual guidance at S4')
         return parser
@@ -26,7 +26,7 @@ class FullCAINetConfig(FullAddConfig):
         cfg = super().parse_arguments()
         cfg.baseline_commit = BASELINE_COMMIT
         cfg.cainet_upstream_commit = UPSTREAM_COMMIT
-        cfg.cacr_stages = [2, 3, 4]
+        cfg.cacr_stages = [1, 2, 3, 4]
         cfg.gcm_grid_stage = 3
         cfg.gcm_concat_order = [4, 3, 2]
         cfg.gcm_injection_stage = 4

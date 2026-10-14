@@ -1,6 +1,6 @@
 # Clean segmentation baselines
 
-This experiment branch adds independently switchable source CACR and GCM
+This experiment branch adds independently switchable source CACR (S1–S4) and GCM
 for Full CT+PET. See [CAINET_FUSION.md](CAINET_FUSION.md) for source provenance,
 the necessary interface adaptation, four-arm training and checkpoint evaluation.
 Start with `bash scripts/run_full_cainet_ablation.sh both`.

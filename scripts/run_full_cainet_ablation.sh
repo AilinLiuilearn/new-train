@@ -14,7 +14,7 @@ case "$arm" in
   *) echo 'Usage: bash scripts/run_full_cainet_ablation.sh add|cacr|gcm|both [shared overrides]' >&2; exit 2 ;;
 esac
 python run_full_cainet_fusion.py \
-  --hash "full-cainet-${arm}-imagenet-ema-s2023" \
+  --hash "full-cainet-s1s4-${arm}-imagenet-ema-s2023" \
   --cacr_enabled "$cacr" --gcm_enabled "$gcm" \
   --root /root/autodl-tmp/data/PCLT20K \
   --train_split_file train_original.txt \

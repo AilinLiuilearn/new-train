@@ -76,6 +76,7 @@ def main():
     metrics = task.evaluate(test_loader, eval_mode='full', tag='test_full', model=model)
     result = dict(metrics, weights=tag, experiment_type='full_cainet_fusion',
                   cacr_enabled=cfg.cacr_enabled, gcm_enabled=cfg.gcm_enabled,
+                  cacr_stages=list(model.fusion.cacr_stages),
                   checkpoint=os.path.abspath(args.checkpoint),
                   best_epoch=ckpt.get('best_epoch'),
                   hd95_mode=cfg.hd95_mode, hd95_unit='pixel', norm_mode=cfg.norm_mode)

@@ -56,13 +56,14 @@ def test_all_switches_forward_backward_and_disabled_modules_absent(cacr, gcm):
     fusion = CAINetFusion(cacr, gcm)
     assert hasattr(fusion, 'cacr') == cacr
     assert hasattr(fusion, 'gcm') == gcm
-    expected = (2380800 if cacr else 0) + (835584 if gcm else 0)
+    expected = (2406400 if cacr else 0) + (835584 if gcm else 0)
     assert sum(p.numel() for p in fusion.parameters()) == expected
     ct, pet = features(), features()
     old = [x.detach().clone() for x in ct + pet]
     out = fusion(ct, pet)
     assert [x.shape for x in out] == [x.shape for x in ct]
-    torch.testing.assert_close(out[0], ct[0] + pet[0], rtol=0, atol=0)
+    if not cacr:
+        torch.testing.assert_close(out[0], ct[0] + pet[0], rtol=0, atol=0)
     sum(x.square().mean() for x in out).backward()
     for x, saved in zip(ct + pet, old):
         assert torch.equal(x.detach(), saved)
@@ -89,11 +90,11 @@ def test_native_cacr_and_gcm_composition_after_projection_is_active():
     ct, pet = features(), features()
     with torch.no_grad():
         out = fusion(ct, pet)
-        joint = [fusion.cacr[i-1](torch.cat((ct[i], pet[i]), 1)) for i in range(1, 4)]
-        expected = [ct[0] + pet[0]] + [sum(x.chunk(2, 1)) for x in joint]
-        grid = joint[1].shape[-2:]
+        joint = [fusion.cacr[i](torch.cat((ct[i], pet[i]), 1)) for i in range(4)]
+        expected = [sum(x.chunk(2, 1)) for x in joint]
+        grid = joint[2].shape[-2:]
         context = torch.cat([torch.nn.functional.interpolate(
-            x, size=grid, mode='bilinear', align_corners=False) for x in reversed(joint)], 1)
+            x, size=grid, mode='bilinear', align_corners=False) for x in reversed(joint[1:])], 1)
         delta = torch.nn.functional.interpolate(fusion.gcm_to_s4(fusion.gcm(context)),
             size=expected[3].shape[-2:], mode='bilinear', align_corners=False)
         expected[3] = expected[3] + delta
@@ -156,6 +157,8 @@ def test_real_model_optimizer_loss_and_saved_switches(monkeypatch, tmp_path, cac
     task.save_checkpoint(str(path), 1, 0.5, 1, {'dice': 0.5})
     fresh, saved, _, tag = load_full_checkpoint(str(path))
     assert saved.cacr_enabled == cacr and saved.gcm_enabled == gcm
+    assert saved.cacr_stages == [1, 2, 3, 4]
+    assert fresh.fusion.cacr_stages == (1, 2, 3, 4)
     assert tag == 'raw'
     for k, v in task.model.state_dict().items():
         assert torch.equal(v, fresh.state_dict()[k]), k
@@ -183,6 +186,7 @@ def test_training_final_rebuild_preserves_each_combination(monkeypatch, tmp_path
     main()
     result = json.loads((Path(cfg.checkpoint_dir) / 'final_test_full.json').read_text())
     assert result['cacr_enabled'] == cacr and result['gcm_enabled'] == gcm
+    assert result['cacr_stages'] == [1, 2, 3, 4]
     assert result['weights'] == 'raw'
     assert result['model_arch'] == 'full_cainet_fusion'
     assert result['experiment_type'] == 'full_cainet_fusion'
@@ -216,7 +220,7 @@ def test_relation_blocks_use_float32_under_autocast():
         out = fusion(ct, pet)
         loss = sum(x.float().square().mean() for x in out)
     loss.backward()
-    assert observed == [torch.float32] * 4
+    assert observed == [torch.float32] * 5
     assert all(x.dtype == torch.bfloat16 for x in out)
     assert all(p.grad is not None and torch.isfinite(p.grad).all()
                for p in fusion.parameters())
@@ -262,3 +266,47 @@ def test_existing_run_cannot_be_overwritten(monkeypatch, tmp_path):
     with pytest.raises(FileExistsError, match='fresh --hash'):
         FullCAINetConfig.parse_arguments()
     assert path.read_text() == '{"existing": true}'
+
+
+@pytest.mark.parametrize('gcm', [False, True])
+def test_s1_cacr_is_executed_and_learns_from_s1_loss(gcm):
+    torch.manual_seed(7)
+    fusion = CAINetFusion(True, gcm)
+    assert len(fusion.cacr) == 4
+    assert fusion.cacr[0].theta.in_channels == 128
+    captured = []
+    fusion.cacr[0].register_forward_pre_hook(
+        lambda module, args: captured.append(tuple(args[0].shape)))
+    opt = torch.optim.SGD(fusion.parameters(), lr=0.01)
+    ct, pet = features(), features()
+    out = fusion(ct, pet)
+    assert captured == [(2, 128, 16, 16)]
+    assert (out[0] - ct[0] - pet[0]).abs().max() > 1e-6
+    before = [p.detach().clone() for p in fusion.cacr[0].parameters()]
+    out[0].square().mean().backward()
+    grads = [p.grad for p in fusion.cacr[0].parameters()]
+    assert all(g is not None and torch.isfinite(g).all() for g in grads)
+    assert sum(float(g.abs().sum()) for g in grads) > 0
+    opt.step()
+    assert any(not torch.equal(old, p) for old, p in zip(before, fusion.cacr[0].parameters()))
+
+
+@pytest.mark.parametrize('gcm', [False, True])
+def test_legacy_three_scale_checkpoint_restores_saved_layout(monkeypatch, tmp_path, gcm):
+    cfg = config(monkeypatch, tmp_path, True, gcm)
+    cfg.cacr_stages = [2, 3, 4]
+    task = MDTSegTeacher(build_full_cainet_model(cfg), cfg)
+    task.model.eval()
+    assert len(task.model.fusion.cacr) == 3
+    assert task.model.fusion.cacr[0].theta.in_channels == 256
+    path = tmp_path / 'legacy.pth.tar'
+    task.save_checkpoint(str(path), 1, 0.5, 1, {'dice': 0.5})
+    restored, saved, _, _ = load_full_checkpoint(str(path))
+    assert saved.cacr_stages == [2, 3, 4]
+    assert restored.fusion.cacr_stages == (2, 3, 4)
+    assert len(restored.fusion.cacr) == 3
+    data = batch()
+    with torch.no_grad():
+        a = task.model(data['ct'], pet=data['pet'])['logits']
+        b = restored(data['ct'], pet=data['pet'])['logits']
+    torch.testing.assert_close(a, b, rtol=0, atol=0)

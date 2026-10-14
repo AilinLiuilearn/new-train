@@ -281,7 +281,7 @@ def main(config_cls=FullAddConfig, model_builder=build_dual_model,
         'best_epoch': ckpt['best_epoch'],
         'checkpoint': os.path.abspath(paths['best_full']),
     }
-    for flag in ('cacr_enabled', 'gcm_enabled'):
+    for flag in ('cacr_enabled', 'gcm_enabled', 'cacr_stages'):
         if hasattr(cfg, flag):
             result[flag] = getattr(cfg, flag)
     with open(os.path.join(cfg.checkpoint_dir, 'final_test_full.json'), 'w') as f:
