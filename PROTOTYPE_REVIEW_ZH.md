@@ -68,19 +68,19 @@ CT 对照只对 Full 子集额外解码，不增加 CT 编码次数。这个额�
 
 ## 运行
 
-沿用原基线环境和预训练权重。`val_disjoint.txt` 请替换为实际的独立验证集划分。
+沿用原基线环境和预训练权重。下面使用已确认的验证/测试共用 `test.txt` 设置。
 
 ```bash
 python run_decoder_prototype_add.py \
-  --hash add-mixed-dualproto-s2023 \
+  --hash add-mixed-dualproto-k4-diag-s2023 \
   --root /root/autodl-tmp/data/PCLT20K \
   --train_split_file train_original.txt \
-  --val_split_file val_disjoint.txt \
-  --test_split_file test.txt \
+  --val_split_file test.txt --test_split_file test.txt \
+  --allow_val_equals_test true \
   --image_size_2d 512 --batch_size 16 --epochs 60 \
   --ct_pretrained_path /root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano \
   --pet_pretrained_path /root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1 \
-  --prototype_outlier_filter false \
+  --prototype_clusters 4 --prototype_outlier_filter false --log_interval 100 \
   --aug_mode cipa --norm_mode imagenet --hd95_mode cipa_official --random_state 2023
 ```
 
@@ -98,25 +98,80 @@ Dice/IoU 沿用基线的 sigmoid 0.5 阈值和全数据像素计数；HD95 的�
 同样参数、同一 `--hash` 下，额外加入以下参数恢复：
 
 ```bash
---resume checkpoints_new/MDT/add-mixed-dualproto-s2023/ckpt.last.pth.tar
+--resume checkpoints_new/MDT/add-mixed-dualproto-k4-diag-s2023/ckpt.last.pth.tar
 ```
 
 单独评估：
 
 ```bash
 python eval_decoder_prototype_add.py \
-  --checkpoint checkpoints_new/MDT/add-mixed-dualproto-s2023/ckpt.best_joint.pth.tar
+  --checkpoint checkpoints_new/MDT/add-mixed-dualproto-k4-diag-s2023/ckpt.best_joint.pth.tar
 ```
 
 训练时检查 `prototype_log.jsonl` 的逐尺度有效标记、候选数和更新次数，
 确认两类库实际激活，而不是仅凭最终 Dice 判断原型已经生效。
 
-终端会打印数据加载阶段、epoch 开始、首批加载和首次前向完成，并默认每
-20 个 batch 输出损失、学习率、原型有效状态、耗时及 ETA；验证和 checkpoint
-保存也有阶段提示。可用 `--log_interval 10` 调整频率。CSV/原型 JSONL 仍按
-epoch 写入。已有训练进程不会自动加载新日志代码，下次启动/恢复后才生效。
+终端默认每 **100 个完成的 batch** 打印一次训练/验证进度，保留每轮开始、
+结束和 checkpoint 阶段提示，移除首批/首次前向调试提示。每 100 个训练 batch
+以及每轮训练结束写一次诊断，未满 100 批的一轮也会有记录。
+
+新增三个 CSV，原 `train_log.csv` 的表头保持兼容：
+
+| 文件 | 用途 | 关键字段 |
+| --- | --- | --- |
+| `prototype_gain.csv` | 判断是否筛出了足够有用区域，以及前景是否稀缺 | `useful_image_fraction`、`fg_selected_fraction`、`bg_selected_fraction`、`fg_mean_selected_gain`、Full/CT-reference 的 FN/FP 及比率、成功/跳过/warmup batch 数 |
+| `prototype_banks.csv` | 按 D4–D1、空间/通道各库观察建库与更新状态 | `status`、`pool_size`、`accepted_total`、`generated_epoch`、`written_epoch`、更新失败原因、`occupied_clusters`、`assignment_entropy_normalized`、`max_cluster_fraction`、中心间距、EMA 前后移动量、读库注意力熵及校正 RMS 比 |
+| `prototype_clusters.csv` | 观察每个原型槽的样本分布和使用情况 | `pool_count`、`pool_fraction`、`mean_member_distance`、`center_norm`、`last_success_count`、`read_attention_mean`、`read_top1_fraction` |
+
+读这些记录时需明确以下口径：
+
+1. 仍然是每尺度两个库、每库 K 个无监督聚类；没有新增病灶/背景子库。
+   空间候选里的 FG patch 指含有正前景收益质量的窗口，可能混有背景。
+2. `pool_size` 是当前 FIFO 占用，最多 256；`accepted_total` 是历史累计写入，
+   可以超过 256。`generated_epoch` 包括 warmup 和优化器跳过批次产生的候选；
+   `written_epoch` 仅统计成功更新且结束 warmup 后真正写入的候选。
+3. 每个快照的收益计数和 `_epoch` 计数都是**本轮累计**，不能把相邻行相加；
+   `event` 区分间隔快照与轮末快照，轮末刚好是第 100 批时会保留两种事件。
+   无前景等情况下的比率、建库前的簇分布会留空，避免把未定义误记为 0。
+4. `pool_count` 是当前缓冲区对当前 **EMA 中心**的最近中心分配；每库各簇
+   计数之和等于 `pool_size`。`last_success_count` 是最近一次成功 K-means
+   在 EMA/可选离群裁剪之前的分簇数，已匹配到同样的槽编号。两者可以不同。
+   归一化分布熵 1 表示均匀、0 表示全部落到一簇；中心编号不是病灶语义标签。
+5. `last_attempt_status` 是最近尝试的状态；`last_success_*` 和中心移动量
+   来自最近一次成功刷新。首次建库直接复制中心，EMA 移动量留空。之后对比
+   `last_raw_center_drift` 与 `last_applied_center_drift`，能看出 0.999 是否
+   使实际更新很慢。不同维度/尺度的距离不能直接当作同一量纲比较。
+6. 收益和 FN/FP 只比较 **Full 行**的 Full/CT-reference 输出，并不是验证集
+   指标，也不是主训练 Missing 半批的表现。原始增益均值不含前景/背景权重；
+   加权质量占比才含权重。可靠但低于阈值的像素计入 `below_gain`。
+7. 注意力统计只采样打印批次和最后一批的 **Missing 行**，在优化器更新前
+   读库；建库快照则在本批成功提交后计算。检查 `read_sample_global_step`
+   和 `read_available`：本批刚初始化的库，在本批前向时可能尚不可读。
+   `read_attention_mean` 是各中心平均注意力，`read_top1_fraction` 是成为
+   最大注意力中心的查询占比，两者分别在各簇上求和为 1。
+8. 校正 RMS / 输入 RMS 比可以观察模块是否输出了实际调整；零初始化时为 0。
+   注意力熵、门控大小或非零校正均不能单独证明调整有益，仍要结合 Missing
+   验证指标与消融对照。空间查询数按解码器位置计，通道查询数按 Missing 图像计。
+9. 前 100 个**成功优化器步**是既有 warmup，这时库为空、状态 `warmup` 正常；
+   第 101 步开始写入，满足候选数/唯一向量要求后建立库。优化器溢出跳过会
+   推迟成功步计数。`successful_steps` 是原型成功提交数，关闭模块时不增长。
+
+所有诊断都 detach，不进入损失、检索或候选筛选；不保存患者标识或特征张量，
+也不增加模型前向。池与中心的距离仅在快照时于 CPU 计算，复杂度为 N×K×D，
+不会构造 N×N 的样本矩阵；校正强度计算也避免额外构造完整通道残差特征图。
+
+新 checkpoint 单独保存刷新诊断元数据，没有改变模型 tensor state_dict。
+旧 checkpoint 可以严格加载，缺失的尝试/失败/最近刷新元数据从恢复后重新累计，
+历史 accepted/update tensor 计数仍保留；无法从 checkpoint 重建之前缺失的 CSV。
+恢复时清理 checkpoint 之后未完成轮次的诊断行，防止重复计算中断的半轮。
+已有进程不会热加载更改，需下次启动/恢复后生效。
 
 ## 已完成的验证与边界
+
+本次完整测试：80 项通过。新增覆盖手工收益/簇分布计数、EMA 实际移动量、
+诊断只读与不消耗随机数、注意力统计开启前后的输出/梯度逐元素一致、
+不同日志频率下的连续/断点恢复一致、warmup/溢出跳过的写入统计、
+旧检查点兼容、CSV 快照与中断半轮清理、默认每 100 批的打印行为。
 
 - 原型合同测试包含零初始化基线等价、Full 旁路、PET 隔离、行顺序、
   收益正确性、无收益拒绝、有符号矩阵、两分支梯度、CPU bfloat16、

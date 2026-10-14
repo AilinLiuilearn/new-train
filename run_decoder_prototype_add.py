@@ -21,6 +21,7 @@ from utils.optimization import get_cosine_scheduler
 from utils.run_common import (seed_everything, build_balanced_pet_available,
                               optimizer_step_succeeded, eval_missing_rates)
 from utils.train_logger import init_train_log, append_epoch_log, CSV_HEADER
+from utils.prototype_diagnostics import PrototypeCSVLogger
 
 
 class PrototypeConfig(SegMDTConfig):
@@ -45,8 +46,9 @@ class PrototypeConfig(SegMDTConfig):
         p.add_argument('--prototype_min_gain', type=float, default=.01)
         p.add_argument('--prototype_ct_aux_weight', type=float, default=.1)
         p.add_argument('--resume', type=str, default=None)
-        p.add_argument('--log_interval', type=int, default=20,
-                       help='Print training/validation progress every N batches, plus first/last.')
+        p.add_argument('--log_interval', type=int, default=100,
+                       help='Print progress and save prototype CSV snapshots every N batches; '
+                            'also save an epoch-end diagnostic snapshot.')
         return p
 
 
@@ -117,6 +119,7 @@ def main():
                 raise ValueError('resume log schema does not match this runner')
     else:
         init_train_log(log_path, extra_headers)
+    prototype_logger = PrototypeCSVLogger(cfg.checkpoint_dir, start_epoch=start_epoch)
 
     for epoch in range(start_epoch, cfg.epochs + 1):
         task.model.train()
@@ -126,19 +129,16 @@ def main():
         begin = time.time()
         print(f'[epoch {epoch}/{cfg.epochs}] train start; waiting for first batch...', flush=True)
         for batch in train_loader:
-            if batches == 0:
-                print(f'[epoch {epoch}] first batch loaded in {time.time() - begin:.1f}s; '
-                      'starting forward/backward...', flush=True)
             if batch['ct'].shape[0] != cfg.batch_size:
                 raise ValueError('expected fixed full-size batches with drop_last=True')
             state = build_balanced_pet_available(cfg.batch_size, task.global_batch_step,
                                                  cfg.random_state, task.device)
             task.optimizer.zero_grad(set_to_none=True)
+            task.capture_prototype_reads = ((batches + 1) % cfg.log_interval == 0
+                                            or batches + 1 == len(train_loader))
             with torch.autocast(device_type=task.device.type,
                                 enabled=bool(cfg.mixed_precision) and task.device.type == 'cuda'):
                 loss, _, _, stats = task.train_step_mixed(batch, state)
-            if batches == 0:
-                print(f'[epoch {epoch}] first forward complete; backward/optimizer start...', flush=True)
             if task.scaler.is_enabled():
                 task.scaler.scale(loss).backward()
                 task.scaler.unscale_(task.optimizer)
@@ -166,7 +166,7 @@ def main():
             batches += 1
             samples += cfg.batch_size // 2
             task.global_batch_step += 1
-            if batches == 1 or batches % cfg.log_interval == 0 or batches == len(train_loader):
+            if batches % cfg.log_interval == 0:
                 elapsed = time.time() - begin
                 remaining = elapsed / batches * (len(train_loader) - batches)
                 sv_now = sum(bool(s.spatial_bank.valid) for s in task.model.prototype.scales)
@@ -179,8 +179,10 @@ def main():
                       f'lr={task.optimizer.param_groups[0]["lr"]:.3e} '
                       f'spatial_valid={sv_now}/4 channel_valid={cv_now}/4 '
                       f'elapsed={elapsed:.0f}s ETA={remaining:.0f}s skipped={skipped}', flush=True)
+                prototype_logger.snapshot(task, epoch, batches, event='interval')
         if batches == 0:
             raise ValueError('training loader has no complete mixed batch')
+        prototype_logger.snapshot(task, epoch, batches, event='epoch_end')
         print(f'[epoch {epoch}] train complete in {time.time() - begin:.1f}s; validation start', flush=True)
         active = task.eval_model()
         full = task.evaluate(val_loader, eval_mode='full', tag=f'val_full epoch {epoch}', model=active)

@@ -41,7 +41,7 @@ class PrototypeAddModel(DualSharedAddPETCTBaseline):
         self.background_weight = float(prototype_background_weight)
         self.min_gain = float(prototype_min_gain)
 
-    def _decode_trace(self, features, target_size, missing_index=None):
+    def _decode_trace(self, features, target_size, missing_index=None, read_diagnostics=None):
         """Same ops as UNetStyleDecoder; extra seam follows each decode block.
 
         features and trace order differ deliberately: encoder [S1..S4],
@@ -55,7 +55,8 @@ class PrototypeAddModel(DualSharedAddPETCTBaseline):
         def finish(x, level):
             if self.prototype_enabled and missing_index is not None and missing_index.numel():
                 rows = x.index_select(0, missing_index)
-                corrected = self.prototype.scales[level](rows)
+                corrected = self.prototype.scales[level](
+                    rows, diagnostics=read_diagnostics[level] if read_diagnostics is not None else None)
                 x = x.index_copy(0, missing_index, corrected)
             trace.append(x)
             return x
@@ -77,7 +78,7 @@ class PrototypeAddModel(DualSharedAddPETCTBaseline):
         return logits, trace
 
     def forward(self, ct, pet=None, pet_available=None, target_size=None,
-                forward_mode='auto', return_knowledge=False):
+                forward_mode='auto', return_knowledge=False, return_diagnostics=False):
         if return_knowledge and not self.training:
             raise RuntimeError('knowledge collection is training-only')
         batch = ct.shape[0]
@@ -105,9 +106,12 @@ class PrototypeAddModel(DualSharedAddPETCTBaseline):
             ct_full = [x.index_select(0, full_idx) for x in ct_feats]
             full_fused = self.fusion(ct_full, pet_full)  # strictly AddFusion
             fused = [c.index_copy(0, full_idx, f.to(c.dtype)) for c, f in zip(ct_feats, full_fused)]
-        logits, trace = self._decode_trace(fused, target_size, missing_idx)
+        read_diagnostics = [{} for _ in self.prototype.scales] if return_diagnostics else None
+        logits, trace = self._decode_trace(fused, target_size, missing_idx, read_diagnostics)
         out = dict(logits=logits, pred=logits, aux={}, pet_available=state.detach().cpu(),
                    num_full=int(full_idx.numel()), num_missing=int(missing_idx.numel()))
+        if read_diagnostics is not None:
+            out['prototype_reads'] = read_diagnostics
         if return_knowledge and full_idx.numel():
             reference_logits, reference_trace = self._decode_trace(ct_full, target_size)
             # Trace collection itself carries no gradient. Reference logits
@@ -121,18 +125,23 @@ class PrototypeAddModel(DualSharedAddPETCTBaseline):
         return out
 
     @torch.no_grad()
-    def prepare_candidates(self, knowledge, mask):
+    def prepare_candidates(self, knowledge, mask, return_diagnostics=False):
         if not self.training:
             raise RuntimeError('candidate extraction is training-only')
         target = mask.index_select(0, knowledge['full_index'])
         if target.ndim == 3:
             target = target[:, None]
+        stats = {} if return_diagnostics else None
         weight = gain_weights(knowledge['full_logits'], knowledge['reference_logits'], target,
-                              self.foreground_weight, self.background_weight, self.min_gain)
-        return [scale.candidates(full, reference, weight, target)
-                for scale, full, reference in zip(self.prototype.scales,
-                                                 knowledge['full_features'],
-                                                 knowledge['reference_features'])]
+                              self.foreground_weight, self.background_weight, self.min_gain, stats=stats)
+        candidates = []
+        for i, (scale, full, reference) in enumerate(zip(
+                self.prototype.scales, knowledge['full_features'], knowledge['reference_features'])):
+            scale_stats = {} if return_diagnostics else None
+            candidates.append(scale.candidates(full, reference, weight, target, stats=scale_stats))
+            if stats is not None:
+                stats.update({f'd{4-i}_{k}': v for k, v in scale_stats.items()})
+        return (candidates, stats) if return_diagnostics else candidates
 
 
 def build_prototype_model(cfg):

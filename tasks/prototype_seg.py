@@ -19,12 +19,26 @@ class PrototypeSegTask(MDTSegTeacher):
         self._pending_candidates = None
         self.current_epoch, self.no_improve = 0, 0
         self.loader_generators = {}
+        self.prototype_epoch_stats = {}
+        self.capture_prototype_reads = False
+        self.prototype_read_stats = None
         # Persist the actual effective setting, including legacy configs.
         self.config.prototype_outlier_filter = self.model.prototype.scales[0].spatial_bank.outlier_filter
 
     def begin_epoch(self, epoch):
         self.current_epoch = int(epoch)
+        self.prototype_epoch_stats = {}
+        self.prototype_read_stats = None
         super().begin_epoch(epoch)
+
+    @torch.no_grad()
+    def _record_prototype_stats(self, stats):
+        for key, value in stats.items():
+            value = torch.as_tensor(value, dtype=torch.float64, device=self.device).detach()
+            if key not in self.prototype_epoch_stats:
+                self.prototype_epoch_stats[key] = value.clone()
+            else:
+                self.prototype_epoch_stats[key].add_(value)
 
     def train_step_mixed(self, batch, pet_available):
         if not self.model.training:
@@ -40,7 +54,11 @@ class PrototypeSegTask(MDTSegTeacher):
         if nf == 0 or nf != nm:
             raise ValueError('prototype training requires exact-half Full/Missing batches')
         collect = self.model.prototype_enabled or self.ct_aux_weight > 0
-        out = self.model(ct, pet=pet, pet_available=state, return_knowledge=collect)
+        out = self.model(ct, pet=pet, pet_available=state, return_knowledge=collect,
+                         return_diagnostics=self.capture_prototype_reads)
+        if self.capture_prototype_reads:
+            self.prototype_read_stats = dict(global_batch_step=self.global_batch_step + 1,
+                                             scales=out.pop('prototype_reads'))
         logits = out['logits']
         full_loss, _ = self.criterion(logits[full], mask[full])
         missing_loss, _ = self.criterion(logits[missing], mask[missing])
@@ -50,7 +68,9 @@ class PrototypeSegTask(MDTSegTeacher):
             if self.ct_aux_weight:
                 ct_loss, _ = self.criterion(knowledge['reference_logits'], mask[full])
             if self.model.prototype_enabled:
-                self._pending_candidates = self.model.prepare_candidates(knowledge, mask)
+                self._pending_candidates, diagnostics = self.model.prepare_candidates(
+                    knowledge, mask, return_diagnostics=True)
+                self._record_prototype_stats(diagnostics)
         total = .5 * full_loss + .5 * missing_loss + self.ct_aux_weight * ct_loss
         if not torch.isfinite(total):
             self._pending_candidates = None
@@ -64,10 +84,19 @@ class PrototypeSegTask(MDTSegTeacher):
         pending, self._pending_candidates = self._pending_candidates, None
         if succeeded and pending is not None:
             self.model.prototype.commit(pending)
+        if pending is not None:
+            writing = succeeded and int(self.model.prototype.update_steps) > self.model.prototype.warmup_steps
+            stats = dict(attempted_batches=1, successful_batches=int(succeeded),
+                         skipped_batches=int(not succeeded),
+                         warmup_batches=int(succeeded and not writing))
+            for i, (spatial, channel) in enumerate(pending):
+                for label, values in (('spatial', spatial), ('channel', channel)):
+                    stats[f'd{4-i}_{label}_written'] = values.shape[0] if writing else 0
+            self._record_prototype_stats(stats)
 
     def evaluate(self, loader, eval_mode='full', tag='val', model=None):
         """Keep parent metrics/dataflow; report completed evaluation batches."""
-        interval = int(getattr(self.config, 'log_interval', 20))
+        interval = int(getattr(self.config, 'log_interval', 100))
         if interval < 1:
             raise ValueError('log_interval must be positive')
         total = len(loader) if hasattr(loader, '__len__') else None
@@ -79,7 +108,7 @@ class PrototypeSegTask(MDTSegTeacher):
             for index, batch in enumerate(loader, 1):
                 yield batch
                 # Parent has completed forward, loss and metrics by now.
-                if index == 1 or index % interval == 0 or index == total:
+                if index % interval == 0:
                     print(f'[{tag}] batch {index}/{total if total is not None else "?"} '
                           f'elapsed={time.time() - start:.0f}s', flush=True)
 
@@ -118,6 +147,9 @@ class PrototypeSegTask(MDTSegTeacher):
             random_state_torch=torch.get_rng_state(), ema_active=self.ema_active,
             no_improve=self.no_improve, experiment_type='decoder_dual_prototype_add',
             prototype_diagnostics=self.model.prototype.diagnostics(),
+            prototype_refresh_stats=[
+                [bank.refresh_stats for bank in (scale.spatial_bank, scale.channel_bank)]
+                for scale in self.model.prototype.scales],
             loader_generator_states={name: gen.get_state() for name, gen in self.loader_generators.items()})
         if torch.cuda.is_available():
             ckpt['random_state_cuda'] = torch.cuda.get_rng_state_all()
@@ -153,6 +185,10 @@ class PrototypeSegTask(MDTSegTeacher):
             if a != b:
                 raise ValueError(f'resume configuration mismatch for {key}: {a!r} != {b!r}')
         self.model.load_state_dict(ckpt['model'], strict=True)
+        if 'prototype_refresh_stats' in ckpt:
+            for scale, stats in zip(self.model.prototype.scales, ckpt['prototype_refresh_stats']):
+                for bank, saved in zip((scale.spatial_bank, scale.channel_bank), stats):
+                    bank.refresh_stats = dict(saved)
         self.optimizer.load_state_dict(ckpt['optimizer'])
         if self.scheduler is not None and ckpt.get('scheduler') is not None:
             self.scheduler.load_state_dict(ckpt['scheduler'])

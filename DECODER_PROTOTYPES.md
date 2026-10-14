@@ -117,21 +117,23 @@ distribution difference, not a guarantee of exact feature alignment.
 
 ## Train
 
-Use your existing environment and pretrained paths. Replace `val_disjoint.txt`
-with your patient-disjoint validation split; all data/split checks are inherited.
+Use your existing environment and pretrained paths. The example below uses
+four clusters and the authorized shared validation/test split. All other data
+checks are inherited.
 
 ```bash
 git switch exp/decoder-dual-prototype-add
 python run_decoder_prototype_add.py \
-  --hash add-mixed-dualproto-s2023 \
+  --hash add-mixed-dualproto-k4-diag-s2023 \
   --root /root/autodl-tmp/data/PCLT20K \
   --train_split_file train_original.txt \
-  --val_split_file val_disjoint.txt --test_split_file test.txt \
+  --val_split_file test.txt --test_split_file test.txt \
+  --allow_val_equals_test true \
   --batch_size 16 --epochs 60 --image_size_2d 512 \
   --ct_backbone convnextv2_nano --pet_backbone mit_b1 \
   --ct_pretrained_path /root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano \
   --pet_pretrained_path /root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1 \
-  --prototype_outlier_filter false \
+  --prototype_clusters 4 --prototype_outlier_filter false --log_interval 100 \
   --aug_mode cipa --norm_mode imagenet --hd95_mode cipa_official --random_state 2023
 ```
 
@@ -168,7 +170,7 @@ original runner are possible; exact zero-head equivalence is tested in eval.
 Resume with **the same settings and --hash**, adding:
 
 ```bash
---resume checkpoints_new/MDT/add-mixed-dualproto-s2023/ckpt.last.pth.tar
+--resume checkpoints_new/MDT/add-mixed-dualproto-k4-diag-s2023/ckpt.last.pth.tar
 ```
 
 The original best checkpoint must remain alongside the last checkpoint.
@@ -179,7 +181,7 @@ Evaluate separately:
 
 ```bash
 python eval_decoder_prototype_add.py \
-  --checkpoint checkpoints_new/MDT/add-mixed-dualproto-s2023/ckpt.best_joint.pth.tar
+  --checkpoint checkpoints_new/MDT/add-mixed-dualproto-k4-diag-s2023/ckpt.best_joint.pth.tar
 ```
 
 Output: `train_log.csv`, `prototype_log.jsonl`, `ckpt.last.pth.tar`,
@@ -187,13 +189,99 @@ Output: `train_log.csv`, `prototype_log.jsonl`, `ckpt.last.pth.tar`,
 `prototype_log.jsonl` reports validity/candidate/update counts per scale/branch;
 check these before attributing any change to a library that never activated.
 
-Progress is flushed to the terminal: setup/loader counts, epoch start and
-first-batch arrival, first forward completion, training batches 1/N and every
-20 batches (and the last), validation first/periodic/last batches, and checkpoint
-save stages. Use `--log_interval 10` to print more often. ETA is a running
-wall-clock average, not a CUDA kernel benchmark. CSV/prototype JSONL records
-remain epoch-based. Updating files does not change an already-running process;
-the new logging takes effect on its next start/resume.
+Progress defaults to **every 100 completed training/validation batches**
+(`--log_interval 100`). Setup, epoch/phase completion and checkpoint messages
+remain visible; first-batch/first-forward debug messages have been removed.
+Updating files takes effect on the next start/resume. Use a new `--hash` for a
+fresh experiment; use `--resume` only when continuing the same experiment.
+
+## Prototype diagnostic CSVs
+
+Three additional files are saved every `log_interval` training batches and at
+**every epoch end**, including epochs shorter than the interval. `event` is
+`interval` or `epoch_end`; when an epoch ends exactly on an interval, both
+snapshots are deliberately retained. Counters ending in `_epoch` and all gain
+counters are **cumulative within the current epoch**, not interval deltas.
+`global_batch_step` counts attempted batches, while `successful_steps` counts
+successful prototype-collection commits (including warmup) and stays zero
+when the entire prototype module is disabled. Undefined values are blank,
+including cluster distributions before a bank is ready and rates with no
+foreground/background pixels. These blanks do not mean zero benefit.
+
+| File | Row granularity | Key content |
+| --- | --- | --- |
+| `prototype_gain.csv` | One row per snapshot | Full/useful-image counts; FG/BG pixel counts, selected fractions, rejected Full-wrong/below-gain counts; selected mean raw gain and weighted mass share; Full vs CT-reference FN/FP counts and rates; successful/skipped/warmup batch counts |
+| `prototype_banks.csv` | One row per scale and bank (8 rows) | Enabled/ready/warmup status; current FIFO occupancy vs cumulative accepted and epoch generated/written counts; FG/BG spatial patch composition; refresh attempts/failure reasons; K-means iterations and retained count; raw vs applied EMA center drift; occupied clusters, normalized occupancy entropy, dominant-cluster share, distances and norms; sampled attention entropy, correction/input RMS ratio and spatial gate mean |
+| `prototype_clusters.csv` | One row per scale, bank and cluster (32 rows for K=4) | Current FIFO count/fraction and member-to-center distance; center norm; last successful K-means assignment count; sampled mean attention probability and top-1 query share |
+
+Important definitions:
+
+- Gain diagnostics use **Full training rows only**, comparing Full to the
+  uncorrected CT-reference pass on the same rows. Their FN/FP rates are not
+  validation metrics or the main Missing-half performance. Gains are the
+  unweighted squared-error improvement; weighted mass includes FG/BG priority.
+  `selected` requires strictly positive final weight. `below_gain` includes
+  reliable pixels below the threshold; exact zero gains at a zero threshold
+  have zero final weight and are not selected.
+- `generated_epoch` includes warmup and optimizer-skipped batches.
+  `written_epoch` counts only accepted writes after successful steps past
+  warmup. `accepted_total` is cumulative input count, not FIFO occupancy:
+  overwritten entries are still included. FG patches mean patches containing
+  **any positive foreground gain mass**, not pure lesion patches. Pure BG
+  patches contain none. Channel candidates mix useful FG/BG pixels per image.
+- **There are no lesion/background sub-banks.** Every scale still has one
+  spatial and one channel bank. Cluster IDs are unsupervised slot IDs, not
+  semantic labels; one-to-one matching stabilizes slots across EMA refreshes.
+- `pool_count`/`pool_fraction` assign the **current FIFO** to the **currently
+  deployed EMA centers** using Euclidean nearest centers. Counts sum to FIFO
+  occupancy. `last_success_count` instead describes the latest successful
+  K-means partition before optional trimming and EMA, aligned to the same slot
+  order. With strong EMA these two partitions can differ substantially.
+- Entropy is divided by log(K): 1 means uniform occupancy, 0 means all assigned
+  to one center. A ready bank may temporarily have empty assigned slots after
+  the FIFO changes; `occupied_clusters` exposes this. Distances are ordinary
+  Euclidean distances in each bank's feature space, not directly comparable
+  between spatial/channel banks or scales with different descriptor dimensions.
+  `mean_nearest_margin` is second-nearest minus nearest distance; larger means
+  a clearer assignment, not automatically a more useful prototype.
+- `last_attempt_status` reports the most recent refresh attempt; failure
+  counters distinguish insufficient candidates, insufficient unique vectors,
+  and empty clusters. `last_success_*` and center-drift values refer to the
+  most recent **successful** refresh. Initialization has blank drift: it is a
+  direct copy, not an EMA update. Later `last_raw_center_drift` is mean slot
+  L2(new K-means center - old center), while `last_applied_center_drift` is
+  L2(applied EMA center - old center), revealing the effect of decay=0.999.
+- Attention diagnostics are sampled only on printing batches and the last
+  training batch. They describe the **Missing rows' pre-optimizer reads**;
+  FIFO/centroid snapshots describe the post-commit bank. Check
+  `read_sample_global_step` and `read_available` because the sampled read can
+  precede a bank's first initialization on that same batch. Mean attention
+  probabilities/top-1 fractions sum to one per active bank. Spatial queries
+  count decoder positions; channel queries count Missing images. The branch
+  correction/input RMS ratio measures output activity, not causal usefulness;
+  it starts at zero with zero-initialized heads. Gate magnitude alone is
+  insufficient evidence of useful correction.
+- Diagnostics are detached, never feed selection/loss/attention/update, and
+  never write feature tensors or patient identifiers. Bank-distance calculations
+  run on CPU over at most 256 candidates and K centers only at snapshot times.
+  There is no all-pairs candidate matrix or extra model forward. Gain counters
+  accumulate device-side; the sampled reads add reductions only at snapshots.
+- Tensor checkpoint schemas are unchanged: old weights load strictly.
+  New checkpoints additionally save refresh metadata outside the model
+  state_dict. When resuming older checkpoints without it, refresh failure and
+  last-success diagnostics restart from that resume; tensor accepted/update
+  totals retain their full history. Epoch-local gain/read statistics restart
+  each epoch. On resume CSV rows after the restored checkpoint epoch are
+  removed so an interrupted partial epoch is not counted twice. Previous
+  missing diagnostic snapshots cannot be reconstructed from a checkpoint.
+
+Read the files together: low FG gain/candidate counts suggest investigating
+benefit selection; persistent collection/unique-vector failures explain why a
+bank never activates; dominant clusters or tiny center separation expose
+redundancy; large raw drift but tiny applied drift shows slow EMA tracking;
+uniform read probabilities or near-zero residuals show weak differentiation
+or negligible correction. None alone proves model benefit: compare Full and
+Missing validation metrics and matched ablations before changing a setting.
 
 ## Validation and source attribution
 

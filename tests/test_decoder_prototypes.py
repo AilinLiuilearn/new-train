@@ -317,6 +317,7 @@ def test_protocol_defaults_and_imagenet_normalization(monkeypatch):
         assert config.norm_mode == 'imagenet'
         assert config.hd95_mode == 'cipa_official'
     assert PrototypeConfig.parse_arguments().prototype_outlier_filter is False
+    assert PrototypeConfig.parse_arguments().log_interval == 100
     assert inspect.signature(get_pclt20k_loaders_cipa_aligned).parameters['norm_mode'].default == 'imagenet'
     gray = np.array([[0, 127], [128, 255]], dtype=np.uint8)
     expected = (np.repeat(gray[None].astype(np.float32) / 255., 3, axis=0)
@@ -430,7 +431,7 @@ def test_epoch_runner_final_selection_and_resume_match_uninterrupted(tmp_path, m
               '--prototype_min_candidates', '2', '--prototype_refresh_steps', '1',
               '--prototype_warmup_steps', '0', '--cosine_warmup', '0',
               '--checkpoint_root', str(tmp_path)]
-    monkeypatch.setattr(sys, 'argv', common + ['--hash', 'continuous'])
+    monkeypatch.setattr(sys, 'argv', common + ['--hash', 'continuous', '--log_interval', '1'])
     runner.main()
     reference = PrototypeSegTask.load_state_dicts(str(tmp_path / 'MDT/continuous/ckpt.last.pth.tar'))
 
@@ -460,8 +461,185 @@ def test_epoch_runner_final_selection_and_resume_match_uninterrupted(tmp_path, m
         assert torch.equal(value, resumed['model_ema'][key]), key
     assert (tmp_path / 'MDT/resumed/final_test_metrics.json').exists()
     output = capsys.readouterr().out
+    assert output.count('[train epoch 1] batch 1/1') == 1
+    assert 'first forward complete;' not in output
     for expected in ('[setup] train_batches=', 'waiting for first batch...',
-                     'first forward complete;', '[train epoch 1] batch 1/1',
-                     '[val_full epoch 1] batch 1/1', '[val_missing epoch 1] batch 1/1',
+                     '[prototype epoch 1 batch 1]',
                      '[checkpoint epoch 1] saving last...', '[final] evaluating best epoch'):
         assert expected in output
+
+    import csv
+    directory = tmp_path / 'MDT/continuous'
+    for filename, per_epoch in (('prototype_banks.csv', 16), ('prototype_clusters.csv', 32),
+                                ('prototype_gain.csv', 2)):
+        with open(directory / filename, newline='') as stream:
+            rows = list(csv.DictReader(stream))
+        assert len(rows) == 2 * per_epoch
+        assert {row['event'] for row in rows} == {'interval', 'epoch_end'}
+    assert reference['prototype_refresh_stats'] == resumed['prototype_refresh_stats']
+
+
+def test_gain_diagnostics_counts_errors_and_selection_without_changing_weights():
+    pf = torch.tensor([[[[.9, .4, .2, .6]]]])
+    p0 = torch.tensor([[[[.5, .3, .4, .7]]]])
+    y = torch.tensor([[[[1., 1., 0., 0.]]]])
+    full, reference = torch.logit(pf), torch.logit(p0)
+    stats = {}
+    expected = gain_weights(full, reference, y)
+    actual = gain_weights(full, reference, y, stats=stats)
+    assert torch.equal(expected, actual)
+    assert int(stats['full_images']) == int(stats['useful_full_images']) == 1
+    assert int(stats['fg_selected']) == int(stats['bg_selected']) == 1
+    assert int(stats['full_fn']) == int(stats['reference_fn']) == 1
+    assert int(stats['full_fp']) == int(stats['reference_fp']) == 1
+    assert float(stats['fg_gain_sum']) == pytest.approx(.24)
+    assert float(stats['bg_gain_sum']) == pytest.approx(.12)
+    for label in ('fg', 'bg'):
+        assert stats[f'{label}_pixels'] == sum(stats[f'{label}_{k}'] for k in
+                                              ('selected', 'full_wrong', 'below_gain'))
+    assert all(not value.requires_grad for value in stats.values() if torch.is_tensor(value))
+
+
+def test_bank_diagnostics_known_distribution_and_ema_movement_are_read_only():
+    from utils.prototype_diagnostics import bank_snapshot
+    bank = EMACentroidBank(2, 1, capacity=8, min_candidates=4, decay=.5)
+    assert not bank.refresh()
+    row, clusters = bank_snapshot(bank, True)
+    assert row['status'] == 'collecting' and row['refresh_insufficient_pool'] == 1
+    assert 'pool_count' not in clusters[0]  # Undefined before initialization.
+    bank.add(torch.tensor([[0.], [0.], [10.], [10.]]))
+    assert bank.refresh()
+    before = copy.deepcopy(bank.state_dict())
+    metadata = copy.deepcopy(bank.refresh_stats)
+    rng = torch.get_rng_state().clone()
+    row, clusters = bank_snapshot(bank, True)
+    assert row['occupied_clusters'] == 2
+    assert row['assignment_entropy_normalized'] == pytest.approx(1.)
+    assert row['max_cluster_fraction'] == .5
+    assert row['min_center_distance'] == 10.
+    assert row['mean_nearest_distance'] == 0.
+    assert [c['pool_count'] for c in clusters] == [2, 2]
+    assert row['last_raw_center_drift'] is None  # Initialization is not an EMA update.
+    assert torch.equal(rng, torch.get_rng_state())
+    assert metadata == bank.refresh_stats
+    assert all(torch.equal(v, bank.state_dict()[k]) for k, v in before.items())
+    bank.pool[:4].add_(2.)
+    assert bank.refresh()
+    assert bank.refresh_stats['last_raw_drift'] == pytest.approx(2.)
+    assert bank.refresh_stats['last_applied_drift'] == pytest.approx(1.)
+    # FIFO ownership against EMA centers is distinct from last K-means ownership.
+    bank.pool[:4].fill_(100.)
+    row, clusters = bank_snapshot(bank, True)
+    assert row['occupied_clusters'] == 1
+    assert row['assignment_entropy_normalized'] == 0.
+    assert row['max_cluster_fraction'] == 1.
+    assert sum(c['last_success_count'] for c in clusters) == 4
+    duplicate = EMACentroidBank(2, 1, capacity=4, min_candidates=4)
+    duplicate.add(torch.ones(4, 1))
+    assert not duplicate.refresh()
+    assert duplicate.refresh_stats['last_status'] == 'insufficient_unique'
+
+
+def test_candidate_composition_and_success_warmup_skip_accounting(tmp_path):
+    import csv
+    from utils.prototype_diagnostics import PrototypeCSVLogger
+    task = PrototypeSegTask({'model': model()}, cfg())
+    task.model.prototype.warmup_steps = 1
+    task.begin_epoch(1)
+    b, state = batch(), torch.tensor([1, 0, 1, 0])
+    for succeeded in (True, False, True):
+        task.train_step_mixed(b, state)
+        # Supply a deterministic candidate count to test lifecycle accounting.
+        task._pending_candidates = [(torch.ones(3, s.spatial_bank.dimension),
+                                     torch.ones(2, s.channel_bank.dimension))
+                                    for s in task.model.prototype.scales]
+        task.after_optimizer_step(succeeded)
+    stats = task.prototype_epoch_stats
+    assert stats['attempted_batches'] == 3 and stats['successful_batches'] == 2
+    assert stats['skipped_batches'] == 1 and stats['warmup_batches'] == 1
+    assert stats['d4_spatial_written'] == 3 and stats['d4_channel_written'] == 2
+    assert int(task.model.prototype.scales[0].spatial_bank.accepted) == 3
+    logger = PrototypeCSVLogger(str(tmp_path))
+    logger.snapshot(task, 1, 3, 'epoch_end')
+    for filename in logger.paths:
+        with open(logger.paths[filename], newline='') as stream:
+            assert list(csv.DictReader(stream))
+    # Preserve earlier completed epochs and remove uncheckpointed future rows.
+    logger.snapshot(task, 2, 1, 'interval')
+    PrototypeCSVLogger(str(tmp_path), start_epoch=2)
+    with open(tmp_path / 'prototype_gain.csv', newline='') as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 1 and rows[0]['epoch'] == '1'
+    assert rows[0]['fg_selected_fraction'] != ''
+    # Old checkpoints have no logging metadata and remain strictly loadable.
+    path = str(tmp_path / 'legacy.pt')
+    task.save_checkpoint(path, 1, best=0., best_epoch=1)
+    legacy = task.load_state_dicts(path)
+    legacy.pop('prototype_refresh_stats')
+    torch.save(legacy, path)
+    fresh = PrototypeSegTask({'model': model()}, cfg())
+    fresh.resume(path)
+    assert all(torch.equal(v, fresh.model.state_dict()[k]) for k, v in task.model.state_dict().items())
+    # Foreground-patch counts describe patches with any positive FG gain mass.
+    scale = task.model.prototype.scales[0]
+    full = torch.randn(1, scale.channels, 10, 10)
+    fg = torch.zeros(1, 1, 10, 10); fg[:, :, :5] = 1
+    counts = {}
+    spatial, channel = scale.candidates(full, full + .5, torch.ones_like(fg), fg, stats=counts)
+    assert counts == dict(spatial_generated=4, channel_generated=1,
+                          spatial_fg_patches=2, spatial_bg_patches=2)
+    assert spatial.shape[0] == 4 and channel.shape[0] == 1
+
+
+def test_default_validation_prints_only_every_100_batches(monkeypatch, capsys):
+    from tasks.mdt_seg import MDTSegTeacher
+    task = PrototypeSegTask({'model': model()}, cfg())
+
+    def consume(self, loader, **kwargs):
+        assert len(list(loader)) == 205
+        return dict(dice=.5, hd95=1.)
+
+    monkeypatch.setattr(MDTSegTeacher, 'evaluate', consume)
+    task.evaluate([{}] * 205, tag='hundred')
+    output = capsys.readouterr().out
+    lines = [line for line in output.splitlines() if line.startswith('[hundred] batch ')]
+    assert len(lines) == 2
+    assert 'batch 100/205' in lines[0] and 'batch 200/205' in lines[1]
+
+
+def test_sampled_attention_is_detached_and_does_not_change_outputs_or_gradients():
+    scale = DecoderPrototypeScale(8, dim=4, clusters=2, capacity=16, min_candidates=2)
+    for bank in (scale.spatial_bank, scale.channel_bank):
+        bank.add(torch.randn(8, bank.dimension))
+        bank.refresh()
+    with torch.no_grad():
+        scale.spatial_out.weight.normal_(std=.1)
+        scale.channel_out.weight.normal_(std=.1)
+    twin = copy.deepcopy(scale)
+    x = torch.randn(2, 8, 8, 8, requires_grad=True)
+    xx = x.detach().clone().requires_grad_()
+    stats = {}
+    plain, sampled = scale(x), twin(xx, diagnostics=stats)
+    assert torch.equal(plain, sampled)
+    plain.sum().backward(); sampled.sum().backward()
+    assert torch.equal(x.grad, xx.grad)
+    for p, pp in zip(scale.parameters(), twin.parameters()):
+        assert (p.grad is None and pp.grad is None) or torch.equal(p.grad, pp.grad)
+    for label, queries in (('spatial', 128), ('channel', 2)):
+        read = stats[label]
+        assert read['available'] and read['query_count'] == queries
+        assert 0 <= read['attention_entropy'] <= 1
+        assert read['attention_mean'].sum() == pytest.approx(1.)
+        assert read['top1_fraction'].sum() == pytest.approx(1.)
+        assert read['correction_rms_ratio'] > 0
+        assert all(not value.requires_grad for value in read.values() if torch.is_tensor(value))
+
+
+def test_channel_correction_diagnostic_matches_broadcast_residual_rms():
+    correction = torch.randn(2, 8, 5, 7)
+    shift = torch.randn(2, 8, 1, 1)
+    x = torch.randn_like(correction)
+    attention = torch.randn(2, 4).softmax(-1)
+    stats = DecoderPrototypeScale._read_diagnostics(attention, correction, x, shift)
+    expected = (correction + shift).square().mean().sqrt() / x.square().mean().sqrt()
+    assert stats['correction_rms_ratio'] == pytest.approx(float(expected), rel=1e-6)

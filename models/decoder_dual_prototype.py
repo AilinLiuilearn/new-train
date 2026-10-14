@@ -43,6 +43,10 @@ EMA, using deterministic greedy minimum-distance matching.
         self.register_buffer('valid', torch.zeros((), dtype=torch.bool))
         self.register_buffer('updates', torch.zeros((), dtype=torch.long))
         self.register_buffer('accepted', torch.zeros((), dtype=torch.long))
+        # Logging metadata only; excluded from tensor state_dict so old weights
+        # load strictly. The task checkpoints this separately when available.
+        self.refresh_stats = dict(attempts=0, insufficient_pool=0, insufficient_unique=0,
+                                  empty_cluster=0, last_status='never_attempted')
 
     @torch.no_grad()
     def add(self, values: Tensor) -> None:
@@ -70,12 +74,17 @@ EMA, using deterministic greedy minimum-distance matching.
 
     @torch.no_grad()
     def refresh(self) -> bool:
+        self.refresh_stats['attempts'] += 1
         if int(self.size) < self.min_candidates:
+            self.refresh_stats['insufficient_pool'] += 1
+            self.refresh_stats['last_status'] = 'insufficient_pool'
             return False
         # Disable ambient AMP: Gram/K-means/EMA stay float32 in formal AMP runs.
         with torch.autocast(device_type=self.pool.device.type, enabled=False):
             x = self.pool[:int(self.size)].float()
             if torch.unique(x, dim=0).shape[0] < self.clusters:
+                self.refresh_stats['insufficient_unique'] += 1
+                self.refresh_stats['last_status'] = 'insufficient_unique'
                 return False
             if bool(self.valid):
                 centers = self.centers.float().clone()
@@ -87,7 +96,9 @@ EMA, using deterministic greedy minimum-distance matching.
                     seeds.append(x[self._distance(x, torch.stack(seeds)).min(1).values.argmax()])
                 centers = torch.stack(seeds)
             previous = None
+            iterations_run = 0
             for _ in range(self.iterations):
+                iterations_run += 1
                 distances = self._distance(x, centers)
                 assignment = distances.argmin(1)
                 if previous is not None and torch.equal(previous, assignment):
@@ -104,10 +115,13 @@ EMA, using deterministic greedy minimum-distance matching.
             assignment = self._distance(x, centers).argmin(1)
             # Default: every cluster member contributes to its center.
             # Optional MAD trimming is retained only for explicit ablations.
+            retained = 0
             for k in range(self.clusters):
                 members = x[assignment == k]
                 if members.shape[0] == 0:
                     # Do not mark a collapsed bank as a valid K-center library.
+                    self.refresh_stats['empty_cluster'] += 1
+                    self.refresh_stats['last_status'] = 'empty_cluster'
                     return False
                 if self.outlier_filter:
                     distance = (members - centers[k]).square().sum(1).sqrt()
@@ -115,27 +129,44 @@ EMA, using deterministic greedy minimum-distance matching.
                     mad = (distance - median).abs().median()
                     keep = distance <= median + self.outlier_mad * 1.4826 * mad + 1e-6
                     members = members[keep]
+                retained += members.shape[0]
                 centers[k] = members.mean(0)
+            counts = torch.bincount(assignment, minlength=self.clusters)
+            initialized = not bool(self.valid)
+            raw_drift = applied_drift = None
             if bool(self.valid):
                 distances = self._distance(self.centers.float(), centers)
                 ordered = torch.empty_like(centers)
+                ordered_counts = torch.empty_like(counts)
                 for _ in range(self.clusters):
                     flat = int(distances.argmin())
                     old, new = divmod(flat, self.clusters)
                     ordered[old] = centers[new]
+                    ordered_counts[old] = counts[new]
                     distances[old, :] = float('inf')
                     distances[:, new] = float('inf')
+                raw_drift = float((ordered - self.centers.float()).norm(dim=1).mean())
+                old_centers = self.centers.clone()
                 self.centers.mul_(self.decay).add_(ordered, alpha=1 - self.decay)
+                applied_drift = float((self.centers - old_centers).norm(dim=1).mean())
+                counts = ordered_counts
             else:
                 self.centers.copy_(centers)
                 self.valid.fill_(True)
             self.updates.add_(1)
+            self.refresh_stats.update(last_status='initialized' if initialized else 'updated',
+                                      last_iterations=iterations_run,
+                                      last_pool_size=int(x.shape[0]),
+                                      last_retained=retained,
+                                      last_cluster_counts=counts.cpu().tolist(),
+                                      last_raw_drift=raw_drift,
+                                      last_applied_drift=applied_drift)
         return True
 
 
 def gain_weights(full_logits: Tensor, reference_logits: Tensor, target: Tensor,
                  foreground_weight: float = 2., background_weight: float = 1.,
-                 min_gain: float = .01) -> Tensor:
+                 min_gain: float = .01, stats: dict | None = None) -> Tensor:
     """Detached soft error improvement; Full must also be threshold-correct.
 
 Foreground/background weights influence candidate selection/composition;
@@ -151,7 +182,25 @@ not a causal estimate of PET contribution.
         improvement = (p0 - y).square() - (pf - y).square()
         reliable = pf.ge(.5).eq(y.bool())
         priority = foreground_weight * y + background_weight * (1 - y)
-        return improvement.clamp_min(0) * reliable * (improvement >= min_gain) * priority
+        weight = improvement.clamp_min(0) * reliable * (improvement >= min_gain) * priority
+        if stats is not None:
+            # Additive detached reductions, transferred together by the task.
+            selected = weight > 0
+            stats['full_images'] = pf.shape[0]
+            stats['useful_full_images'] = selected.flatten(1).any(1).sum()
+            for label, region in (('fg', y.bool()), ('bg', ~y.bool())):
+                passed = selected & region
+                stats[f'{label}_pixels'] = region.sum()
+                stats[f'{label}_selected'] = passed.sum()
+                stats[f'{label}_full_wrong'] = (region & ~reliable).sum()
+                stats[f'{label}_below_gain'] = (region & reliable & (improvement < min_gain)).sum()
+                stats[f'{label}_gain_sum'] = (improvement * passed).sum()
+                stats[f'{label}_weight_sum'] = (weight * passed).sum()
+            for label, probability in (('full', pf), ('reference', p0)):
+                prediction = probability >= .5
+                stats[f'{label}_fn'] = (~prediction & y.bool()).sum()
+                stats[f'{label}_fp'] = (prediction & ~y.bool()).sum()
+        return weight
 
 
 class DecoderPrototypeScale(nn.Module):
@@ -220,7 +269,7 @@ channel centers [K,d*d]. Both final heads start at exactly zero.
 
     @torch.no_grad()
     def candidates(self, full: Tensor, reference: Tensor, weight: Tensor,
-                   foreground: Tensor | None = None) -> tuple[Tensor, Tensor]:
+                   foreground: Tensor | None = None, stats: dict | None = None) -> tuple[Tensor, Tensor]:
         if full.shape != reference.shape or full.ndim != 4 or full.shape[1] != self.channels:
             raise ValueError('Full/reference decoder features must match [B,C,H,W]')
         with torch.autocast(device_type=full.device.type, enabled=False):
@@ -236,6 +285,7 @@ channel centers [K,d*d]. Both final heads start at exactly zero.
             if not self.channel_enabled:
                 relations = relations[:0]
             spatial = []
+            fg_count = bg_count = 0
             if self.spatial_enabled:
                 local = self._local(zf)
                 p = min(self.patch_size, *full.shape[-2:])
@@ -257,16 +307,44 @@ channel centers [K,d*d]. Both final heads start at exactly zero.
                     bg_budget = min(self.max_patches // 2, self.max_patches - fg_idx.numel())
                     bg_idx = bg_idx[score[bg_idx].argsort(descending=True)][:bg_budget]
                     idx = torch.cat([fg_idx, bg_idx])
+                    fg_count += fg_idx.numel()
+                    bg_count += bg_idx.numel()
                     if idx.numel():
                         spatial.append(pooled[b].flatten(1).T[idx])
             s = torch.cat(spatial) if spatial else full.new_empty((0, 3 * self.dim), dtype=torch.float32)
+            if stats is not None:
+                stats.update(spatial_generated=s.shape[0], channel_generated=relations.shape[0],
+                             spatial_fg_patches=fg_count, spatial_bg_patches=bg_count)
             return s.detach(), relations.detach()
 
-    def forward(self, x: Tensor) -> Tensor:
+    @staticmethod
+    @torch.no_grad()
+    def _read_diagnostics(attention, correction, x, shift=None):
+        probabilities = attention.detach().reshape(-1, attention.shape[-1])
+        correction = correction.detach()
+        squared_norm = correction.norm().square()
+        if shift is not None:
+            # ||scale*x + shift|| without materializing another full feature
+            # map (important for the high-resolution decoder on small GPUs).
+            shift = shift.detach()
+            squared_norm = (squared_norm + 2 * (correction.sum((2, 3), keepdim=True) * shift).sum()
+                            + correction.shape[-2] * correction.shape[-1] * shift.norm().square())
+        return dict(query_count=probabilities.shape[0],
+                    attention_entropy=(-(probabilities * probabilities.clamp_min(1e-12).log()).sum(1)
+                                       / math.log(probabilities.shape[-1])).mean(),
+                    attention_mean=probabilities.mean(0),
+                    top1_fraction=torch.bincount(probabilities.argmax(1), minlength=probabilities.shape[-1])
+                                  / probabilities.shape[0],
+                    correction_rms_ratio=squared_norm.clamp_min(0).sqrt()
+                                         / x.detach().float().norm().clamp_min(1e-8))
+
+    def forward(self, x: Tensor, diagnostics: dict | None = None) -> Tensor:
         if x.ndim != 4 or x.shape[1] != self.channels:
             raise ValueError(f'expected decoder [B,{self.channels},H,W] feature')
         use_s = self.spatial_enabled and bool(self.spatial_bank.valid)
         use_c = self.channel_enabled and bool(self.channel_bank.valid)
+        if diagnostics is not None:
+            diagnostics.update(spatial=dict(available=use_s), channel=dict(available=use_c))
         if not use_s and not use_c:
             return x
         # Statistics and softmax in float32; final residual returns input dtype.
@@ -282,19 +360,28 @@ channel centers [K,d*d]. Both final heads start at exactly zero.
                 attn = (q @ k.T / math.sqrt(self.dim)).softmax(-1)
                 read = (attn @ v).transpose(1, 2).reshape(x.shape[0], self.dim, *x.shape[-2:])
                 gate = self.spatial_gate(torch.cat([x.float(), read], 1)).sigmoid()
-                residual = residual + gate * self.spatial_out(read)
+                spatial_residual = gate * self.spatial_out(read)
+                residual = residual + spatial_residual
+                if diagnostics is not None:
+                    diagnostics['spatial'].update(self._read_diagnostics(attn, spatial_residual, x))
+                    diagnostics['spatial']['gate_mean'] = gate.detach().mean()
             if use_c:
                 stat = torch.cat([z.mean((2, 3)), self._gram(z, torch.ones_like(z[:, :1])).flatten(1)], 1)
                 q = self.channel_q(self.channel_norm_q(stat))
                 memory = self.channel_norm_k(self.channel_bank.centers.detach())
                 k, v = self.channel_k(memory), self.channel_v(memory)
-                read = (q @ k.T / math.sqrt(self.dim)).softmax(-1) @ v
+                attn = (q @ k.T / math.sqrt(self.dim)).softmax(-1)
+                read = attn @ v
                 # The correction head receives retrieved knowledge only;
                 # no CT-only adapter shortcut can bypass the memory read.
                 a, b = self.channel_out(read).chunk(2, 1)
                 # Bounded additive affine residual; not a new PET feature.
-                residual = residual + .25 * a.tanh()[:, :, None, None] * x.float()
-                residual = residual + .25 * b.tanh()[:, :, None, None]
+                scale_residual = .25 * a.tanh()[:, :, None, None] * x.float()
+                shift_residual = .25 * b.tanh()[:, :, None, None]
+                residual = residual + scale_residual
+                residual = residual + shift_residual
+                if diagnostics is not None:
+                    diagnostics['channel'].update(self._read_diagnostics(attn, scale_residual, x, shift_residual))
             result = x + residual.to(x.dtype)
             if not torch.isfinite(result).all():
                 raise RuntimeError('nonfinite decoder prototype correction')
