@@ -255,7 +255,7 @@ def test_checkpoint_roundtrip_records_scores_and_step(tmp_path):
     task.global_batch_step = 123
     path = str(tmp_path / 'ckpt.last.pth.tar')
     task.save_checkpoint(path, 2, best=0.4, best_epoch=2, val={'joint_dice': 0.4})
-    ckpt = torch.load(path, map_location='cpu')
+    ckpt = MDTSegTeacher.load_state_dicts(path)
     assert ckpt['best'] == 0.4 and ckpt['best_epoch'] == 2
     assert ckpt['val']['joint_dice'] == 0.4
     assert ckpt['global_batch_step'] == 123

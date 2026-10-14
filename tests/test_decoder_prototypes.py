@@ -1,0 +1,323 @@
+"""Synthetic contracts; fake encoders isolate decoder/prototype integration."""
+import copy
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+from models.decoder_dual_prototype import EMACentroidBank, DecoderPrototypeScale, gain_weights
+from models.prototype_add_model import PrototypeAddModel
+from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
+from tasks.prototype_seg import PrototypeSegTask
+
+
+class FakeEncoder(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.layers = nn.ModuleList(nn.Conv2d(3, c, 1) for c in channels)
+        self.feature_info = SimpleNamespace(channels=lambda: list(channels))
+        self.calls = 0
+
+    def forward(self, x):
+        self.calls += 1
+        return [layer(F.adaptive_avg_pool2d(x, (16 // 2**i, 16 // 2**i)))
+                for i, layer in enumerate(self.layers)]
+
+
+@pytest.fixture(autouse=True)
+def fake_encoders(monkeypatch):
+    import models.dual_shared_add_baseline as base
+    monkeypatch.setattr(base, 'create_feature_backbone', lambda name, **kw:
+                        FakeEncoder((8, 16, 24, 32) if 'convnext' in name
+                                    else (64, 128, 320, 512)))
+    torch.set_num_threads(1)
+
+
+def model(**kw):
+    return PrototypeAddModel(pretrained=False, decoder_channels=(32, 24, 16, 8),
+                             prototype_dim=4, prototype_clusters=2,
+                             prototype_capacity=16, prototype_min_candidates=2,
+                             prototype_refresh_steps=1, prototype_warmup_steps=0, **kw)
+
+
+def cfg(**kw):
+    args = dict(learning_rate=1e-3, weight_decay=0., mixed_precision=False,
+                ema_enabled=False, random_state=2023, prototype_ct_aux_weight=.1)
+    args.update(kw)
+    return SimpleNamespace(**args)
+
+
+def batch():
+    return dict(ct=torch.randn(4, 1, 32, 32), pet=torch.randn(4, 1, 32, 32),
+                mask=(torch.rand(4, 1, 32, 32) > .6).float())
+
+
+def populate(m):
+    for scale in m.prototype.scales:
+        for bank in (scale.spatial_bank, scale.channel_bank):
+            bank.add(torch.randn(8, bank.dimension))
+            bank.refresh()
+
+
+def test_zero_init_matches_add_baseline_all_modes():
+    m = model().eval()
+    base = DualSharedAddPETCTBaseline(pretrained=False, decoder_channels=(32, 24, 16, 8)).eval()
+    base.load_state_dict({k: v for k, v in m.state_dict().items()
+                          if not k.startswith('prototype.')}, strict=True)
+    populate(m)
+    b = batch()
+    for mode in ('full', 'missing', 'auto'):
+        kw = dict(pet=b['pet'], forward_mode=mode, pet_available=torch.tensor([1, 0, 1, 0]))
+        assert torch.equal(m(b['ct'], **kw)['logits'], base(b['ct'], **kw)['logits'])
+
+
+def test_pet_isolation_with_active_nonzero_correction():
+    m = model().eval()
+    populate(m)
+    for s in m.prototype.scales:
+        nn.init.normal_(s.spatial_out.weight, std=.03)
+        nn.init.normal_(s.channel_out.weight, std=.03)
+    b = batch()
+    state = torch.tensor([1, 0, 1, 0])
+    a = m(b['ct'], pet=b['pet'], pet_available=state)['logits']
+    pet = b['pet'].clone()
+    pet[state == 0] = float('nan')
+    z = m(b['ct'], pet=pet, pet_available=state)['logits']
+    assert torch.equal(a, z)
+    before = m.enc_pet.calls
+    loss = m(b['ct'], pet=pet, forward_mode='missing')['logits'].square().mean()
+    loss.backward()
+    assert m.enc_pet.calls == before
+    assert all(p.grad is None for p in m.enc_pet.parameters())
+
+
+def test_bank_waits_for_success_and_eval_is_read_only():
+    task = PrototypeSegTask({'model': model()}, cfg())
+    b = batch()
+    state = torch.tensor([1, 0, 1, 0])
+    old = copy.deepcopy(task.model.prototype.state_dict())
+    loss, _, _, stats = task.train_step_mixed(b, state)
+    assert all(torch.equal(old[k], v) for k, v in task.model.prototype.state_dict().items())
+    assert torch.allclose(loss.detach(), .5 * stats['loss_full'] + .5 * stats['loss_missing']
+                          + .1 * stats['loss_ct_aux'])
+    loss.backward()
+    task.after_optimizer_step(False)
+    assert all(torch.equal(old[k], v) for k, v in task.model.prototype.state_dict().items())
+    task.train_step_mixed(b, state)
+    task.after_optimizer_step(True)
+    assert task.model.prototype.update_steps.item() == 1
+    saved = copy.deepcopy(task.model.prototype.state_dict())
+    task.model.eval()
+    task.model(b['ct'], forward_mode='missing')
+    assert all(torch.equal(saved[k], v) for k, v in task.model.prototype.state_dict().items())
+
+
+def test_both_branches_learn_and_buffers_have_no_grads():
+    m = model().train()
+    populate(m)
+    opt = torch.optim.Adam(m.parameters(), lr=.01)
+    for step in range(2):
+        opt.zero_grad(set_to_none=True)
+        m(torch.randn(2, 1, 32, 32), forward_mode='missing')['logits'].square().mean().backward()
+        for scale in m.prototype.scales:
+            assert scale.spatial_out.weight.grad.abs().sum() > 0
+            assert scale.channel_out.weight.grad.abs().sum() > 0
+            if step:
+                assert scale.spatial_q.weight.grad.abs().sum() > 0
+                assert scale.channel_q.weight.grad.abs().sum() > 0
+        opt.step()
+    assert all(not b.requires_grad for b in m.prototype.buffers())
+
+
+def test_centroid_bank_euclidean_ema_filter_and_roundtrip():
+    bank = EMACentroidBank(2, 2, capacity=12, min_candidates=4, decay=.5)
+    x = torch.tensor([[-2., 0.], [-2.1, 0.], [2., 0.], [2.1, 0.]])
+    bank.add(x)
+    assert bank.refresh()
+    old = bank.centers.clone()
+    bank.pool.zero_(); bank.size.zero_(); bank.cursor.zero_()
+    bank.add(x + torch.tensor([0., 2.]))
+    bank.refresh()
+    assert torch.allclose(bank.centers[:, 1], torch.ones(2))
+    assert torch.allclose(bank.centers[:, 0].sort().values, old[:, 0].sort().values)
+    fresh = EMACentroidBank(2, 2, capacity=12, min_candidates=4, decay=.5)
+    fresh.load_state_dict(bank.state_dict(), strict=True)
+    assert all(torch.equal(v, fresh.state_dict()[k]) for k, v in bank.state_dict().items())
+    with pytest.raises(ValueError):
+        bank.add(torch.full((1, 2), float('nan')))
+
+
+def test_gain_filter_and_signed_relations():
+    scale = DecoderPrototypeScale(8, dim=4, clusters=2, capacity=16,
+                                  min_candidates=2, refresh_steps=1)
+    full = torch.randn(2, 8, 8, 8)
+    ref = torch.randn_like(full)
+    empty = torch.zeros(2, 1, 8, 8)
+    s, c = scale.candidates(full, ref, empty)
+    assert s.shape[0] == c.shape[0] == 0
+    w = torch.ones_like(empty)
+    _, plus = scale.candidates(full, ref, w)
+    _, minus = scale.candidates(ref, full, w)
+    assert torch.allclose(plus, -minus, atol=1e-6)
+    assert torch.allclose(plus.view(-1, 4, 4), plus.view(-1, 4, 4).transpose(1, 2))
+
+
+def test_ema_memory_is_copied_not_smoothed():
+    task = PrototypeSegTask({'model': model()}, cfg(ema_enabled=True, ema_start_epoch=0,
+                                                 ema_decay=.99, ema_decay_warmup=False))
+    populate(task.model)
+    task.update_ema()
+    src = dict(task.model.prototype.named_buffers())
+    dst = dict(task.ema.model.prototype.named_buffers())
+    assert all(torch.equal(src[k], dst[k]) for k in src)
+
+
+def test_invalid_configuration_and_eval_collection():
+    with pytest.raises(ValueError):
+        model(prototype_spatial=False, prototype_channel=False)
+    m = model().eval()
+    with pytest.raises(RuntimeError):
+        m(torch.randn(2, 1, 32, 32), pet=torch.randn(2, 1, 32, 32),
+          return_knowledge=True)
+
+
+def test_resume_restores_optimizer_memory_and_rng(tmp_path):
+    task = PrototypeSegTask({'model': model()}, cfg())
+    task.loader_generators = {'train': torch.Generator().manual_seed(4)}
+    populate(task.model)
+    task.global_batch_step = 13
+    task.current_epoch = 2
+    task.no_improve = 1
+    task.train_step_mixed(batch(), torch.tensor([1, 0, 1, 0]))[0].backward()
+    task.optimizer.step()
+    task.after_optimizer_step(True)
+    path = str(tmp_path / 'last.pt')
+    task.save_checkpoint(path, 2, best=.4, best_epoch=1)
+    expected_rng = torch.rand(3)
+    expected_loader_rng = torch.rand(3, generator=task.loader_generators['train'])
+    fresh = PrototypeSegTask({'model': model()}, cfg())
+    fresh.loader_generators = {'train': torch.Generator().manual_seed(1)}
+    ckpt = fresh.resume(path)
+    assert ckpt['epoch'] == 2 and fresh.global_batch_step == 13
+    assert fresh.no_improve == 1
+    assert torch.equal(expected_rng, torch.rand(3))
+    assert torch.equal(expected_loader_rng, torch.rand(3, generator=fresh.loader_generators['train']))
+    assert all(torch.equal(v, fresh.model.state_dict()[k])
+               for k, v in task.model.state_dict().items())
+    assert len(fresh.optimizer.state) == len(task.optimizer.state)
+
+
+def test_gain_is_supervised_detached_and_rejects_harm():
+    y = torch.tensor([[[[1., 0., 1., 0.]]]])
+    p0 = torch.tensor([[[[.2, .8, .8, .2]]]])
+    pf = torch.tensor([[[[.8, .2, .2, .8]]]])
+    logits = torch.logit(pf).requires_grad_()
+    w = gain_weights(logits, torch.logit(p0), y)
+    assert not w.requires_grad
+    assert torch.allclose(w, torch.tensor([[[[1.2, .6, 0., 0.]]]]), atol=1e-6)
+    # Both predictions wrong: improvement alone is insufficient for admission.
+    assert gain_weights(torch.logit(torch.full_like(y, .3)),
+                        torch.logit(torch.full_like(y, .1)), torch.ones_like(y)).sum() == 0
+
+
+def test_full_bypasses_nonzero_correction_and_mixed_order():
+    m = model().eval()
+    populate(m)
+    b = batch()
+    full_before = m(b['ct'], pet=b['pet'], forward_mode='full')['logits']
+    for s in m.prototype.scales:
+        nn.init.normal_(s.spatial_out.weight, std=.05)
+        nn.init.normal_(s.channel_out.weight, std=.05)
+    assert torch.equal(full_before, m(b['ct'], pet=b['pet'], forward_mode='full')['logits'])
+    state = torch.tensor([0, 1, 0, 1])
+    mixed = m(b['ct'], pet=b['pet'], pet_available=state)['logits']
+    separate = m(b['ct'][state == 0], forward_mode='missing')['logits']
+    assert torch.allclose(mixed[state == 0], separate, atol=1e-6)
+
+
+def test_cpu_autocast_and_single_branch_ablations():
+    for s, c in ((True, False), (False, True), (True, True)):
+        m = model(prototype_spatial=s, prototype_channel=c).train()
+        populate(m)
+        with torch.autocast('cpu', dtype=torch.bfloat16):
+            loss = m(torch.randn(2, 1, 32, 32), forward_mode='missing')['logits'].float().square().mean()
+        loss.backward()
+        assert torch.isfinite(loss)
+        assert all(p.grad is None or torch.isfinite(p.grad).all() for p in m.parameters())
+
+
+def test_memory_contents_affect_reads_and_only_full_rows_are_collected():
+    m = model().eval()
+    populate(m)
+    for scale in m.prototype.scales:
+        nn.init.normal_(scale.spatial_out.weight, std=.1)
+        nn.init.normal_(scale.channel_out.weight, std=.1)
+    b = batch()
+    before = m(b['ct'], forward_mode='missing')['logits']
+    for scale in m.prototype.scales:
+        scale.spatial_bank.centers.normal_()
+        scale.channel_bank.centers.normal_()
+    after = m(b['ct'], forward_mode='missing')['logits']
+    assert not torch.allclose(before, after)
+    m.train()
+    state = torch.tensor([0, 1, 0, 1])
+    out = m(b['ct'], pet=b['pet'], pet_available=state, return_knowledge=True)
+    knowledge = out['knowledge']
+    assert torch.equal(knowledge['full_index'], torch.tensor([1, 3]))
+    for level, channels in zip(knowledge['full_features'], (32, 24, 16, 8)):
+        assert level.shape[:2] == (2, channels)
+        assert not level.requires_grad
+    assert all(not x.requires_grad for x in knowledge['reference_features'])
+
+
+def test_epoch_runner_final_selection_and_resume_match_uninterrupted(tmp_path, monkeypatch):
+    import sys
+    from torch.utils.data import DataLoader
+    import run_decoder_prototype_add as runner
+
+    def loaders(_cfg):
+        b = batch()
+        rows = [dict(ct=b['ct'][i], pet=b['pet'][i], mask=b['mask'][i], case_id=f'case{i}')
+                for i in range(4)]
+        return tuple(DataLoader(rows, batch_size=4, shuffle=(i == 0), drop_last=True,
+                                generator=torch.Generator().manual_seed(10 + i)) for i in range(3))
+
+    monkeypatch.setattr(runner, '_loaders', loaders)
+    common = ['run', '--epochs', '2', '--batch_size', '4', '--num_workers', '0',
+              '--pretrained', 'false', '--mixed_precision', 'false', '--ema_enabled', 'true',
+              '--ema_start_epoch', '1', '--decoder_channels', '32', '24', '16', '8',
+              '--prototype_dim', '4', '--prototype_clusters', '2', '--prototype_capacity', '16',
+              '--prototype_min_candidates', '2', '--prototype_refresh_steps', '1',
+              '--prototype_warmup_steps', '0', '--cosine_warmup', '0',
+              '--checkpoint_root', str(tmp_path)]
+    monkeypatch.setattr(sys, 'argv', common + ['--hash', 'continuous'])
+    runner.main()
+    reference = PrototypeSegTask.load_state_dicts(str(tmp_path / 'MDT/continuous/ckpt.last.pth.tar'))
+
+    class InterruptRun(Exception):
+        pass
+
+    original_save = PrototypeSegTask.save_checkpoint
+
+    def interrupted_save(self, path, epoch, *args, **kwargs):
+        original_save(self, path, epoch, *args, **kwargs)
+        if path.endswith('ckpt.last.pth.tar') and epoch == 1:
+            raise InterruptRun()
+
+    monkeypatch.setattr(PrototypeSegTask, 'save_checkpoint', interrupted_save)
+    monkeypatch.setattr(sys, 'argv', common + ['--hash', 'resumed'])
+    with pytest.raises(InterruptRun):
+        runner.main()
+    monkeypatch.setattr(PrototypeSegTask, 'save_checkpoint', original_save)
+    last = str(tmp_path / 'MDT/resumed/ckpt.last.pth.tar')
+    monkeypatch.setattr(sys, 'argv', common + ['--hash', 'resumed', '--resume', last])
+    runner.main()
+    resumed = PrototypeSegTask.load_state_dicts(last)
+    assert reference['global_batch_step'] == resumed['global_batch_step'] == 2
+    for key, value in reference['model'].items():
+        assert torch.equal(value, resumed['model'][key]), key
+    for key, value in reference['model_ema'].items():
+        assert torch.equal(value, resumed['model_ema'][key]), key
+    assert (tmp_path / 'MDT/resumed/final_test_metrics.json').exists()

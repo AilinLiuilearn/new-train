@@ -88,7 +88,7 @@ def test_ema_eval_runs_and_checkpoint_roundtrips():
     import tempfile
     path = os.path.join(tempfile.mkdtemp(), 'ckpt.pth.tar')
     task.save_checkpoint(path, epoch=1)
-    ckpt = torch.load(path, map_location='cpu')
+    ckpt = MDTSegTeacher.load_state_dicts(path)
     assert ckpt['model_ema'] is not None
     assert ckpt['ema_updates'] >= 1
     # EMA weights load strictly back into a fresh model.
