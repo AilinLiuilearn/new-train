@@ -29,6 +29,8 @@ def main():
         raise RuntimeError('CUDA requested but unavailable; this is not a CUDA validation')
     if args.batch_size < 2 or args.image_size < 64 or args.image_size % 32:
         raise ValueError('Use batch_size >= 2 and image_size >=64 divisible by 32')
+    print(f'[INFO] python={sys.executable} torch={torch.__version__} '
+          f'cuda={torch.version.cuda} backend={args.backend}', flush=True)
     # Check actual requested backend first, before allocating full models.
     for dtype in ([torch.float32, torch.float16] if device.type == 'cuda' else [torch.float32]):
         x = torch.randn(2, 64, 13, 17, device=device, dtype=dtype, requires_grad=True)

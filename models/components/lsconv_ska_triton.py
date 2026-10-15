@@ -2,7 +2,7 @@ import torch
 from torch.autograd import Function
 import triton
 import triton.language as tl
-from torch.amp import custom_fwd, custom_bwd
+from .lsconv_amp import custom_fwd, custom_bwd
 import math
 
 def _grid(numel: int, bs: int) -> tuple:

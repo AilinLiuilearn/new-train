@@ -32,6 +32,8 @@ git fetch origin
 git switch --track origin/exp/full-add-lsconv
 
 # 无数据预检：官方 CUDA 算子与参考实现的值/梯度；真实编码器两步 AMP 训练
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
 python scripts/check_lsconv.py --device cuda --backend triton --image_size 512 --batch_size 2
 
 # 四尺度融合训练
@@ -54,8 +56,19 @@ bash scripts/run_full_lsconv_ablation.sh lsconv --random_state 2024 --hash full-
 
 `lsconv` 默认 hash：`full-add-lsconv-imagenet-ema-s2023`。
 `add` 默认 hash：`full-add-lsconv-control-imagenet-ema-s2023`。
-已有相同 hash 的 config 会报错，避免覆盖之前实验。未实现恢复训练。
+默认拒绝覆盖已有相同 hash 的实验。启动脚本开启 `retry_failed_start`：
+若旧目录只有配置和空训练日志，将整个目录改名备份后重试；存在 epoch、
+checkpoint 或其他产物则仍拒绝覆盖。未实现恢复训练。
 这是从 ImageNet 编码器初始化开始的新实验，不是加载旧 Add 分割 checkpoint 微调。
+
+入口默认要求 CUDA，在建立实验目录前检查。CPU smoke test 必须显式选择
+`--require_cuda false --lsconv_backend torch`。
+
+若旧 PyTorch 报 `cannot import name 'custom_fwd' from 'torch.amp'`，更新本分支即可：
+AMP 兼容层自动使用 `torch.cuda.amp`，无需为此升级 PyTorch/CUDA/Triton。
+预检打印 Python、PyTorch 与 CUDA 版本；导入失败时保留具体错误。
+`OMP_NUM_THREADS` 必须为有效的正整数，手动预检前执行上方两行 export；
+训练启动脚本已设置这两个变量。
 
 ## 单独评估
 

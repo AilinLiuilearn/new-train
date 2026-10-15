@@ -20,6 +20,7 @@ def config(monkeypatch, tmp_path, enabled=True):
     monkeypatch.setattr(sys, 'argv', ['x', '--pretrained', 'false',
         '--checkpoint_root', str(tmp_path), '--hash', f'lsconv-{enabled}',
         '--lsconv_enabled', str(enabled), '--lsconv_backend', 'torch',
+        '--require_cuda', 'false',
         '--mixed_precision', 'false', '--hd95_mode', 'surface',
         '--batch_size', '2', '--epochs', '1', '--cosine_warmup', '0'])
     cfg = FullLSConvConfig.parse_arguments()

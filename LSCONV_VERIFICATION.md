@@ -5,6 +5,20 @@
 作者源码：`cbe737c92b7c43ecf02d08545a07f03f1010177c`。
 环境：Python 3.12、PyTorch 2.5.1 CPU；无 CUDA。
 
+## 启动与旧 AMP 接口兼容修复
+
+同日复测全套测试：**90 passed, 2 skipped**（51.06 秒）。
+使用 PyTorch 2.5.1+cpu、timm 1.0.11、transformers 4.44.2。
+新增检查覆盖 CUDA 不可用时不创建实验目录、失败启动文件完整备份、
+拒绝覆盖已有训练产物，以及新 AMP 导入与模拟旧 CUDA AMP 签名的兼容性。
+实际选中的 AMP 装饰器通过 CPU autograd 检查。
+
+`lsconv_ska_triton.py` 现在仅将一行 AMP 导入指向本地兼容层；还原这一行
+后文件仍匹配作者 blob，Triton 核和反向实现没有改变。旧 PyTorch 的真实
+CUDA AMP/Triton 执行仍需用户服务器预检，不能用模拟接口测试替代。
+两项 CUDA FP32/FP16 对照仍因无 GPU 跳过。
+以下为首次接入时的历史核验记录。
+
 ## 已运行
 
 `OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest -q tests`
@@ -13,7 +27,7 @@
 FP32/FP16 与 torch 参考实现的 CUDA 值/反向梯度对照。随后对跨 Python 版本
 的源码 AST 摘要兼容性调整单独运行测试，1 passed。
 
-- 作者 `Conv2d_BN`、`LKP`、`LSConv` 三个类 AST 一致；Triton 文件 Git blob SHA 一致。
+- 作者 `Conv2d_BN`、`LKP`、`LSConv` 三个类 AST 一致；首次接入时 Triton 文件 Git blob SHA 一致。
 - torch SKA 与独立 unfold 计算的数值、输入梯度、动态权重梯度一致。
 - S1–S4 实际尺寸：64@128²、128@64²、320@32²、512@16²。
 - train/eval 下初始融合输出与 Add 精确一致；完整模型初始 logits 精确一致。

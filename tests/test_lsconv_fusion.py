@@ -26,8 +26,11 @@ def features(actual=False):
             for c, s in zip(STAGE_CHANNELS, sizes)]
 
 
-def test_official_triton_file_is_byte_identical():
+def test_official_triton_file_only_changes_amp_import():
     data = Path('models/components/lsconv_ska_triton.py').read_bytes()
+    adapted = b'from .lsconv_amp import custom_fwd, custom_bwd'
+    assert data.count(adapted) == 1
+    data = data.replace(adapted, b'from torch.amp import custom_fwd, custom_bwd')
     git_blob = hashlib.sha1(f'blob {len(data)}\0'.encode() + data).hexdigest()
     assert git_blob == 'ee0ef7ac261ec8821827f781c712431a68ae7b46'
 

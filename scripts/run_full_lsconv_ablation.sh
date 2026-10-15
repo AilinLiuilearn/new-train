@@ -14,6 +14,7 @@ esac
 python run_full_lsconv_fusion.py \
   --hash "$run_hash" \
   --lsconv_enabled "$enabled" --lsconv_backend triton \
+  --require_cuda true --retry_failed_start true \
   --root /root/autodl-tmp/data/PCLT20K \
   --train_split_file train_original.txt \
   --val_split_file test.txt --test_split_file test.txt \

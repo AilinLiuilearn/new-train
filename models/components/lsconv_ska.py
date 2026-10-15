@@ -1,4 +1,4 @@
-"""SKA backend adapter; the CUDA implementation is the unmodified official file.
+"""SKA backend adapter; official CUDA kernels with a localized AMP import.
 
 The reference uses the source kernel's modulo channel sharing (not contiguous
 repeat_interleave), zero padding, no softmax, and no channel mixing in SKA.
@@ -51,7 +51,9 @@ class SKA(nn.Module):
         try:
             source = importlib.import_module('.lsconv_ska_triton', __package__)
         except ImportError as exc:
-            raise RuntimeError('Official SKA requires a compatible Triton installation; '
-                               'run the CUDA preflight before training') from exc
+            raise RuntimeError(
+                f'Cannot import official SKA backend: {exc}. '
+                f'PyTorch={torch.__version__}; run the CUDA preflight before training'
+            ) from exc
         # No silent CUDA fallback: source compilation/gradient errors must surface.
         return source.SkaFn.apply(x, w)
