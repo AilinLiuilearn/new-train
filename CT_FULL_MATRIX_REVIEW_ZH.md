@@ -109,3 +109,28 @@ GT 仅在 forward hook 中用于统计；面积下采样占比 q 对前景加权
 跨整个测试集累积通道平均平方能量后计算 RMS 比值，不平均逐批比值。无该类时输出空值。
 该比值是特征变化幅度，不代表分割收益；与训练日志的采样批次统计不可直接等同。
 不会更新网络、候选缓存或矩阵库。Full 开关结果应一致，Missing Dice 差值正向、HD95 差值负向表示改善。
+
+## 一次完整冻结审查
+
+```bash
+python -u audit_ct_full_matrix.py \
+  --checkpoint checkpoints_new/MDT/add-ctfull-kv-matrix-k4-finalonly-s2023/ckpt.best_joint.pth.tar \
+  --root /root/autodl-tmp/data/PCLT20K \
+  --output_dir checkpoints_new/MDT/add-ctfull-kv-matrix-k4-finalonly-s2023/audit_complete \
+  --weights raw --batch_size 4 --feature_samples 128
+```
+
+16 种解码对照：off/normal/uniform/shuffle，固定门控 .1/.3/1，四个尺度分别开启，四个尺度分别替换真实 Full，全部真实 Full。
+每批只编码一次 CT/PET，解码器重复 16 次；全部 FP32，默认 batch=4，运行时间明显长于单次验证。
+首次批次核对缓存路径与公开 forward 一致；全程前后校验所有参数和 buffer 哈希。
+正常 Missing 对照仅使用 CT 和冻结库；真实 PET 只构建 Full 诊断目标和明确标记的 full_s*/full_all 对照。
+`report.md`/`audit.json`给出规则触发的定位线索，不能保证唯一因果结论。
+`interventions.csv`为全数据累计 TP/FP/FN 的 Dice 和逐切片平均 HD95，与原指标口径一致。
+`per_case.csv`为病例累计计数 Dice、切片平均 HD95；`case_deltas.csv`为相对 off 的病例差异。
+`feature_per_case.csv`、`feature_summary.csv`记录实际 EMA 后矩阵的 CT→Full 误差、正常检索误差、单矩阵 oracle 误差及采样区域校正强度。
+特征每图每尺度每区域最多取128个确定性采样位置，区域权重为病灶面积占比 q／1-q；这不是全像素统计。
+Oracle 是当前矩阵集合内以真实 Full 特征误差选择单矩阵，不是全部可能软组合的最优解，更不是临床分割上限。
+小病灶统计为2D四连通组件、面积≤100像素、任一预测前景像素重叠即检出；不能当作3D病灶评估。
+诊断 Dice 阈值默认 .001（0.1百分点），不是统计显著性标准；参数扫描仅用于定位，不能在测试集选优后报告为独立测试结果。
+可先添加 `--max_batches 2` 检查运行，输出将标记 partial；正式定位必须移除此参数。
+针对性改进顺序：矩阵不泛化→简化矩阵自由度／改善病例覆盖；oracle有效但检索无效→检查key和软混合；固定门控有效→检查采用机制；单尺度有效→检查尺度干扰；特征拟合改善却任务无益→重新设计任务相关建库选择。暂不自动修改训练结构。
