@@ -6,7 +6,7 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
 python -u run_ct_full_matrix_add.py \
-  --hash add-ctfull-kv-matrix-k4-finalonly-s2023 \
+  --hash add-ctfull-kv-lowrank-r8-fullinit-s2023 \
   --root /root/autodl-tmp/data/PCLT20K \
   --train_split_file train_original.txt \
   --val_split_file test.txt \
@@ -41,6 +41,9 @@ python -u run_ct_full_matrix_add.py \
   --early_stop_patience 10 \
   --random_state 2023 \
   --ema_enabled false \
+  --matrix_value_mode lowrank \
+  --matrix_value_rank 8 \
+  --matrix_value_init full \
   --matrix_enabled true \
   --matrix_clusters 4 \
   --matrix_capacity 256 \

@@ -3,8 +3,9 @@
 Contract: scales are S1..S4, each feature [B,C,H,W]. Training collection takes
 paired raw CT/Full features and GT; inference takes CT only. Spherical routing
 uses unit CT directions, while ridge fitting and application use RAW features.
-All pools/keys/transforms/counters are checkpointed buffers, never parameters.
-Only the adoption gates are learned by downstream Missing segmentation loss.
+Pools/keys/counters are checkpointed buffers. Analytic mode uses buffer values;
+lowrank mode uses trainable I+AB values initialized once from paired Full data.
+Missing segmentation loss trains the adoption gates and lowrank factors.
 
 Borrowed principle: FedMEPD (arXiv:2603.04887), sec.3.5: GT class organization,
 multi-anchor maintenance and EMA. Independent pixel-pair pools, spherical CT
@@ -70,6 +71,12 @@ class MatrixBank(nn.Module):
             if first < n: dst[:n-first].copy_(src[first:])
         self.cursor.fill_((start+n) % self.capacity)
         self.size.fill_(min(self.capacity, int(self.size)+n))
+
+    def effective_transforms(self):
+        return self.transforms
+
+    def apply_value(self, query, slot):
+        return query @ self.transforms[slot].detach().T
 
     @staticmethod
     @torch.no_grad()
@@ -169,8 +176,17 @@ class MatrixScale(nn.Module):
             raise ValueError('invalid sampling budget, temperature or gate initialization')
         self.channels, self.samples_per_class = channels, samples_per_class
         self.temperature, self.gate_init = float(temperature), float(gate_init)
-        self.foreground_bank = MatrixBank(channels, **bank_kwargs)
-        self.background_bank = MatrixBank(channels, **bank_kwargs)
+        value_mode = bank_kwargs.pop('value_mode', 'analytic')
+        rank = bank_kwargs.pop('value_rank', 8)
+        initialization = bank_kwargs.pop('value_init', 'full')
+        if value_mode == 'lowrank':
+            from models.ct_full_lowrank_value import LowRankValueBank
+            def make_bank(): return LowRankValueBank(channels, value_rank=rank, value_init=initialization, **bank_kwargs)
+        elif value_mode == 'analytic':
+            def make_bank(): return MatrixBank(channels, **bank_kwargs)
+        else: raise ValueError('value_mode must be analytic/lowrank')
+        self.foreground_bank = make_bank()
+        self.background_bank = make_bank()
         self.gate = nn.Conv2d(2*channels, 1, 1)
         nn.init.zeros_(self.gate.weight)
         nn.init.constant_(self.gate.bias, math.log(gate_init/(1-gate_init)))
@@ -216,14 +232,14 @@ class MatrixScale(nn.Module):
         if not ready or read_mode in ('off', 'identity'): return x
         with torch.autocast(device_type=x.device.type, enabled=False):
             keys = torch.cat([b.keys.detach() for b in ready])
-            transforms = torch.cat([b.transforms.detach() for b in ready])
-            if read_mode == 'shuffle': transforms = transforms.roll(1, dims=0)
+            slots = [(b,j) for b in ready for j in range(b.clusters)]
+            if read_mode == 'shuffle': slots = slots[-1:]+slots[:-1]
             query = x.float().flatten(2).transpose(1,2)
             attention = (F.normalize(query, dim=-1, eps=1e-8) @ keys.T / self.temperature).softmax(-1)
             read = torch.zeros_like(query)
             # Do not allocate [B,H*W,K,C,C] dynamic matrices.
-            for j in range(len(keys)):
-                read = read + (query @ transforms[j].T)*attention[..., j:j+1]
+            for j, (bank, slot) in enumerate(slots):
+                read = read + bank.apply_value(query, slot)*attention[..., j:j+1]
             transformed = read.transpose(1,2).reshape_as(x)
             gate = self.gate(torch.cat([x.float(), transformed], dim=1)).sigmoid()
             corrected = x.float()+gate*(transformed-x.float())

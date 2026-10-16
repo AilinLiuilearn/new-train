@@ -218,7 +218,8 @@ def test_shuffle_changes_value_pairing_without_changing_keys():
     assert torch.equal(keys,b.keys)
 
 
-def test_runner_resume_and_eval_controls(fake_backbones, tmp_path, monkeypatch):
+@pytest.mark.parametrize('value_mode', ['analytic', 'lowrank'])
+def test_runner_resume_and_eval_controls(fake_backbones, tmp_path, monkeypatch, value_mode):
     import csv
     import sys
     from torch.utils.data import DataLoader
@@ -235,7 +236,7 @@ def test_runner_resume_and_eval_controls(fake_backbones, tmp_path, monkeypatch):
             generator=torch.Generator().manual_seed(10+i)) for i in range(3))
 
     monkeypatch.setattr(runner,'_loaders',loaders)
-    common = ['run','--epochs','2','--batch_size','4','--num_workers','0',
+    common = ['run','--matrix_value_mode',value_mode,'--matrix_value_rank','2','--epochs','2','--batch_size','4','--num_workers','0',
         '--hd95_mode','legacy','--pretrained','false','--mixed_precision','false',
         '--ema_enabled','true','--ema_start_epoch','0','--cosine_warmup','0',
         '--decoder_channels','32','24','16','8','--matrix_clusters','2',

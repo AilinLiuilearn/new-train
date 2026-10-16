@@ -84,11 +84,21 @@ class CTFullMatrixSegTask(MDTSegTeacher):
         return result
 
     def update_ema(self):
+        newly_valid = []
+        if self.ema is not None:
+            for source_scale, target_scale in zip(self.model.matrix.scales, self.ema.model.matrix.scales):
+                for source_bank, target_bank in zip(source_scale.banks, target_scale.banks):
+                    if hasattr(source_bank, 'value_a') and bool(source_bank.valid) and not bool(target_bank.valid):
+                        newly_valid.append((source_bank,target_bank))
         decay = super().update_ema()
         if self.ema is not None and self.ema_active:
             # Bank EMA is already applied. Copy all matrix buffers directly,
             # including paired queues, transforms, keys, validity and counters.
             with torch.no_grad():
+                # Newly initialized trainable factors must not be diluted by cold-start EMA.
+                for source_bank,target_bank in newly_valid:
+                    target_bank.value_a.copy_(source_bank.value_a)
+                    target_bank.value_b.copy_(source_bank.value_b)
                 source = dict(self.model.matrix.named_buffers())
                 for name, target in self.ema.model.matrix.named_buffers():
                     target.copy_(source[name])

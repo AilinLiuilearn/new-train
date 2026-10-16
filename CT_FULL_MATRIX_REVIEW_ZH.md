@@ -134,3 +134,20 @@ Oracle 是当前矩阵集合内以真实 Full 特征误差选择单矩阵，不�
 诊断 Dice 阈值默认 .001（0.1百分点），不是统计显著性标准；参数扫描仅用于定位，不能在测试集选优后报告为独立测试结果。
 可先添加 `--max_batches 2` 检查运行，输出将标记 partial；正式定位必须移除此参数。
 针对性改进顺序：矩阵不泛化→简化矩阵自由度／改善病例覆盖；oracle有效但检索无效→检查key和软混合；固定门控有效→检查采用机制；单尺度有效→检查尺度干扰；特征拟合改善却任务无益→重新设计任务相关建库选择。暂不自动修改训练结构。
+
+## 可学习低秩 Value（当前训练脚本默认）
+
+保留旧解析模式 `--matrix_value_mode analytic`，旧 checkpoint 缺少新配置时默认解析模式；不自动迁移旧优化器或续训旧实验。
+新模式 `--matrix_value_mode lowrank --matrix_value_rank 8 --matrix_value_init full`。
+每尺度前景/背景各4槽；V_j=I+A_j B_j，A为[C,r]、B为[r,C]，实际前向按低秩乘法，不生成位置相关大矩阵。
+首次成功建库：原配对岭回归求T，再对T-I截断SVD得到A/B；Full只提供一次初始化方向。
+之后Value仅由Missing最终分割损失反传更新；不再用解析解/EMA覆盖A/B。Key仍为无梯度buffer。
+首次初始化后采用当前Key固定槽位最近方向分配，按类独立EMA更新Key；少于最小支持的槽位保留原Key，不重新编号、不移动参数和优化器动量。
+`identity`对照同样建立Key，但A=0、B为独立固定种子的随机初值，确保初始V=I，同时A有可用梯度；不能把A/B同时置零。
+四尺度额外低秩参数131072，加门控2052，总计133124。Full路径不读取，GT仅用于训练候选组织，不增加辅助头或损失。
+参数、优化器动量、Key/缓存/valid均随新checkpoint保存；低秩模式只能恢复同rank/init的低秩checkpoint。
+训练脚本新hash `add-ctfull-kv-lowrank-r8-fullinit-s2023`，旧实验目录不会覆盖。
+恒等初始化对照：`bash scripts/train_ct_full_matrix.sh --matrix_value_init identity --hash add-ctfull-kv-lowrank-r8-identity-s2023`。
+关闭模块对照：`bash scripts/train_ct_full_matrix.sh --matrix_enabled false --hash add-ctfull-kv-lowrank-off-s2023`。
+旧解析版本重跑需显式 `--matrix_value_mode analytic --hash add-ctfull-kv-analytic-rerun-s2023`。
+完整审查脚本使用实际可学习Value，支持新checkpoint；本版不再持续用Full特征约束Value，仅以Full初始化后由任务训练，Full贡献必须与identity初始化对照证明。

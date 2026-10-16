@@ -8,7 +8,7 @@ from models.ct_full_matrix import CTFullMatrixMemory
 MATRIX_DEFAULTS = dict(enabled=True, clusters=4, capacity=256, min_candidates=24,
     min_cluster_samples=2, ridge=.01, decay=.99, iterations=15, outlier_filter=False,
     samples_per_class=8, temperature=.5, gate_init=.1, warmup_steps=100, refresh_steps=20,
-    sampling_seed=2023)
+    sampling_seed=2023, value_mode='analytic', value_rank=8, value_init='full')
 
 
 class CTFullMatrixAddModel(DualSharedAddPETCTBaseline):
@@ -70,4 +70,6 @@ def build_matrix_model(cfg):
     print('[ct_full_matrix] before_decoder=True independent_scales=True '
           f'K={cfg.matrix_clusters} spherical_CT_keys=True raw_transform_values=True '
           f'enabled={cfg.matrix_enabled} final_supervision_only=True', flush=True)
+    print(f'[matrix_value] mode={getattr(cfg,"matrix_value_mode","analytic")} '
+          f'rank={getattr(cfg,"matrix_value_rank",8)} init={getattr(cfg,"matrix_value_init","full")}', flush=True)
     return {'model': model}

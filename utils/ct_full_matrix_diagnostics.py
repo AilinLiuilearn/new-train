@@ -52,7 +52,7 @@ class MatrixCSVLogger:
                 rows.append(row)
                 for j in range(bank.clusters):
                     slots.append(dict(ctx, slot=j, valid=valid, support=int(bank.support[j]),
-                        key_norm=float(bank.keys[j].norm()), matrix_norm=float(bank.transforms[j].norm()),
+                        key_norm=float(bank.keys[j].norm()), matrix_norm=float(bank.effective_transforms()[j].norm()),
                         fit_mse_in_pool=float(bank.fit_error[j]), identity_mse_in_pool=float(bank.identity_error[j]),
                         ridge_lambda=float(bank.ridge_lambda[j]), applied_matrix_drift=float(bank.matrix_drift[j]),
                         read_attention_mean=attention[start+j] if valid and attention else None,

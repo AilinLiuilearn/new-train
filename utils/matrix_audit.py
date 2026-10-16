@@ -9,7 +9,7 @@ def audit_scale(scale, x, full, mask, samples=128):
     if not banks:
         return dict(normal=x, uniform=x, shuffle=x, g010=x, g030=x, g100=x), []
     keys = torch.cat([b.keys for b in banks]).float()
-    matrices = torch.cat([b.transforms for b in banks]).float()
+    matrices = torch.cat([b.effective_transforms() for b in banks]).float()
     q = x.float().flatten(2).transpose(1, 2)
     a = (F.normalize(q, dim=-1) @ keys.T / scale.temperature).softmax(-1)
     normal, uniform, shuffle = [torch.zeros_like(q) for _ in range(3)]

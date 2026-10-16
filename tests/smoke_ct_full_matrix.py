@@ -15,13 +15,14 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--size', type=int, default=64)
     p.add_argument('--backward', action='store_true')
+    p.add_argument('--value_mode', choices=('analytic','lowrank'), default='analytic')
     args = p.parse_args()
     torch.set_num_threads(2); torch.manual_seed(2023)
     cfg = CTFullMatrixConfig(args=dict(ct_backbone='convnextv2_nano', pet_backbone='mit_b1',
         pretrained=False, ct_pretrained_path=None, pet_pretrained_path=None,
         use_deep_supervision=False, deep_supervision=False, decoder_channels=(512,256,128,64),
         learning_rate=8e-5, weight_decay=1e-4, mixed_precision=False, ema_enabled=False,
-        matrix_enabled=True, matrix_clusters=4))
+        matrix_enabled=True, matrix_clusters=4, matrix_value_mode=args.value_mode))
     task = CTFullMatrixSegTask(build_matrix_model(cfg), cfg)
     # Actually fit all banks, then exercise live gates and nonidentity transforms.
     for s in task.model.matrix.scales:
@@ -38,6 +39,8 @@ def main():
         loss.backward()
         assert all(p.grad is None or torch.isfinite(p.grad).all() for p in task.model.parameters())
         assert all(s.gate.weight.grad is not None for s in task.model.matrix.scales)
+        if args.value_mode=='lowrank':
+            assert all(b.value_a.grad is not None and b.value_b.grad is not None for s in task.model.matrix.scales for b in s.banks)
         task.optimizer.step(); task.after_optimizer_step(True)
     else:
         task.model.eval()
