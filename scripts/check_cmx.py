@@ -1,4 +1,4 @@
-"""Data-free real-backbone preflight for unchanged official CMX modules."""
+"""Data-free real-backbone preflight for official CMX or SKFF modules."""
 import argparse
 import json
 import sys
@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 from configs.base import str2bool
 from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
+from models.components.add_fusion import AddFusion
 from models.full_cmx_fusion import FullCMXPETCT
 from utils.seg_losses import BCEDiceLoss
 
@@ -19,6 +20,7 @@ def main():
     p.add_argument('--batch_size', type=int, default=2)
     p.add_argument('--cmx_ffm_enabled', type=str2bool, default=True)
     p.add_argument('--cmx_frm_enabled', type=str2bool, default=False)
+    p.add_argument('--fusion_backend', choices=('cmx', 'skff'), default='cmx')
     args = p.parse_args()
     if args.device == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA requested but unavailable; not a CUDA validation')
@@ -26,12 +28,15 @@ def main():
         raise ValueError('Use image_size>=64 divisible by 32, batch_size>=2')
     device = torch.device(args.device)
     print(f'[INFO] python={sys.executable} torch={torch.__version__} '
-          f'cuda={torch.version.cuda} ffm={args.cmx_ffm_enabled} frm={args.cmx_frm_enabled}', flush=True)
+          f'cuda={torch.version.cuda} backend={args.fusion_backend} '
+          f'ffm={args.fusion_backend == "cmx" and args.cmx_ffm_enabled} '
+          f'frm={args.fusion_backend == "cmx" and args.cmx_frm_enabled}', flush=True)
     torch.manual_seed(2023)
     base = DualSharedAddPETCTBaseline(pretrained=False).to(device).eval()
     torch.manual_seed(2023)
     model = FullCMXPETCT(cmx_ffm_enabled=args.cmx_ffm_enabled,
-                         cmx_frm_enabled=args.cmx_frm_enabled, pretrained=False).to(device).eval()
+                         cmx_frm_enabled=args.cmx_frm_enabled,
+                         fusion_backend=args.fusion_backend, pretrained=False).to(device).eval()
     for key, value in base.state_dict().items():
         assert torch.equal(value, model.state_dict()[key]), key
     ct = torch.randn(args.batch_size, 3, args.image_size, args.image_size, device=device)
@@ -39,12 +44,13 @@ def main():
     with torch.no_grad():
         expected = base(ct, pet=pet, forward_mode='full')['logits']
         result = model(ct, pet=pet)['logits']
-        if args.cmx_ffm_enabled or args.cmx_frm_enabled:
+        if args.fusion_backend == 'skff' or args.cmx_ffm_enabled or args.cmx_frm_enabled:
             assert not torch.equal(result, expected), 'Official initialization must not be replaced by Add'
-        model.fusion.ffm_enabled = model.fusion.frm_enabled = False
+        selected_fusion = model.fusion
+        model.fusion = AddFusion()
         control = model(ct, pet=pet)['logits']
         torch.testing.assert_close(control, expected, atol=0, rtol=0)
-        model.fusion.ffm_enabled, model.fusion.frm_enabled = args.cmx_ffm_enabled, args.cmx_frm_enabled
+        model.fusion = selected_fusion
     del base, expected, result, control
     print('[PASS] shared baseline weights equal; disabled fusion exactly Add; enabled fusion uses official init', flush=True)
     model.train()
@@ -65,7 +71,7 @@ def main():
             grads = [p.grad for p in getattr(model, name).parameters() if p.requires_grad]
             assert grads and all(g is not None and torch.isfinite(g).all() for g in grads), name
             assert sum(float(g.abs().sum()) for g in grads) > 0, name
-        for blocks in (model.fusion.ffms, model.fusion.frms):
+        for blocks in model.fusion.children():
             for block in blocks:
                 grads = [p.grad for p in block.parameters()]
                 assert grads and all(g is not None and torch.isfinite(g).all() for g in grads)
@@ -74,7 +80,9 @@ def main():
         scaler.update()
         print(f'[PASS] optimizer step={step + 1} main_BCE_Dice={float(loss.detach()):.6f}', flush=True)
     print(json.dumps(dict(status='passed', device=str(device), image_size=args.image_size,
-        batch_size=args.batch_size, cmx_ffm_enabled=args.cmx_ffm_enabled, cmx_frm_enabled=args.cmx_frm_enabled,
+        batch_size=args.batch_size, fusion_backend=args.fusion_backend,
+        cmx_ffm_enabled=args.fusion_backend == 'cmx' and args.cmx_ffm_enabled,
+        cmx_frm_enabled=args.fusion_backend == 'cmx' and args.cmx_frm_enabled,
         params_fusion=sum(p.numel() for p in model.fusion.parameters()),
         params_total=sum(p.numel() for p in model.parameters()),
         peak_cuda_gib=torch.cuda.max_memory_allocated() / 2**30 if device.type == 'cuda' else None), indent=2))

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Isolated Full CMX runner: official FFM/optional FRM, baseline BCE+Dice only.
+"""Full runner: official CMX or SKFF modules, baseline BCE+Dice only.
 
 Baseline data/encoders/aligners/decoder/optimizer/scheduler/EMA/metrics unchanged.
 No lesion prediction, auxiliary supervision, prototype losses or extra residual.
@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from configs.full_cmx import FullCMXConfig
-from models.full_cmx_fusion import CONFIG_FIELDS, build_full_cmx_model
+from models.full_cmx_fusion import CONFIG_FIELDS, build_full_cmx_model, fusion_class
 from models.components.cmx_fusion import CMXFusion
 from tasks.mdt_seg import MDTSegTeacher
 from utils.optimization import get_cosine_scheduler
@@ -23,7 +23,7 @@ from utils.train_logger import append_epoch_log, init_train_log
 
 
 def train_step_full(task, batch):
-    """Full-modality step: all rows train the CT+PET CMX path with BCE+Dice."""
+    """Full-modality step: all rows train the selected CT+PET path with BCE+Dice."""
     ct = batch['ct'].to(task.device, non_blocking=True)
     pet = batch['pet'].to(task.device, non_blocking=True)
     mask = batch['mask'].to(task.device, non_blocking=True).float()
@@ -73,10 +73,12 @@ def _checkpoint_paths(checkpoint_dir):
 
 
 def main(config_cls=FullCMXConfig, model_builder=build_full_cmx_model,
-         expected_fusion=CMXFusion, experiment_type='full_cmx_fusion',
+         expected_fusion=None, experiment_type='full_cmx_fusion',
          result_config_fields=CONFIG_FIELDS, extra_grad_modules=('pet_align', 'fusion')):
-    print(f'[INFO] starting Full-only CT+PET {expected_fusion.__name__}', flush=True)
     cfg = config_cls.parse_arguments()
+    if expected_fusion is None:
+        expected_fusion = fusion_class(getattr(cfg, 'fusion_backend', 'cmx'))
+    print(f'[INFO] starting Full-only CT+PET {expected_fusion.__name__}', flush=True)
     cfg.experiment_type = experiment_type
     cfg.train_batch_mode = 'full'
     cfg.fusion_type = expected_fusion.__name__

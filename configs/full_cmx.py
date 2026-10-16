@@ -10,6 +10,7 @@ import torch
 from configs.base import str2bool
 from models.components.cmx_fusion import STAGE_CHANNELS, STAGE_HEADS, UPSTREAM_COMMIT, UPSTREAM_BLOB
 from models.full_cmx_fusion import BASELINE_COMMIT
+from models.components import skff_fusion
 from run_full_add_baseline import FullAddConfig
 
 
@@ -59,6 +60,8 @@ class FullCMXConfig(FullAddConfig):
                 a.choices = ('full_cmx_fusion',)
         p.add_argument('--cmx_ffm_enabled', type=str2bool, default=True)
         p.add_argument('--cmx_frm_enabled', type=str2bool, default=False)
+        p.add_argument('--fusion_backend', choices=('cmx', 'skff'), default='cmx',
+                       help='Choose one fusion; skff disables CMX FFM/FRM')
         p.add_argument('--require_cuda', type=str2bool, default=True)
         p.add_argument('--retry_failed_start', type=str2bool, default=False)
         return p
@@ -80,5 +83,17 @@ class FullCMXConfig(FullAddConfig):
         cfg.cmx_output_mode = 'replace_add'
         cfg.cmx_upstream_commit = UPSTREAM_COMMIT
         cfg.cmx_source_blob = UPSTREAM_BLOB
+        if cfg.fusion_backend == 'skff':
+            if cfg.cmx_frm_enabled:
+                raise ValueError('SKFF replaces CMX; --cmx_frm_enabled must be false')
+            cfg.cmx_ffm_enabled = False
+            cfg.skff_stage_channels = list(skff_fusion.STAGE_CHANNELS)
+            cfg.skff_stage_order = [1, 2, 3, 4]
+            cfg.skff_height = 2
+            cfg.skff_reduction = 8
+            cfg.skff_output_scale = 1
+            cfg.skff_initialization = 'official'
+            cfg.skff_upstream_commit = skff_fusion.UPSTREAM_COMMIT
+            cfg.skff_source_blob = skff_fusion.UPSTREAM_BLOB
         prepare_run_directory(cfg)
         return cfg

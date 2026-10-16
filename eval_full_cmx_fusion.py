@@ -1,4 +1,4 @@
-"""Evaluate a Full-only CMX checkpoint using its saved architecture and weights."""
+"""Evaluate a Full CMX/SKFF checkpoint using its saved architecture and weights."""
 import argparse
 import json
 import os
@@ -7,8 +7,9 @@ import torch
 
 from configs.base import str2bool
 from configs.seg_mdt import SegMDTConfig
-from models.full_cmx_fusion import CONFIG_FIELDS, build_full_cmx_model
+from models.full_cmx_fusion import CONFIG_FIELDS, build_full_cmx_model, fusion_class
 from models.components.cmx_fusion import STAGE_HEADS, UPSTREAM_BLOB
+from models.components import skff_fusion
 from tasks.mdt_seg import MDTSegTeacher
 from utils.run_common import seed_everything
 
@@ -16,18 +17,25 @@ from utils.run_common import seed_everything
 def load_full_checkpoint(path, device='cpu', use_ema=None):
     ckpt = MDTSegTeacher.load_state_dicts(path)
     saved = dict(ckpt['config'])
+    backend = saved.setdefault('fusion_backend', 'cmx')
     if (saved.get('experiment_type') != 'full_cmx_fusion'
-            or saved.get('fusion_type') != 'CMXFusion'
+            or saved.get('fusion_type') != fusion_class(backend).__name__
             or saved.get('model_arch') != 'full_cmx_fusion'):
         raise ValueError('Expected a Full CMX checkpoint; other experiments are incompatible')
     if saved.get('cmx_stage_channels') != [64, 128, 320, 512] or saved.get('cmx_stage_order') != [1, 2, 3, 4]:
         raise ValueError('Unsupported CMX channels or scale ordering in checkpoint')
-    if (saved.get('cmx_stage_heads') != list(STAGE_HEADS)
+    if backend == 'cmx' and (saved.get('cmx_stage_heads') != list(STAGE_HEADS)
             or saved.get('cmx_reduction') != 1
             or saved.get('cmx_initialization') != 'official'
             or saved.get('cmx_output_mode') != 'replace_add'
             or saved.get('cmx_source_blob') != UPSTREAM_BLOB):
         raise ValueError('Unsupported CMX architecture/source in checkpoint')
+    if backend == 'skff' and any(saved.get(k) != v for k, v in {
+            'skff_stage_channels': [64, 128, 320, 512], 'skff_stage_order': [1, 2, 3, 4],
+            'skff_height': 2, 'skff_reduction': 8, 'skff_output_scale': 1,
+            'skff_initialization': 'official', 'skff_source_blob': skff_fusion.UPSTREAM_BLOB,
+            'cmx_ffm_enabled': False, 'cmx_frm_enabled': False}.items()):
+        raise ValueError('Unsupported SKFF architecture/source in checkpoint')
     saved.pop('checkpoint_dir', None)
     saved.update(pretrained=False, ct_pretrained_path=None, pet_pretrained_path=None)
     cfg = SegMDTConfig(args=saved)

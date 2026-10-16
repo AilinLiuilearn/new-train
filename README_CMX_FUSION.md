@@ -2,6 +2,8 @@
 
 Branch: `exp/full-cmx-ffm`, based on Add baseline `663f9786122365d8b2774e4497df92bc06b715d5`.
 
+The same branch now also offers `--fusion_backend skff` and a standalone SKFF launcher. See [SKFF instructions](README_SKFF_FUSION.md). The existing CMX default, source and FFM/FRM behavior are retained.
+
 Default path: CT/PET encoders → existing projection aligners → **official FFM at S1–S4** → existing decoder. Channels are `[64,128,320,512]`, heads `[1,2,5,8]`, reduction 1. At 512 input, spatial sizes are `[128,64,32,16]`. FFM replaces Add and retains its own internal residuals, native initialization, LayerNorm and BatchNorm2d. There is no external Add around FFM.
 
 The original CMX source and MIT license are vendored byte-for-byte; see [source provenance](CMX_SOURCE.md). No Triton extension is introduced. This experiment is Full-only; it rejects missing PET and mixed availability before encoder execution. It does not connect CMX to retrieval/prototype paths.
