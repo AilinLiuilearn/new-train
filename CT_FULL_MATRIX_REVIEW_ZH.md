@@ -93,3 +93,19 @@ PYTHONPATH=. python tests/smoke_ct_full_matrix.py --size 512
 前向/反向/优化提交通过，512输入有效矩阵前向、Full旁路和Missing的PET隔离通过。
 训练脚本bash语法、实际入口--help、109个参数token解析通过。未运行真实患者数据或CUDA训练；
 RTX3090的batch16峰值显存、速度、收敛及性能收益必须实测。
+
+## 同一 checkpoint 开启／关闭补偿诊断
+
+```bash
+python -u eval_ct_full_matrix_add.py \
+  --checkpoint checkpoints_new/MDT/add-ctfull-kv-matrix-k4-finalonly-s2023/ckpt.best_joint.pth.tar \
+  --compare_on_off true --missing_rates 0 1 \
+  --output_dir checkpoints_new/MDT/add-ctfull-kv-matrix-k4-finalonly-s2023/diagnosis_on_off
+```
+
+`normal/`、`off/`分别保存相同病例分配下的评估结果，`comparison.json`汇总开启减关闭的 Dice/HD95 差值。
+`missing_region_correction.csv`另一次全 Missing、FP32 诊断遍历记录四尺度前景／背景校正强度。
+GT 仅在 forward hook 中用于统计；面积下采样占比 q 对前景加权、1-q 对背景加权，混合单元按比例计入两类。
+跨整个测试集累积通道平均平方能量后计算 RMS 比值，不平均逐批比值。无该类时输出空值。
+该比值是特征变化幅度，不代表分割收益；与训练日志的采样批次统计不可直接等同。
+不会更新网络、候选缓存或矩阵库。Full 开关结果应一致，Missing Dice 差值正向、HD95 差值负向表示改善。
