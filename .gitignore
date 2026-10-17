@@ -3,3 +3,10 @@ __pycache__/
 .pytest_cache/
 pytest-of-root/
 tmp*/
+
+# Local data, pretrained weights and experiment outputs
+/checkpoints_new/
+/pretrained/
+/data/
+*.pth
+*.pth.tar

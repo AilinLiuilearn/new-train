@@ -1,6 +1,6 @@
 # 解码器前统一空间调制库
 
-新分支 `exp/ct-full-spatial-modulation-bank`，基于可学习矩阵分支；原矩阵模型、任务、训练脚本保持原样。
+新分支 `exp/ct-full-spatial-modulation-bank`，基于可学习矩阵分支；本分支只保留当前方案及必要依赖；历史矩阵/原型实现保留在原分支。
 
 ## 数据流和损失
 
@@ -52,3 +52,5 @@ GT只用于分割监督与日志前景占比/拟合误差，不参与聚类、�
 不调用旧矩阵专用audit脚本分析这个新模型。
 
 设计风险：背景主导、beta退化为特征偏移、库平均后失去个体信息、编码器/调制生成器变化导致知识陈旧；需通过日志及开关对照验证。该实现不宣称实验收益。
+
+清理兼容性：matrix_*命令行字段、model.matrix及其state_dict键名保留，以加载既有调制库checkpoint；不代表仍存在矩阵Value。公共加载函数迁移至utils/spatial_modulation_runtime.py。
