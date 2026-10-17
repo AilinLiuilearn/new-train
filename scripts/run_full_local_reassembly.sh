@@ -4,9 +4,8 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 python run_full_local_reassembly.py \
-  --hash full-add-local-reassembly-protect-lr4e5-s2023 --local_enabled true \
-  --protect_enabled true --protect_weight 0.1 --baseline_weights auto \
-  --baseline_checkpoint /root/autodl-tmp/mkd-main/new-train/checkpoints_new/MDT/full-add-baseline/ckpt.best_full.pth.tar \
+  --hash full-local-reassembly-lr4e5-60ep-ema-s2023 --local_enabled true \
+  --baseline_checkpoint "" --protect_enabled false \
   --require_cuda true --root /root/autodl-tmp/data/PCLT20K \
   --train_split_file train_original.txt --val_split_file test.txt --test_split_file test.txt \
   --allow_val_equals_test true --image_size_2d 512 --batch_size 16 \

@@ -1,4 +1,4 @@
-"""Isolated Full local reassembly, optional relative protection, explicit warm-start."""
+"""Full local reassembly: fresh segmentation training by default; opt-in warm-start."""
 import math
 from pathlib import Path
 
@@ -42,7 +42,7 @@ class FullLocalConfig(FullAddConfig):
     def train_parser():
         parser=FullAddConfig.train_parser()
         parser.set_defaults(learning_rate=4e-5,early_stop_patience=60,ema_enabled=True)
-        parser.add_argument('--protect_enabled',type=str2bool,default=True)
+        parser.add_argument('--protect_enabled',type=str2bool,default=False)
         parser.add_argument('--protect_weight',type=float,default=.1,
                             help='Unvalidated starting weight; training-only class-balanced relative BCE')
         return parser

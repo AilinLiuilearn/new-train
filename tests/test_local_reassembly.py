@@ -262,8 +262,47 @@ def test_parser_guards_and_scratch_initialization(monkeypatch,tmp_path):
     (Path(cfg.checkpoint_dir)/'keep.txt').write_text('original')
     with pytest.raises(FileExistsError): FullLocalConfig.parse_arguments()
     assert (Path(cfg.checkpoint_dir)/'keep.txt').read_text()=='original'
-    monkeypatch.setattr(sys,'argv',['x','--require_cuda','false'])
+    monkeypatch.setattr(sys,'argv',['x','--require_cuda','false','--protect_enabled','true'])
     with pytest.raises(ValueError,match='Protection requires'): FullLocalConfig.parse_arguments()
+
+
+@pytest.mark.parametrize('local',[True,False])
+def test_default_fresh_training_main_loss_only_and_no_reference(monkeypatch,tmp_path,local):
+    """Primary ablation starts both arms afresh, with no segmentation checkpoint."""
+    from configs.full_local_reassembly import FullLocalConfig
+    from eval_full_local_reassembly import load_full_checkpoint
+    import run_full_local_reassembly as runner
+    from utils.seg_losses import BCEDiceLoss
+    monkeypatch.setattr(sys,'argv',['x','--pretrained','false','--require_cuda','false',
+        '--checkpoint_root',str(tmp_path),'--hash','fresh-default','--local_enabled',str(local),
+        '--image_size_2d','64','--batch_size','2','--epochs','1','--cosine_warmup','0',
+        '--mixed_precision','false','--hd95_mode','surface'])
+    cfg=FullLocalConfig.parse_arguments()
+    assert not cfg.protect_enabled and cfg.baseline_checkpoint is None
+    assert cfg.learning_rate==4e-5 and cfg.ema_enabled and cfg.ema_decay==.999
+    cfg.ema_start_epoch=0
+    monkeypatch.setattr(FullLocalConfig,'parse_arguments',classmethod(lambda cls:cfg))
+    mask=torch.zeros(2,1,64,64); mask[:,:,20:32,20:32]=1
+    batch=dict(ct=torch.randn(2,3,64,64),pet=torch.randn(2,3,64,64),mask=mask)
+    monkeypatch.setattr(runner,'_loaders',lambda cfg:([batch,batch],[batch],[batch]))
+    actual_step=runner.train_step_full
+    seen=[]
+    def audited_step(task,batch):
+        assert task.reference_model is None
+        loss,out,stats=actual_step(task,batch)
+        main,_=BCEDiceLoss()(out['logits'],batch['mask'].to(task.device))
+        torch.testing.assert_close(loss,main,atol=0,rtol=0)
+        assert stats['loss_protect']==0 and stats['loss_protect_weighted']==0
+        seen.append(True)
+        return loss,out,stats
+    monkeypatch.setattr(runner,'train_step_full',audited_step)
+    runner.main()
+    assert len(seen)==2
+    folder=Path(cfg.checkpoint_dir)
+    model,saved,checkpoint,tag=load_full_checkpoint(folder/'ckpt.best_full.pth.tar')
+    assert saved.initialization_mode=='from_scratch_or_encoder_pretrained'
+    assert saved.baseline_sha256 is None and not saved.protect_enabled
+    assert tag=='ema' and saved.local_enabled==local
 
 
 def test_builder_disabled_pretraining_never_reads_encoder_files(monkeypatch):
