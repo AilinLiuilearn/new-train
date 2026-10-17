@@ -1,0 +1,3 @@
+# Additional pure-Python dependency for the extracted official KTB DSCF core.
+# Existing project torch/timm/transformers versions are retained.
+einops==0.8.1
