@@ -1,72 +1,45 @@
-"""One randomly initialized PET-CT network; no pretrained or baseline loading.
-
-The optional training loss compares fused and Add logits produced by the
-SAME encoder features and SAME decoder. It creates no second model.
-"""
+"""Baseline encoder pretraining plus four-scale fusion, with BCE+Dice only."""
 import torch
-from torch import nn
-from torch.nn import functional as F
 
-from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline, DECODER_INPUT_CHANNELS
-from models.components.backbones import create_feature_backbone
-from models.components.channel_align import StageChannelAlign
-from models.components.group_unet_decoder import UNetStyleDecoder
+from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
 from models.components.local_reassembly import LocalReassemblyFusion
 
-CONFIG_FIELDS = ('local_enabled','protect_enabled','protect_weight','initialization_mode','pretrained')
+CONFIG_FIELDS = ('local_enabled', 'initialization_mode', 'pretrained', 'loss_method')
 
 
 class FullLocalReassemblyPETCT(DualSharedAddPETCTBaseline):
-    """Retain baseline Full/Missing routing, but never invoke its weight loader."""
+    """Preserve the original baseline constructor and Full/Missing routing."""
     def __init__(self, local_enabled=True, ct_backbone='convnextv2_nano', pet_backbone='mit_b1',
+                 ct_pretrained_path=None, pet_pretrained_path=None, pretrained=True,
                  decoder_channels=(512,256,128,64), in_channels=3, out_channels=1,
                  use_deep_supervision=False):
         if use_deep_supervision:
-            raise ValueError('This experiment uses main BCE+Dice and optional internal Add correction only')
-        nn.Module.__init__(self)
-        self.use_deep_supervision=False
-        # Factory constructors explicitly build random backbones, with no from_pretrained call.
-        self.enc_ct=create_feature_backbone(ct_backbone,in_channels=in_channels)
-        self.enc_pet=create_feature_backbone(pet_backbone,in_channels=in_channels)
-        self.ct_align=StageChannelAlign(list(self.enc_ct.feature_info.channels()),list(DECODER_INPUT_CHANNELS))
-        self.pet_align=StageChannelAlign(list(self.enc_pet.feature_info.channels()),list(DECODER_INPUT_CHANNELS))
-        self.decoder=UNetStyleDecoder(list(DECODER_INPUT_CHANNELS),decoder_channels=tuple(decoder_channels),
-                                     out_channels=out_channels,use_deep_supervision=False)
+            raise ValueError('This experiment uses main BCE+Dice only')
+        # Same encoder factory, local weight loader, aligners and decoder as Add.
+        # Explicitly suppress paths when opting out: optional loaders otherwise
+        # still read a supplied existing path even if required=False.
+        super().__init__(ct_backbone=ct_backbone, pet_backbone=pet_backbone,
+            ct_pretrained_path=ct_pretrained_path if pretrained else None,
+            pet_pretrained_path=pet_pretrained_path if pretrained else None,
+            pretrained=pretrained, decoder_channels=tuple(decoder_channels),
+            in_channels=in_channels, out_channels=out_channels, use_deep_supervision=False)
+        # Adding fusion must not change shared initialization or subsequent RNG.
         with torch.random.fork_rng(devices=[]):
             self.fusion=LocalReassemblyFusion(enabled=local_enabled)
 
-    def forward(self,ct,pet=None,pet_available=None,target_size=None,forward_mode='auto',return_add_logits=False):
-        if type(return_add_logits) is not bool:
-            raise ValueError('return_add_logits must be boolean')
-        if not return_add_logits:
-            return super().forward(ct,pet,pet_available,target_size,forward_mode)
-        if forward_mode != 'full':
-            raise ValueError('Internal Add correction is only supported for explicit Full training')
-        if pet is None:
-            raise ValueError('Full path requires PET')
-        target_size=ct.shape[-2:] if target_size is None else target_size
-        ct_feats=self._encode_ct(ct)
-        pet_feats=self._encode_pet(pet)
-        out=self._decode(self.fusion(ct_feats,pet_feats),target_size)
-        # Decoder is stateless Conv+GroupNorm+ReLU (no BN/dropout). Same mode,
-        # same AMP precision, no extra encoder pass, and no extra model/weights.
-        with torch.no_grad():
-            added=[]
-            for c,p in zip(ct_feats,pet_feats):
-                c,p=c.detach(),p.detach()
-                if c.shape[-2:] != p.shape[-2:]:
-                    p=F.interpolate(p,c.shape[-2:],mode='bilinear',align_corners=False)
-                added.append(c+p)
-            out['add_logits']=self._decode(added,target_size)['logits'].detach()
-        return out
 
-
-def build_full_local_model(cfg):
+def build_full_local_model(cfg, *, initialize_encoders=True):
+    """Load encoder sources at training init; full-checkpoint rebuild skips them."""
+    load_encoders=bool(cfg.pretrained and initialize_encoders)
     model=FullLocalReassemblyPETCT(local_enabled=cfg.local_enabled,
         ct_backbone=cfg.ct_backbone,pet_backbone=cfg.pet_backbone,
-        decoder_channels=tuple(cfg.decoder_channels),
+        ct_pretrained_path=getattr(cfg,'ct_pretrained_path',None),
+        pet_pretrained_path=getattr(cfg,'pet_pretrained_path',None),
+        pretrained=load_encoders,decoder_channels=tuple(cfg.decoder_channels),
         use_deep_supervision=bool(cfg.use_deep_supervision or cfg.deep_supervision))
-    print(f'[model] Single PETCT network; initialization=all_random external_weights=none '
+    mode=('encoder_pretrained_fresh_segmentation' if load_encoders else
+          ('checkpoint_reconstruction' if not initialize_encoders else 'all_random'))
+    print(f'[model] Single PETCT network; initialization={mode} '
           f'fusion={cfg.local_enabled} scales=S1..S4 ranks=16,16,40,64 '
           f'params_fusion={sum(p.numel() for p in model.fusion.parameters())} '
           f'params_total={sum(p.numel() for p in model.parameters())}',flush=True)

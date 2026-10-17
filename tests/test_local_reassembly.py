@@ -1,4 +1,4 @@
-"""Contracts for local transport, abstention, additive init and relative protection."""
+"""Contracts for pretrained encoder initialization and fusion-only ablation."""
 import copy
 import json
 from pathlib import Path
@@ -13,7 +13,6 @@ from models.components.local_reassembly import (
     LocalReassemblyFusion, LocalTransport, STAGE_CHANNELS, STAGE_RANKS)
 from models.full_local_reassembly import FullLocalReassemblyPETCT, build_full_local_model
 from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
-from utils.relative_protection import relative_protection_loss
 
 
 def features(actual=False, dtype=torch.float32):
@@ -123,38 +122,6 @@ def test_invalid_features(bad):
         LocalReassemblyFusion()(cs, ps)
 
 
-def test_internal_add_loss_balances_classes_and_detaches_add_output():
-    target = torch.tensor([[[[1., 0., 1., 0.]]]])
-    base = torch.tensor([[[[2., -2., -2., 2.]]]], requires_grad=True)
-    # Regress on correct FG/BG; improve both original mistakes, which are unprotected.
-    pred = torch.tensor([[[[1., -1., 4., -4.]]]], requires_grad=True)
-    loss, stats = relative_protection_loss(pred, base, target)
-    expected = F.softplus(torch.tensor(-1.)) - F.softplus(torch.tensor(-2.))
-    torch.testing.assert_close(loss, expected)
-    loss.backward()
-    assert base.grad is None
-    assert pred.grad[0, 0, 0, 0] < 0 and pred.grad[0, 0, 0, 1] > 0
-    assert torch.equal(pred.grad[..., 2:], torch.zeros_like(pred.grad[..., 2:]))
-    assert stats['protect_correct_fg'] == 1 and stats['protect_correct_bg'] == 1
-    same, _ = relative_protection_loss(base.detach(), base, target)
-    assert same == 0
-    better, _ = relative_protection_loss(base.detach()*2, base, target)
-    assert better == 0
-    # No correct pixels must return a finite graph-connected zero.
-    wrong, _ = relative_protection_loss(pred, -base.detach(), target)
-    assert torch.isfinite(wrong)
-    zero, _ = relative_protection_loss(pred, -base.detach(), 1-target)
-    assert torch.isfinite(zero)
-    all_wrong = -torch.ones_like(pred, requires_grad=True)
-    zero, _ = relative_protection_loss(pred, all_wrong, torch.ones_like(pred))
-    assert zero == 0
-    many_bg = torch.cat([pred.detach()[..., :1], pred.detach()[..., 1:2].expand(1,1,1,100)], -1)
-    many_ref = torch.cat([base.detach()[..., :1], base.detach()[..., 1:2].expand(1,1,1,100)], -1)
-    labels = torch.zeros_like(many_bg); labels[..., 0] = 1
-    balanced, _ = relative_protection_loss(many_bg, many_ref, labels)
-    torch.testing.assert_close(balanced, expected)
-
-
 @pytest.mark.parametrize('enabled',[True,False])
 def test_random_model_matches_random_add_and_never_loads_weights(monkeypatch,enabled):
     import models.dual_shared_add_baseline as baseline_module
@@ -163,9 +130,9 @@ def test_random_model_matches_random_add_and_never_loads_weights(monkeypatch,ena
     rng=torch.get_rng_state()
     def forbidden(*args,**kwargs): raise AssertionError('Initialization must not read weights')
     monkeypatch.setattr(torch,'load',forbidden)
-    monkeypatch.setattr(baseline_module,'load_local_weights_safe',forbidden)
     torch.manual_seed(2023)
-    model=FullLocalReassemblyPETCT(local_enabled=enabled).eval()
+    model=FullLocalReassemblyPETCT(local_enabled=enabled,pretrained=False,
+        ct_pretrained_path='must-not-read',pet_pretrained_path='must-not-read').eval()
     assert torch.equal(rng,torch.get_rng_state())
     for key,value in base.state_dict().items(): assert torch.equal(value,model.state_dict()[key]),key
     assert not any('reference' in key or 'teacher' in key for key in model.state_dict())
@@ -175,8 +142,48 @@ def test_random_model_matches_random_add_and_never_loads_weights(monkeypatch,ena
                                    base(ct,pet,forward_mode='full')['logits'],atol=0,rtol=0)
 
 
-def test_internal_add_encodes_once_and_uses_one_decoder_without_grad():
-    model=FullLocalReassemblyPETCT().train()
+def test_pretraining_loads_encoders_only_and_preserves_add_initialization(monkeypatch):
+    import models.dual_shared_add_baseline as baseline_module
+    calls=[]
+    def load_encoder(module,path,name,required):
+        calls.append((name,path,required))
+        assert name in ('CT_Encoder','PET_Encoder') and required is True
+        with torch.no_grad():
+            next(module.parameters()).fill_(.0123)
+    monkeypatch.setattr(baseline_module,'load_local_weights_safe',load_encoder)
+    kwargs=dict(pretrained=True,ct_pretrained_path='ct-source',pet_pretrained_path='pet-source')
+    torch.manual_seed(2023)
+    base=DualSharedAddPETCTBaseline(**kwargs).eval()
+    rng=torch.get_rng_state()
+    torch.manual_seed(2023)
+    model=FullLocalReassemblyPETCT(**kwargs).eval()
+    assert calls==[('CT_Encoder','ct-source',True),('PET_Encoder','pet-source',True)]*2
+    assert torch.equal(rng,torch.get_rng_state())
+    for key,value in base.state_dict().items(): assert torch.equal(value,model.state_dict()[key]),key
+    ct,pet=torch.randn(2,3,64,64),torch.randn(2,3,64,64)
+    with torch.no_grad():
+        torch.testing.assert_close(model(ct,pet,forward_mode='full')['logits'],
+                                   base(ct,pet,forward_mode='full')['logits'],atol=0,rtol=0)
+
+
+def test_actual_encoder_files_load_and_missing_sources_fail(tmp_path):
+    model=FullLocalReassemblyPETCT(pretrained=False)
+    ct_path=tmp_path/'ct.pth'; pet_path=tmp_path/'pet.pth'
+    torch.save(model.enc_ct.state_dict(),ct_path)
+    torch.save(model.enc_pet.state_dict(),pet_path)
+    other=FullLocalReassemblyPETCT(pretrained=True,ct_pretrained_path=str(ct_path),
+                                  pet_pretrained_path=str(pet_path))
+    for name in ('enc_ct','enc_pet'):
+        for key,value in getattr(model,name).state_dict().items():
+            torch.testing.assert_close(value,getattr(other,name).state_dict()[key],atol=0,rtol=0)
+    with pytest.raises(ValueError,match='pretrained path'):
+        FullLocalReassemblyPETCT(pretrained=True)
+    with pytest.raises(FileNotFoundError):
+        FullLocalReassemblyPETCT(pretrained=True,ct_pretrained_path=str(tmp_path/'absent'))
+
+
+def test_one_encoder_pass_one_decoder_pass_and_no_add_output():
+    model=FullLocalReassemblyPETCT(pretrained=False).train()
     calls=dict(ct=0,pet=0,decoder=0)
     def count(name):
         def hook(*args): calls[name]+=1
@@ -185,19 +192,15 @@ def test_internal_add_encodes_once_and_uses_one_decoder_without_grad():
            model.enc_pet.register_forward_hook(count('pet')),
            model.decoder.register_forward_hook(count('decoder'))]
     ct,pet=torch.randn(2,3,64,64),torch.randn(2,3,64,64)
-    out=model(ct,pet,forward_mode='full',return_add_logits=True)
-    assert calls==dict(ct=1,pet=1,decoder=2)
-    assert out['logits'].requires_grad and not out['add_logits'].requires_grad
-    torch.testing.assert_close(out['logits'],out['add_logits'],atol=0,rtol=0)
-    assert model.training and model.decoder.training
-    assert not any(isinstance(m,nn.modules.batchnorm._BatchNorm) for m in model.decoder.modules())
-    model(ct,pet,forward_mode='full')
-    assert calls==dict(ct=2,pet=2,decoder=3)
+    out=model(ct,pet,forward_mode='full')
+    assert calls==dict(ct=1,pet=1,decoder=1)
+    assert out['logits'].requires_grad and 'add_logits' not in out
     for hook in hooks: hook.remove()
+    with pytest.raises(TypeError): model(ct,pet,forward_mode='full',return_add_logits=True)
 
 
 def test_missing_and_auto_bypass_pet_and_fusion():
-    model=FullLocalReassemblyPETCT().eval()
+    model=FullLocalReassemblyPETCT(pretrained=False).eval()
     ct,pet=torch.randn(2,3,64,64),torch.randn(2,3,64,64)
     def forbidden(*args): raise AssertionError('Missing cannot call PET/fusion')
     hooks=[m.register_forward_pre_hook(forbidden) for m in (model.enc_pet,model.fusion)]
@@ -211,62 +214,77 @@ def test_missing_and_auto_bypass_pet_and_fusion():
         pet[1].fill_(float('nan'))
         b=model(ct,pet,pet_available=[1,0],forward_mode='auto')['logits']
     torch.testing.assert_close(a,b,atol=0,rtol=0)
-    with pytest.raises(ValueError,match='Full'):
-        model(ct,pet=None,forward_mode='missing',return_add_logits=True)
 
 
-def test_config_has_no_weight_loading_interface(monkeypatch,tmp_path):
+def test_config_defaults_match_encoder_pretrained_baseline_and_remove_correction(monkeypatch,tmp_path):
     from configs.full_local_reassembly import FullLocalConfig
-    args=['x','--require_cuda','false','--checkpoint_root',str(tmp_path),'--hash','random']
+    args=['x','--require_cuda','false','--checkpoint_root',str(tmp_path),'--hash','pretrained']
     monkeypatch.setattr(sys,'argv',args)
     cfg=FullLocalConfig.parse_arguments()
-    assert cfg.pretrained is False and cfg.initialization_mode=='all_random'
-    assert cfg.protect_enabled and cfg.protect_weight==.1 and cfg.learning_rate==4e-5
-    assert not hasattr(cfg,'baseline_checkpoint') and not hasattr(cfg,'reference_checkpoint')
+    assert cfg.pretrained is True and cfg.initialization_mode=='encoder_pretrained_fresh_segmentation'
+    assert cfg.loss_method=='BCE+Dice' and cfg.learning_rate==4e-5
+    assert cfg.ct_pretrained_path.endswith('pretrained/convnextv2_nano')
+    assert cfg.pet_pretrained_path.endswith('pretrained/mit-b1')
+    for name in ('baseline_checkpoint','reference_checkpoint','protect_enabled','protect_weight'):
+        assert not hasattr(cfg,name)
     (Path(cfg.checkpoint_dir)/'keep.txt').write_text('keep')
     with pytest.raises(FileExistsError): FullLocalConfig.parse_arguments()
-    for flag in ('--baseline_checkpoint','--reference_checkpoint','--pretrained','--ct_pretrained_path'):
+    for flag in ('--baseline_checkpoint','--reference_checkpoint','--protect_enabled','--protect_weight'):
         monkeypatch.setattr(sys,'argv',args+[flag,'anything'])
         with pytest.raises(SystemExit): FullLocalConfig.parse_arguments()
 
 
-@pytest.mark.parametrize('local,protect',[(True,True),(True,False),(False,True),(False,False)])
-def test_single_model_runner_loss_checkpoint_and_no_external_load(monkeypatch,tmp_path,local,protect):
+@pytest.mark.parametrize('local,pretrained',[(True,True),(False,False)])
+def test_single_model_runner_main_loss_and_checkpoint_without_encoder_files(monkeypatch,tmp_path,local,pretrained):
     from configs.full_local_reassembly import FullLocalConfig
     from eval_full_local_reassembly import load_full_checkpoint
     from utils.seg_losses import BCEDiceLoss
+    import models.dual_shared_add_baseline as baseline_module
     import run_full_local_reassembly as runner
     monkeypatch.setattr(sys,'argv',['x','--require_cuda','false','--checkpoint_root',str(tmp_path),
-        '--hash','single','--local_enabled',str(local),'--protect_enabled',str(protect),
+        '--hash','single','--local_enabled',str(local),'--pretrained',str(pretrained),
         '--image_size_2d','64','--batch_size','2','--epochs','1','--cosine_warmup','0',
         '--mixed_precision','false','--hd95_mode','surface'])
     cfg=FullLocalConfig.parse_arguments(); cfg.ema_start_epoch=0
     monkeypatch.setattr(FullLocalConfig,'parse_arguments',classmethod(lambda cls:cfg))
+    # Source weights are simulated; actual encoder files live on the training server.
+    sources=[]
+    def load_encoder(module,path,name,required):
+        if required:
+            sources.append(name)
+            with torch.no_grad(): next(module.parameters()).fill_(.0123)
+        else:
+            assert path is None  # checkpoint rebuild must never touch encoder source files
+    monkeypatch.setattr(baseline_module,'load_local_weights_safe',load_encoder)
     mask=torch.zeros(2,1,64,64); mask[:,:,20:32,20:32]=1
     batch=dict(ct=torch.randn(2,3,64,64),pet=torch.randn(2,3,64,64),mask=mask)
     monkeypatch.setattr(runner,'_loaders',lambda cfg:([batch,batch],[batch],[batch]))
     actual=runner.train_step_full
     def audited(task,batch):
         assert not hasattr(task,'reference_model')
+        calls=[]
+        hook=task.model.decoder.register_forward_hook(lambda *args:calls.append(1))
         loss,out,stats=actual(task,batch)
+        hook.remove()
+        assert calls==[1] and 'add_logits' not in out
+        assert not any('protect' in key for key in stats)
         main,_=BCEDiceLoss()(out['logits'],batch['mask'].to(task.device))
-        torch.testing.assert_close(loss,main+cfg.protect_weight*stats['loss_protect'])
-        assert ('add_logits' in out)==protect
-        if protect: assert not out['add_logits'].requires_grad
-        if not protect: torch.testing.assert_close(loss,main,atol=0,rtol=0)
-        if not local: assert stats['loss_protect']==0
+        torch.testing.assert_close(loss,main,atol=0,rtol=0)
         return loss,out,stats
     monkeypatch.setattr(runner,'train_step_full',audited)
     runner.main()
+    assert sources==(['CT_Encoder','PET_Encoder'] if pretrained else [])
     folder=Path(cfg.checkpoint_dir)
     for choice in (None,False):
         model,saved,checkpoint,tag=load_full_checkpoint(folder/'ckpt.best_full.pth.tar',use_ema=choice)
-        assert saved.initialization_mode=='all_random' and saved.pretrained is False
-        assert saved.protect_enabled==protect and saved.local_enabled==local
+        assert saved.pretrained==pretrained and saved.local_enabled==local
+        assert saved.loss_method=='BCE+Dice'
         assert tag==('ema' if choice is None else 'raw')
+    assert sources==(['CT_Encoder','PET_Encoder'] if pretrained else [])
     result=json.loads((folder/'final_test_full.json').read_text())
-    assert result['initialization_mode']=='all_random'
-    checkpoint['config']['protect_schema_version']=1
+    assert result['pretrained']==pretrained and result['loss_method']=='BCE+Dice'
+    assert 'protect' not in (folder/'train_log.csv').read_text().splitlines()[0]
+    checkpoint['config']['local_schema_version']=2
     torch.save(checkpoint,folder/'old_protocol.pth')
     with pytest.raises(ValueError,match='architecture'): load_full_checkpoint(folder/'old_protocol.pth')
 
@@ -274,17 +292,16 @@ def test_single_model_runner_loss_checkpoint_and_no_external_load(monkeypatch,tm
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA unavailable')
 def test_cuda_amp_single_model_two_steps():
     from utils.seg_losses import BCEDiceLoss
-    model=FullLocalReassemblyPETCT().cuda().train()
+    model=FullLocalReassemblyPETCT(pretrained=False).cuda().train()
     ct,pet=torch.randn(2,3,64,64,device='cuda'),torch.randn(2,3,64,64,device='cuda')
     mask=torch.zeros(2,1,64,64,device='cuda'); mask[:,:,20:32,20:32]=1
     optimizer=torch.optim.AdamW(model.parameters(),lr=4e-5)
+    scaler=torch.amp.GradScaler('cuda',init_scale=128.)
     for step in range(2):
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast('cuda',dtype=torch.float16):
-            out=model(ct,pet,forward_mode='full',return_add_logits=True)
-            main,_=BCEDiceLoss()(out['logits'],mask)
-            correction,_=relative_protection_loss(out['logits'],out['add_logits'],mask)
-            loss=main+.1*correction
-        loss.backward()
+            out=model(ct,pet,forward_mode='full')
+            loss,_=BCEDiceLoss()(out['logits'],mask)
+        scaler.scale(loss).backward(); scaler.unscale_(optimizer)
         assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
-        optimizer.step()
+        scaler.step(optimizer); scaler.update()

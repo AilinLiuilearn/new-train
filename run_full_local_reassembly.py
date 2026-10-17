@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Single-model random-init Full training with internal Add correction loss.
-
-Encoders, aligners, fusion and decoder are initialized afresh. Training
-compares fused and detached Add logits from the same network; no other model.
-"""
+"""Full-only single-model fusion training with encoder pretraining and BCE+Dice."""
 import json
 import os
 import time
@@ -14,7 +10,6 @@ import torch
 from configs.full_local_reassembly import FullLocalConfig
 from models.full_local_reassembly import CONFIG_FIELDS, build_full_local_model
 from models.components.local_reassembly import LocalReassemblyFusion, DIAGNOSTIC_KEYS
-from utils.relative_protection import relative_protection_loss
 from tasks.mdt_seg import MDTSegTeacher as SegmentationTask
 from utils.optimization import get_cosine_scheduler
 from utils.run_common import (count_parameters, module_grad_norm,
@@ -23,27 +18,18 @@ from utils.train_logger import append_epoch_log, init_train_log
 
 
 def train_step_full(task, batch):
-    """GT is used only here; Add logits are detached outputs of the same network."""
+    """Exactly the baseline segmentation objective, with one fused forward."""
     ct = batch['ct'].to(task.device, non_blocking=True)
     pet = batch['pet'].to(task.device, non_blocking=True)
     mask = batch['mask'].to(task.device, non_blocking=True).float()
-    outputs = task.model(ct, pet=pet, forward_mode='full',
-                         return_add_logits=bool(task.config.protect_enabled))
+    outputs = task.model(ct, pet=pet, forward_mode='full')
     logits = outputs['logits']
     if not torch.isfinite(logits).all():
         raise RuntimeError('[NaN/Inf] logits at train_step_full')
-    main_loss, _ = task.criterion(logits, mask)
-    protection = main_loss.detach()*0
-    counts = dict(protect_correct_fg=0., protect_correct_bg=0.)
-    if task.config.protect_enabled:
-        protection, counts = relative_protection_loss(logits, outputs['add_logits'], mask)
-    weighted = task.config.protect_weight*protection if task.config.protect_enabled else protection
-    loss = main_loss+weighted
+    loss, _ = task.criterion(logits, mask)
     if not torch.isfinite(loss).all():
-        raise RuntimeError('[NaN/Inf] total local reassembly loss')
-    stats = dict(loss_total=loss.detach(), loss_main=main_loss.detach(),
-                 loss_protect=protection.detach(), loss_protect_weighted=weighted.detach(),
-                 num_samples=int(ct.shape[0]), **counts)
+        raise RuntimeError('[NaN/Inf] segmentation loss')
+    stats = dict(loss_total=loss.detach(), loss_main=loss.detach(), num_samples=int(ct.shape[0]))
     return loss, outputs, stats
 
 
@@ -96,9 +82,8 @@ def main(config_cls=FullLocalConfig, model_builder=build_full_local_model,
           f'test_batches={len(test_loader)}', flush=True)
 
     task = SegmentationTask(model_builder(cfg), cfg)
-    print(f'[INIT] mode=all_random pretrained=False external_weights=none '
-          f'correction_loss={cfg.protect_enabled} weight={cfg.protect_weight} '
-          'comparison=same_model_detached_Add', flush=True)
+    print(f'[INIT] mode={cfg.initialization_mode} pretrained={cfg.pretrained} '
+          'segmentation_checkpoint=none loss=BCE+Dice extra_loss=none', flush=True)
     _assert_full_add_protocol(cfg, task.model, expected_fusion=expected_fusion)
     total_params, trainable_params = count_parameters(task.model)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
@@ -121,8 +106,7 @@ def main(config_cls=FullLocalConfig, model_builder=build_full_local_model,
         'best_full', 'best_full_epoch',
         'grad_enc_ct', 'grad_enc_pet', 'grad_ct_align', 'grad_decoder',
         'ema_enabled', 'ema_updates', 'skipped_updates',
-        'epoch_time', 'train_loss_main', 'train_protect_loss', 'train_protect_weighted',
-        'train_protect_correct_fg', 'train_protect_correct_bg',
+        'epoch_time', 'train_loss_main',
     ]
     extra_headers.extend(f'grad_{name}' for name in extra_grad_modules)
     extra_headers.extend(DIAGNOSTIC_KEYS)
@@ -143,8 +127,7 @@ def main(config_cls=FullLocalConfig, model_builder=build_full_local_model,
         task.model.fusion.reset_diagnostics()
         train_loss_sum = 0.0
         train_sample_count = 0
-        component_sums = dict(loss_main=0.,loss_protect=0.,loss_protect_weighted=0.)
-        protected_counts = dict(protect_correct_fg=0.,protect_correct_bg=0.)
+        component_sums = dict(loss_main=0.)
         train_n = 0
         grad_norm_accum = 0.0
         grad_norm_steps = 0
@@ -183,8 +166,6 @@ def main(config_cls=FullLocalConfig, model_builder=build_full_local_model,
                       f'loss={float(loss.detach()):.6f}', flush=True)
             for key in component_sums:
                 component_sums[key] += float(train_stats[key]) * int(train_stats['num_samples'])
-            for key in protected_counts:
-                protected_counts[key] += float(train_stats[key])
             train_loss_sum += float(loss.detach()) * int(train_stats['num_samples'])
             train_sample_count += int(train_stats['num_samples'])
             train_n += 1
@@ -235,10 +216,6 @@ def main(config_cls=FullLocalConfig, model_builder=build_full_local_model,
                 'skipped_updates': float(skipped_update_count),
                 'epoch_time': time.time() - epoch_start,
                 'train_loss_main': component_sums['loss_main']/max(1,train_sample_count),
-                'train_protect_loss': component_sums['loss_protect']/max(1,train_sample_count),
-                'train_protect_weighted': component_sums['loss_protect_weighted']/max(1,train_sample_count),
-                'train_protect_correct_fg': protected_counts['protect_correct_fg'],
-                'train_protect_correct_bg': protected_counts['protect_correct_bg'],
                 **fusion_diagnostics,
                 **{f'grad_{name}': float(np.mean(grads[name])) if grads[name] else 0.0
                    for name in extra_grad_modules},
@@ -258,7 +235,7 @@ def main(config_cls=FullLocalConfig, model_builder=build_full_local_model,
     use_ema = (task.ema is not None and recorded == 'ema'
                and ckpt.get('model_ema') is not None)
     weights_tag = 'ema' if use_ema else 'raw'
-    eval_model = model_builder(cfg)['model'].to(task.device)
+    eval_model = model_builder(cfg, initialize_encoders=False)['model'].to(task.device)
     if not isinstance(eval_model.fusion, expected_fusion):
         raise RuntimeError(f'final test must rebuild {expected_fusion.__name__}, '
                            f'got {type(eval_model.fusion).__name__}')

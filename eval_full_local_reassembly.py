@@ -24,11 +24,14 @@ def load_full_checkpoint(path, device='cpu', use_ema=None):
                     model_arch='full_local_reassembly', fusion_type='LocalReassemblyFusion')
     if (any(saved.get(k) != v for k, v in expected.items())
             or not isinstance(saved.get('local_enabled'), bool)
-            or not isinstance(saved.get('protect_enabled'), bool)):
+            or not isinstance(saved.get('pretrained'), bool)
+            or saved.get('initialization_mode') != ('encoder_pretrained_fresh_segmentation'
+                                                   if saved.get('pretrained') else 'all_random')
+            or any(key in saved for key in ('protect_enabled','protect_weight','baseline_checkpoint','reference_checkpoint'))):
         raise ValueError('Unsupported local reassembly checkpoint architecture/source')
     saved.pop('checkpoint_dir', None)
     cfg = SegMDTConfig(args=saved)
-    model = build_full_local_model(cfg)['model'].to(device)
+    model = build_full_local_model(cfg, initialize_encoders=False)['model'].to(device)
     if use_ema is None:
         use_ema = checkpoint.get('eval_weights', 'raw') == 'ema'
     tag = 'ema' if use_ema else 'raw'
