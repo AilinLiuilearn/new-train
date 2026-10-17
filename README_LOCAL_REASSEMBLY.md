@@ -1,208 +1,128 @@
-# Full PET–CT：可拒绝的双向局部重组融合
+# 单模型 PET–CT 局部重组融合与内部修正损失
 
-分支 `exp/full-add-local-reassembly`；从 `exp/full-add-dscf-residual`
-的 `e5693414c4c91b3d9f56e6fcee2aefb81f13d409` 派生。旧 baseline、
-DSCF、数据、主损失、EMA 与解码器文件均未改动。新入口不启用 DSCF。
+当前分支：`exp/full-add-local-reassembly`。当前配置/损失 schema=2。
 
-**当前主实验：与相加 baseline 相同的初始训练协议。只加载相同来源的两个编码器
-预训练权重，重新初始化解码器、对齐器和融合模块；不加载任何分割 checkpoint，
-不建立冻结参照，保护损失默认关闭。** “从头训练”指重新训练分割任务，
-并不是把 baseline 使用的编码器预训练也取消。
+## 当前训练形式
 
-## 待验证假设
+只有一个可训练的分割网络：
+CT/PET → 独立编码器 → 四尺度对齐 → 局部重组融合 → GN 解码器 → 分割。
 
-历史诊断显示已有融合的修复和新增错误相互抵消。本实验检验：
-在保留相加路径的基础上，允许双向局部内容选择和拒绝候选，
-在相同初始权重、数据、主损失和训练预算下，能否比纯相加得到更稳定的净收益。
-主实验只改变融合结构。相加参照与保护损失保留为显式选择的后续实验。
-不预设空间错位是主要病因，不承诺提升，也不将约 0.78 视为架构上限。
+- **所有组件均随机初始化，包括 CT、PET 编码器；不读取任何预训练或分割权重。**
+- 没有学生/教师、冻结 baseline、外部参照模型、蒸馏或原型库。
+- 不再提供 baseline_checkpoint、reference_checkpoint、pretrained 或预训练路径参数。
+- 优化器、学习率调度和 EMA 从第1轮建立。EMA 是普通评价权重平均，不提供损失参照。
+- 默认开启融合和修正损失；两者均有独立开关。
 
-## 精确实现
+若之前相加 baseline 使用了编码器预训练，则当前全随机模型不能与它单独比较来归因于融合。
+结构消融须使用本入口关闭融合，保证初始化、损失、学习率和预算一致。
 
-每尺度输入已对齐的 `C,P: B×D×H×W`；D=[64,128,320,512]。
-四尺度参数独立，低维 r=[16,16,40,64]，两个注意力头。
+## 融合模块
 
-1. 独立 1×1 压缩得到 `c,p`。Q/K 使用逐位置 LayerNorm 后的表达，
-   value 使用压缩后的原表达。不是对整张图池化。
-2. CT 生成 query，PET 邻域生成 key/value；反方向独立执行。
-3. 每个 query 的候选为其 3×3 邻域（含中心）和一个空候选。
-   空候选的 key 可学习、value 固定为零。越界邻居在 softmax 前屏蔽。
-   不是所有 query 共享一张 8×8 采样网格，也不执行全局 N×N 注意力。
-4. `delta_P=U_P(transport(P|C)-p)`；`delta_C=U_C(transport(C|P)-c)`。
-5. `F=(C+P)+(delta_C+delta_P)`。不额外乘 2、不做末端 ReLU。
-   仅 U_C/U_P 的权重置零，无输出偏置，其余正常初始化。
-   初始严格等于 Add；第一个反传输出头有梯度，内部梯度为零，
-   输出头更新后内部 Q/K、投影与空候选 key 才获得非零梯度。
+S1..S4 通道 `[64,128,320,512]`，低维通道 `[16,16,40,64]`，两个注意力头，各尺度独立参数。
+CT query 选择 PET 的3×3邻域内容，反方向同样执行；每个位置还有一个可学习 key、固定零 value
+的空候选，越界邻居在 softmax 前屏蔽。通道压缩、逐位置 LayerNorm 后生成 Q/K，value保留原低维表达。
 
-核心计算固定 FP32，输出残差转换为 Add 的 dtype；支持 CUDA AMP、
-FP16/BF16 特征，不支持将整个模块 `.half()`/`.double()`。
-不依赖 Triton、einops 或自定义 CUDA 扩展。
-采用移位视图，避免展开完整九邻域 value；实际显存仍需服务器预检。
+`delta_P = U_P(transport(P|C)-project(P))`
+`delta_C = U_C(transport(C|P)-project(C))`
+`F = C+P+delta_C+delta_P`
 
-空候选和负残差只提供抑制候选内容的能力，不保证消除假阳性。
-注意力相似度不等于医学可靠性，空候选权重也不是经过校准的置信度。
+仅两个输出投影置零，无输出偏置，无末端ReLU，不乘2，初始严格等于相加。
+第一步反传内部梯度为零、输出头有梯度；输出头更新后内部投影、Q/K和空候选获得梯度。
+核心 FP32，输出转换为 Add 的 dtype；支持 AMP，不支持整个模块 `.half()`/`.double()`。
+不使用全局 N×N 注意力、Triton 或自定义 CUDA 扩展。融合新增参数220,208，默认网络总参数32,662,849。
+空候选提供拒绝邻域内容的能力，不代表经过验证的医学可靠性。
 
-## 主实验：重新训练分割任务
+## 修正损失：同一个模型的内部相加比较
 
-默认 `baseline_checkpoint=None/空字符串`、`protect_enabled=false`、`pretrained=true`。
-CT、PET 编码器加载与 baseline 相同的本地预训练文件；对齐器、解码器、融合模块
-重新初始化。旧的最佳分割权重、旧 optimizer、scheduler 和 EMA 均不载入。
-所有参数从第 1 epoch 联合训练；优化器、scheduler、EMA 都重新建立。
+CT/PET只编码一次，得到四尺度 C/P。开启修正损失时：
 
-`L = main_BCE_Dice`
+1. 常规路径：`z_fuse = Decoder(F)`，正常反向传播。
+2. 对照计算：在 `torch.no_grad()` 下，用**同一个解码器**计算 `z_add = Decoder(C+P)`。
+   复用已经产生的特征，不再调用编码器，不复制解码器，不加载任何权重。
+3. 用训练GT确定当前相加输出按0.5阈值预测正确的位置。
+4. 正确前景/背景分别平均 `relu(BCE(z_fuse,GT)-BCE(z_add,GT))`，再对非空类别平均。
 
-维持 lr=4e-5、AdamW、60 epoch、batch16、warmup3、EMA0.999（epoch3后激活）、clip5。
-新融合的输出头为零，所以初始特征严格等于相加；不代表继承了相加模型学到的权重。
-同 seed 构建时，新模块的初始化不改变共享参数或后续 RNG；可用同入口关闭融合进行配对对照。
-这里的最佳 baseline 仅用于最终结果比较，不参与初始化、训练损失或推理。
-主协议下 `train_protect_loss/weighted` 和正确区域计数应为零，参照模型不构建。
+`L = BCE_Dice(z_fuse,GT) + 0.1 * L_internal_add`
 
-## 可选实验：相加权重微调与保护损失
+0.1是未验证的起点，不承诺最优。参照预测和筛选 mask 均停止梯度；GT仅用于训练损失。
+对照分支不产生自己的梯度，主路径和修正项共同更新整个网络。
+现有解码器只包含 Conv/GroupNorm/ReLU，没有BN或Dropout，第二次解码不额外更新运行统计。
+初始融合等于相加，所以两条输出相同，修正损失初始为零（相同精度下）。
 
-仅显式传 `--baseline_checkpoint PATH` 才加载已训练的原始 Full Add 权重；
-仅显式开启 `--protect_enabled true` 才建立冻结相加参照和额外前向。
-这属于另一种训练协议，不能与主实验混用来证明结构有效性。
+**这已经不是“冻结最佳 baseline 的保护损失”。** 内部相加对照随当前网络变化，
+只检验当前融合是否比当前相加更差，不能保护历史 baseline 的能力，也不保证最终Dice提升。
+对照路径未单独接受分割监督，可能较弱；需通过有/无损失消融判断是否有价值。
+它不是PNDC原版或其他论文的直接复现，不将该组合宣称为已验证创新。
 
-相加参照固定 eval、无梯度、FP32，两者输入相同的已增强训练 batch。
-只在参照按 0.5 阈值预测正确的位置，计算
-`relu(BCE(student,GT)-BCE(reference,GT))`。
-正确前景、正确背景分别平均，再对非空类别平均；空集合返回图连接的零。
-`L = main_BCE_Dice + protect_weight * relative_protection`。
-默认可选权重0.1未经调优；错误位置不受保护，主损失可以纠正它们。
-学生 train 与参照 eval/FP32 不同，首步保护损失不必为零；该项反映整个学生变化，
-不能解释为只由融合导致的因果损害，也不保证 Dice 不退化。
+关闭 `--protect_enabled false` 后只计算原 BCE+Dice，解码器也只前向一次。
+验证/推理默认只走融合预测，不计算相加对照或修正损失，不需要GT。
+继承原Missing路径：缺失PET时不调用PET编码器或融合，直接CT-only；auto只编码Full行PET。
+目前仍是Full训练，未接入Stage-2检索补偿。
 
-可选参照必须声明 `full_add_baseline`/`AddFusion`，且尺寸、归一化、编码器、
-解码通道和共享 state keys/shapes 一致；auto 按 checkpoint 的 eval_weights 选 raw/EMA。
-记录 SHA256、epoch、所选权重、来源学习率和 EMA decay。
-即使微调也重建 optimizer/scheduler/EMA，不恢复旧优化器状态。
-参照在 task 外部属性，不注册到学生、不参与优化或 EMA，不写入学生 state_dict。
-独立评估不需要源分割权重或编码器预训练目录。
-原有 warm-start checkpoint 仍可严格加载，架构未改变。
-不支持断点续训，同名非空输出目录仍会拒绝覆盖。
+## 运行
 
-## Full / Missing 生命周期
-
-- Full：CT+真实 PET，四尺度融合后交给原 GN 解码器。
-- Missing：继承 baseline 的 CT-only 路径，完全绕过 PET encoder 和融合，
-  PET=None 或无效 PET 内容都不得影响 Missing 输出。
-- auto：只给 Full 行编码 PET/调用融合，再还原 batch 顺序。
-- 本入口仅训练 Full；没有实现 Stage-2 的检索 PET 路由。
-  未来接入检索 PET 需单独适配和训练，不能默认零样本迁移有效。
-
-## 运行主实验
+先停止旧训练，再在正确分支更新：
 
 ```bash
 cd /root/autodl-tmp/mkd-main/new-train
-git fetch origin
 git switch exp/full-add-local-reassembly
 git pull --ff-only
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-# 首次运行可做 CUDA 预检；使用随机真实编码器，不读真实数据。
 python scripts/check_local_reassembly.py --device cuda --image_size 512 --batch_size 2
-
-# 主实验：不加载任何已训练的分割 checkpoint。
 bash scripts/run_full_local_reassembly.sh
-
-# 同入口纯相加对照，初始权重、损失、学习率、预算相同。
-bash scripts/run_full_local_reassembly.sh \
-  --local_enabled false --hash full-add-local-control-lr4e5-60ep-ema-s2023
 ```
 
-主训练读取已有 `pretrained/convnextv2_nano` 和 `pretrained/mit-b1`，
-无需下载新的论文权重。环境变量 BASELINE_CKPT 不会自动传入脚本。
-启动日志应为 `mode=from_scratch_or_encoder_pretrained`、`baseline_sha256=None`、`protect=False`，
-不应出现加载原始 Full Add checkpoint 的 `[REFERENCE]` 日志。
-要重跑同配置，用新的 `--hash`；无需删除已有实验。
+默认输出 `checkpoints_new/MDT/full-local-single-random-protect-lr4e5-s2023/`。
+同名非空目录会拒绝覆盖；重新运行用新 `--hash`。
+启动日志应为 `mode=all_random pretrained=False external_weights=none`，
+修正方式应为 `same_model_detached_Add`，不会出现参照模型权重来源信息。
+不要再传旧的 baseline_checkpoint/pretrained 参数。
 
-默认输出：`checkpoints_new/MDT/full-local-reassembly-lr4e5-60ep-ema-s2023/`。
-脚本沿用 train_original.txt / test.txt / test.txt，显式开启 allow_val_equals_test，
-与现有开发诊断一致；它不是独立保留测试评估。
-batch2 CUDA 预检不能证明 batch16 显存或真实效果，需要时可用 `--batch_size 16` 预检。
-CPU smoke 可末尾加 `--pretrained false --require_cuda false`，但不用于正式性能比较。
+保留当前 lr4e-5、AdamW、batch16、512输入、60epoch、warmup3、EMA0.999、clip5、seed2023。
+数据仍为 train_original.txt / test.txt / test.txt，并显式允许val与test相同，
+与原开发诊断一致，不是独立保留测试评估。
+原主任务类的历史名字含Teacher，但新入口只将它作为普通分割训练器使用，不创建教师网络。
 
-评估主实验：
+四组消融：
+
+```bash
+bash scripts/run_full_local_reassembly.sh --local_enabled false --protect_enabled false --hash add-random-s2023
+bash scripts/run_full_local_reassembly.sh --local_enabled false --protect_enabled true  --hash add-random-correction-s2023
+bash scripts/run_full_local_reassembly.sh --local_enabled true  --protect_enabled false --hash local-random-no-loss-s2023
+bash scripts/run_full_local_reassembly.sh --local_enabled true  --protect_enabled true  --hash local-random-correction-s2023
+```
+
+关闭融合时两条路径相同，内部修正项应为零，是一致性检查。
+评价全量Dice、病例平均、小前景组、边界F1、FP/FN和修复/新增错误；不能只凭单次峰值判断有效。
+
+## 日志与 checkpoint
+
+保留原指标、梯度，额外记录主损失、修正原值及加权值、有效正确前景/背景计数，
+四尺度残差范数比、空候选/中心注意力质量。后两项不代表贡献正确或临床可靠。
+保存普通模型raw、EMA和优化器等训练状态；独立评估严格检查schema和参数。
+架构张量相同，但旧的冻结参照损失schema=1与当前协议不同，不混用其训练配置。
 
 ```bash
 python eval_full_local_reassembly.py \
-  --checkpoint checkpoints_new/MDT/full-local-reassembly-lr4e5-60ep-ema-s2023/ckpt.best_full.pth.tar \
-  --output_dir eval_local_fresh --device cuda
-# --use_ema false 可评估 raw；默认按 checkpoint 记录的选择。
+  --checkpoint checkpoints_new/MDT/full-local-single-random-protect-lr4e5-s2023/ckpt.best_full.pth.tar \
+  --output_dir eval_local_single --device cuda
 ```
 
-可选旧协议必须显式传入两个参数，单独命名输出：
+## 实现来源与验证
 
-```bash
-bash scripts/run_full_local_reassembly.sh \
-  --baseline_checkpoint /absolute/path/to/add/ckpt.best_full.pth.tar \
-  --protect_enabled true --protect_weight 0.1 --hash local-warmstart-protect-s2023
-```
+双向逐位置交互借鉴 GeminiFusion（ICML2024）的思路，原代码：
+https://github.com/JiaDingCN/GeminiFusion/blob/main/models/mix_transformer.py 。
+正负影响校准思想参考PNDC（TMI2025），官方代码：https://github.com/yansheng-qiu/PNDC 。
+本实现的局部候选、零value候选、中心残差与内部Add损失均是任务适配，不声称原版复现。
 
-若要研究该可选策略，需相同源 checkpoint/微调预算下分别比较
-Add、Add+保护、Local、Local+保护；不能将微调结果直接归因于结构。
+单元验证覆盖：禁止初始化读权重、相加初始化、空候选与边界mask、两步梯度、
+编码器只运行一次/解码器复用、Add输出无梯度、Missing隔离、损失/融合四开关、
+训练/EMA/严格checkpoint重载和旧损失schema拒绝。
+本地CPU测试不证明CUDA可用、batch16显存足够或真实数据有效。
 
-## 日志与验证标准
-
-保留原指标/梯度列，额外包含：
-- `train_loss_main`、`train_protect_loss`、`train_protect_weighted`；
-- `train_protect_correct_fg/bg`：本 epoch 参照预测正确的训练像素累计次数；
-- 每尺度 `local_delta_ratio_s*`：每样本修正范数 / max(Add范数,1e-6) 的均值；
-- `local_null_mass_s*`、`local_center_mass_s*`：两个方向、所有 head/位置/样本的平均注意力质量。
-
-至少同时检查全量 Dice、病例均值、小前景组、边界 F1、FP/FN、
-修复与新增错误计数，配对种子确认方向。当前入口沿用常规分割指标；
-分组/错误转移分析使用既有诊断流程，未声称训练 CSV 已自动包含这些分析。
-先用不加载分割权重、不加保护损失的 Add/Local 配对实验判断结构有效性。
-只有主实验显示正向迹象后再单独研究可选训练策略；若结构持续没有净收益，关闭结构。
-
-## 来源边界
-
-这是我们根据已批准设计编写的新模块，不是直接复制某一论文模块。
-
-- GeminiFusion，ICML 2024：借鉴逐位置、双向跨模态交互的思路。
-  论文 https://proceedings.mlr.press/v235/jia24b.html
-  官方实现 https://github.com/JiaDingCN/GeminiFusion/blob/main/models/mix_transformer.py
-  已检查 Attention 中的两个 cross-attention、relation_judger 与 noise embedding。
-  原方法嵌入 MiT/Swin；本实现放在异构编码器对齐之后，改用局部邻域、
-  固定零值空候选与中心差分，不声称复现原版或复制其源码。
-- PNDC，TMI 2025，DOI 10.1109/TMI.2025.3526818：借鉴区分正负影响的训练思想。
-  官方实现 https://github.com/yansheng-qiu/PNDC/blob/main/train_PNDC.py
-  已检查 findPNmap 熵划分及正负区域处理。
-  本实现不移植其四模态 BraTS 熵筛选/Reverse Audit/Forward Checksum，
-  改用训练 GT 与冻结相加预测定义正确区域。
-
-单独的注意力、残差、空候选或该损失均不宣称原创；研究新意与有效性待查重和消融。
-
-## 独立调用与本地验证
-
-```python
-from models.components.local_reassembly import LocalReassemblyFusion
-
-fusion = LocalReassemblyFusion(enabled=True)
-# 两个列表均为 S1..S4 的 BCHW 特征，通道 64/128/320/512。
-fused_features = fusion(ct_features, pet_features)
-diagnostics = fusion.pop_diagnostics()  # 仅训练模式积累，读取后清空。
-```
-
-新融合参数 220,208；默认完整学生模型参数 32,662,849。
-主实验不建立冻结参照。仅可选保护模式会增加一个 baseline 的训练前向和常驻显存。
-
-```bash
-python -m pytest tests/test_local_reassembly.py -q
-python scripts/check_local_reassembly.py --device cpu --image_size 512 --batch_size 2
-```
-
-本地 PyTorch 2.5.1 CPU：当前新模块测试 26 passed、1 CUDA skipped；
-连同原 Full Add runner 与 EMA 回归测试，共 48 passed、1 CUDA skipped。
-覆盖真实四尺度尺寸、空候选/邻域选择/越界 mask、两个方向两步梯度、
-FP16/BF16 特征、严格 Add 初始化、Missing/auto 禁止调用、参照冻结、
-四开关组合的训练/EMA/final test/raw及EMA严格重载、源文件移除后独立推理、
-源架构/配置防错和目录保护。
-新增测试确认默认无分割 checkpoint、无参照模型、总损失严格等于原 BCE+Dice，
-并覆盖融合开/关两种从头训练的两步更新、EMA、final test 与严格 checkpoint 加载。
-512×512、batch=2 的真实双编码器 CPU 两步预检通过：
-主损失 1.749383→1.580462；冻结参照的参数和所有 buffer 完全未变。
-这些是合成数据上的数值验证，不是性能提升证据。
-未验证 AutoDL 的 CUDA/AMP、batch16 显存、真实预训练文件和真实数据效果。
+本地验证（PyTorch2.5.1 CPU）：新入口23项通过、1项CUDA跳过；原Full Add/EMA/混合训练
+回归37项通过。512×512、batch2、真实双编码器两步预检通过，主损失1.749383→1.581113，
+初始内部修正损失0，第二步约1.67e-6；调用计数为CT/PET各2次、同一解码器4次。
+这些只验证数值/生命周期，不代表真实数据性能。新单模型路径尚需在服务器重新做CUDA预检。

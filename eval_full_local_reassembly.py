@@ -9,12 +9,12 @@ from configs.base import str2bool
 from configs.seg_mdt import SegMDTConfig
 from configs.full_local_reassembly import architecture_metadata
 from models.full_local_reassembly import build_full_local_model
-from tasks.mdt_seg import MDTSegTeacher
+from tasks.mdt_seg import MDTSegTeacher as SegmentationTask
 from utils.run_common import seed_everything
 
 
 def load_full_checkpoint(path, device='cpu', use_ema=None):
-    checkpoint = MDTSegTeacher.load_state_dicts(path)
+    checkpoint = SegmentationTask.load_state_dicts(path)
     saved = dict(checkpoint['config'])
     try:
         metadata = architecture_metadata(saved.get('image_size_2d'))
@@ -27,7 +27,6 @@ def load_full_checkpoint(path, device='cpu', use_ema=None):
             or not isinstance(saved.get('protect_enabled'), bool)):
         raise ValueError('Unsupported local reassembly checkpoint architecture/source')
     saved.pop('checkpoint_dir', None)
-    saved.update(pretrained=False, ct_pretrained_path=None, pet_pretrained_path=None)
     cfg = SegMDTConfig(args=saved)
     model = build_full_local_model(cfg)['model'].to(device)
     if use_ema is None:
@@ -61,7 +60,7 @@ def main():
             setattr(cfg, name, getattr(args, name))
     seed_everything(cfg.random_state)
     cfg.ema_enabled = cfg.mixed_precision = False
-    task = MDTSegTeacher({'model': model}, cfg)
+    task = SegmentationTask({'model': model}, cfg)
     task.device = torch.device(args.device)
     task.model.to(task.device)
     from datasets.pclt20k_seg import get_pclt20k_loaders_cipa_aligned

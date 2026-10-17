@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Full local reassembly with optional frozen-Add relative protection.
+"""Single-model random-init Full training with internal Add correction loss.
 
-Derived from the existing Full runner. Fresh optimizer/EMA/scheduler even
-when warm-starting from Add. Frozen reference is training-only, outside model.
+Encoders, aligners, fusion and decoder are initialized afresh. Training
+compares fused and detached Add logits from the same network; no other model.
 """
-import argparse
 import json
 import os
 import time
@@ -15,8 +14,8 @@ import torch
 from configs.full_local_reassembly import FullLocalConfig
 from models.full_local_reassembly import CONFIG_FIELDS, build_full_local_model
 from models.components.local_reassembly import LocalReassemblyFusion, DIAGNOSTIC_KEYS
-from utils.relative_protection import initialize_from_add, relative_protection_loss
-from tasks.mdt_seg import MDTSegTeacher
+from utils.relative_protection import relative_protection_loss
+from tasks.mdt_seg import MDTSegTeacher as SegmentationTask
 from utils.optimization import get_cosine_scheduler
 from utils.run_common import (count_parameters, module_grad_norm,
                               optimizer_step_succeeded, seed_everything)
@@ -24,11 +23,12 @@ from utils.train_logger import append_epoch_log, init_train_log
 
 
 def train_step_full(task, batch):
-    """GT/reference are used here only, never in the inference module."""
+    """GT is used only here; Add logits are detached outputs of the same network."""
     ct = batch['ct'].to(task.device, non_blocking=True)
     pet = batch['pet'].to(task.device, non_blocking=True)
     mask = batch['mask'].to(task.device, non_blocking=True).float()
-    outputs = task.model(ct, pet=pet, forward_mode='full')
+    outputs = task.model(ct, pet=pet, forward_mode='full',
+                         return_add_logits=bool(task.config.protect_enabled))
     logits = outputs['logits']
     if not torch.isfinite(logits).all():
         raise RuntimeError('[NaN/Inf] logits at train_step_full')
@@ -36,13 +36,7 @@ def train_step_full(task, batch):
     protection = main_loss.detach()*0
     counts = dict(protect_correct_fg=0., protect_correct_bg=0.)
     if task.config.protect_enabled:
-        reference = task.reference_model
-        if reference is None or reference.training or any(p.requires_grad for p in reference.parameters()):
-            raise RuntimeError('Protection requires a frozen eval-mode Add reference')
-        # Same already-augmented CT/PET batch; no val/test labels or saved prediction cache.
-        with torch.no_grad(), torch.autocast(device_type=ct.device.type, enabled=False):
-            reference_logits = reference(ct.float(), pet=pet.float(), forward_mode='full')['logits']
-        protection, counts = relative_protection_loss(logits, reference_logits, mask)
+        protection, counts = relative_protection_loss(logits, outputs['add_logits'], mask)
     weighted = task.config.protect_weight*protection if task.config.protect_enabled else protection
     loss = main_loss+weighted
     if not torch.isfinite(loss).all():
@@ -101,22 +95,10 @@ def main(config_cls=FullLocalConfig, model_builder=build_full_local_model,
     print(f'[INFO] train_batches={len(train_loader)} val_batches={len(val_loader)} '
           f'test_batches={len(test_loader)}', flush=True)
 
-    networks = model_builder(cfg)
-    reference = initialize_from_add(networks['model'], cfg)
-    # Save resolved source SHA/tag/epoch, not just the user-supplied path.
-    with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
-        json.dump(vars(cfg), f, indent=2, default=str)
-    print(f'[INIT] mode={cfg.initialization_mode} baseline_weights={cfg.baseline_weights_resolved} '
-          f'baseline_sha256={cfg.baseline_sha256} protect={cfg.protect_enabled} '
-          f'protect_weight={cfg.protect_weight}', flush=True)
-    if cfg.baseline_checkpoint:
-        print(f'[REFERENCE] source_epoch={cfg.baseline_epoch} '
-              f'source_learning_rate={cfg.baseline_source_learning_rate} '
-              f'source_ema_decay={cfg.baseline_source_ema_decay} '
-              f'current_learning_rate={cfg.learning_rate}', flush=True)
-    task = MDTSegTeacher(networks, cfg)
-    task.reference_model = reference.to(task.device) if reference is not None else None
-    del reference
+    task = SegmentationTask(model_builder(cfg), cfg)
+    print(f'[INIT] mode=all_random pretrained=False external_weights=none '
+          f'correction_loss={cfg.protect_enabled} weight={cfg.protect_weight} '
+          'comparison=same_model_detached_Add', flush=True)
     _assert_full_add_protocol(cfg, task.model, expected_fusion=expected_fusion)
     total_params, trainable_params = count_parameters(task.model)
     print(f'[INFO] params_total={total_params} params_trainable={trainable_params}', flush=True)
@@ -271,12 +253,11 @@ def main(config_cls=FullLocalConfig, model_builder=build_full_local_model,
 
     if not os.path.isfile(paths['best_full']):
         raise RuntimeError('best_full checkpoint was not created')
-    ckpt = MDTSegTeacher.load_state_dicts(paths['best_full'])
+    ckpt = SegmentationTask.load_state_dicts(paths['best_full'])
     recorded = ckpt.get('eval_weights', 'raw')
     use_ema = (task.ema is not None and recorded == 'ema'
                and ckpt.get('model_ema') is not None)
     weights_tag = 'ema' if use_ema else 'raw'
-    task.reference_model = None  # Training-only model is not needed for final evaluation.
     eval_model = model_builder(cfg)['model'].to(task.device)
     if not isinstance(eval_model.fusion, expected_fusion):
         raise RuntimeError(f'final test must rebuild {expected_fusion.__name__}, '

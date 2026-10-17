@@ -1,19 +1,16 @@
-"""Real-backbone two-step preflight, including training-only frozen reference."""
+"""Single-network random-init preflight with optional internal Add correction loss."""
 import argparse
-import copy
 import json
 from pathlib import Path
 import sys
-from types import SimpleNamespace
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 
 import torch
 
-from models.components.add_fusion import AddFusion
-from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
+from configs.base import str2bool
 from models.full_local_reassembly import FullLocalReassemblyPETCT
-from utils.relative_protection import initialize_from_add,relative_protection_loss
+from utils.relative_protection import relative_protection_loss
 from utils.seg_losses import BCEDiceLoss
 
 
@@ -26,43 +23,28 @@ def main():
     parser.add_argument('--device',choices=('cuda','cpu'),default='cuda')
     parser.add_argument('--image_size',type=int,default=512)
     parser.add_argument('--batch_size',type=int,default=2)
-    parser.add_argument('--baseline_checkpoint')
-    parser.add_argument('--baseline_weights',choices=('auto','raw','ema'),default='auto')
+    parser.add_argument('--protect_enabled',type=str2bool,default=True)
     args=parser.parse_args()
     if args.device=='cuda' and not torch.cuda.is_available():
-        raise RuntimeError('CUDA unavailable; a CPU run cannot validate CUDA')
+        raise RuntimeError('CUDA unavailable; CPU does not validate CUDA')
     if args.batch_size<2 or args.image_size<32 or args.image_size%32:
         raise ValueError('Use batch_size>=2 and image_size>=32 divisible by 32')
     device=torch.device(args.device)
     torch.manual_seed(2023)
-    model=FullLocalReassemblyPETCT(pretrained=False).eval()
-    if args.baseline_checkpoint:
-        cfg=SimpleNamespace(baseline_checkpoint=args.baseline_checkpoint,baseline_weights=args.baseline_weights,
-            protect_enabled=True,image_size_2d=args.image_size,norm_mode='imagenet',
-            ct_backbone='convnextv2_nano',pet_backbone='mit_b1',decoder_channels=[512,256,128,64])
-        reference=initialize_from_add(model,cfg)
-        source=dict(path=args.baseline_checkpoint,sha256=cfg.baseline_sha256,weights=cfg.baseline_weights_resolved)
-    else:
-        torch.manual_seed(2023)
-        reference=DualSharedAddPETCTBaseline(pretrained=False).eval().requires_grad_(False)
-        for key,value in reference.state_dict().items():
-            assert torch.equal(value,model.state_dict()[key]),key
-        source=dict(path=None,weights='synthetic_random_shared_baseline')
-    reference.eval().requires_grad_(False)
+    model=FullLocalReassemblyPETCT().to(device).eval()
     ct=torch.randn(args.batch_size,3,args.image_size,args.image_size,device=device)
     pet=torch.randn_like(ct)
-    model.to(device); reference.to(device)
     with torch.no_grad():
-        expected=reference(ct,pet,forward_mode='full')['logits']
-        actual=model(ct,pet,forward_mode='full')['logits']
-        torch.testing.assert_close(actual,expected,atol=0,rtol=0)
-        fusion=model.fusion
-        model.fusion=AddFusion()
-        torch.testing.assert_close(model(ct,pet,forward_mode='full')['logits'],expected,atol=0,rtol=0)
-        model.fusion=fusion
-    del expected,actual
-    frozen_before={k:v.detach().cpu().clone() for k,v in reference.state_dict().items()}
-    print('[PASS] shared Add weights, enabled zero init, and disabled output match exactly',flush=True)
+        out=model(ct,pet,forward_mode='full',return_add_logits=True)
+        torch.testing.assert_close(out['logits'],out['add_logits'],atol=0,rtol=0)
+    del out
+    print('[PASS] one model, random initialization; fused logits exactly match internal Add at initialization',flush=True)
+    calls=dict(ct=0,pet=0,decoder=0)
+    def count(name):
+        def hook(*args): calls[name]+=1
+        return hook
+    hooks=[model.enc_ct.register_forward_hook(count('ct')),model.enc_pet.register_forward_hook(count('pet')),
+           model.decoder.register_forward_hook(count('decoder'))]
     mask=torch.zeros(args.batch_size,1,args.image_size,args.image_size,device=device)
     mask[:,:,args.image_size//3:args.image_size//2,args.image_size//3:args.image_size//2]=1
     model.train()
@@ -73,12 +55,13 @@ def main():
     for step in range(2):
         opt.zero_grad(set_to_none=True)
         with torch.autocast(device.type,dtype=torch.float16,enabled=device.type=='cuda'):
-            outputs=model(ct,pet,forward_mode='full')
-            main_loss,_=criterion(outputs['logits'],mask)
-        with torch.no_grad():
-            ref_logits=reference(ct,pet,forward_mode='full')['logits']
-        protect,counts=relative_protection_loss(outputs['logits'],ref_logits,mask)
-        loss=main_loss+.1*protect
+            out=model(ct,pet,forward_mode='full',return_add_logits=args.protect_enabled)
+            main_loss,_=criterion(out['logits'],mask)
+            protection=main_loss.detach()*0
+            if args.protect_enabled:
+                assert not out['add_logits'].requires_grad
+                protection,_=relative_protection_loss(out['logits'],out['add_logits'],mask)
+            loss=main_loss+.1*protection
         scaler.scale(loss).backward(); scaler.unscale_(opt)
         for name in ('enc_ct','enc_pet','ct_align','pet_align','decoder','fusion'):
             grads=[p.grad for p in getattr(model,name).parameters() if p.requires_grad]
@@ -92,16 +75,16 @@ def main():
             for name in ('ct_project','pet_project','ct_query','pet_query','ct_key','pet_key','pet_to_ct','ct_to_pet'):
                 assert (values[name]==0) if step==0 else (values[name]>0),(step,index,name)
             stages.append(dict(stage=index+1,**values))
-        assert all(p.grad is None and not p.requires_grad for p in reference.parameters())
+        assert calls==dict(ct=step+1,pet=step+1,decoder=(step+1)*(2 if args.protect_enabled else 1))
         torch.nn.utils.clip_grad_norm_(model.parameters(),5.)
         scaler.step(opt); scaler.update()
         print(json.dumps(dict(step=step+1,main_loss=float(main_loss.detach()),
-            protection=float(protect.detach()),gradients=stages,
+            correction_loss=float(protection.detach()),calls=calls,gradients=stages,
             diagnostics=model.fusion.pop_diagnostics())),flush=True)
-    for key,value in reference.state_dict().items():
-        assert torch.equal(value.cpu(),frozen_before[key]),key
+    for hook in hooks: hook.remove()
     print(json.dumps(dict(status='passed',device=str(device),image_size=args.image_size,
-        batch_size=args.batch_size,source=source,reference_unchanged=True,
+        batch_size=args.batch_size,initialization='all_random',external_weights=False,
+        extra_reference_model=False,protect_enabled=args.protect_enabled,
         params_fusion=sum(p.numel() for p in model.fusion.parameters()),
         params_total=sum(p.numel() for p in model.parameters()),
         peak_cuda_gib=torch.cuda.max_memory_allocated()/2**30 if device.type=='cuda' else None),indent=2))
