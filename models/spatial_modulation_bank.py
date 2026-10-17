@@ -1,55 +1,68 @@
-"""Unified streaming CT-key / affine-value banks; no pixel candidate truncation.
+"""Per-scale CT keys (streaming/EMA buffers) and learnable affine Values.
 
-First batch seeds online spherical clustering; all first-epoch positions then
-contribute to count-weighted sufficient statistics. Later batches update paired
-keys/values with EMA. This is streaming clustering, not exact epoch-wide kmeans.
+Inputs/outputs are matching [B,C,H,W] tensors. Full CT positions update only
+keys after a successful optimizer step. Gamma/beta are Parameters, trained by
+Missing segmentation and optional detached-CT -> detached-Full retrieval L1.
+Epoch 1 is key collection only; epoch >=2 enables positional soft retrieval.
+This module has no PET encoder, segmentation head, GT routing or spatial gate.
 """
+
+import math
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 
+EXPERIMENT_TYPE = "ct_key_learnable_affine_value"
+
 
 class UnifiedModulationBank(nn.Module):
-    def __init__(self, channels, clusters=8, decay=0.99, chunk_size=8192):
+    def __init__(
+        self,
+        channels: int,
+        clusters: int = 8,
+        decay: float = 0.99,
+        chunk_size: int = 8192,
+    ):
         super().__init__()
         if channels < 1 or clusters < 2 or not 0 <= decay < 1 or chunk_size < 1:
             raise ValueError("invalid bank settings")
-        self.channels, self.clusters, self.decay, self.chunk_size = (
-            channels,
-            clusters,
-            decay,
-            chunk_size,
+        self.channels, self.clusters = channels, clusters
+        self.decay, self.chunk_size = decay, chunk_size
+        self.register_buffer("keys", torch.zeros(clusters, channels))
+        self.gamma = nn.Parameter(torch.zeros(clusters, channels))
+        self.beta = nn.Parameter(torch.zeros(clusters, channels))
+        self.register_buffer(
+            "key_sum", torch.zeros(clusters, channels, dtype=torch.float64)
         )
-        for name, shape in [
-            ("keys", (clusters, channels)),
-            ("gamma", (clusters, channels)),
-            ("beta", (clusters, channels)),
-        ]:
-            self.register_buffer(name, torch.zeros(shape))
-        for name, shape in [
-            ("key_sum", (clusters, channels)),
-            ("gamma_sum", (clusters, channels)),
-            ("beta_sum", (clusters, channels)),
-            ("count", (clusters,)),
-            ("fg_mass", (clusters,)),
-        ]:
-            self.register_buffer(name, torch.zeros(shape, dtype=torch.float64))
+        self.register_buffer("count", torch.zeros(clusters, dtype=torch.float64))
+        self.register_buffer("fg_mass", torch.zeros(clusters, dtype=torch.float64))
         self.register_buffer("initialized", torch.tensor(False))
         self.register_buffer("accepted", torch.tensor(0, dtype=torch.long))
         self.register_buffer("updates", torch.tensor(0, dtype=torch.long))
-        self.refresh_stats = {"status": "accumulating"}
+        self.refresh_stats = {"status": "accumulating_keys"}
 
     @torch.no_grad()
-    def add_all(self, key, gamma, beta, foreground, first_epoch):
-        if key.shape != gamma.shape or key.shape != beta.shape or key.ndim != 2:
-            raise ValueError("paired [N,C] required")
-        if not all(torch.isfinite(x).all() for x in (key, gamma, beta, foreground)):
-            raise ValueError("nonfinite candidates")
+    def add_all(
+        self, key: torch.Tensor, foreground: torch.Tensor, first_epoch: bool
+    ) -> None:
+        """Consume every finite Full CT position; NEVER write gamma or beta.
+
+        foreground is an occupancy statistic only and cannot affect assignment.
+        chunk_size limits temporary assignment matrices, not sample count.
+        """
+        if not self.training:
+            raise RuntimeError("evaluation bank writes forbidden")
+        if key.ndim != 2 or key.shape[1] != self.channels:
+            raise ValueError("CT keys must have shape [N,C]")
+        if foreground.shape != (len(key),):
+            raise ValueError("foreground statistics must have shape [N]")
+        if not torch.isfinite(key).all() or not torch.isfinite(foreground).all():
+            raise ValueError("nonfinite CT keys or occupancy statistics")
         n = len(key)
         if not n:
             return
-        # Include zero CT vectors as well: all finite positions participate.
+        # Include zero CT vectors: all finite positions participate.
         if not bool(self.initialized):
             if n < self.clusters:
                 raise ValueError("initial batch needs at least K positions")
@@ -61,7 +74,7 @@ class UnifiedModulationBank(nn.Module):
                 chosen.append(int(score.argmin()))
             self.keys.copy_(unit[chosen])
             self.initialized.fill_(True)
-        sums = [torch.zeros_like(self.key_sum) for _ in range(3)]
+        sums = torch.zeros_like(self.key_sum)
         count = torch.zeros_like(self.count)
         fg = torch.zeros_like(self.fg_mass)
         for start in range(0, n, self.chunk_size):
@@ -70,117 +83,67 @@ class UnifiedModulationBank(nn.Module):
             count.index_add_(
                 0, ids, torch.ones(len(ids), device=ids.device, dtype=torch.float64)
             )
+            sums.index_add_(0, ids, k.double())
             fg.index_add_(0, ids, foreground[start : start + self.chunk_size].double())
-            for total, values in zip(
-                sums,
-                (
-                    k,
-                    gamma[start : start + self.chunk_size],
-                    beta[start : start + self.chunk_size],
-                ),
-            ):
-                total.index_add_(0, ids, values.double())
+        self.count.add_(count)
+        self.fg_mass.add_(fg)
         if first_epoch:
-            for total, add in zip((self.key_sum, self.gamma_sum, self.beta_sum), sums):
-                total.add_(add)
-            self.count.add_(count)
-            self.fg_mass.add_(fg)
-            source = (self.key_sum, self.gamma_sum, self.beta_sum)
-            den = self.count
+            self.key_sum.add_(sums)
+            source, den = self.key_sum, self.count
         else:
-            source = sums
-            den = count
-            self.count.add_(count)
-            self.fg_mass.add_(fg)
+            source, den = sums, count
         present = den > 0
-        for target, total in zip((self.keys, self.gamma, self.beta), source):
-            mean = (total[present] / den[present, None]).float()
-            updated = (
-                mean
-                if first_epoch
-                else self.decay * target[present] + (1 - self.decay) * mean
-            )
-            target[present] = (
-                F.normalize(updated, dim=1) if target is self.keys else updated
-            )
+        mean = (source[present] / den[present, None]).float()
+        updated = (
+            mean
+            if first_epoch
+            else self.decay * self.keys[present] + (1 - self.decay) * mean
+        )
+        self.keys[present] = F.normalize(updated, dim=1)
         self.accepted.add_(n)
         self.updates.add_(1)
         self.refresh_stats = {
-            "status": "first_epoch_cumulative" if first_epoch else "paired_ema"
+            "status": "first_epoch_cumulative_keys" if first_epoch else "key_ema"
         }
 
 
 class SpatialModulationScale(nn.Module):
     def __init__(
-        self, channels, clusters=8, decay=0.99, temperature=0.5, chunk_size=8192
+        self,
+        channels: int,
+        clusters: int = 8,
+        decay: float = 0.99,
+        temperature: float = 0.5,
+        chunk_size: int = 8192,
     ):
         super().__init__()
-        if temperature <= 0:
-            raise ValueError("temperature must be positive")
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature must be finite and positive")
         self.channels, self.temperature = channels, temperature
         self.bank = UnifiedModulationBank(channels, clusters, decay, chunk_size)
-        self.generator = nn.Sequential(
-            nn.Conv2d(2 * channels, 2 * channels, 3, padding=1, groups=2 * channels),
-            nn.GELU(),
-            nn.Conv2d(2 * channels, 32, 1),
-            nn.GELU(),
-            nn.Conv2d(32, 2 * channels, 1),
-        )
-        nn.init.zeros_(self.generator[-1].weight)
-        nn.init.zeros_(self.generator[-1].bias)
         self.register_buffer("epoch", torch.tensor(1, dtype=torch.long))
+        self.last_supervision = {}
 
-    def describe(self, x):
+    @property
+    def read_enabled(self) -> bool:
+        return bool(self.bank.initialized) and int(self.epoch) >= 2
+
+    def describe(self, x: torch.Tensor) -> torch.Tensor:
         return F.avg_pool2d(x.float(), 3, stride=1, padding=1, count_include_pad=False)
 
-    def supervise(self, ct, full, mask, loss_enabled, eps=1e-6):
-        if ct.shape != full.shape or ct.ndim != 4 or ct.shape[1] != self.channels:
-            raise ValueError("matching [B,C,H,W] required")
-        if mask.ndim == 3:
-            mask = mask[:, None]
-        with torch.autocast(device_type=ct.device.type, enabled=False):
-            c, f = ct.detach().float(), full.detach().float()
-            gamma, beta = self.generator(torch.cat([c, f], 1)).chunk(2, dim=1)
-            dims = (1, 2, 3)
-            reference = f.square().mean(dims).sqrt() + eps
-            loss = (
-                ((c * (1 + gamma) + beta - f).abs().mean(dims) / reference).mean()
-                if loss_enabled
-                else c.new_zeros(())
-            )
-            q = F.interpolate(mask.detach().float(), size=c.shape[-2:], mode="area")
-            with torch.no_grad():
-                error = (
-                    (c * (1 + gamma.detach()) + beta.detach() - f)
-                    .abs()
-                    .mean(1, keepdim=True)
-                )
-                error = error / reference[:, None, None, None]
-                self.last_supervision = {}
-                for name, weight in [("foreground", q), ("background", 1 - q)]:
-                    self.last_supervision[name + "_error"] = (
-                        float((error * weight).sum() / weight.sum())
-                        if weight.sum() > 0
-                        else None
-                    )
-            flat = (
-                lambda x: x.flatten(2).transpose(1, 2).reshape(-1, x.shape[1]).detach()
-            )
-            pending = (
-                flat(self.describe(c)),
-                flat(gamma),
-                flat(beta),
-                q.flatten().detach(),
-            )
-            return loss, pending
-
-    def forward(self, x, diagnostics=None, read_mode="normal"):
+    def forward(
+        self,
+        x: torch.Tensor,
+        diagnostics: dict | None = None,
+        read_mode: str = "normal",
+    ) -> torch.Tensor:
+        if x.ndim != 4 or x.shape[1] != self.channels:
+            raise ValueError("CT features must have shape [B,C,H,W]")
         if read_mode not in ("normal", "off", "identity", "shuffle"):
             raise ValueError("invalid read mode")
-        ready = bool(self.bank.initialized) and int(self.epoch) >= 2
         if diagnostics is not None:
-            diagnostics["available"] = ready
-        if not ready or read_mode in ("off", "identity"):
+            diagnostics["available"] = self.read_enabled
+        if not self.read_enabled or read_mode in ("off", "identity"):
             return x
         with torch.autocast(device_type=x.device.type, enabled=False):
             query = self.describe(x).flatten(2).transpose(1, 2)
@@ -196,16 +159,83 @@ class SpatialModulationScale(nn.Module):
             if not torch.isfinite(result).all():
                 raise RuntimeError("nonfinite affine output")
             if diagnostics is not None:
-                rms = x.float().square().mean().sqrt().clamp_min(1e-6)
-                diagnostics.update(
-                    correction_rms_ratio=float(
-                        ((result - x).square().mean().sqrt() / rms).detach()
-                    ),
-                    gamma_effect_rms=float((g * x).detach().square().mean().sqrt()),
-                    beta_rms=float(b.detach().square().mean().sqrt()),
-                    attention_mean=attention.mean((0, 1)).detach().cpu().tolist(),
-                )
+                with torch.no_grad():
+                    rms = x.float().square().mean().sqrt().clamp_min(1e-6)
+                    entropy = -(attention * attention.clamp_min(1e-12).log()).sum(-1)
+                    diagnostics.update(
+                        correction_rms_ratio=float(
+                            (result - x).square().mean().sqrt() / rms
+                        ),
+                        gamma_effect_rms=float((g * x).square().mean().sqrt()),
+                        beta_rms=float(b.square().mean().sqrt()),
+                        attention_mean=attention.mean((0, 1)).cpu().tolist(),
+                        attention_top1_mean=float(attention.max(-1).values.mean()),
+                        attention_entropy_normalized=float(
+                            entropy.mean() / math.log(self.bank.clusters)
+                        ),
+                    )
             return result.to(x.dtype)
+
+    def supervise(
+        self,
+        ct: torch.Tensor,
+        full: torch.Tensor,
+        mask: torch.Tensor,
+        loss_enabled: bool,
+        eps: float = 1e-6,
+    ):
+        """Supervise the SAME retrieval used by Missing, with detached references.
+
+        Return (loss, pending_CT_key_statistics). Epoch 1 has no Value graph.
+        With loss disabled, Missing segmentation still trains Values normally.
+        """
+        if ct.shape != full.shape or ct.ndim != 4 or ct.shape[1] != self.channels:
+            raise ValueError("matching [B,C,H,W] references required")
+        if mask.ndim == 3:
+            mask = mask[:, None]
+        if mask.ndim != 4 or mask.shape[:2] != (ct.shape[0], 1):
+            raise ValueError("diagnostic mask must have shape [B,1,H,W]")
+        with torch.autocast(device_type=ct.device.type, enabled=False):
+            c, f = ct.detach().float(), full.detach().float()
+            q = F.interpolate(mask.detach().float(), size=c.shape[-2:], mode="area")
+            pending = (
+                self.describe(c)
+                .flatten(2)
+                .transpose(1, 2)
+                .reshape(-1, self.channels)
+                .detach(),
+                q.flatten().detach(),
+            )
+            self.last_supervision = {}
+            if not self.read_enabled:
+                return c.new_zeros(()), pending
+            with torch.set_grad_enabled(torch.is_grad_enabled() and loss_enabled):
+                # Do not detach the bank Values or put this read under no_grad
+                # when the auxiliary objective is enabled.
+                prediction = self(c)
+                reference = f.square().mean((1, 2, 3)).sqrt() + eps
+                per_image = (prediction - f).abs().mean((1, 2, 3)) / reference
+                loss = per_image.mean() if loss_enabled else c.new_zeros(())
+            with torch.no_grad():
+                error = (prediction - f).abs().mean(1, keepdim=True) / reference[
+                    :, None, None, None
+                ]
+                identity = (c - f).abs().mean(1, keepdim=True) / reference[
+                    :, None, None, None
+                ]
+                self.last_supervision = dict(
+                    retrieval_error=float(per_image.mean()),
+                    identity_error=float(identity.mean()),
+                )
+                for name, weight in (("foreground", q), ("background", 1 - q)):
+                    mass = weight.sum()
+                    self.last_supervision[name + "_error"] = (
+                        float((error * weight).sum() / mass) if mass > 0 else None
+                    )
+                    self.last_supervision[name + "_identity_error"] = (
+                        float((identity * weight).sum() / mass) if mass > 0 else None
+                    )
+            return loss, pending
 
 
 class SpatialModulationMemory(nn.Module):
@@ -218,15 +248,20 @@ class SpatialModulationMemory(nn.Module):
         chunk_size=8192,
     ):
         super().__init__()
+        if len(channels) != 4:
+            raise ValueError("four scales required")
         self.scales = nn.ModuleList(
             SpatialModulationScale(c, clusters, decay, temperature, chunk_size)
             for c in channels
         )
         self.register_buffer("update_steps", torch.tensor(0, dtype=torch.long))
 
-    def set_epoch(self, epoch):
+    def set_epoch(self, epoch: int) -> None:
+        if epoch < 1:
+            raise ValueError("epoch must be >= 1")
         for s in self.scales:
             s.epoch.fill_(epoch)
+            s.last_supervision = {}
 
     def forward(self, features, diagnostics=None, read_mode="normal"):
         if len(features) != 4:
@@ -237,7 +272,7 @@ class SpatialModulationMemory(nn.Module):
         ]
 
     @torch.no_grad()
-    def commit(self, pending):
+    def commit(self, pending) -> None:
         if not self.training:
             raise RuntimeError("evaluation bank writes forbidden")
         if len(pending) != 4:
@@ -247,16 +282,16 @@ class SpatialModulationMemory(nn.Module):
         self.update_steps.add_(1)
 
     def diagnostics(self):
-        return {
-            "successful_steps": int(self.update_steps),
-            "scales": [
+        return dict(
+            successful_steps=int(self.update_steps),
+            scales=[
                 dict(
                     accepted=int(s.bank.accepted),
                     initialized=bool(s.bank.initialized),
-                    read_enabled=bool(s.bank.initialized) and int(s.epoch) >= 2,
+                    read_enabled=s.read_enabled,
                     count=s.bank.count.cpu().tolist(),
                     fg_mass=s.bank.fg_mass.cpu().tolist(),
                 )
                 for s in self.scales
             ],
-        }
+        )

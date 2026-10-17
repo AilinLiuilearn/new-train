@@ -42,7 +42,8 @@ if args.backward:
     loss = task.train_step_mixed(b, torch.tensor([1, 0]))[0]
     loss.backward()
     assert all(
-        s.generator[-1].weight.grad is not None for s in task.model.matrix.scales
+        s.bank.gamma.grad is None and s.bank.beta.grad is None
+        for s in task.model.matrix.scales
     )
     task.optimizer.step()
     task.after_optimizer_step(True)
@@ -58,6 +59,16 @@ else:
             pending.append(s.supervise(c, f, b["mask"][:1], True)[1])
         task.model.matrix.commit(pending)
 task.begin_epoch(2)
+if args.backward:
+    task.optimizer.zero_grad(set_to_none=True)
+    loss = task.train_step_mixed(b, torch.tensor([1, 0]))[0]
+    loss.backward()
+    assert all(
+        s.bank.beta.grad is not None and s.bank.beta.grad.abs().sum() > 0
+        for s in task.model.matrix.scales
+    )
+    task.optimizer.step()
+    task.after_optimizer_step(True)
 task.model.eval()
 with torch.no_grad():
     before = {k: v.clone() for k, v in task.model.state_dict().items()}

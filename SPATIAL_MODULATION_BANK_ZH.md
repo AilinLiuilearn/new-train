@@ -1,56 +1,96 @@
-# 解码器前统一空间调制库
+# CT Key＋可学习仿射 Value：实验设计与运行说明
 
-新分支 `exp/ct-full-spatial-modulation-bank`，基于可学习矩阵分支；本分支只保留当前方案及必要依赖；历史矩阵/原型实现保留在原分支。
+分支：`exp/ct-key-learnable-affine-value`。
+基础：已清理的 `exp/ct-full-spatial-modulation-bank@e697de2`；编码器、对齐、AddFusion、共享解码器、数据、分割损失、选模和指标实现保持不变。旧统计调制库保留在原分支。
 
-## 数据流和损失
+## 独立四尺度与数据流
 
-Full：通道对齐后的干净CT C、PET P 正常相加得到F，F直接进入共享解码器，不读取调制库。
-旁路：detach(C)、detach(F)拼接，深度3×3卷积→GELU→1×1降到32通道→GELU→1×1输出2C通道，分成gamma/beta。末层零初始化。
-生成的参数为[B,C,H,W]局部调制图，Ctilde=(1+gamma)*detach(C)+beta。
-每样本每尺度计算 mean(abs(Ctilde-detach(F)))/(RMS(detach(F))+1e-6)，对Full样本、四尺度平均。
-总损失=.5*Full最终BCE+Dice+.5*Missing最终BCE+Dice+mod_loss_weight*Lmod。
-不增加分割头/深度监督；旁路损失只更新生成器。bank写入detach的参数后，Missing损失不能直接反传到生成器。
+对齐通道为64/128/320/512，512输入时空间为128/64/32/16。
+Full：CT C与真实PET P正常相加F=C+P，进入共享解码器。Full主分割不读取库。
+Missing：仅编码CT，查询本尺度独立库，生成逐位置gamma/beta，校正CT后进入同一个解码器；不调用PET编码器、不使用GT或Full特征。
 
-## 所有位置参与、首轮不读
+每尺度默认K=8；Key [K,C]为buffer；gamma、beta [K,C]为nn.Parameter。四尺度Value总参数16384。没有额外生成器、分割头、深度监督、前景/背景分库、门控或RMS限幅。
 
-四尺度独立，每尺度一个统一库、默认8槽位，不分前景/背景。
-Key是干净CT的3×3平均邻域描述，L2方向用于路由；Value是配对的原始gamma/beta通道向量。
-首个成功batch用确定性最远方向初始化临时中心；首轮每个成功batch所有Full位置按当前中心归属，累计key方向和gamma/beta之和与计数，以累计均值更新。
-这是在线球面聚类的初始化和统计，不是保存整个epoch后做精确离线K-means；归属会随中心演化，但每个位置均计入一次。首批可能决定初始分组；空槽位保留，不用GT强行补齐。
-没有256缓存、随机位置采样或候选FIFO。chunk_size=8192只用于分块计算，不会丢弃位置。所有有限CT位置（包括零向量）参与，异常非有限值报错。
-整个epoch1训练和验证均不检索；begin_epoch(2)启用已累计库。第一轮之后每个成功batch按当前Key分配所有位置，对有成员槽位的Key、gamma和beta一起以decay=.99做EMA；Key再归一化。
-EMA单位为成功batch，不是每20步；没有成员的槽位保留。EMA不是全部历史样本的严格平均，首轮才是当前在线归属下的累计均值。
-梯度非有限导致跳过optimizer step时，整个batch不写库；所有数据更新发生在backward结束之后。
-GT只用于分割监督与日志前景占比/拟合误差，不参与聚类、检索、候选筛选。
+## 建Key与更新
 
-## Missing
+Key描述为CT的3×3邻域均值，L2归一化后按余弦相似度硬分配。所有Full CT位置参与，包括有限零向量；不做收益筛选、256候选缓存、随机抽样。chunk_size=8192仅控制统计分块，不丢样本。
+首次成功batch采用确定性最远方向初始化中心。epoch1按每批当前中心分配所有位置，累计归一化Key和及计数，归一化累计均值；这是流式聚类，非全epoch离线K-means。
+epoch>=2对有成员槽位使用本批Key均值做EMA：normalize(.99*K+.01*batch_mean)。空槽保留原中心，不重排槽号。
+所有Key更新都在本次backward和成功optimizer step之后。失败batch丢弃pending Key统计。GT仅记录槽位病灶占比，不影响分配或更新权重。
 
-相同3×3 CT描述查询全部8个Key，cosine/temperature(.5)后softmax。
-按权重分别读取gamma/beta，在当前Missing病例各位置重建调制图，输出(1+gamma_hat)*CT+beta_hat，再进入解码器。
-不调用PET编码器、不需要GT、没有新增门控/RMS限幅。仅空间上下文决定逐位置通道仿射，不搬运其他病例绝对坐标。
-验证/测试不更新库；Full开关检索应完全一致。参数、累计和/计数、epoch、optimizer、RNG和库状态均支持严格恢复；不能直接续训旧矩阵checkpoint。
+## 读取与空间调制
 
-## 运行
+对每个Missing位置i，使用同样的CT局部描述查询：
+`a_ij = softmax_j(cosine(describe(C)_i, K_j)/temperature)`，默认temperature=.5。
+`gamma_hat_i = sum_j a_ij*gamma_j`，`beta_hat_i = sum_j a_ij*beta_j`。
+`C_hat_i = (1+gamma_hat_i)*C_i + beta_hat_i`。
+查询描述归一化；被调制的CT保留原始幅值。各位置权重不同，得到[B,C,H,W]调制图；库不存整张二维图或绝对坐标，不直接搬运邻居内容。
 
-`bash scripts/train_spatial_modulation.sh`
+## Value学习与辅助监督
 
-默认hash `add-spatial-modulation-unified-k8-lmod010-s2023`，默认额外损失开启、权重0.1（起始实验值，未验证最优）。
-关闭额外损失：
-`bash scripts/train_spatial_modulation.sh --matrix_mod_loss_enabled false --hash add-spatial-modulation-k8-nomodloss-s2023`
-修改权重：
-`bash scripts/train_spatial_modulation.sh --matrix_mod_loss_weight 0.05 --hash add-spatial-modulation-k8-lmod005-s2023`
-关闭整个补偿分支：
-`bash scripts/train_spatial_modulation.sh --matrix_enabled false --hash add-spatial-modulation-off-s2023`
-零初始化下关闭额外损失会使生成器没有训练信号，库保持零调制，预期是身份补偿；这正是消融含义。
-断点恢复使用原命令加 `--resume <ckpt.last.pth.tar>`，开关/权重等配置必须一致。
+gamma、beta零初始化，仅由优化器更新，绝不被Key统计/EMA覆盖。
+Full的旁路只用detach(C)执行与Missing完全相同的读取和仿射，目标是detach(F)。Full信息通过损失梯度进入Value，而不是作为查询/生成器输入。
+每样本每尺度：`mean(abs(retrieve_and_modulate(detach(C))-detach(F)))/(RMS(detach(F))+1e-6)`，平均Full样本与四尺度，得到Lret。
+`L=.5*Lseg_full+.5*Lseg_missing+matrix_mod_loss_weight*Lret`；默认权重.1，待实验验证。
+Lret只更新Value；Missing分割更新Value、CT编码器/对齐和共享解码器；Full分割更新CT、PET及共享解码器。Key不反传；Missing查询对CT保持可微。
 
-## 日志与评估
+epoch1仅积累Key，gamma/beta保持0，训练和验证均不读库，Lret=0；epoch2开始读库并训练Value。验证/测试库全部冻结。
 
-训练主CSV新增modulation_loss、modulation_initialized_scales；modulation_slots.csv记录全部槽位计数、病灶占比、Key范数、gamma/beta幅值、检索权重、采样校正强度和前景/背景拟合误差。
-计数为累计所有写入位置；GT占比是诊断而非类权重；拟合误差为最新训练batch，modulation_loss为本epoch平均。
-使用 `eval_spatial_modulation_add.py --checkpoint <best> --compare_on_off true --output_dir <diagnosis> --missing_rates 0 1` 做同checkpoint开关评估及GT区域强度统计。
-不调用旧矩阵专用audit脚本分析这个新模型。
+## 训练命令与开关
 
-设计风险：背景主导、beta退化为特征偏移、库平均后失去个体信息、编码器/调制生成器变化导致知识陈旧；需通过日志及开关对照验证。该实现不宣称实验收益。
+```bash
+cd /root/autodl-tmp/mkd-main/new-train
+git fetch origin
+git switch exp/ct-key-learnable-affine-value
+git pull --ff-only origin exp/ct-key-learnable-affine-value
+bash scripts/train_spatial_modulation.sh
+```
 
-清理兼容性：matrix_*命令行字段、model.matrix及其state_dict键名保留，以加载既有调制库checkpoint；不代表仍存在矩阵Value。公共加载函数迁移至utils/spatial_modulation_runtime.py。
+默认hash：`add-learnable-affine-k8-lret010-s2023`，其余正式训练配置沿用清理分支（seed2023、512、batch16、mixed各半、预训练、AdamW8e-5、AMP、60轮、patience10、模型EMA关闭）。Key EMA始终独立存在。
+
+关闭Full特征辅助损失，Value仍通过Missing最终分割学习：
+```bash
+bash scripts/train_spatial_modulation.sh --matrix_mod_loss_enabled false --hash add-learnable-affine-k8-no-lret-s2023
+```
+
+关闭整个模块（同时关闭Key写入和辅助损失）：
+```bash
+bash scripts/train_spatial_modulation.sh --matrix_enabled false --hash add-learnable-affine-off-s2023
+```
+
+调整辅助权重：`--matrix_mod_loss_weight 0.05`，同时使用新的hash。值为0或开关false均不向辅助路径提供有效梯度；不能把关闭辅助损失解释为关闭Value训练。
+
+恢复同一实验：原命令加 `--resume <ckpt.last.pth.tar>`。配置必须一致。
+`experiment_type=ct_key_learnable_affine_value`；旧统计库/矩阵checkpoint无法直接resume或用新评估器读取，避免参数语义及优化器状态混用。新实验从头加载backbone预训练权重训练。
+`model.matrix`及`matrix_*`CLI名保留以减少接口改动；它们表示本仿射模块。
+
+## 日志与验证
+
+`modulation_slots.csv`记录每槽count/foreground_fraction/key_norm/gamma_rms/beta_rms、Value梯度范数、读取注意力均值、逐查询最大权重均值和归一化熵、Missing校正强度。
+新增retrieval_error和identity_error比较同一Full训练batch中检索后特征和原CT相对Full的误差，并分别记录GT前景/背景误差。epoch1这些误差为空，辅助损失为0。
+主CSV的modulation_loss沿用字段名，现指实际检索输出Lret的epoch平均；拟合/读取/梯度统计为采样批次，不能当作全数据集指标。梯度记录在unscale/clip之后；失败步骤仍可能显示非有限梯度，结合skipped_updates判断。
+count是累计硬分配数，Value按软读取梯度更新，两种计数不能混为一谈。
+
+```bash
+python -u eval_spatial_modulation_add.py \
+  --checkpoint checkpoints_new/MDT/add-learnable-affine-k8-lret010-s2023/ckpt.best_joint.pth.tar \
+  --root /root/autodl-tmp/data/PCLT20K \
+  --use_ema false --compare_on_off true --missing_rates 0 1 \
+  --output_dir checkpoints_new/MDT/add-learnable-affine-k8-lret010-s2023/diagnosis_on_off
+```
+
+该命令评估同checkpoint读取开关并生成GT区域校正强度；它用于解释推理作用，不能替代从头训练的模块消融，也不是整体方法唯一的通过条件。
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=. python -m pytest tests -q
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=. python tests/smoke_spatial_modulation.py --size 64 --backward
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=. python tests/smoke_spatial_modulation.py --size 512
+```
+
+假设与风险：CT相似不一定意味着PET作用相似；8个仿射槽位表达有限；背景可能主导全图拟合；Key EMA漂移可能暂时改变Value的使用分布；特征拟合与分割目标可能冲突。此实现验证监督检索输出及可学习Value的作用，不宣称已获得分割收益。
+
+## 本次本地验证
+
+8项测试通过，覆盖全位置Key统计及GT不参与路由、Key写入不覆盖Value、首轮恒等与无Value梯度、辅助损失只训练Value且可降低检索误差、关闭辅助损失后Missing仍能更新Value、位置相关读取及查询梯度、Full与干净Add基线严格一致、零Value的Missing与基线严格一致、Missing禁止调用PET、评估禁止写库、失败步骤不写库、参数及优化器状态恢复、旧版本拒绝恢复、两轮训练/存档/评估与整个模块关闭。
+真实ConvNeXtV2-Nano/MiT-B1、合成数据、无预训练：CPU 64输入两轮前向/反向/优化器更新通过；CPU 512输入K8 Full/Missing前向和评估状态不变检查通过。
+Shell语法和git diff空白检查通过。未连接AutoDL、未使用真实数据/预训练checkpoint、未验证CUDA AMP或正式分割收益。

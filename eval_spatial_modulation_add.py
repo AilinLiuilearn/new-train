@@ -4,6 +4,7 @@ import argparse
 import os
 import json
 from configs.base import str2bool
+from models.spatial_modulation_bank import EXPERIMENT_TYPE
 from run_spatial_modulation_add import SpatialModulationConfig, _loaders
 from models.spatial_modulation_add_model import build_matrix_model
 from tasks.spatial_modulation_seg import SpatialModulationSegTask
@@ -25,8 +26,10 @@ def main():
     p.add_argument("--compare_on_off", type=str2bool, default=False)
     args = p.parse_args()
     ckpt = SpatialModulationSegTask.load_state_dicts(args.checkpoint)
-    if ckpt.get("experiment_type") != "ct_full_spatial_modulation":
-        raise ValueError("requires a spatial modulation checkpoint")
+    if ckpt.get("experiment_type") != EXPERIMENT_TYPE:
+        raise ValueError(
+            "requires a learnable affine Value checkpoint (old statistical banks are incompatible)"
+        )
     if any(not 0 <= r <= 1 for r in args.missing_rates):
         raise ValueError("invalid missing rate")
     if not {0.0, 1.0}.issubset(args.missing_rates):

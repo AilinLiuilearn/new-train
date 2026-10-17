@@ -5,53 +5,6 @@ import torch
 from models.spatial_modulation_bank import SpatialModulationScale, UnifiedModulationBank
 
 
-def test_every_position_and_paired_means():
-    bank = UnifiedModulationBank(2, clusters=2, chunk_size=3)
-    x = torch.cat(
-        [
-            torch.tensor([[1.0, 0.0]]).repeat(7, 1),
-            torch.tensor([[0.0, 1.0]]).repeat(5, 1),
-        ]
-    )
-    g = 2 * x
-    b = 3 * x
-    fg = torch.arange(12).float() / 12
-    bank.add_all(x, g, b, fg, True)
-    assert int(bank.accepted) == 12 and bank.count.sum() == 12
-    assert torch.allclose(bank.gamma, 2 * bank.keys) and torch.allclose(
-        bank.beta, 3 * bank.keys
-    )
-    before = bank.gamma.clone()
-    bank.add_all(x, 4 * x, 6 * x, fg, False)
-    assert torch.allclose(bank.gamma, 0.99 * before + 0.01 * 4 * bank.keys)
-    assert bank.count.sum() == 24
-
-
-def test_warmup_loss_detach_and_switch():
-    scale = SpatialModulationScale(4, clusters=2)
-    ct = torch.randn(2, 4, 4, 4, requires_grad=True)
-    full = (ct.detach() + 1).requires_grad_()
-    mask = torch.ones(2, 1, 16, 16)
-    loss, p = scale.supervise(ct, full, mask, True)
-    loss.backward()
-    assert ct.grad is None and full.grad is None
-    assert scale.generator[-1].bias.grad.abs().sum() > 0
-    expected = (
-        (ct.detach() - full.detach()).abs().mean((1, 2, 3))
-        / (full.detach().square().mean((1, 2, 3)).sqrt() + 1e-6)
-    ).mean()
-    assert torch.allclose(loss, expected)
-    scale.bank.add_all(*p, True)
-    scale.bank.gamma.fill_(0.2)
-    scale.bank.beta.fill_(0.1)
-    assert torch.equal(scale(ct), ct)
-    scale.epoch.fill_(2)
-    assert torch.allclose(scale(ct), 1.2 * ct + 0.1, atol=1e-6)
-    scale.zero_grad()
-    off, _ = scale.supervise(ct, full, mask, False)
-    assert not off.requires_grad and off == 0
-
-
 def test_model_task_and_resume(monkeypatch, tmp_path):
     from tests.helpers import FakeEncoder
     import models.dual_shared_add_baseline as base
@@ -83,7 +36,8 @@ def test_model_task_and_resume(monkeypatch, tmp_path):
     loss = task.train_step_mixed(batch, state)[0]
     loss.backward()
     assert all(
-        s.generator[-1].weight.grad is not None for s in task.model.matrix.scales
+        s.bank.gamma.grad is None and s.bank.beta.grad is None
+        for s in task.model.matrix.scales
     )
     before = copy.deepcopy(task.model.matrix.state_dict())
     task.after_optimizer_step(False)
@@ -96,14 +50,33 @@ def test_model_task_and_resume(monkeypatch, tmp_path):
     task.optimizer.step()
     task.after_optimizer_step(True)
     assert all(int(s.bank.accepted) > 0 for s in task.model.matrix.scales)
+    task.begin_epoch(2)
+    task.optimizer.zero_grad(set_to_none=True)
+    task.config.matrix_mod_loss_enabled = False
+    task.train_step_mixed(batch, state)[0].backward()
+    assert all(s.bank.beta.grad.abs().sum() > 0 for s in task.model.matrix.scales)
+    task.optimizer.step()
+    task.after_optimizer_step(True)
+    assert all(torch.count_nonzero(s.bank.beta) > 0 for s in task.model.matrix.scales)
+    task.config.matrix_mod_loss_enabled = True
     path = str(tmp_path / "checkpoint.pt")
-    task.save_checkpoint(path, 1, 0.2, 1)
+    task.save_checkpoint(path, 2, 0.2, 2)
     other = SpatialModulationSegTask({"model": model()}, copy.deepcopy(cfg))
     other.resume(path)
     assert all(
         torch.equal(v, other.model.state_dict()[k])
         for k, v in task.model.state_dict().items()
     )
+    assert len(other.optimizer.state) == len(task.optimizer.state)
+    value_ids = {
+        id(p) for group in task.optimizer.param_groups for p in group["params"]
+    }
+    assert all(id(s.bank.beta) in value_ids for s in task.model.matrix.scales)
+    old = task.load_state_dicts(path)
+    old["experiment_type"] = "ct_full_spatial_modulation"
+    torch.save(old, tmp_path / "old.pt")
+    with pytest.raises(ValueError, match="learnable"):
+        other.resume(str(tmp_path / "old.pt"))
     task.begin_epoch(2)
     task.model.eval()
     ct = batch["ct"]
@@ -112,12 +85,51 @@ def test_model_task_and_resume(monkeypatch, tmp_path):
     task.model.matrix_read_mode = "off"
     assert torch.equal(full, task.model(ct, pet, forward_mode="full")["logits"])
     task.model.matrix_read_mode = "normal"
+    baseline = base.DualSharedAddPETCTBaseline(
+        pretrained=False, decoder_channels=(32, 24, 16, 8)
+    )
+    baseline.load_state_dict(
+        {
+            k: v
+            for k, v in task.model.state_dict().items()
+            if not k.startswith("matrix.")
+        },
+        strict=True,
+    )
+    baseline.eval()
+    assert torch.equal(full, baseline(ct, pet, forward_mode="full")["logits"])
+    # Zero Value gives exact baseline Missing outputs even after Key collection.
+    zero_model = copy.deepcopy(task.model)
+    with torch.no_grad():
+        for s in zero_model.matrix.scales:
+            s.bank.gamma.zero_()
+            s.bank.beta.zero_()
+    assert torch.equal(
+        zero_model(ct, forward_mode="missing")["logits"],
+        baseline(ct, forward_mode="missing")["logits"],
+    )
     before = copy.deepcopy(task.model.state_dict())
     pred = task.model(ct, pet, state)["logits"]
     pet = pet.clone()
     pet[state == 0] = float("nan")
     assert torch.equal(pred, task.model(ct, pet, state)["logits"])
+
+    def forbid_pet(*args):
+        pytest.fail("pure Missing called PET encoder")
+
+    handle = task.model.enc_pet.register_forward_pre_hook(forbid_pet)
+    try:
+        task.model(ct, forward_mode="missing")
+    finally:
+        handle.remove()
     assert all(torch.equal(v, task.model.state_dict()[k]) for k, v in before.items())
+    with pytest.raises(RuntimeError, match="evaluation"):
+        task.model.matrix.commit(
+            [
+                (torch.zeros(1, s.channels), torch.zeros(1))
+                for s in task.model.matrix.scales
+            ]
+        )
 
 
 def test_runner_two_epochs_and_eval(monkeypatch, tmp_path):
@@ -189,6 +201,14 @@ def test_runner_two_epochs_and_eval(monkeypatch, tmp_path):
     runner.main()
     last = str(tmp_path / "MDT/modtest/ckpt.last.pth.tar")
     ckpt = SpatialModulationSegTask.load_state_dicts(last)
+    assert ckpt["experiment_type"] == "ct_key_learnable_affine_value"
+    assert torch.count_nonzero(ckpt["model"]["matrix.scales.0.bank.beta"]) > 0
+    import csv
+
+    with open(tmp_path / "MDT/modtest/modulation_slots.csv") as f:
+        rows = list(csv.DictReader(f))
+    assert all(float(r["value_grad_norm"]) == 0 for r in rows if r["epoch"] == "1")
+    assert any(float(r["value_grad_norm"]) > 0 for r in rows if r["epoch"] == "2")
     assert ckpt["epoch"] == 2
     assert ckpt["model"]["matrix.scales.0.epoch"] == 2
     assert ckpt["model"]["matrix.scales.0.bank.accepted"] == 2 * 2 * 16 * 16
@@ -209,3 +229,37 @@ def test_runner_two_epochs_and_eval(monkeypatch, tmp_path):
     evaluator.main()
     result = json.loads((tmp_path / "comparison/comparison.json").read_text())
     assert result["on_minus_off"][0]["dice"] == 0
+
+
+def test_disabled_module_has_no_value_gradient_or_bank_writes(monkeypatch):
+    from tests.helpers import FakeEncoder
+    import models.dual_shared_add_baseline as base
+    from models.spatial_modulation_add_model import SpatialModulationAddModel
+    from tasks.spatial_modulation_seg import SpatialModulationSegTask
+
+    monkeypatch.setattr(base, "create_feature_backbone", lambda *a, **kw: FakeEncoder())
+    model = SpatialModulationAddModel(
+        pretrained=False,
+        decoder_channels=(32, 24, 16, 8),
+        matrix_enabled=False,
+        matrix_clusters=2,
+    )
+    cfg = SimpleNamespace(
+        learning_rate=0.001, weight_decay=0.0, mixed_precision=False, ema_enabled=False
+    )
+    task = SpatialModulationSegTask({"model": model}, cfg)
+    task.begin_epoch(2)
+    batch = dict(
+        ct=torch.randn(4, 1, 32, 32),
+        pet=torch.randn(4, 1, 32, 32),
+        mask=(torch.rand(4, 1, 32, 32) > 0.5).float(),
+    )
+    loss = task.train_step_mixed(batch, torch.tensor([1, 0, 1, 0]))[0]
+    loss.backward()
+    task.optimizer.step()
+    task.after_optimizer_step(True)
+    assert all(
+        int(s.bank.accepted) == 0 and s.bank.beta.grad is None
+        for s in model.matrix.scales
+    )
+    assert task.mod_loss_sum == 0

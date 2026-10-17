@@ -22,7 +22,7 @@ class SpatialModulationAddModel(DualSharedAddPETCTBaseline):
         self.matrix_enabled = bool(settings.pop("enabled"))
         if kwargs.get("use_deep_supervision", False):
             raise ValueError(
-                "matrix experiment uses final segmentation supervision only"
+                "learnable Value experiment uses final segmentation supervision only"
             )
         super().__init__(**kwargs)
         self.matrix_settings = dict(enabled=self.matrix_enabled, **settings)
@@ -125,8 +125,9 @@ def build_matrix_model(cfg):
         },
     )
     print(
-        f"[spatial_modulation] independent_scales=4 unified_K={cfg.matrix_clusters} "
-        f"all_positions=True first_epoch_no_read=True mod_loss={cfg.matrix_mod_loss_enabled} "
+        f"[learnable_affine] independent_scales=4 unified_K={cfg.matrix_clusters} "
+        f"key_update=EMA value_update=gradient all_positions=True first_epoch_no_read=True "
+        f"retrieval_loss={cfg.matrix_mod_loss_enabled} "
         f"weight={cfg.matrix_mod_loss_weight}",
         flush=True,
     )

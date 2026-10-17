@@ -1,4 +1,4 @@
-"""Mixed segmentation with optional normalized L1 supervision of affine modulation."""
+"""Mixed segmentation with learnable affine Values and optional retrieval-output L1."""
 
 import os
 import random
@@ -6,6 +6,7 @@ import time
 import numpy as np
 import torch
 from tasks.mdt_seg import MDTSegTeacher
+from models.spatial_modulation_bank import EXPERIMENT_TYPE
 from models.dual_shared_add_baseline import _validate_state
 
 
@@ -175,7 +176,7 @@ class SpatialModulationSegTask(MDTSegTeacher):
             random_state_torch=torch.get_rng_state(),
             ema_active=self.ema_active,
             no_improve=self.no_improve,
-            experiment_type="ct_full_spatial_modulation",
+            experiment_type=EXPERIMENT_TYPE,
             matrix_diagnostics=self.model.matrix.diagnostics(),
             matrix_refresh_stats=[
                 [bank.refresh_stats for bank in (scale.bank,)]
@@ -198,9 +199,9 @@ class SpatialModulationSegTask(MDTSegTeacher):
 
     def resume(self, path):
         ckpt = self.load_state_dicts(path)
-        if ckpt.get("experiment_type") != "ct_full_spatial_modulation":
+        if ckpt.get("experiment_type") != EXPERIMENT_TYPE:
             raise ValueError(
-                "resume requires a matrix checkpoint; baseline weights are a separate warm start"
+                "resume requires a learnable affine Value checkpoint; old statistical/matrix banks are incompatible"
             )
         # Non-tensor settings affect the meaning of restored banks. Never
         # silently resume using a different projection/collection policy.

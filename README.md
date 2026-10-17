@@ -5,9 +5,11 @@
 ## 当前模型
 
 CT：ConvNeXtV2-Nano；PET：MiT-B1。四尺度对齐后，Full 正常相加融合并进入共享解码器。
-旁路根据 detach 的 CT/Full 配对特征学习局部 gamma/beta，以归一化 L1 监督。
-各尺度统一库保存 CT Key 和配对 gamma/beta；所有 Full 位置参与流式累计，首轮不检索，第二轮起读取并同步 EMA 更新。
-Missing 仅使用自身 CT 查询并应用调制，不调用 PET 编码器。
+四尺度各自维护统一CT Key（buffer，聚类/EMA更新）与可学习gamma/beta（Parameter，梯度更新）。
+所有Full CT位置参与；首轮只积累Key并保持零Value，第二轮起逐位置读取和仿射补偿。
+Full的detach CT执行同样检索，以detach融合特征监督检索后的输出；辅助损失只更新Value。
+Missing只使用自身CT，最终分割损失同时训练Value与CT/解码器，不调用PET编码器。
+本分支 `exp/ct-key-learnable-affine-value` 基于清理分支 `exp/ct-full-spatial-modulation-bank@e697de2`。
 
 ## 运行
 
@@ -21,32 +23,32 @@ bash scripts/train_spatial_modulation.sh
 ```bash
 bash scripts/train_spatial_modulation.sh \
   --matrix_clusters 4 \
-  --hash add-spatial-modulation-unified-k4-lmod010-s2023
+  --hash add-learnable-affine-k4-lret010-s2023
 ```
 
-关闭额外损失：
+关闭额外损失（Value仍通过Missing分割损失学习）：
 
 ```bash
 bash scripts/train_spatial_modulation.sh \
   --matrix_mod_loss_enabled false \
-  --hash add-spatial-modulation-k8-nomodloss-s2023
+  --hash add-learnable-affine-k8-no-lret-s2023
 ```
 
 同一 checkpoint 开关补偿验证：
 
 ```bash
 python -u eval_spatial_modulation_add.py \
-  --checkpoint checkpoints_new/MDT/add-spatial-modulation-unified-k8-lmod010-s2023/ckpt.best_joint.pth.tar \
+  --checkpoint checkpoints_new/MDT/add-learnable-affine-k8-lret010-s2023/ckpt.best_joint.pth.tar \
   --root /root/autodl-tmp/data/PCLT20K \
   --use_ema false --compare_on_off true --missing_rates 0 1 \
-  --output_dir checkpoints_new/MDT/add-spatial-modulation-unified-k8-lmod010-s2023/diagnosis_on_off
+  --output_dir checkpoints_new/MDT/add-learnable-affine-k8-lret010-s2023/diagnosis_on_off
 ```
 
 ## 文件职责
 
 | 文件 | 职责 |
 |---|---|
-| `models/spatial_modulation_bank.py` | 调制生成器、归一化L1、统一流式库和检索 |
+| `models/spatial_modulation_bank.py` | EMA CT Key、可学习仿射Value、检索输出归一化L1 |
 | `models/spatial_modulation_add_model.py` | Full/Missing 分流与解码器前接入 |
 | `models/dual_shared_add_baseline.py`、`models/components/` | 共享骨干、对齐、相加融合和解码器 |
 | `tasks/spatial_modulation_seg.py` | 混合训练、成功更新后入库、恢复 |
@@ -58,8 +60,8 @@ python -u eval_spatial_modulation_add.py \
 | `eval_spatial_modulation_add.py` | 评估和开关诊断入口 |
 | `tests/` | 当前模块、恢复、训练/评估和区域统计测试 |
 
-为兼容已有权重，`model.matrix`的state_dict键名及`--matrix_*`参数保持不变；它们指当前仿射调制库，不是旧矩阵Value模型。
-本次清理不改变训练公式、超参数、读取方式或选模规则。历史版本不需复制回本分支，可切换对应旧分支查看。
+`model.matrix`及`--matrix_*`命令行名称保留以减少接口改动，表示本仿射模块。
+新checkpoint采用独立experiment_type，不能直接续训旧统计库或矩阵权重；原版保留在原分支。
 数据、预训练权重和本地实验输出不纳入版本控制。
 
 ## 检查

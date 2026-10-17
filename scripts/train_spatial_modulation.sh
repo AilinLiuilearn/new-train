@@ -6,7 +6,7 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
 python -u run_spatial_modulation_add.py \
-  --hash add-spatial-modulation-unified-k8-lmod010-s2023 \
+  --hash add-learnable-affine-k8-lret010-s2023 \
   --root /root/autodl-tmp/data/PCLT20K \
   --train_split_file train_original.txt \
   --val_split_file test.txt \

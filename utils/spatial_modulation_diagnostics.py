@@ -27,6 +27,13 @@ class ModulationCSVLogger:
             "modulation_loss",
             "foreground_fit_error",
             "background_fit_error",
+            "retrieval_error",
+            "identity_error",
+            "foreground_identity_error",
+            "background_identity_error",
+            "attention_top1_mean",
+            "attention_entropy_normalized",
+            "value_grad_norm",
         ]
         retained = []
         if os.path.exists(self.path):
@@ -44,6 +51,15 @@ class ModulationCSVLogger:
         rows = []
         for i, s in enumerate(task.model.matrix.scales, 1):
             b = s.bank
+            value_grads = [
+                p.grad.detach().float().square().sum()
+                for p in (b.gamma, b.beta)
+                if p.grad is not None
+            ]
+            grad_norm = (
+                float(torch.stack(value_grads).sum().sqrt()) if value_grads else 0.0
+            )
+            fit = s.last_supervision
             read = (task.matrix_read_stats or [{}, {}, {}, {}])[i - 1]
             for j in range(b.clusters):
                 a = read.get("attention_mean", [])
@@ -74,6 +90,15 @@ class ModulationCSVLogger:
                         background_fit_error=getattr(s, "last_supervision", {}).get(
                             "background_error"
                         ),
+                        retrieval_error=fit.get("retrieval_error"),
+                        identity_error=fit.get("identity_error"),
+                        foreground_identity_error=fit.get("foreground_identity_error"),
+                        background_identity_error=fit.get("background_identity_error"),
+                        attention_top1_mean=read.get("attention_top1_mean"),
+                        attention_entropy_normalized=read.get(
+                            "attention_entropy_normalized"
+                        ),
+                        value_grad_norm=grad_norm,
                     )
                 )
         with open(self.path, "a", newline="") as f:

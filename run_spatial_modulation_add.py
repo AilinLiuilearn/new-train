@@ -14,6 +14,7 @@ import time
 import torch
 
 from configs.base import str2bool
+from models.spatial_modulation_bank import EXPERIMENT_TYPE
 from configs.seg_mdt import SegMDTConfig
 from models.spatial_modulation_add_model import build_matrix_model, MATRIX_DEFAULTS
 from tasks.spatial_modulation_seg import SpatialModulationSegTask
@@ -38,7 +39,9 @@ class SpatialModulationConfig(SegMDTConfig):
 
     @staticmethod
     def task_specific_parser():
-        p = argparse.ArgumentParser("CT-key / transform-value memories", add_help=False)
+        p = argparse.ArgumentParser(
+            "EMA CT keys / learnable affine Values", add_help=False
+        )
         for name, default in MATRIX_DEFAULTS.items():
             kind = str2bool if isinstance(default, bool) else type(default)
             p.add_argument("--matrix_" + name, type=kind, default=default)
@@ -70,9 +73,9 @@ def main():
         )
     if cfg.matrix_mod_loss_weight < 0:
         raise ValueError("modulation loss weight must be nonnegative")
-    cfg.experiment_type = "ct_full_spatial_modulation"
+    cfg.experiment_type = EXPERIMENT_TYPE
     cfg.model_arch = "spatial_modulation_add_model"
-    cfg.baseline_reference = "exp/aligned-add-baseline@663f978"
+    cfg.baseline_reference = "exp/ct-full-spatial-modulation-bank@e697de2"
     cfg.fusion_type, cfg.pet_missing_rate = "AddFusion", 0.5
     print(
         f"[protocol] norm_mode={cfg.norm_mode} hd95_mode={cfg.hd95_mode} "
@@ -327,7 +330,7 @@ def main():
         )
         print(
             f'[epoch {epoch}] Full={full["dice"]:.4f} Missing={missing["dice"]:.4f} '
-            f"Joint={joint:.4f} unified_initialized={sv}/4 mod_loss={task.mod_loss_sum/max(1,task.mod_loss_batches):.5f}",
+            f"Joint={joint:.4f} unified_initialized={sv}/4 retrieval_loss={task.mod_loss_sum/max(1,task.mod_loss_batches):.5f}",
             flush=True,
         )
         if task.no_improve >= cfg.early_stop_patience:
