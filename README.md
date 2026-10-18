@@ -1,3 +1,16 @@
+# 当前分支：同构 MiT-B1，50% Full / 50% Missing 相加基线
+
+`exp/mixed-mitb1-add-baseline`：CT/PET各自独立MiT-B1，保留两侧四尺度对齐和共享GN解码器，学习率4e-5。
+每batch16固定8 Full、8 Missing；Full正常相加，Missing直接使用对齐CT，无补偿或实验融合模块。
+默认EMA与60轮设置沿用参考同构Full-only实验，按Full/Missing平均Dice选择同一个最佳checkpoint。
+
+```bash
+bash scripts/run_mixed_add_mitb1_lr4e5.sh
+```
+
+完整结构、预检、配置及评价说明见 [README_MIXED_MIT_B1_BASELINE.md](README_MIXED_MIT_B1_BASELINE.md)。
+以下保留参考分支原有基线说明。
+
 # Clean segmentation baselines
 
 Branch: `exp/aligned-add-baseline`. Three independent, runnable baselines that
