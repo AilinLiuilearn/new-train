@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """CT-only segmentation baseline.
 
-ConvNeXtV2-Nano CT encoder -> StageChannelAlign -> shared GroupNorm decoder.
+CT encoder (ConvNeXtV2-Nano or MiT-B1) -> StageChannelAlign -> GroupNorm decoder.
 No PET encoder is instantiated, no PET file is read, no fusion is used.
 """
 import torch

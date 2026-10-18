@@ -12,8 +12,8 @@ def build_dual_model(cfg):
     model = DualSharedAddPETCTBaseline(
         ct_backbone=_get(cfg, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=_get(cfg, 'pet_backbone', 'mit_b1'),
-        ct_pretrained_path=_get(cfg, 'ct_pretrained_path', None),
-        pet_pretrained_path=_get(cfg, 'pet_pretrained_path', None),
+        ct_pretrained_path=_get(cfg, 'ct_pretrained_path', None) if _get(cfg, 'pretrained', True) else None,
+        pet_pretrained_path=_get(cfg, 'pet_pretrained_path', None) if _get(cfg, 'pretrained', True) else None,
         in_channels=3,
         out_channels=1,
         decoder_channels=tuple(_get(cfg, 'decoder_channels', (512, 256, 128, 64))),
@@ -29,12 +29,12 @@ def build_dual_model(cfg):
 
 
 def build_ct_only_model(cfg):
-    if str(_get(cfg, 'ct_backbone', 'convnextv2_nano')).lower().replace('-', '_') != 'convnextv2_nano':
-        raise ValueError('CT-only baseline is fixed to convnextv2_nano, '
+    if str(_get(cfg, 'ct_backbone', 'convnextv2_nano')).lower().replace('-', '_') not in ('convnextv2_nano', 'mit_b1'):
+        raise ValueError('CT-only baseline supports convnextv2_nano or mit_b1, '
                          f'got {_get(cfg, "ct_backbone", None)!r}')
     model = CTOnlySegmentationModel(
         ct_backbone=_get(cfg, 'ct_backbone', 'convnextv2_nano'),
-        ct_pretrained_path=_get(cfg, 'ct_pretrained_path', None),
+        ct_pretrained_path=_get(cfg, 'ct_pretrained_path', None) if _get(cfg, 'pretrained', True) else None,
         in_channels=3,
         out_channels=1,
         decoder_channels=tuple(_get(cfg, 'decoder_channels', (512, 256, 128, 64))),

@@ -14,7 +14,6 @@ from tasks.mdt_seg import MDTSegTeacher
 
 
 OLD_FILES = [
-    'run_ct_only_seg.py',
     'run_full_missing_baseline.py',
     'run_mdt_seg.py',
     'models/dual_shared_add_baseline.py',

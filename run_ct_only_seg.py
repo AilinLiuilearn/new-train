@@ -16,8 +16,7 @@ from configs.seg_mdt import SegMDTConfig
 from models.build_mdt_seg import build_ct_only_model
 from tasks.mdt_seg import MDTSegTeacher
 from utils.optimization import get_cosine_scheduler
-from utils.run_common import (build_balanced_pet_available, count_parameters,
-                              eval_missing_rates, module_grad_norm,
+from utils.run_common import (count_parameters, module_grad_norm,
                               optimizer_step_succeeded, seed_everything)
 from utils.train_logger import append_epoch_log, init_train_log
 
@@ -34,7 +33,8 @@ def _loaders(cfg):
 
 
 def _assert_ct_only_protocol(cfg):
-    assert str(cfg.ct_backbone).lower().replace('-', '_') == 'convnextv2_nano'
+    if str(cfg.ct_backbone).lower().replace('-', '_') not in ('convnextv2_nano', 'mit_b1'):
+        raise ValueError('CT-only supports convnextv2_nano or mit_b1')
     assert cfg.accumulation_steps == 1
     assert bool(cfg.use_deep_supervision) is False
     assert bool(cfg.deep_supervision) is False
@@ -52,6 +52,8 @@ def main():
     print('[INFO] starting CT-only baseline (all CT slices, fixed protocol)', flush=True)
     cfg = SegMDTConfig.parse_arguments()
     _assert_ct_only_protocol(cfg)
+    cfg.experiment_type = 'ct_only_baseline'
+    cfg.fusion_type = 'none'
     seed_everything(cfg.random_state)
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     with open(os.path.join(cfg.checkpoint_dir, 'config_args.json'), 'w') as f:
@@ -187,14 +189,21 @@ def main():
     if not os.path.isfile(paths['best_ct']):
         raise RuntimeError('best CT-only checkpoint was not created')
     ckpt = MDTSegTeacher.load_state_dicts(paths['best_ct'])
-    use_ema = task.ema is not None and ckpt.get('model_ema') is not None
+    use_ema = (task.ema is not None and ckpt.get('eval_weights', 'raw') == 'ema'
+               and ckpt.get('model_ema') is not None)
     weights_tag = 'ema' if use_ema else 'raw'
     eval_model = build_ct_only_model(cfg)['model'].to(task.device)
     eval_model.load_state_dict(ckpt['model_ema'] if use_ema else ckpt['model'], strict=True)
     eval_model.eval()
-    eval_missing_rates(task, eval_model, test_loader, cfg.random_state,
-                       cfg.checkpoint_dir, 'final_test_ct',
-                       rates=list(cfg.final_test_missing_rates), weights_tag=weights_tag)
+    test_ct = task.evaluate(test_loader, eval_mode='ct', tag='test_ct', model=eval_model)
+    result = dict(experiment_type='ct_only_baseline', ct_backbone=cfg.ct_backbone,
+                  dice=float(test_ct['dice']), iou=float(test_ct['iou']),
+                  hd95=float(test_ct['hd95']), hd95_mode=task.metrics.hd95_mode, hd95_unit='pixel',
+                  loss=float(test_ct['total_loss']), weights=weights_tag,
+                  best_epoch=ckpt['best_epoch'], checkpoint=os.path.abspath(paths['best_ct']))
+    with open(os.path.join(cfg.checkpoint_dir, 'final_test_ct.json'), 'w') as f:
+        json.dump(result, f, indent=2)
+    print('[FINAL TEST CT]', json.dumps(result, indent=2), flush=True)
     print('done', flush=True)
 
 
