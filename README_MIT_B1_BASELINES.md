@@ -3,6 +3,8 @@
 当前分支：`exp/full-add-local-reassembly`。新增两个独立启动脚本，复用原相加/CT-only训练器。
 不调用 LocalReassemblyFusion，不使用内部相加修正损失，不加载训练好的分割 baseline。
 
+同分支的双 ConvNeXtV2-Nano 同协议对照见 [README_CONVNEXT_NANO_BASELINE.md](README_CONVNEXT_NANO_BASELINE.md)。
+
 ## 两组设置
 
 | 实验 | CT 编码器 | PET 编码器 | 融合 | 主损失 |

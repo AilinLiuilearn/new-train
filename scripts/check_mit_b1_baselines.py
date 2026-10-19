@@ -17,15 +17,23 @@ from utils.run_common import seed_everything
 from utils.seg_losses import BCEDiceLoss
 
 
-def check(args, mode):
+def check(args, mode, *, backbone='mit_b1', pretrained_path=None):
     seed_everything(2023)
     device = torch.device(args.device)
-    cfg = SimpleNamespace(ct_backbone='mit_b1', pet_backbone='mit_b1',
-        ct_pretrained_path=args.mit_pretrained_path, pet_pretrained_path=args.mit_pretrained_path,
+    encoder_types = {'mit_b1': 'SegformerFeatureBackbone',
+                     'convnextv2_nano': 'TimmFeatureBackbone'}
+    if backbone not in encoder_types:
+        raise ValueError(f'Unsupported preflight backbone: {backbone}')
+    if pretrained_path is None:
+        if backbone != 'mit_b1':
+            raise ValueError('Provide the matching encoder pretrained_path explicitly')
+        pretrained_path = args.mit_pretrained_path
+    cfg = SimpleNamespace(ct_backbone=backbone, pet_backbone=backbone,
+        ct_pretrained_path=pretrained_path, pet_pretrained_path=pretrained_path,
         pretrained=args.pretrained, decoder_channels=(512,256,128,64),
         use_deep_supervision=False, deep_supervision=False)
     model = (build_dual_model(cfg) if mode == 'full' else build_ct_only_model(cfg))['model'].to(device)
-    assert type(model.enc_ct).__name__ == 'SegformerFeatureBackbone'
+    assert type(model.enc_ct).__name__ == encoder_types[backbone]
     if mode == 'full':
         assert isinstance(model.fusion, AddFusion)
         assert type(model.enc_ct) is type(model.enc_pet)
@@ -80,8 +88,11 @@ def check(args, mode):
         losses.append(float(loss.detach()))
         assert all(value == step+1 for value in calls.values()), calls
     for hook in hooks: hook.remove()
-    result = dict(status='passed',mode=mode,device=str(device),encoder='mit_b1',
+    result = dict(status='passed',mode=mode,device=str(device),encoder=backbone,
         independent_encoders=mode=='full',encoder_pretrained=args.pretrained,
+        encoder_pretrained_path=pretrained_path if args.pretrained else None,
+        encoder_channels=list(model.enc_ct.feature_info.channels()),
+        aligned_channels=expected_channels,
         learning_rate=4e-5,loss='BCE+Dice',image_size=args.image_size,batch_size=args.batch_size,
         calls=calls,losses=losses,params_total=sum(p.numel() for p in model.parameters()),
         peak_cuda_gib=torch.cuda.max_memory_allocated()/2**30 if device.type=='cuda' else None)
