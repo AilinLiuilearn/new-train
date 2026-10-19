@@ -1,3 +1,7 @@
+# 新增：二维 nnU-Net 双专家分支
+
+本分支主要入口见 [README_EXPERTS2D.md](README_EXPERTS2D.md)。以下为保留的旧异构基线说明。
+
 # 两个独立的干净基线
 
 分支：`exp/clean-ct-full-add-hetero-lr8e5`。

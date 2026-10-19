@@ -1,0 +1,10 @@
+# Network dependency is the official MIC-DKFZ implementation used by nnU-Net.
+# Install an appropriate CPU/CUDA torch wheel separately for your machine.
+torch>=2.3
+dynamic-network-architectures==0.3.1
+numpy>=1.24
+scipy>=1.10
+Pillow>=9
+opencv-python-headless>=4.8
+medpy>=0.5
+pytest>=7
