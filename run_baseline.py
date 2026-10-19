@@ -24,10 +24,7 @@ def loaders(cfg):
 def evaluate(task, loader, model):
     if task.config.baseline == 'ct_only':
         return {'ct_only': task.evaluate(loader, 'missing', model=model)}
-    full = task.evaluate(loader, 'full', model=model)
-    missing = task.evaluate(loader, 'missing', model=model)
-    return {'full': full, 'missing': missing,
-            'joint_dice': 0.5 * (full['dice'] + missing['dice'])}
+    return {'full': task.evaluate(loader, 'full', model=model)}
 
 
 def main():
@@ -52,7 +49,7 @@ def main():
         warmup_steps=cfg.cosine_warmup * len(train), steps_per_epoch=len(train),
         min_lr=cfg.cosine_min_lr, flat_ratio=cfg.lr_flat_ratio)
     log = os.path.join(directory, 'train_log.csv')
-    headers = ['val_full_dice', 'val_missing_dice', 'joint_dice', 'ema_updates', 'skipped_updates', 'epoch_time']
+    headers = ['val_full_dice', 'ema_updates', 'skipped_updates', 'epoch_time']
     init_train_log(log, extra_headers=headers)
     best, best_epoch, stale = -1., 0, 0
     best_path = os.path.join(directory, 'ckpt.best.pth.tar')
@@ -92,8 +89,6 @@ def main():
         append_epoch_log(log, epoch, loss_sum / samples, primary,
             lr=task.optimizer.param_groups[0]['lr'], grad_norm=grad_sum / len(train),
             extra_metrics={'val_full_dice': result.get('full', {}).get('dice', float('nan')),
-                'val_missing_dice': result.get('missing', {}).get('dice', float('nan')),
-                'joint_dice': result.get('joint_dice', float('nan')),
                 'ema_updates': task.ema.updates if task.ema else 0,
                 'skipped_updates': skipped, 'epoch_time': time.time() - start})
         print(f'[epoch {epoch}] {cfg.baseline} dice={score:.4f} best={best:.4f} results={result}', flush=True)

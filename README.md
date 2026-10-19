@@ -29,9 +29,7 @@ bash scripts/train_full_add_lr8e5.sh
 已存在 config_args.json 时拒绝覆盖。预训练缺失或不兼容直接报错。
 
 每轮保存 ckpt.last.pth.tar，以及按自身训练场景 Dice 选择的 ckpt.best.pth.tar。
-Full Add 在同一组权重上同时报告 Full、Missing（不调用 PET）、Joint=两者 Dice 均值。
-该 Missing 是 Full-only 模型的移除 PET 诊断，不等价于经过混合训练的缺失模型。
-CT-only 仅报告自身指标，不把它拼成 Full Add 的 Joint。
+Full Add 仅执行 Full 验证与最终评价；CT-only 仅评价 CT。每轮各验证一次，不执行 Missing/Joint 诊断。
 训练结束加载最佳 checkpoint 中记录的 raw/EMA 权重，写入 final_test.json。
 
 ```bash
