@@ -1,0 +1,13 @@
+# Install a CUDA-compatible torch/torchvision pair separately on AutoDL.
+# Core APIs support the existing PyTorch 2.1 environment; local checks used 2.5.1 CPU.
+torch>=2.1
+torchvision>=0.16
+timm>=0.9,<2
+transformers>=4.30,<5
+numpy>=1.24,<2
+Pillow>=9
+scipy>=1.10
+opencv-python-headless>=4.7,<4.12
+MedPy>=0.4
+safetensors>=0.3
+pytest>=7

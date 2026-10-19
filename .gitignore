@@ -3,3 +3,9 @@ __pycache__/
 .pytest_cache/
 pytest-of-root/
 tmp*/
+checkpoints_new/
+pretrained/
+*.pth
+*.pth.tar
+*.safetensors
+verification_local.json
