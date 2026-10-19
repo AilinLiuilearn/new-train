@@ -1,14 +1,5 @@
-# -*- coding: utf-8 -*-
-"""Dual-modal Full/Missing baseline with pure per-scale addition.
-
-- full:    aligned_CT + PET_features -> shared decoder (PET required).
-- missing: aligned_CT + zeros_like(aligned_CT) -> same decoder.
-           Missing rows' PET is never encoded, so Missing outputs cannot
-           depend on Missing rows' PET content. ``pet=None`` is allowed.
-- auto:    routes each sample by a length-B bool / 0-1-int state, encodes PET
-           for Full rows only, then restores the original sample order.
-
-Only the Full path goes through :class:`AddFusion` (the future fusion seam).
+"""Independent CT-only or heterogeneous aligned-add segmentation baseline.
+CT-only allocates no PET encoder, PET aligner or fusion module.
 """
 import torch
 import torch.nn as nn
@@ -31,40 +22,29 @@ def _check_finite(name, xs):
         raise RuntimeError(f'[NaN/Inf] {name} contains invalid values')
 
 
-def _validate_state(pet_available, batch, name='pet_available'):
-    """Validate the raw state without silent truncation: bool or 0/1 ints."""
-    raw = torch.as_tensor(pet_available)
-    if raw.numel() != batch:
-        raise ValueError(f'{name} must contain one state per sample: '
-                         f'got {raw.numel()} for batch {batch}')
-    if raw.dtype == torch.bool:
-        return raw.long().view(-1)
-    if raw.dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
-        if not torch.all((raw == 0) | (raw == 1)):
-            raise ValueError(f'{name} values must be 0 or 1')
-        return raw.long().view(-1)
-    raise ValueError(f'{name} must be bools or 0/1 integers, no silent float truncation')
-
-
 class DualSharedAddPETCTBaseline(nn.Module):
     def __init__(self, ct_backbone='convnextv2_nano', pet_backbone='mit_b1',
                  ct_pretrained_path=None, pet_pretrained_path=None,
                  in_channels=3, out_channels=1,
                  decoder_channels=(512, 256, 128, 64),
-                 use_deep_supervision=False, pretrained=True):
+                 use_deep_supervision=False, pretrained=True, baseline="full_add"):
         super().__init__()
+        self.baseline = baseline
+        if baseline not in ("ct_only", "full_add"):
+            raise ValueError(baseline)
         self.use_deep_supervision = bool(use_deep_supervision)
         self.enc_ct = create_feature_backbone(ct_backbone, in_channels=in_channels)
-        self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
         load_local_weights_safe(self.enc_ct, ct_pretrained_path,
                                 name='CT_Encoder', required=bool(pretrained))
-        load_local_weights_safe(self.enc_pet, pet_pretrained_path,
-                                name='PET_Encoder', required=bool(pretrained))
         ct_channels = list(self.enc_ct.feature_info.channels())
         self.ct_align = StageChannelAlign(ct_channels, list(DECODER_INPUT_CHANNELS))
-        pet_channels = list(self.enc_pet.feature_info.channels())
-        self.pet_align = StageChannelAlign(pet_channels, list(DECODER_INPUT_CHANNELS))
-        self.fusion = AddFusion()
+        if baseline == "full_add":
+            self.enc_pet = create_feature_backbone(pet_backbone, in_channels=in_channels)
+            load_local_weights_safe(self.enc_pet, pet_pretrained_path,
+                                    name='PET_Encoder', required=bool(pretrained))
+            self.pet_align = StageChannelAlign(
+                list(self.enc_pet.feature_info.channels()), list(DECODER_INPUT_CHANNELS))
+            self.fusion = AddFusion()
         self.decoder = UNetStyleDecoder(
             list(DECODER_INPUT_CHANNELS), decoder_channels=decoder_channels,
             out_channels=out_channels, use_deep_supervision=self.use_deep_supervision)
@@ -110,40 +90,10 @@ class DualSharedAddPETCTBaseline(nn.Module):
         _check_finite('fused_feats', fused)
         return self._decode(fused, target_size)
 
-    def _forward_auto(self, ct, pet, pet_available, target_size):
-        batch = ct.shape[0]
-        state = _validate_state(pet_available, batch).to(ct.device)
-        full_idx = state.eq(1).nonzero(as_tuple=True)[0]
-        num_full = int(full_idx.numel())
-        ct_feats = self._encode_ct(ct)
-        if num_full > 0:
-            if pet is None:
-                raise ValueError(f'auto path has {num_full} Full rows but pet=None')
-            pet_full = self._encode_pet(pet.index_select(0, full_idx).contiguous())
-            ct_full = [c.index_select(0, full_idx) for c in ct_feats]
-            fused_full = self.fusion(ct_full, pet_full)
-        # Missing rows: aligned_CT, zero increment. Full rows replaced below.
-        fused = [c + torch.zeros_like(c) for c in ct_feats]
-        if num_full > 0:
-            fused = [base.index_copy(0, full_idx, f.to(dtype=base.dtype))
-                     for base, f in zip(fused, fused_full)]
-        _check_finite('fused_feats', fused)
-        out = self._decode(fused, target_size)
-        out['pet_available'] = state.detach().cpu()
-        out['num_full'] = num_full
-        out['num_missing'] = batch - num_full
-        return out
-
-    def forward(self, ct, pet=None, pet_available=None, target_size=None,
-                forward_mode='auto'):
-        if target_size is None:
-            target_size = ct.shape[-2:]
-        if forward_mode == 'full':
-            return self._forward_full(ct, pet, target_size)
-        if forward_mode == 'missing':
-            return self._forward_missing(ct, pet, target_size)
-        if forward_mode == 'auto':
-            if pet_available is None:
-                pet_available = torch.ones(ct.shape[0], dtype=torch.long)
-            return self._forward_auto(ct, pet, pet_available, target_size)
-        raise ValueError(f'Unsupported forward_mode={forward_mode!r}')
+    def forward(self, ct, pet=None, target_size=None, forward_mode=None):
+        target_size = ct.shape[-2:] if target_size is None else target_size
+        if self.baseline == "ct_only":
+            return self._decode(self._encode_ct(ct), target_size)
+        if forward_mode == "missing":
+            return self._forward_missing(ct, None, target_size)
+        return self._forward_full(ct, pet, target_size)

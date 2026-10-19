@@ -25,6 +25,7 @@ class SegMDTConfig(ConfigBase):
     @staticmethod
     def model_parser():
         p = argparse.ArgumentParser('Model', add_help=False)
+        p.add_argument('--baseline', choices=('ct_only', 'full_add'), required=True)
         p.add_argument('--model_arch', type=str, default='dual_shared_add_baseline',
                        choices=('dual_shared_add_baseline',))
         p.add_argument('--ct_backbone', type=str, default='convnextv2_nano')
@@ -47,7 +48,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--batch_size', type=int, default=16)
         p.add_argument('--accumulation_steps', type=int, default=1)
         p.add_argument('--optimizer', type=str, default='adamw', choices=('adamw', 'sgd'))
-        p.add_argument('--learning_rate', type=float, default=4e-5)
+        p.add_argument('--learning_rate', type=float, default=8e-5)
         p.add_argument('--weight_decay', type=float, default=1e-4)
         p.add_argument('--cosine_warmup', type=int, default=3)
         p.add_argument('--cosine_min_lr', type=float, default=1e-6)
@@ -62,11 +63,6 @@ class SegMDTConfig(ConfigBase):
                        choices=('legacy', 'surface', 'cipa_official'))
         p.add_argument('--early_stop_patience', type=int, default=60)
         p.add_argument('--random_state', type=int, default=2023)
-        p.add_argument('--final_test_missing_rates', type=float, nargs='+',
-                       default=[0.0, 0.25, 0.5, 0.75, 1.0])
-        p.add_argument('--train_batch_mode', type=str, default='mixed',
-                       choices=('mixed',),
-                       help='Exact-half Full/Missing rows in each training batch.')
         return p
 
     @staticmethod

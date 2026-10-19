@@ -9,6 +9,7 @@ def _get(cfg, name, default):
 
 def build_dual_model(cfg):
     model = DualSharedAddPETCTBaseline(
+        baseline=cfg.baseline,
         ct_backbone=_get(cfg, 'ct_backbone', 'convnextv2_nano'),
         pet_backbone=_get(cfg, 'pet_backbone', 'mit_b1'),
         ct_pretrained_path=_get(cfg, 'ct_pretrained_path', None) if _get(cfg, 'pretrained', True) else None,
@@ -20,8 +21,4 @@ def build_dual_model(cfg):
                                   or _get(cfg, 'deep_supervision', False)),
         pretrained=bool(_get(cfg, 'pretrained', True)),
     )
-    print(f'[dual_baseline] ct={_get(cfg, "ct_backbone", "convnextv2_nano")} '
-          f'pet={_get(cfg, "pet_backbone", "mit_b1")} '
-          f'fusion=AddFusion shared_decoder=UNetStyleDecoder(GroupNorm) '
-          f'params_total={sum(p.numel() for p in model.parameters())}', flush=True)
     return {'model': model}
