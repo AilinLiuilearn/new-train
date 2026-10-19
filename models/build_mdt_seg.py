@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Model builders for the two clean baselines (no registration system)."""
-from models.ct_only_baseline import CTOnlySegmentationModel
+"""Model builder for the clean Full/Missing Add baseline."""
 from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
 
 
@@ -26,30 +25,3 @@ def build_dual_model(cfg):
           f'fusion=AddFusion shared_decoder=UNetStyleDecoder(GroupNorm) '
           f'params_total={sum(p.numel() for p in model.parameters())}', flush=True)
     return {'model': model}
-
-
-def build_ct_only_model(cfg):
-    if str(_get(cfg, 'ct_backbone', 'convnextv2_nano')).lower().replace('-', '_') not in ('convnextv2_nano', 'mit_b1'):
-        raise ValueError('CT-only baseline supports convnextv2_nano or mit_b1, '
-                         f'got {_get(cfg, "ct_backbone", None)!r}')
-    model = CTOnlySegmentationModel(
-        ct_backbone=_get(cfg, 'ct_backbone', 'convnextv2_nano'),
-        ct_pretrained_path=_get(cfg, 'ct_pretrained_path', None) if _get(cfg, 'pretrained', True) else None,
-        in_channels=3,
-        out_channels=1,
-        decoder_channels=tuple(_get(cfg, 'decoder_channels', (512, 256, 128, 64))),
-        use_deep_supervision=bool(_get(cfg, 'use_deep_supervision', False)
-                                  or _get(cfg, 'deep_supervision', False)),
-        pretrained=bool(_get(cfg, 'pretrained', True)),
-    )
-    print(f'[ct_only_baseline] ct={_get(cfg, "ct_backbone", "convnextv2_nano")} '
-          f'fusion=none pet_encoder=none shared_decoder=UNetStyleDecoder(GroupNorm) '
-          f'params_total={sum(p.numel() for p in model.parameters())}', flush=True)
-    return {'model': model}
-
-
-def build_mdt_seg_teacher(cfg):
-    """Legacy entry kept for compatibility: forwards to the dual baseline."""
-    print('[INFO] run_mdt_seg.py is a compatibility entry: '
-          'actual training mode is the Full/Missing mixed baseline', flush=True)
-    return build_dual_model(cfg)

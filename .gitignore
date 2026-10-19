@@ -3,3 +3,8 @@ __pycache__/
 .pytest_cache/
 pytest-of-root/
 tmp*/
+checkpoints_new/
+checkpoints/
+pretrained/
+data/
+runs/

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Contracts for the two clean baselines.
+"""Contracts for the clean heterogeneous Full/Missing baseline.
 
 Covers: shared CT encoder/align/decoder structure, GroupNorm decoder,
 exact-half reproducible mixed batches, Full-encodes-PET / Missing-skips-PET,
@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 
 from models.components.add_fusion import AddFusion
-from models.ct_only_baseline import CTOnlySegmentationModel
 from models.dual_shared_add_baseline import DualSharedAddPETCTBaseline
 from models.components.group_unet_decoder import UNetStyleDecoder
 from tasks.mdt_seg import MDTSegTeacher
@@ -44,38 +43,9 @@ def _tiny_dual(**kwargs):
     return DualSharedAddPETCTBaseline(**kw)
 
 
-def test_ct_only_has_no_pet_encoder():
-    model = CTOnlySegmentationModel(ct_pretrained_path=None, pretrained=False)
-    assert not hasattr(model, 'enc_pet')
-    assert not hasattr(model, 'fusion')
-    assert isinstance(model.decoder, UNetStyleDecoder)
-
-
-def test_shared_structure_between_baselines():
-    ct_only = CTOnlySegmentationModel(ct_pretrained_path=None, pretrained=False)
-    dual = _tiny_dual()
-    assert type(ct_only.enc_ct).__name__ == type(dual.enc_ct).__name__
-    assert type(ct_only.ct_align).__name__ == type(dual.ct_align).__name__
-    assert type(ct_only.decoder).__name__ == type(dual.decoder).__name__
-    assert ct_only.decoder.proj1[0].in_channels == dual.decoder.proj1[0].in_channels == 64
-    assert ct_only.decoder.proj4[0].in_channels == dual.decoder.proj4[0].in_channels == 512
-
-
-def test_decoder_uses_groupnorm_only():
-    for ctor in (lambda: CTOnlySegmentationModel(ct_pretrained_path=None, pretrained=False),
-                 _tiny_dual):
-        dec = ctor().decoder
-        gn = [m for m in dec.modules() if isinstance(m, nn.GroupNorm)]
-        bn = [m for m in dec.modules() if isinstance(m, nn.BatchNorm2d)]
-        assert len(gn) > 0 and len(bn) == 0
-
-
 def test_forward_shapes_and_finite():
     ct = torch.randn(2, 1, 64, 64)
     pet = torch.randn(2, 1, 64, 64)
-    out_ct = CTOnlySegmentationModel(ct_pretrained_path=None, pretrained=False)(ct)
-    assert out_ct['logits'].shape == (2, 1, 64, 64)
-    assert torch.isfinite(out_ct['logits']).all()
     dual = _tiny_dual()
     for mode, kwargs in (('full', {'pet': pet}),
                          ('missing', {'pet': None}),
@@ -253,17 +223,7 @@ def test_ema_checkpoint_roundtrip_and_eval(tmp_path):
     assert torch.isfinite(out).all()
 
 
-def test_ct_only_dataset_has_no_pet(tmp_path):
-    from datasets.pclt20k_seg import PCLT20KSegDataset
-    import numpy as np
-    from PIL import Image
-    img = (np.random.rand(16, 16) * 255).astype(np.uint8)
-    Image.fromarray(img).save(tmp_path / 'caseA_000_CT.png')
-    Image.fromarray((img > 128).astype(np.uint8) * 255).save(tmp_path / 'caseA_000_mask.png')
-    records = [{'image_id': 'caseA_000', 'case_id': 'caseA', 'slice_id': 'caseA_000',
-                'ct_path': str(tmp_path / 'caseA_000_CT.png'),
-                'mask_path': str(tmp_path / 'caseA_000_mask.png')}]
-    ds = PCLT20KSegDataset(records, image_size=16, ct_only=True)
-    sample = ds[0]
-    assert 'pet' not in sample
-    assert sample['ct'].shape == (3, 16, 16)
+def test_decoder_uses_groupnorm_only():
+    decoder = _tiny_dual().decoder
+    assert any(isinstance(m, nn.GroupNorm) for m in decoder.modules())
+    assert not any(isinstance(m, nn.BatchNorm2d) for m in decoder.modules())

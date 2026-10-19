@@ -19,7 +19,7 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--num_workers', type=int, default=4)
         p.add_argument('--pin_memory', type=str2bool, default=True)
         p.add_argument('--aug_mode', type=str, default='cipa', choices=('cipa', 'light', 'none'))
-        p.add_argument('--norm_mode', type=str, default='cipa', choices=('imagenet', 'cipa'))
+        p.add_argument('--norm_mode', type=str, default='imagenet', choices=('imagenet', 'cipa'))
         return p
 
     @staticmethod
@@ -38,9 +38,6 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--deep_supervision', type=str2bool, default=False)
         p.add_argument('--pretrained', type=str2bool, default=True,
                        help='Set False for smoke tests that opt out of pretrained weights.')
-        p.add_argument('--enable_gradient_diagnostics', type=str2bool, default=False)
-        p.add_argument('--gradient_diagnostics_interval', type=int, default=5)
-        p.add_argument('--gradient_diagnostics_num_samples', type=int, default=1)
         return p
 
     @staticmethod
@@ -50,26 +47,26 @@ class SegMDTConfig(ConfigBase):
         p.add_argument('--batch_size', type=int, default=16)
         p.add_argument('--accumulation_steps', type=int, default=1)
         p.add_argument('--optimizer', type=str, default='adamw', choices=('adamw', 'sgd'))
-        p.add_argument('--learning_rate', type=float, default=8e-5)
+        p.add_argument('--learning_rate', type=float, default=4e-5)
         p.add_argument('--weight_decay', type=float, default=1e-4)
         p.add_argument('--cosine_warmup', type=int, default=3)
         p.add_argument('--cosine_min_lr', type=float, default=1e-6)
         p.add_argument('--lr_flat_ratio', type=float, default=0.3)
         p.add_argument('--mixed_precision', type=str2bool, default=True)
-        p.add_argument('--ema_enabled', type=str2bool, default=False)
+        p.add_argument('--ema_enabled', type=str2bool, default=True)
         p.add_argument('--ema_decay', type=float, default=0.999)
         p.add_argument('--ema_start_epoch', type=int, default=3)
         p.add_argument('--ema_decay_warmup', type=str2bool, default=True)
         p.add_argument('--grad_clip', type=float, default=5.0)
         p.add_argument('--hd95_mode', type=str, default='cipa_official',
                        choices=('legacy', 'surface', 'cipa_official'))
-        p.add_argument('--early_stop_patience', type=int, default=10)
+        p.add_argument('--early_stop_patience', type=int, default=60)
         p.add_argument('--random_state', type=int, default=2023)
         p.add_argument('--final_test_missing_rates', type=float, nargs='+',
                        default=[0.0, 0.25, 0.5, 0.75, 1.0])
         p.add_argument('--train_batch_mode', type=str, default='mixed',
-                       choices=('alternating', 'mixed', 'full'),
-                       help='Compat only: run_mdt_seg.py forwards mixed, rejects the rest.')
+                       choices=('mixed',),
+                       help='Exact-half Full/Missing rows in each training batch.')
         return p
 
     @staticmethod

@@ -1,4 +1,4 @@
-"""Two-step homogeneous mixed baseline preflight, without real data/checkpoints."""
+"""Two-step heterogeneous mixed baseline preflight, without real data/checkpoints."""
 
 import argparse
 import json
@@ -12,7 +12,7 @@ import torch
 from configs.base import str2bool
 from models.build_mdt_seg import build_dual_model
 from models.components.add_fusion import AddFusion
-from run_mixed_mitb1_baseline import MixedMiTB1Task
+from run_full_missing_baseline import MixedHeteroTask
 from utils.run_common import build_balanced_pet_available, seed_everything
 
 
@@ -23,9 +23,10 @@ def main():
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--pretrained", type=str2bool, default=True)
     p.add_argument(
-        "--mit_pretrained_path",
+        "--pet_pretrained_path",
         default="/root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1",
     )
+    p.add_argument("--ct_pretrained_path", default="/root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano")
     args = p.parse_args()
     if (
         args.batch_size < 2
@@ -39,10 +40,10 @@ def main():
     seed_everything(2023)
     device = torch.device(args.device)
     cfg = SimpleNamespace(
-        ct_backbone="mit_b1",
+        ct_backbone="convnextv2_nano",
         pet_backbone="mit_b1",
-        ct_pretrained_path=args.mit_pretrained_path,
-        pet_pretrained_path=args.mit_pretrained_path,
+        ct_pretrained_path=args.ct_pretrained_path,
+        pet_pretrained_path=args.pet_pretrained_path,
         pretrained=args.pretrained,
         decoder_channels=(512, 256, 128, 64),
         use_deep_supervision=False,
@@ -54,13 +55,13 @@ def main():
         random_state=2023,
         hd95_mode="surface",
     )
-    task = MixedMiTB1Task(build_dual_model(cfg), cfg)
+    task = MixedHeteroTask(build_dual_model(cfg), cfg)
     # The regular task auto-selects CUDA when present; this preflight honors --device.
     task.device = device
     task.model.to(device)
     model = task.model
     assert isinstance(model.fusion, AddFusion)
-    assert model.enc_ct is not model.enc_pet and type(model.enc_ct) is type(
+    assert model.enc_ct is not model.enc_pet and type(model.enc_ct) is not type(
         model.enc_pet
     )
     assert {p.data_ptr() for p in model.enc_ct.parameters()}.isdisjoint(
@@ -148,6 +149,8 @@ def main():
                 missing_per_batch=args.batch_size // 2,
                 pet_encoded_rows=seen,
                 learning_rate=4e-5,
+                ct_backbone="convnextv2_nano",
+                pet_backbone="mit_b1",
                 alignment=True,
                 compensation=False,
                 encoder_pretrained=args.pretrained,

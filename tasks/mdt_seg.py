@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Segmentation training task shared by the two clean baselines.
+"""Plain supervised Full/Missing segmentation training task.
 
-- ``train_step_ct``: CT-only forward, one BCE+Dice loss.
 - ``train_step_mixed``: one auto forward on an exact-half batch, then
   0.5 * full_subset_loss + 0.5 * missing_subset_loss, one backward upstream.
-- ``evaluate``: ``full`` / ``missing`` / ``ct`` modes.
+- ``evaluate``: ``full`` / ``missing`` modes.
 - Single AdamW optimizer with one unified learning rate (no decoder_lr).
 - Non-finite logits/loss raise with their location instead of being masked.
 """
@@ -20,17 +19,8 @@ from utils.metrics_seg import SegmentationMetricsCIPA
 from utils.ema import ModelEMA
 
 
-def _flatten_grads(grads):
-    flat = []
-    for g in grads:
-        if g is None:
-            continue
-        flat.append(g.reshape(-1))
-    return torch.cat(flat) if flat else torch.zeros(1)
-
-
 class MDTSegTeacher:
-    """Task object shared by both runners ("Teacher" is a legacy name).
+    """Plain supervised task ("Teacher" is a legacy name).
 
     The name does not imply distillation: this is plain supervised training.
     """
@@ -97,18 +87,6 @@ class MDTSegTeacher:
             raise RuntimeError(f'[NaN/Inf] loss at {where}')
         return loss, loss_stats
 
-    def train_step_ct(self, batch):
-        """CT-only step: every sample trains the CT path."""
-        ct = batch['ct'].to(self.device, non_blocking=True)
-        mask = batch['mask'].to(self.device, non_blocking=True).float()
-        outputs = self.model(ct)
-        logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-        loss, loss_stats = self._finish_step(logits, mask, 'train_step_ct')
-        stats = {
-            'loss_total': loss.detach(),
-            'loss_seg': loss_stats.get('loss_dice', loss.detach()),
-        }
-        return loss, logits, outputs, stats
 
     def train_step_mixed(self, batch, pet_available):
         """Mixed step: exact-half batch, 0.5*full + 0.5*missing, one backward."""
@@ -160,7 +138,7 @@ class MDTSegTeacher:
 
     @torch.no_grad()
     def evaluate(self, loader, eval_mode='full', tag='val', model=None):
-        """eval_mode: 'full' | 'missing' | 'ct'. Missing passes pet=None."""
+        """eval_mode: 'full' | 'missing'. Missing passes pet=None."""
         active = model if model is not None else self.model
         was_training = self.model.training
         active.eval()
@@ -178,8 +156,6 @@ class MDTSegTeacher:
                 outputs = active(ct, pet=pet, forward_mode='full')
             elif eval_mode == 'missing':
                 outputs = active(ct, pet=None, forward_mode='missing')
-            elif eval_mode == 'ct':
-                outputs = active(ct)
             else:
                 raise ValueError(f'Unsupported eval_mode={eval_mode!r}')
             logits = outputs['logits'] if isinstance(outputs, dict) else outputs
@@ -195,89 +171,6 @@ class MDTSegTeacher:
             self.model.train(was_training)
         return out
 
-    def _module_param_grads(self, module):
-        return [p.grad for p in module.parameters() if p.requires_grad and p.grad is not None]
-
-    def gradient_diagnostics(self, batch, max_samples=1):
-        was_training = self.model.training
-        self.model.eval()
-        bn_states = []
-        for m in self.model.modules():
-            if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
-                bn_states.append((m, m.track_running_stats))
-                m.track_running_stats = False
-        try:
-            ct = batch['ct'][:max_samples].to(self.device, non_blocking=True)
-            mask = batch['mask'][:max_samples].to(self.device, non_blocking=True).float()
-            pet = batch.get('pet')
-            if pet is not None:
-                pet = pet[:max_samples].to(self.device, non_blocking=True)
-            params_shared = (list(self.model.enc_ct.parameters())
-                             + list(self.model.ct_align.parameters())
-                             + list(self.model.decoder.parameters()))
-            params_ct = list(self.model.enc_ct.parameters())
-            params_align = list(self.model.ct_align.parameters())
-            params_dec = list(self.model.decoder.parameters())
-            params_pet = list(getattr(self.model, 'enc_pet', []))
-            if not params_pet:
-                params_pet = []
-            else:
-                params_pet = list(self.model.enc_pet.parameters())
-            outputs_full = self.model(ct, pet=pet, forward_mode='full') if pet is not None \
-                else self.model(ct)
-            logits_full = outputs_full['logits'] if isinstance(outputs_full, dict) else outputs_full
-            loss_full, _ = self.criterion(logits_full.float(), mask.float())
-            g_full_shared = torch.autograd.grad(loss_full, params_shared, retain_graph=True, allow_unused=True)
-            if pet is None:
-                full_vec = _flatten_grads(g_full_shared)
-                return {
-                    'full_shared_grad_norm': float(full_vec.norm()),
-                    'full_ct_grad_norm': float(_flatten_grads(
-                        torch.autograd.grad(loss_full, params_ct, retain_graph=True, allow_unused=True)).norm()),
-                    'full_align_grad_norm': float(_flatten_grads(
-                        torch.autograd.grad(loss_full, params_align, retain_graph=True, allow_unused=True)).norm()),
-                    'full_dec_grad_norm': float(_flatten_grads(
-                        torch.autograd.grad(loss_full, params_dec, retain_graph=True, allow_unused=True)).norm()),
-                }
-            outputs_missing = self.model(ct, pet=None, forward_mode='missing')
-            logits_missing = outputs_missing['logits'] if isinstance(outputs_missing, dict) else outputs_missing
-            loss_missing, _ = self.criterion(logits_missing.float(), mask.float())
-            g_missing_shared = torch.autograd.grad(loss_missing, params_shared, retain_graph=True, allow_unused=True)
-            g_full_ct = torch.autograd.grad(loss_full, params_ct, retain_graph=True, allow_unused=True)
-            g_missing_ct = torch.autograd.grad(loss_missing, params_ct, retain_graph=True, allow_unused=True)
-            g_full_align = torch.autograd.grad(loss_full, params_align, retain_graph=True, allow_unused=True)
-            g_missing_align = torch.autograd.grad(loss_missing, params_align, retain_graph=True, allow_unused=True)
-            g_full_dec = torch.autograd.grad(loss_full, params_dec, retain_graph=True, allow_unused=True)
-            g_missing_dec = torch.autograd.grad(loss_missing, params_dec, retain_graph=True, allow_unused=True)
-            g_missing_pet = torch.autograd.grad(loss_missing, params_pet, allow_unused=True) if params_pet else []
-
-            def cos(a, b):
-                a = _flatten_grads(a)
-                b = _flatten_grads(b)
-                eps = 1e-8
-                return float(torch.dot(a, b) / (a.norm() * b.norm() + eps))
-
-            full_vec = _flatten_grads(g_full_shared)
-            missing_vec = _flatten_grads(g_missing_shared)
-            stats = {
-                'shared_grad_cosine_total': cos(g_full_shared, g_missing_shared),
-                'ct_encoder_grad_cosine': cos(g_full_ct, g_missing_ct),
-                'ct_alignment_grad_cosine': cos(g_full_align, g_missing_align),
-                'shared_decoder_grad_cosine': cos(g_full_dec, g_missing_dec),
-                'full_shared_grad_norm': float(full_vec.norm()),
-                'missing_shared_grad_norm': float(missing_vec.norm()),
-                'full_missing_grad_norm_ratio': float(full_vec.norm() / (missing_vec.norm() + 1e-8)),
-                'missing_pet_grad_norm': float(_flatten_grads(g_missing_pet).norm()),
-                'negative_parameter_tensor_ratio': float(np.mean([x < 0 for x in [
-                    cos(g_full_ct, g_missing_ct),
-                    cos(g_full_align, g_missing_align),
-                    cos(g_full_dec, g_missing_dec)]])),
-            }
-            return stats
-        finally:
-            for m, state in bn_states:
-                m.track_running_stats = state
-            self.model.train(was_training)
 
     def save_checkpoint(self, path, epoch, best=None, best_epoch=None, val=None):
         os.makedirs(os.path.dirname(path), exist_ok=True)

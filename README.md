@@ -1,150 +1,92 @@
-# 当前分支：同构 MiT-B1，50% Full / 50% Missing 相加基线
+# 干净异构编码器 Full/Missing 相加基线
 
-`exp/mixed-mitb1-add-baseline`：CT/PET各自独立MiT-B1，保留两侧四尺度对齐和共享GN解码器，学习率4e-5。
-每batch16固定8 Full、8 Missing；Full正常相加，Missing直接使用对齐CT，无补偿或实验融合模块。
-默认EMA与60轮设置沿用参考同构Full-only实验，按Full/Missing平均Dice选择同一个最佳checkpoint。
+分支：`exp/clean-full-missing-hetero-lr4e5`。
+基于 `exp/mixed-mitb1-add-baseline@c64a8c6`，将 CT 编码器恢复为 ConvNeXtV2-Nano，PET 保持 MiT-B1，峰值学习率为 **4e-5**。
+本分支只保留混合基线的训练、评估、预检、数据、模型与相关测试。
+实验融合、原型/仿射/重建/蒸馏模块、Full-only/CT-only 入口、旧诊断工具及历史运行日志均移出当前分支；原实验分支保留。
 
-```bash
-bash scripts/run_mixed_add_mitb1_lr4e5.sh
-```
+## 结构
 
-完整结构、预检、配置及评价说明见 [README_MIXED_MIT_B1_BASELINE.md](README_MIXED_MIT_B1_BASELINE.md)。
-以下保留参考分支原有基线说明。
+- CT：ConvNeXtV2-Nano；PET：MiT-B1，独立权重，分别加载对应本地预训练。
+- 保留两侧四尺度 `1×1 Conv + BatchNorm + ReLU` 对齐，目标通道 `64/128/320/512`。512 输入对应空间尺寸 `128/64/32/16`。
+- Full：`aligned_CT + aligned_PET → GroupNorm UNet 解码器`。
+- Missing：`aligned_CT + 0 → 同一个解码器`。Missing 行不调用 PET 编码器或 PET 对齐层，推理允许 `pet=None`。
+- batch=16，每个 batch 精确 **8 Full + 8 Missing**，按 seed 和 step 可复现地打乱状态。每个样本只走一种状态，不复制成两份；不保证每名患者整个训练历史恰好缺失一半。
+- CT 一次处理 16 行，PET 只处理 8 个 Full 行，共享解码器一次处理 16 行。
+- 损失：`0.5 × (Full BCE + Dice) + 0.5 × (Missing BCE + Dice)`；一次反向，一次 AdamW 更新。
+- 只监督最终输出，不使用补偿、重建、蒸馏、深度监督或额外分割头。
 
-# Clean segmentation baselines
+## 默认设置
 
-Branch: `exp/aligned-add-baseline`. Three independent, runnable baselines that
-share config / loss / metrics / logging / EMA code (no duplicated utilities).
+| 设置 | 默认值 |
+|---|---|
+| CT / PET 预训练 | `pretrained/convnextv2_nano` / `pretrained/mit-b1` |
+| 学习率 / 优化器 / weight decay | `4e-5` / AdamW / `1e-4` |
+| 训练预算 / patience | 60 / 60 |
+| warmup / min LR / flat ratio | 3 轮 / `1e-6` / 0.3 |
+| batch / 分辨率 / seed | 16 / 512 / 2023 |
+| 增强 / 归一化 / HD95 | cipa / imagenet / cipa_official（pixel） |
+| AMP / 梯度裁剪 | 开 / 5 |
+| 模型 EMA | 开，0.999，前三轮不启用，第 4 轮同步后开始更新 |
+| 数据划分 | train_original.txt / test.txt / test.txt，显式允许 val=test |
 
-## A. CT-only — `run_ct_only_seg.py`
+除 CT 编码器及其预训练来源外，设置与最近双 MiT-B1 混合基线一致。
+更早 EMA 关闭、patience=10 的实验与本配置并非只差学习率；比较时应记录这些差异。
+沿用已有 val=test 开发协议，按该集合选模后的最终结果不是独立测试指标。
+相同随机种子不保证 CUDA 下逐位复现。
 
-- All training slices, CT + mask only. The loader never requires PET files.
-- `ConvNeXtV2-Nano` CT encoder → `StageChannelAlign` (Conv1x1+BN+ReLU, fixed
-  output `(64, 128, 320, 512)`) → shared GroupNorm `UNetStyleDecoder`.
-- No PET encoder, no fusion. Best by val CT Dice → `ckpt.best_ct.pth.tar`.
-
-## B. Full/Missing mixed — `run_full_missing_baseline.py`
-
-- CT `convnextv2_nano` + PET `mit_b1`, same align spec as CT-only.
-- Every batch is exact-half Full/Missing (`build_balanced_pet_available`,
-  reproducible per step). Each sample takes exactly one state per batch.
-- Full: `aligned_CT + aligned_PET` → shared decoder. Missing: `aligned_CT + zeros` →
-  same decoder; Missing rows' PET is never encoded (`pet=None` allowed).
-- `loss = 0.5 * full_subset + 0.5 * missing_subset`, one backward/step.
-- Val runs whole-set Full and Missing; `Joint = 0.5*(Full+Missing)` Dice.
-- Best by val Joint → `ckpt.best_joint.pth.tar`. Final Full/Missing/Joint
-  all come from this one checkpoint.
-
-`run_mdt_seg.py` is a compatibility shim: it prints the forwarding rule and
-delegates `--train_batch_mode mixed` to the mixed runner; other modes raise.
-
-## C. Full-only add — `run_full_add_baseline.py`
-
-- CT `convnextv2_nano` and PET `mit_b1`, with separate channel alignment.
-- All samples use both modalities: `aligned_CT + aligned_PET` → shared decoder.
-- Best by val Full Dice; final test uses this checkpoint and its recorded
-  raw/EMA weight choice. No experimental fusion or background loss is enabled.
-
-## Run
+## 运行
 
 ```bash
-# CT-only (formal: real splits + pretrained; needs a disjoint val split)
-python3 run_ct_only_seg.py --root /root/autodl-tmp/data/PCLT20K \
-  --train_split_file train_original.txt --val_split_file <your_val>.txt \
-  --test_split_file test.txt --checkpoint_root <out> --epochs 60 --batch_size 16
-
-# Full-only add (stage-one baseline)
-python3 run_full_add_baseline.py --root /root/autodl-tmp/data/PCLT20K \
-  --train_split_file train_original.txt --val_split_file <your_val>.txt \
-  --test_split_file test.txt --checkpoint_root <out> --epochs 60 --batch_size 16
-
-# Full/Missing mixed
-python3 run_full_missing_baseline.py --root /root/autodl-tmp/data/PCLT20K \
-  --train_split_file train_original.txt --val_split_file <your_val>.txt \
-  --test_split_file test.txt --checkpoint_root <out> --epochs 60 --batch_size 16
-
-# Evaluate a checkpoint at missing rates 0/0.25/0.5/0.75/1 (same seeded
-# patient assignments for both experiments)
-python3 eval_joint_baseline.py --checkpoint <ckpt> --mode dual --use_ema True \
-  --hd95_mode cipa_official --output_dir <new_eval_dir>
-python3 eval_joint_baseline.py --checkpoint <ckpt> --mode ct_only \
-  --hd95_mode cipa_official --output_dir <new_eval_dir>
+cd /root/autodl-tmp/mkd-main/new-train
+git fetch origin
+git switch exp/clean-full-missing-hetero-lr4e5
+git pull --ff-only origin exp/clean-full-missing-hetero-lr4e5
+bash scripts/train_full_missing_hetero_lr4e5.sh
 ```
 
-Notes:
-
-- `--val_split_file` must differ from `--test_split_file`; train/val/test are
-  enforced patient-disjoint (the shipped `val.txt` overlaps train cases, so
-  provide an explicit disjoint val split — the loader reports the condition
-  instead of silently re-splitting).
-- The CT-only and Full/Missing runners auto-run the missing-rate final eval from the best checkpoint
-  and record whether `raw` or `ema` weights were used.
-- Formal runs require local pretrained weights (`--ct_pretrained_path`,
-  `--pet_pretrained_path`); missing/unparseable/zero-match paths raise.
-  `--pretrained False` opts out explicitly for smoke tests only.
-- Results land only in the run's own `checkpoint_dir`; existing experiment
-  outputs are never touched.
-
-## Evaluation protocol
-
-- Training defaults to `--hd95_mode cipa_official`; final evaluation uses
-  the same selected mode and threshold. Final result files record mode and unit.
-- Dice/IoU accumulate pixel counts over the dataset; HD95 is the mean of
-  per-slice MedPy HD95 in pixels, without physical voxel spacing.
-- `cipa_official` follows CIPA `pred.py` at commit
-  `5c90d86ba1331e8043a92b8e732aa36234c548dc`: 512×512 masks, threshold 0.5,
-  both-empty = 0, empty prediction with positive GT = insert a center pixel
-  on a copy for HD95 only. Dice and missed-case counts keep the original mask.
-- MedPy is required (`pip install MedPy`); no silent approximate fallback.
-  Empty GT with nonempty prediction raises, since the official script does
-  not define a working score for that case.
-- Standalone evaluation honors a checkpoint's saved metric mode unless
-  `--hd95_mode` overrides it; absent saved mode defaults to `cipa_official`.
-  Re-evaluate old checkpoints with the explicit flag above for comparison;
-  historical `legacy`/`surface` scores do not change automatically.
-
-## Smoke (no data/weights needed)
+脚本设置 OMP/MKL 线程为 1，并自动生成时间戳 hash。
+输出：`checkpoints_new/MDT/mixed-add-hetero-lr4e5-60ep-ema-s2023-时间戳/`。
+这是重新训练：只加载编码器预训练，不加载旧分割 checkpoint，不冻结网络。
+发现已有 checkpoint 或训练日志会拒绝覆盖；当前不提供断点续训参数。
+可在脚本末尾覆盖参数，例如匹配已有的无 EMA 实验：
 
 ```bash
-PYTHONPATH=. python3 /tmp/smoke_clean.py   # real encoders, 512x512, CUDA
-python3 -m pytest tests/test_baseline_contract.py tests/test_ema.py \
-  tests/test_mixed_batch_training.py -q -p no:cacheprovider
+bash scripts/train_full_missing_hetero_lr4e5.sh --ema_enabled false --hash mixed-add-hetero-lr4e5-noema-s2023-rerun1
 ```
 
-## Future fusion seam
+## 选模和复评
 
-Only the Full path calls `AddFusion` (`models/components/add_fusion.py`). A new fusion
-module replaces that call; Missing keeps feeding `aligned_CT` to the same
-decoder. No fusion/prototype/retrieval/text code is wired in this round.
+每轮分别对全部验证样本运行 Full 和 Missing，按 `Joint Dice = 0.5×Full Dice + 0.5×Missing Dice` 保存同一个 `ckpt.best_joint.pth.tar`，同时保存 `ckpt.last.pth.tar`。
+日志包含 Full/Missing 损失、样本数、Dice、HD95、两侧编码器/对齐层/解码器梯度及跳过更新数。
+最终使用最佳 Joint checkpoint 记录的 raw/EMA 权重，输出缺失率 `0/0.25/0.5/0.75/1` 的指标和患者级缺失分配。
+中间缺失率按患者分配，与训练 batch 内缺失不是同一口径。
+独立复评自动遵循 checkpoint 选模权重，不重新加载编码器预训练：
 
-## Changed files
+```bash
+python -u eval_full_missing_baseline.py --checkpoint checkpoints_new/MDT/你的实验目录/ckpt.best_joint.pth.tar
+```
 
-- `models/components/backbones.py` (new): timm/HF encoders, strict offline loading.
-- `models/components/channel_align.py` (new): `StageChannelAlign` moved unchanged.
-- `models/components/group_unet_decoder.py` (new): GroupNorm decoder moved + finite check.
-- `models/components/add_fusion.py` (new): strict per-scale add (4 scales, channels,
-  finite; no NaN masking).
-- `models/ct_only_baseline.py` (new): `CTOnlySegmentationModel`.
-- `models/dual_shared_add_baseline.py`: rewritten auto (Full-only PET encode,
-  order restore, `pet=None` support); strict state validation.
-- `models/build_mdt_seg.py`: two builders + compat forward note.
-- `models/baseline_blocks.py` (deleted): split into the files above.
-- `datasets/pclt20k_seg.py`: `ct_only` mode, disjointness incl. val/test,
-  val≠test enforcement.
-- `tasks/mdt_seg.py`: `train_step_ct` / fixed-0.5 `train_step_mixed`,
-  `evaluate(full|missing|ct)`, unified single-LR AdamW, new ckpt schema.
-- `utils/run_common.py` (new): seed/grad-norm/AMP-step/balanced-state/
-  missing-rate eval shared by both runners.
-- `utils/ema.py`: tensor-only EMA (text/extra-state machinery removed).
-- `utils/region_tversky_loss.py` (deleted): unused.
-- `configs/seg_mdt.py`: removed `decoder_lr`, loss weights, joint weights,
-  `missing_loss_weight`, `train_pet_drop_prob`, `boundary_loss_weight`,
-  `train_batch_mode` choices legacy, viz/eval toggles, `validation_frequency`;
-  val default is now `val.txt`; added `--pretrained`.
-- `run_ct_only_seg.py` / `run_full_missing_baseline.py` (new logic):
-  independent entries on shared utils.
-- `run_mdt_seg.py`: compat shim with explicit forwarding rule.
-- `eval_joint_baseline.py`: `--checkpoint --mode dual|ct_only --use_ema`.
-- Deleted unused: `models/petct_text_region_fusion.py`,
-  `tests/test_dcim_wiring.py`, `tools/smoke_dcim_full.py`.
-- `tests/`: updated to the new API + added the §八 contract checks.
+## 预检和测试
+
+```bash
+# AutoDL：真实预训练、CUDA、两步混合前反传；batch2 不代表 batch16 显存足够。
+python scripts/check_full_missing_baseline.py --device cuda --image_size 512 --batch_size 2
+
+# 无真实数据/权重的 CPU 结构检查
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python scripts/check_full_missing_baseline.py --device cpu --image_size 64 --batch_size 2 --pretrained false
+
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=. python -m pytest tests -q
+```
+
+预检使用真实异构网络，检查两侧对齐、主要组件梯度及 Missing 禁止调用 PET。
+预训练缺失或不兼容会报错，不静默替换随机网络；`--pretrained false` 用于显式结构预检。
+基础依赖：PyTorch、torchvision、timm、transformers、safetensors、numpy、scipy、Pillow、opencv-python、medpy；测试另需 pytest。
+本地验证使用合成数据与随机初始化，不代表已完成 AutoDL 真实数据训练或验证了分割收益。
+
+## 本次本地验证
+
+- 43 项测试通过，覆盖真实异构模型、精确一半分流、PET 泄漏防护、梯度、EMA、保存重载、最终 raw/EMA 选模及独立复评一致性。
+- 512×512、batch=2、CPU、随机初始化：两步混合前向/反向/AdamW 更新通过；PET 每步只处理 1 个 Full 样本，纯 Missing 不调用 PET。
+- 模型参数量：32,442,641。未执行 AutoDL 真实数据训练、未验证真实预训练文件或 CUDA batch=16 显存。
+- 核心编码器、对齐、相加、解码器、数据增强、损失、指标、EMA 和调度实现沿用来源基线。

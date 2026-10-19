@@ -1,8 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Shared training utilities for the two clean baselines.
-
-One implementation is shared by both runners; independence means separate
-entry points and checkpoints, not duplicated logic.
+"""Training and evaluation helpers for the clean Full/Missing baseline.
 """
 import csv
 import json
@@ -87,12 +84,8 @@ def build_case_mask(case_ids, missing_rate, seed):
 
 
 @torch.inference_mode()
-def run_missing_rate_eval(task, model, loader, case_mask, tag='test', ct_only=False):
-    """Evaluate one missing-rate operating point; returns full metric dict.
-
-    ``ct_only=True`` calls the model with CT alone (the result is
-    PET-invariant by construction); otherwise routes per-sample state.
-    """
+def run_missing_rate_eval(task, model, loader, case_mask, tag='test'):
+    """Evaluate one patient-level missing-rate operating point."""
     from utils.metrics_seg import SegmentationMetricsCIPA
     # Use the exact evaluation protocol already selected by the training task.
     metric = SegmentationMetricsCIPA(
@@ -113,12 +106,9 @@ def run_missing_rate_eval(task, model, loader, case_mask, tag='test', ct_only=Fa
             case_ids = list(batch['case_id'])
             total_case_ids.update(case_ids)
             missing_case_ids.update([cid for cid in case_ids if case_mask.get(cid, 1) == 1])
-            if ct_only:
-                outputs = model(ct)
-            else:
-                state = torch.tensor([0 if case_mask.get(cid, 1) else 1 for cid in case_ids],
-                                     device=task.device, dtype=torch.long)
-                outputs = model(ct, pet=pet, pet_available=state, forward_mode='auto')
+            state = torch.tensor([0 if case_mask.get(cid, 1) else 1 for cid in case_ids],
+                                 device=task.device, dtype=torch.long)
+            outputs = model(ct, pet=pet, pet_available=state, forward_mode='auto')
             logits = outputs['logits'] if isinstance(outputs, dict) else outputs
             loss, _ = task.criterion(logits, mask)
             metric.update(logits, mask)
@@ -146,7 +136,7 @@ def collect_case_ids(loader):
 
 
 def eval_missing_rates(task, model, loader, seed, checkpoint_dir, stem,
-                       rates=None, weights_tag='raw', ct_only=False):
+                       rates=None, weights_tag='raw'):
     """Run all missing-rate operating points and write metrics + assignments.
 
     Returns (results, joint) with joint = 0.5 * (rate0 dice + rate1 dice).
@@ -158,8 +148,7 @@ def eval_missing_rates(task, model, loader, seed, checkpoint_dir, stem,
     for rate in rates:
         case_mask = build_case_mask(case_ids, rate, int(seed))
         assignments[str(rate)] = case_mask
-        out = run_missing_rate_eval(task, model, loader, case_mask, tag=f'{stem}_{rate}',
-                                    ct_only=ct_only)
+        out = run_missing_rate_eval(task, model, loader, case_mask, tag=f'{stem}_{rate}')
         results.append({
             'missing_rate': rate,
             'dice': out['dice'],

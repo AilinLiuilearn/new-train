@@ -1,4 +1,4 @@
-"""Homogeneous Add baseline, exact-half routing and selected weight contracts."""
+"""Heterogeneous Add baseline, exact-half routing and selected weight contracts."""
 
 import csv
 import json
@@ -11,9 +11,10 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-import run_mixed_mitb1_baseline as runner
+import run_full_missing_baseline as runner
 from models.build_mdt_seg import build_dual_model
 from models.components.add_fusion import AddFusion
+from models.components.backbones import TimmFeatureBackbone, SegformerFeatureBackbone
 from tasks.mdt_seg import MDTSegTeacher
 from utils.run_common import build_balanced_pet_available
 
@@ -47,7 +48,7 @@ def parse(monkeypatch, tmp_path, *extra):
             *extra,
         ],
     )
-    return runner.MixedMiTB1Config.parse_arguments()
+    return runner.MixedHeteroConfig.parse_arguments()
 
 
 def test_launcher_actual_arguments(monkeypatch, tmp_path):
@@ -63,7 +64,7 @@ def test_launcher_actual_arguments(monkeypatch, tmp_path):
     subprocess.run(
         [
             "bash",
-            str(root / "scripts/run_mixed_add_mitb1_lr4e5.sh"),
+            str(root / "scripts/train_full_missing_hetero_lr4e5.sh"),
             "--hash",
             "override",
         ],
@@ -76,12 +77,13 @@ def test_launcher_actual_arguments(monkeypatch, tmp_path):
     )
     data = json.loads(capture.read_text())
     assert data["omp"] == data["mkl"] == "1"
-    assert data["argv"][0] == "-u" and data["argv"][1] == "run_mixed_mitb1_baseline.py"
+    assert data["argv"][0] == "-u" and data["argv"][1] == "run_full_missing_baseline.py"
     monkeypatch.setattr(sys, "argv", ["run", *data["argv"][2:]])
-    cfg = runner.MixedMiTB1Config.parse_arguments()
-    assert cfg.hash == "override" and cfg.ct_backbone == cfg.pet_backbone == "mit_b1"
-    assert cfg.ct_pretrained_path == cfg.pet_pretrained_path
-    assert cfg.ct_pretrained_path.endswith("/pretrained/mit-b1") and cfg.pretrained
+    cfg = runner.MixedHeteroConfig.parse_arguments()
+    assert cfg.hash == "override" and cfg.ct_backbone == "convnextv2_nano" and cfg.pet_backbone == "mit_b1"
+    assert cfg.ct_pretrained_path != cfg.pet_pretrained_path
+    assert cfg.ct_pretrained_path.endswith("/pretrained/convnextv2_nano") and cfg.pretrained
+    assert cfg.pet_pretrained_path.endswith("/pretrained/mit-b1")
     assert cfg.learning_rate == 4e-5 and cfg.train_batch_mode == "mixed"
     assert cfg.batch_size == 16 and cfg.epochs == cfg.early_stop_patience == 60
     assert cfg.ema_enabled and cfg.ema_start_epoch == 3 and cfg.ema_decay == 0.999
@@ -90,14 +92,16 @@ def test_launcher_actual_arguments(monkeypatch, tmp_path):
     assert not hasattr(cfg, "local_enabled") and not hasattr(cfg, "matrix_enabled")
 
 
-def test_actual_mit_alignment_routing_and_gradients(monkeypatch, tmp_path):
+def test_actual_heterogeneous_alignment_routing_and_gradients(monkeypatch, tmp_path):
     cfg = parse(monkeypatch, tmp_path, "--ema_enabled", "false")
-    task = runner.MixedMiTB1Task(build_dual_model(cfg), cfg)
+    task = runner.MixedHeteroTask(build_dual_model(cfg), cfg)
     model = task.model
     runner.assert_protocol(cfg, model)
     assert isinstance(model.fusion, AddFusion)
+    assert isinstance(model.enc_ct, TimmFeatureBackbone)
+    assert isinstance(model.enc_pet, SegformerFeatureBackbone)
     assert (
-        type(model.enc_ct) is type(model.enc_pet) and model.enc_ct is not model.enc_pet
+        type(model.enc_ct) is not type(model.enc_pet) and model.enc_ct is not model.enc_pet
     )
     assert {p.data_ptr() for p in model.enc_ct.parameters()}.isdisjoint(
         {p.data_ptr() for p in model.enc_pet.parameters()}
@@ -171,7 +175,7 @@ def test_training_checkpoint_and_selected_final_weights(
         "1",
     )
     monkeypatch.setattr(
-        runner.MixedMiTB1Config, "parse_arguments", classmethod(lambda cls: cfg)
+        runner.MixedHeteroConfig, "parse_arguments", classmethod(lambda cls: cfg)
     )
     g = torch.Generator().manual_seed(2)
     rows = [
@@ -210,6 +214,28 @@ def test_training_checkpoint_and_selected_final_weights(
         metrics = list(csv.DictReader(f))
     assert [float(r["missing_rate"]) for r in metrics] == [0, 0.25, 0.5, 0.75, 1]
     assert all(r["weights"] == expected for r in metrics)
+    # Standalone reevaluation must use the same selected weights and metric protocol.
+    import eval_full_missing_baseline as evaluation
+    monkeypatch.setattr(evaluation, "_loaders", runner._loaders)
+    monkeypatch.setattr(sys, "argv", [
+        "eval", "--checkpoint", str(folder / "ckpt.best_joint.pth.tar"),
+    ])
+    evaluation.main()
+    final = json.loads((folder / "final_test_metrics.json").read_text())
+    reeval = json.loads((folder / "reeval_test_metrics.json").read_text())
+    assert reeval == final
     # A fresh invocation must not overwrite the completed run.
     with pytest.raises(FileExistsError):
         runner.main()
+
+
+def test_evaluator_rejects_missing_selected_ema():
+    from eval_full_missing_baseline import select_checkpoint_weights
+    with pytest.raises(ValueError, match="does not contain ema"):
+        select_checkpoint_weights({"eval_weights": "ema", "model": {}, "model_ema": None})
+
+
+def test_protocol_rejects_homogeneous_backbones(monkeypatch, tmp_path):
+    cfg = parse(monkeypatch, tmp_path, "--ct_backbone", "mit_b1")
+    with pytest.raises(ValueError, match="CT=convnextv2_nano"):
+        runner.assert_protocol(cfg)
