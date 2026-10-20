@@ -36,6 +36,15 @@ bash scripts/train_joint.sh checkpoints_new/STAGED/dual-add-joint-nocttask-s2023
 
 启动会打印两侧 `[PRETRAIN]` 加载报告、`[INIT] ... backbone_pretrained ... no CT-only task weights loaded`，以及 `[PAIRED] each batch: Full=16 CT-only=16`。`initialization.json`和checkpoint的source记录两侧实际权重文件SHA256及随机对齐/解码器初始化，不生成CT任务迁移的transfer.json。
 
+预检会打印每次尝试的loss和AMP缩放值。若反向出现实际Inf/NaN梯度，允许GradScaler跳过该次更新、降低scale并重试（最多8次）；只有一次真实成功的参数更新及EMA更新才算通过。最终JSON记录attempts、skipped_updates和amp_scale。权重/前向异常、FP32梯度异常、仅总范数溢出或持续AMP溢出仍然报错，严格裁剪检查不会被关闭。该修复仅影响预检，不改正式训练配置。
+
+若新版预检仍失败，可只做FP32诊断（不会自动改正式训练精度）：
+
+```bash
+python scripts/check_staged.py --device cuda --stage 2 --batch_size 16 \
+  --joint_from_pretrained --no-mixed_precision
+```
+
 `--joint_from_pretrained`与`--stage1_checkpoint`互斥。内部 `--stage 2` 仅选择双路径结构；此入口只执行一次60epoch联合训练，不先执行CT-only训练。使用新输出目录，不能在旧训练目录上覆盖。
 
 需要继续或评价时，仍使用原入口，不重新读取通用预训练文件：
@@ -189,7 +198,7 @@ Stage 2 始终按同一个检查点的 Full、Missing 平均 Dice 选模，不�
 ## 审查与测试
 
 ```bash
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest tests/test_staged.py -q
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest tests/test_staged.py tests/test_preflight_amp.py -q
 python scripts/check_staged.py --device cpu --image_size 64 --batch_size 2
 ```
 
@@ -199,6 +208,7 @@ CPU 合成流程通过只能证明实现合同，不证明真实分割收益，�
 
 实际审查记录：
 
+- AMP预检修复后10项测试全部通过（CPU约35.2秒）。使用真实CPU GradScaler注入Inf，验证跳过错误更新、缩放回退后仅一次optimizer/EMA更新；持续溢出、FP32异常、非有限权重及有限元素的总范数溢出均拒绝通过。这不等于已在用户GPU复现或排除了其全部数值问题。
 - 本次7项合同测试全部通过（CPU复测约30.3秒）。
 - 直接联合训练新增合同测试：本地测试权重完整加载到CT/PET编码器，对齐/解码器保持随机初值，两解码器参数独立；无需任何CT-only文件即可完成训练；删除通用预训练文件后仍可恢复且raw/EMA逐值一致，并可重新评价。
 - 直接联合入口的CPU预检已通过512²、batch=2的完整前向/反向、AdamW、EMA及Missing隔离；此预检显式使用随机权重，通用预训练加载另由上面的本地权重测试覆盖。未测AutoDL真实权重、真实数据性能或GPU显存。
