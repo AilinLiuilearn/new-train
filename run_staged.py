@@ -16,6 +16,7 @@ import torch
 from datasets.staged import loaders, split_signature
 from models.staged_petct import StagedPETCT
 from utils.ema import ModelEMA
+from utils.amp import make_grad_scaler, autocast_context
 from utils.metrics_seg import SegmentationMetricsCIPA
 from utils.optimization import get_cosine_scheduler
 from utils.run_common import seed_everything, module_grad_norm
@@ -26,7 +27,27 @@ FORMAT = 'ct_pretrain_dual_decoder_v1'
 
 def load(path):
     # Only load your own trusted local checkpoints (legacy files include RNG objects).
-    return torch.load(path, map_location='cpu', weights_only=False)
+    try:
+        return torch.load(path, map_location='cpu', weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location='cpu')
+
+
+def prepare_output(output):
+    if not output.exists() or not any(output.iterdir()):
+        output.mkdir(parents=True, exist_ok=True)
+        return
+    # A failure before optimizer/EMA initialization leaves only these audit files.
+    # Preserve the entire failed startup instead of deleting or overwriting it.
+    startup_files = {'split_summary.json', 'transfer.json'}
+    entries = list(output.iterdir())
+    if all(x.is_file() and x.name in startup_files for x in entries):
+        archive = output.with_name(output.name+f'.failed-start-{time.time_ns()}')
+        output.rename(archive)
+        output.mkdir(parents=True)
+        print(f'[RETRY] preserved failed startup at {archive}', flush=True)
+        return
+    raise FileExistsError('Run directory is not empty; use a new --output or --resume last.pt')
 
 
 def atomic_save(payload, path):
@@ -273,8 +294,8 @@ def main(argv=None):
         cfg.output = str(Path(cfg.output).resolve())
         cfg.root = str(Path(cfg.root).resolve())
     output = Path(cfg.output)
-    if not checkpoint and output.exists() and any(output.iterdir()):
-        raise FileExistsError('Run directory is not empty; use a new --output or --resume last.pt')
+    if not checkpoint:
+        prepare_output(output)
     if args.resume:
         if Path(args.resume).name != 'last.pt':
             raise ValueError('Resume last.pt; evaluate best.pt instead')
@@ -319,7 +340,7 @@ def main(argv=None):
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     scheduler = get_cosine_scheduler(optimizer, cfg.epochs, warmup_steps=cfg.cosine_warmup*len(train),
         min_lr=cfg.cosine_min_lr, steps_per_epoch=len(train), flat_ratio=cfg.lr_flat_ratio)
-    scaler = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda' and cfg.mixed_precision)
+    scaler = make_grad_scaler(device, cfg.mixed_precision)
     ema = ModelEMA(model, cfg.ema_decay, warmup=True, device=device) if cfg.ema_enabled else None
     active, best, best_epoch, start_epoch, global_step = False, -1., 0, 1, 0
     if checkpoint:
@@ -359,7 +380,7 @@ def main(argv=None):
         print(f'[TRAIN {epoch}/{cfg.epochs}] start batches={len(train)}', flush=True)
         for step, batch in enumerate(train, 1):
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, enabled=scaler.is_enabled()):
+            with autocast_context(device, enabled=scaler.is_enabled()):
                 loss, stats = forward_loss(model, batch, cfg.stage, device, criterion)
             if not torch.isfinite(loss): raise RuntimeError('Nonfinite loss')
             scaler.scale(loss).backward(); scaler.unscale_(optimizer)

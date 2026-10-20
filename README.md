@@ -95,7 +95,7 @@ export MKL_NUM_THREADS=1
 python scripts/check_staged.py --device cuda --stage 2 --batch_size 16 \
   --stage1_checkpoint checkpoints/ct_stage1/ckpt.best.pth.tar
 
-# 检查通过后启动。新目录不可覆盖旧实验。
+# 检查通过后启动。新目录不可覆盖旧实验；仅初始化失败、只留下审计文件时，会自动归档失败目录后重试。
 bash scripts/train_stage2.sh \
   checkpoints/ct_stage1/ckpt.best.pth.tar \
   checkpoints_new/STAGED/dual-add-s2023
@@ -160,3 +160,5 @@ CPU 合成流程通过只能证明实现合同，不证明真实分割收益，�
 - 与旧数据实现对照：CT-only/配对两种模式、8组随机种子的 CIPA 增强、ImageNet归一化和0/255标签输出逐值相同。
 - 实际默认双解码器模型参数35,907,538；CPU完成512²、batch=2的前向、反向、AdamW和EMA更新及Missing隔离检查。该batch包含1 Full + 1 Missing，耗时约11秒只是CPU预检，不能推算3090训练吞吐。
 - 未取得你的真实Stage 1 checkpoint、未访问AutoDL真实数据、未测GPU显存；对应检查须在服务器执行。
+
+AMP 兼容修复：训练和预检根据 API 可用性选择 `torch.amp` 或旧版 `torch.cuda.amp`，继续使用现有 myenv，无需升级 torch。若启动在创建 optimizer/EMA 前失败，且目录仅含 split_summary.json / transfer.json，会将失败目录完整改名保存，再用原输出路径重试；含 config、日志或 checkpoint 的目录仍拒绝覆盖。

@@ -204,3 +204,37 @@ def test_official_metrics_and_protocol_guards():
     with pytest.raises(ValueError, match='requires image_size'): runner.validate(cfg)
     cfg.hd95_mode = 'surface'; cfg.eval_mode = 'missing'
     with pytest.raises(ValueError, match='evaluation-only'): runner.validate(cfg)
+
+
+def test_legacy_amp_api_and_failed_start_retry(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    from utils.amp import make_grad_scaler, autocast_context
+    # Reproduce the reported environment: torch.amp exists but has no GradScaler.
+    monkeypatch.delattr(torch.amp, 'GradScaler')
+    with pytest.warns(FutureWarning):
+        scaler = make_grad_scaler('cpu', enabled=True)
+    assert not scaler.is_enabled()
+    layer = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(layer.parameters(), lr=.01)
+    before = layer.weight.detach().clone()
+    with autocast_context('cpu'):
+        loss = layer(torch.ones(2, 2)).square().mean()
+    scaler.scale(loss).backward(); scaler.unscale_(optimizer)
+    scaler.step(optimizer); scaler.update()
+    assert not torch.equal(before, layer.weight)
+    called = []
+    monkeypatch.delattr(torch.amp, 'autocast')
+    monkeypatch.setattr(torch.cuda.amp, 'autocast', lambda **kw: (called.append(kw) or nullcontext()))
+    with autocast_context('cuda', enabled=True): pass
+    assert called == [{'enabled': True}]
+    failed = tmp_path/'run'
+    failed.mkdir()
+    (failed/'transfer.json').write_text('{"weights":"ema"}')
+    (failed/'split_summary.json').write_text('{}')
+    runner.prepare_output(failed)
+    archives = list(tmp_path.glob('run.failed-start-*'))
+    assert len(archives) == 1 and (archives[0]/'transfer.json').is_file()
+    assert not any(failed.iterdir())
+    (failed/'last.pt').write_bytes(b'existing checkpoint')
+    with pytest.raises(FileExistsError): runner.prepare_output(failed)
+    assert (failed/'last.pt').read_bytes() == b'existing checkpoint'

@@ -10,6 +10,7 @@ from models.staged_petct import StagedPETCT
 from run_staged import forward_loss, import_stage1, parser
 from datasets.staged import split_signature
 from utils.ema import ModelEMA
+from utils.amp import make_grad_scaler, autocast_context
 from utils.run_common import module_grad_norm
 from utils.seg_losses import BCEDiceLoss
 
@@ -39,7 +40,7 @@ def main():
     model.to(device).train()
     ema = ModelEMA(model, decay=.999, device=device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=8e-5, weight_decay=1e-4)
-    scaler = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
+    scaler = make_grad_scaler(device)
     shape = (a.batch_size, 3, a.image_size, a.image_size)
     batch = {'ct': torch.randn(shape), 'mask': (torch.rand(a.batch_size, 1, a.image_size, a.image_size) > .98).float()}
     if a.stage == 2:
@@ -49,7 +50,7 @@ def main():
         batch.update(pet=pet, is_full=flags)
     if device.type == 'cuda': torch.cuda.reset_peak_memory_stats(device)
     begin = time.time()
-    with torch.autocast(device_type=device.type, enabled=scaler.is_enabled()):
+    with autocast_context(device, enabled=scaler.is_enabled()):
         loss, stats = forward_loss(model, batch, a.stage, device, BCEDiceLoss())
     scaler.scale(loss).backward(); scaler.unscale_(optimizer)
     torch.nn.utils.clip_grad_norm_(model.parameters(), 5., error_if_nonfinite=True)
