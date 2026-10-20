@@ -48,13 +48,13 @@ class StagedPETCT(nn.Module):
     def encode_ct(self, ct):
         return self.ct_align(self.enc_ct(self._input(ct)))
 
-    def forward(self, ct, pet=None, mode='missing', full_indices=None):
-        """missing: only CT; full: full+CT on all rows; mixed: PET on selected rows.
+    def forward(self, ct, pet=None, mode='missing'):
+        """missing: CT only; full: paired Full+CT predictions for every row.
 
-        mixed expects PET already SUBSETTED, in full_indices order. CT is encoded
-        and decoded once on all rows; only selected rows enter PET/fusion/D_full.
+        CT is encoded and decoded once. Full adds a PET pass and an independent
+        fusion decoder; it never feeds PET features/logits into the CT-only path.
         """
-        if mode not in ('missing', 'full', 'mixed'):
+        if mode not in ('missing', 'full'):
             raise ValueError(mode)
         if self.stage == 1 and mode != 'missing':
             raise ValueError('stage 1 has only a CT path')
@@ -65,22 +65,12 @@ class StagedPETCT(nn.Module):
         if mode == 'missing':
             result['logits'] = ct_logits
             return result  # PET is intentionally not touched, even if supplied.
-        if mode == 'full':
-            indices = torch.arange(len(ct), device=ct.device)
-        else:
-            indices = full_indices
-            if indices is None or indices.dtype != torch.long or indices.ndim != 1:
-                raise ValueError('mixed requires 1D long full_indices')
-            if indices.numel() * 2 != len(ct) or indices.unique().numel() != indices.numel():
-                raise ValueError('mixed requires exactly half of the batch, without duplicates')
-            if indices.min() < 0 or indices.max() >= len(ct):
-                raise ValueError('full_indices out of range')
-        if pet is None or len(pet) != len(indices) or pet.shape[-2:] != ct.shape[-2:]:
-            raise ValueError('PET must contain exactly the selected paired rows, with matching H,W')
+        if pet is None or len(pet) != len(ct) or pet.shape[-2:] != ct.shape[-2:]:
+            raise ValueError('Full requires paired PET for every CT row, with matching H,W')
         p = self.pet_align(self.enc_pet(self._input(pet)))
-        fused = self.fusion([x.index_select(0, indices) for x in c], p)
+        fused = self.fusion(c, p)
         full_logits = self.decoder_full(fused, ct.shape[-2:])['logits']
-        result.update(full_logits=full_logits, full_indices=indices, logits=full_logits)
+        result.update(full_logits=full_logits, logits=full_logits)
         return result
 
     def import_stage1_state(self, state):

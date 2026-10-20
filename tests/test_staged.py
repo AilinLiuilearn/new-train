@@ -1,4 +1,5 @@
 """Contract tests use REAL timm/HF encoders, aligners and GN decoders, no toy substitutes."""
+import csv
 import gc
 import json
 from pathlib import Path
@@ -9,7 +10,7 @@ import torch
 
 import run_staged as runner
 from datasets.pclt20k_seg import PCLT20KSegDataset, _records_from_ids
-from datasets.staged import HalfMissingBatches
+from datasets.staged import loaders
 from models.staged_petct import StagedPETCT
 from utils.run_common import module_grad_norm
 from utils.seg_losses import BCEDiceLoss
@@ -59,15 +60,23 @@ def test_real_paths_exact_loss_gradients_and_pet_isolation():
     model = StagedPETCT(2).eval()
     ct = torch.randn(4, 3, 64, 64)
     pet = torch.randn_like(ct)
-    flags = torch.tensor([True, False, False, True])
-    pet[~flags] = float('nan')
+    flags = torch.ones(4, dtype=torch.bool)
     y = (torch.rand(4, 1, 64, 64) > .97).float()
     batch = {'ct': ct, 'pet': pet, 'mask': y, 'is_full': flags}
-    observed = []
-    hook = model.enc_pet.register_forward_pre_hook(lambda m, args: observed.append(len(args[0])))
+    observed = {'ct': [], 'pet': []}
+    hooks = [model.enc_ct.register_forward_pre_hook(lambda m, args: observed['ct'].append(len(args[0]))),
+             model.enc_pet.register_forward_pre_hook(lambda m, args: observed['pet'].append(len(args[0])))]
     criterion = BCEDiceLoss()
-    loss, stats = runner.forward_loss(model, batch, 2, torch.device('cpu'), criterion)
-    assert observed == [2] and stats['ct_samples'] == 4 and stats['full_samples'] == 2
+    targets = []
+    def tracked_criterion(logits, target):
+        targets.append(target)
+        assert logits.shape == target.shape == y.shape
+        return criterion(logits, target)
+    loss, stats = runner.forward_loss(model, batch, 2, torch.device('cpu'), tracked_criterion)
+    assert observed == {'ct': [4], 'pet': [4]}
+    assert stats['ct_samples'] == stats['full_samples'] == stats['missing_samples'] == 4
+    assert len(targets) == 2 and targets[0] is targets[1]
+    torch.testing.assert_close(targets[0], y, atol=0, rtol=0)
     torch.testing.assert_close(loss.detach(), torch.tensor(.5*(stats['ct_loss']+stats['full_loss'])))
     loss.backward()
     for name, module in model.named_children():
@@ -75,7 +84,14 @@ def test_real_paths_exact_loss_gradients_and_pet_isolation():
     tracked = {name: next(m.parameters()).detach().clone() for name, m in model.named_children() if list(m.parameters())}
     torch.optim.AdamW(model.parameters(), lr=8e-5).step()
     assert all(not torch.equal(tracked[name], next(getattr(model, name).parameters())) for name in tracked)
-    hook.remove()
+    for hook in hooks: hook.remove()
+    # For fixed CT, changing PET may only change the Full prediction.
+    with torch.no_grad():
+        paired = model(ct, pet, mode='full')
+        changed = model(ct, -pet, mode='full')
+        torch.testing.assert_close(paired['ct_logits'], changed['ct_logits'], atol=0, rtol=0)
+        torch.testing.assert_close(paired['ct_logits'], model(ct, mode='missing')['logits'], atol=0, rtol=0)
+        assert not torch.equal(paired['full_logits'], changed['full_logits'])
     model.zero_grad(set_to_none=True)
     def forbidden(*unused): raise AssertionError('PET/Full module used on Missing')
     hooks = [m.register_forward_pre_hook(forbidden) for m in
@@ -87,8 +103,11 @@ def test_real_paths_exact_loss_gradients_and_pet_isolation():
     assert all(p.grad is None for p in model.enc_pet.parameters())
     assert all(p.grad is None for p in model.decoder_full.parameters())
     for hook in hooks: hook.remove()
-    with pytest.raises(ValueError, match='exactly half'):
-        model(ct, pet[:1], mode='mixed', full_indices=torch.tensor([0]))
+    with pytest.raises(ValueError, match='every CT row'):
+        model(ct, pet[:1], mode='full')
+    with pytest.raises(ValueError, match='real PET for every'):
+        runner.forward_loss(model, {**batch, 'is_full': torch.tensor([True, False, True, False])},
+                            2, torch.device('cpu'), criterion)
 
 
 def make_pngs(root, train=4):
@@ -107,16 +126,21 @@ def make_pngs(root, train=4):
     return names
 
 
-def test_balanced_sampling_missing_io_and_mask_labels(tmp_path):
-    batches = HalfMissingBatches(10, 4, 2023)
-    first = list(batches)
-    batches.set_epoch(2); second = list(batches)
-    assert len(first) == 2
-    for a, b in zip(first, second):
-        assert sum(flag for _, flag in a) == 2
-        assert [idx for idx, _ in a] == [idx for idx, _ in b]
-        assert all(f != g for (_, f), (_, g) in zip(a, b))
+def test_paired_loader_missing_io_and_mask_labels(tmp_path):
     names = make_pngs(tmp_path)
+    cfg = runner.parser().parse_args(['--stage', '2', '--root', str(tmp_path),
+        '--output', str(tmp_path/'audit'),
+        '--batch_size', '3', '--image_size_2d', '64', '--hd95_mode', 'surface',
+        '--num_workers', '0', '--aug_mode', 'none'])
+    runner.validate(cfg)
+    train, _, _ = loaders(cfg, tmp_path/'audit')
+    assert train.batch_size == 3 and train.drop_last and len(train) == 1
+    first = next(iter(train))
+    assert first['is_full'].tolist() == [True]*3
+    for row, idx in enumerate(first['idx'].tolist()):
+        # Each PET stays paired with the same CT after loading/normalization.
+        torch.testing.assert_close(first['pet'][row], first['ct'][row].flip(-2), atol=0, rtol=0)
+        assert first['image_id'][row] == names[idx]
     records = _records_from_ids(tmp_path, names[:4])
     # Remove PET: simulated Missing must still work; Full must fail.
     Path(records[0]['pet_path']).unlink()
@@ -135,7 +159,6 @@ def test_balanced_sampling_missing_io_and_mask_labels(tmp_path):
         sample = ds[(1, True)]
         assert sample['ct'].shape == (3, 64, 64)
         assert set(sample['mask'].unique().tolist()) <= {0., 1.}
-    with pytest.raises(ValueError): HalfMissingBatches(10, 3, 0)
 
 
 def test_real_two_stage_png_pipeline_resume_ema_and_reevaluation(tmp_path, monkeypatch):
@@ -145,13 +168,27 @@ def test_real_two_stage_png_pipeline_resume_ema_and_reevaluation(tmp_path, monke
               '--ema_start_epoch', '0', '--device', 'cpu', '--no_pretrained',
               '--aug_mode', 'none', '--log_interval', '20', '--hd95_mode', 'surface']
     stage1 = tmp_path/'ct'
-    runner.main(['--stage', '1', '--output', str(stage1), *common])
+    ct_result = runner.main(['--stage', '1', '--output', str(stage1), *common])
+    # Stage-1 training is unchanged: legacy checkpoints/log schemas can resume.
+    old_ct = runner.load(stage1/'last.pt'); old_ct['format'] = runner.LEGACY_FORMAT
+    old_ct['config'].pop('training_protocol'); old_ct['log_row'].pop('training_protocol')
+    torch.save(old_ct, stage1/'last.pt')
+    del old_ct; gc.collect()
+    old_rows = [json.loads(x) for x in (stage1/'train.jsonl').read_text().splitlines()]
+    for row in old_rows: row.pop('training_protocol')
+    (stage1/'train.jsonl').write_text(''.join(json.dumps(row)+'\n' for row in old_rows))
+    assert runner.main(['--resume', str(stage1/'last.pt'), '--device', 'cpu']) == ct_result
+    with (stage1/'train.csv').open() as stream:
+        csv_rows = list(csv.DictReader(stream))
+    assert all(row['training_protocol'] == 'ct_only' and row['ct_samples'] == '4' for row in csv_rows)
+    assert all(None not in row for row in csv_rows)
     full = tmp_path/'joint'
     stage2_args = ['--stage', '2', '--stage1_checkpoint', str(stage1/'best.pt'), *common]
     result = runner.main([*stage2_args, '--output', str(full)])
     rows = [json.loads(x) for x in (full/'train.jsonl').read_text().splitlines()]
-    assert len(rows) == 2 and all(r['full_samples'] == r['missing_samples'] == 2 for r in rows)
+    assert len(rows) == 2 and all(r['full_samples'] == r['missing_samples'] == 4 for r in rows)
     assert all(r['ct_samples'] == 4 for r in rows)
+    assert all(r['training_protocol'] == 'paired_full_missing' for r in rows)
     assert result['metrics']['joint_dice'] == .5*(result['metrics']['full']['dice']+result['metrics']['missing']['dice'])
     transfer = json.loads((full/'transfer.json').read_text())
     assert transfer['split_hash_verified'] and transfer['weights'] == 'ema'
@@ -178,6 +215,14 @@ def test_real_two_stage_png_pipeline_resume_ema_and_reevaluation(tmp_path, monke
     gc.collect()
     evaluated = runner.main(['--evaluate', str(full/'best.pt'), '--device', 'cpu'])
     assert evaluated == result
+    # Old routing checkpoints remain evaluable, but cannot silently resume as paired training.
+    legacy = runner.load(full/'best.pt'); legacy['format'] = runner.LEGACY_FORMAT
+    legacy['config'].pop('training_protocol')
+    legacy_path = tmp_path/'legacy_stage2.pt'; torch.save(legacy, legacy_path)
+    del legacy; gc.collect()
+    assert runner.main(['--evaluate', str(legacy_path), '--device', 'cpu']) == result
+    with pytest.raises(ValueError, match='Cannot resume old 50%'):
+        runner.main(['--resume', str(legacy_path), '--device', 'cpu'])
     # Missing-only evaluation must not require PET files anywhere in the dataset.
     for path in root.rglob('*_PET.png'): path.unlink()
     missing = runner.main(['--evaluate', str(full/'best.pt'), '--eval_mode', 'missing', '--device', 'cpu'])
@@ -199,7 +244,9 @@ def test_official_metrics_and_protocol_guards():
     result = metric.compute()
     assert result['dice'] == 1. and result['hd95'] == 0.
     cfg = runner.parser().parse_args(['--stage', '2', '--output', 'unused', '--batch_size', '3'])
-    with pytest.raises(ValueError, match='even batch'): runner.validate(cfg)
+    runner.validate(cfg)  # Paired paths no longer require an even batch size.
+    cfg.batch_size = 0
+    with pytest.raises(ValueError, match='batch_size >= 1'): runner.validate(cfg)
     cfg.batch_size = 2; cfg.image_size_2d = 64
     with pytest.raises(ValueError, match='requires image_size'): runner.validate(cfg)
     cfg.hd95_mode = 'surface'; cfg.eval_mode = 'missing'

@@ -22,7 +22,8 @@ from utils.optimization import get_cosine_scheduler
 from utils.run_common import seed_everything, module_grad_norm
 from utils.seg_losses import BCEDiceLoss
 
-FORMAT = 'ct_pretrain_dual_decoder_v1'
+FORMAT = 'ct_pretrain_dual_decoder_v2_paired'
+LEGACY_FORMAT = 'ct_pretrain_dual_decoder_v1'
 
 
 def load(path):
@@ -124,18 +125,16 @@ def forward_loss(model, batch, stage, device, criterion):
         loss = criterion(out['ct_logits'], target)[0]
         return loss, {'ct_loss': float(loss.detach()), 'full_loss': 0.,
                       'ct_samples': len(ct), 'full_samples': 0, 'missing_samples': len(ct)}
-    full = batch['is_full'].to(device=device, dtype=torch.bool)
-    indices = full.nonzero(as_tuple=True)[0]
-    if indices.numel()*2 != len(ct):
-        raise ValueError('Stage 2 requires exact half Full rows')
-    # Subset before device transfer and before PET encoding. Missing PET rows are unused.
-    pet = batch['pet'][batch['is_full'].bool()].to(device, non_blocking=True)
-    out = model(ct, pet, mode='mixed', full_indices=indices)
+    full = batch['is_full']
+    if full.ndim != 1 or len(full) != len(ct) or not full.bool().all():
+        raise ValueError('Paired stage 2 requires real PET for every training row; half-missing batches are unsupported')
+    pet = batch['pet'].to(device, non_blocking=True)
+    out = model(ct, pet, mode='full')
     lc = criterion(out['ct_logits'], target)[0]
-    lf = criterion(out['full_logits'], target.index_select(0, indices))[0]
+    lf = criterion(out['full_logits'], target)[0]
     return .5*(lc+lf), {'ct_loss': float(lc.detach()), 'full_loss': float(lf.detach()),
-                        'ct_samples': len(ct), 'full_samples': len(indices),
-                        'missing_samples': len(ct)-len(indices)}
+                        'ct_samples': len(ct), 'full_samples': len(ct),
+                        'missing_samples': len(ct)}
 
 
 @torch.inference_mode()
@@ -229,8 +228,6 @@ def parser():
 def validate(cfg, evaluating=False):
     if cfg.stage not in (1, 2) or not cfg.output:
         raise ValueError('--stage and --output are required for new runs')
-    if cfg.stage == 2 and (cfg.batch_size < 2 or cfg.batch_size % 2):
-        raise ValueError('Stage 2 requires an even batch_size >= 2')
     if cfg.batch_size < 1 or cfg.image_size_2d < 64 or cfg.image_size_2d % 32:
         raise ValueError('batch_size >= 1; image_size_2d must be >=64 and a multiple of 32')
     if cfg.hd95_mode == 'cipa_official' and cfg.image_size_2d != 512:
@@ -273,9 +270,16 @@ def main(argv=None):
     if args.resume and args.evaluate:
         raise ValueError('Choose --resume or --evaluate')
     checkpoint = load(args.resume or args.evaluate) if args.resume or args.evaluate else None
-    if checkpoint and checkpoint.get('format') != FORMAT:
+    if checkpoint and checkpoint.get('format') not in (FORMAT, LEGACY_FORMAT):
         raise ValueError('Resume/evaluate needs a new staged checkpoint; use --stage1_checkpoint for legacy CT weights')
+    if (args.resume and checkpoint.get('format') == LEGACY_FORMAT
+            and checkpoint['config']['stage'] == 2):
+        raise ValueError('Cannot resume old 50% stage-2 routing with the paired protocol. '
+                         'Keep that run for evaluation; start a new --output from --stage1_checkpoint. '
+                         'To continue the old protocol, use its original commit.')
     cfg = argparse.Namespace(**checkpoint['config']) if checkpoint else args
+    cfg.training_protocol = ('ct_only' if cfg.stage == 1 else
+        'half_missing_v1' if checkpoint and checkpoint.get('format') == LEGACY_FORMAT else 'paired_full_missing')
     if checkpoint:
         supplied = set((argv if argv is not None else sys.argv[1:]))
         allowed = {'--evaluate', '--resume', '--device'}
@@ -308,7 +312,10 @@ def main(argv=None):
     if checkpoint and signature != checkpoint['splits']:
         raise ValueError('Dataset split contents changed')
     print(f'[START] stage={cfg.stage} device={device} batch={cfg.batch_size} lr={cfg.learning_rate} '
-          f'size={cfg.image_size_2d} epochs={cfg.epochs}', flush=True)
+          f'size={cfg.image_size_2d} epochs={cfg.epochs} protocol={cfg.training_protocol}', flush=True)
+    if cfg.stage == 2 and not args.evaluate:
+        print(f'[PAIRED] each batch: Full={cfg.batch_size} CT-only={cfg.batch_size}; '
+              'one shared CT encode; loss=0.5*CT_loss+0.5*Full_loss; no ranking/compensation', flush=True)
     print('[DATA] checking split membership and PNG paths', flush=True)
     train, val, test = loaders(cfg, output)
     if not len(train): raise ValueError('No complete train batch; reduce batch_size')
@@ -360,15 +367,18 @@ def main(argv=None):
             if checkpoint.get('log_row') and not any(r['epoch'] == checkpoint['epoch'] for r in rows):
                 rows.append(checkpoint['log_row'])
             log.unlink(); (output/'train.csv').unlink(missing_ok=True)
-            for row in rows: append_log(output, row)
+            for row in rows:
+                # Old stage-1 logs predate this column; keep CSV headers aligned
+                # with later rows when safely continuing unchanged CT training.
+                append_log(output, {'epoch': row['epoch'], 'training_protocol': cfg.training_protocol, **row})
         elif checkpoint.get('log_row'):
-            append_log(output, checkpoint['log_row'])
+            row = checkpoint['log_row']
+            append_log(output, {'epoch': row['epoch'], 'training_protocol': cfg.training_protocol, **row})
     else:
         (output/'config.json').write_text(json.dumps(vars(cfg), indent=2))
         (output/'splits.json').write_text(json.dumps(signature, indent=2))
         save_environment(output, device)
     for epoch in range(start_epoch, cfg.epochs+1):
-        if hasattr(train.batch_sampler, 'set_epoch'): train.batch_sampler.set_epoch(epoch)
         if ema and not active and epoch > cfg.ema_start_epoch:
             ema.reset(model); active = True
         model.train()
@@ -404,15 +414,17 @@ def main(argv=None):
                       f'ct={stats["ct_loss"]:.4f} full={stats["full_loss"]:.4f} '
                       f'lr={optimizer.param_groups[0]["lr"]:.3g} elapsed={elapsed:.0f}s '
                       f'eta={elapsed/step*(len(train)-step):.0f}s', flush=True)
-        if cfg.stage == 2 and counts['full_samples'] != counts['missing_samples']:
-            raise AssertionError('Full/Missing count mismatch')
+        if cfg.stage == 2 and not (counts['ct_samples'] == counts['full_samples'] == counts['missing_samples']):
+            raise AssertionError('Every CT sample must receive both Full and Missing supervision')
         weights = 'ema' if active else 'raw'
         result = evaluate(ema.model if active else model, val, cfg, device, criterion, 'val', weights)
         score = result['missing']['dice'] if cfg.stage == 1 else result['joint_dice']
         if not np.isfinite(score): raise RuntimeError('Nonfinite selection Dice')
         improved = score > best
         if improved: best, best_epoch = score, epoch
-        row = {'epoch': epoch, **{'train_'+k: v/counts['ct_samples'] for k, v in sums.items()},
+        print('[COVERAGE] '+json.dumps(counts)+' (Full/Missing are overlapping paths, not disjoint samples)', flush=True)
+        row = {'epoch': epoch, 'training_protocol': cfg.training_protocol,
+               **{'train_'+k: v/counts['ct_samples'] for k, v in sums.items()},
                **counts, **grads, 'selection_dice': score, 'best': best, 'best_epoch': best_epoch,
                'weights': weights, 'lr': optimizer.param_groups[0]['lr'], 'skipped_updates': skipped,
                'ema_updates': ema.updates if ema else 0, 'epoch_seconds': time.time()-begin}
