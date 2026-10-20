@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
 """Shared optimizer-step and random-seed helpers.
 """
-import csv
-import json
-import os
 import random
 
 import numpy as np
@@ -28,21 +25,3 @@ def module_grad_norm(module):
         value = p.grad.detach().float().pow(2).sum()
         total = value if total is None else total + value
     return float(total.sqrt().item()) if total is not None else 0.0
-
-
-def optimizer_step_succeeded(task):
-    """AMP-aware optimizer step. Returns False when the step was skipped."""
-    if not task.scaler.is_enabled():
-        task.optimizer.step()
-        return True
-    before = task.scaler.get_scale()
-    task.scaler.step(task.optimizer)
-    task.scaler.update()
-    after = task.scaler.get_scale()
-    return bool(after >= before)
-
-
-def count_parameters(model):
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return total, trainable

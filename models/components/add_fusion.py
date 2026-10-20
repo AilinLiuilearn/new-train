@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Pure per-scale addition fusion.
-
-This is the explicit Full-path fusion seam (§九): a future fusion module only
-needs to replace this call for the Full path. Missing never enters it; the
-Missing path feeds ``aligned_CT`` straight to the shared decoder.
-"""
+"""Pure four-scale addition; Full only. Missing uses its own CT decoder."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

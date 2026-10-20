@@ -25,7 +25,7 @@ def _decoder_block(in_channels, out_channels, kernel_size=1, stride=1, dilation=
 
 
 class UNetStyleDecoder(nn.Module):
-    """Shared decoder for both baselines. Expects exactly four scales."""
+    """GN decoder, instantiated independently for CT and Full. Expects exactly four scales."""
 
     def __init__(self, encoder_channels=(64, 128, 320, 512),
                  decoder_channels=(512, 256, 128, 64),
@@ -33,7 +33,8 @@ class UNetStyleDecoder(nn.Module):
         super().__init__()
         c1, c2, c3, c4 = encoder_channels
         d4, d3, d2, d1 = decoder_channels
-        self.use_deep_supervision = bool(use_deep_supervision)
+        if use_deep_supervision:
+            raise ValueError("This clean baseline does not use deep supervision")
         self.proj4 = _decoder_block(c4, d4, kernel_size=1)
         self.proj3 = _decoder_block(c3, d3, kernel_size=1)
         self.proj2 = _decoder_block(c2, d2, kernel_size=1)
@@ -45,10 +46,6 @@ class UNetStyleDecoder(nn.Module):
         self.fuse1 = nn.Sequential(_decoder_block(d2 + d1, d1, kernel_size=3),
                                    _decoder_block(d1, d1, kernel_size=3))
         self.seg_head = nn.Conv2d(d1, out_channels, kernel_size=1)
-        if self.use_deep_supervision:
-            self.aux_head_d2 = nn.Conv2d(d2, out_channels, kernel_size=1)
-            self.aux_head_d3 = nn.Conv2d(d3, out_channels, kernel_size=1)
-            self.aux_head_d4 = nn.Conv2d(d4, out_channels, kernel_size=1)
 
     def forward(self, features, target_size):
         if len(features) != 4:
@@ -68,7 +65,4 @@ class UNetStyleDecoder(nn.Module):
         final_logits = F.interpolate(logits, size=target_size, mode='bilinear', align_corners=False)
         if not torch.isfinite(final_logits).all():
             raise RuntimeError('[NaN/Inf] decoder logits contain invalid values')
-        if not self.use_deep_supervision:
-            return {'logits': final_logits}
-        return {'logits': final_logits,
-                'aux_logits': [self.aux_head_d2(d2), self.aux_head_d3(d3), self.aux_head_d4(d4)]}
+        return {'logits': final_logits}

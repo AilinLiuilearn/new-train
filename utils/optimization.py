@@ -5,12 +5,6 @@ import math
 import torch
 
 
-def get_optimizer(params, name='adamw', lr=1e-4, weight_decay=1e-4):
-    if isinstance(params, list) and len(params) > 0 and isinstance(params[0], dict):
-        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
-    return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
-
-
 def get_cosine_scheduler(optimizer, epochs, warmup_steps=0, cycles=1, min_lr=1e-6, steps_per_epoch=None, flat_ratio=0.0):
     """
     Cosine LR with optional flat tail.

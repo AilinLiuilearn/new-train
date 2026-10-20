@@ -20,10 +20,9 @@ except Exception:  # pragma: no cover - guarded by strict checks below
     timm = None
 
 try:
-    from transformers import SegformerConfig, SegformerModel, ConvNextConfig, ConvNextModel
+    from transformers import SegformerConfig, SegformerModel
 except Exception:  # pragma: no cover - guarded by strict checks below
     SegformerConfig = SegformerModel = None
-    ConvNextConfig = ConvNextModel = None
 
 
 class SimpleFeatureInfo:
@@ -256,26 +255,8 @@ def load_local_weights_safe(model, path, name='Encoder', required=True):
           f'unexpected_after_load={len(msg.unexpected_keys)}')
     if skipped:
         print(f'[PRETRAIN] {name}: skipped_examples={skipped[:8]}')
-    _verify_core_stages_loaded(name, model_state, msg.missing_keys)
-
-
-def _verify_core_stages_loaded(name, model_state, missing_keys):
-    """Ensure the stem and all four encoder stages actually received weights."""
-    missing = set(missing_keys)
-    def stage_loaded(prefix):
-        return not any(k.startswith(prefix) for k in missing)
-    if _has_stage(model_state, 'stem'):
-        if not stage_loaded('stem'):
-            raise RuntimeError(f'{name}: stem weights missing after load; refusing random init')
-    for i in range(4):
-        prefixes = (f'stages.{i}.', f'stages_{i}.', f'encoder.stages.{i}.', f'encoder.stages_{i}.')
-        if any(any(k.startswith(p) for p in prefixes) for k in model_state):
-            if not stage_loaded(prefixes[0]) and not stage_loaded(prefixes[1]):
-                raise RuntimeError(f'{name}: stage {i} weights missing after load; refusing random init')
-
-
-def _has_stage(model_state, prefix):
-    return any(k.startswith(prefix) for k in model_state)
+    if msg.missing_keys:
+        raise RuntimeError(f'{name}: incomplete encoder weights: {msg.missing_keys[:8]}')
 
 
 class SegformerFeatureBackbone(nn.Module):
@@ -285,7 +266,6 @@ class SegformerFeatureBackbone(nn.Module):
         super().__init__()
         variant = _normalize_backbone_name(variant)
         settings = {
-            'mit_b0': dict(depths=[2, 2, 2, 2], hidden_sizes=[32, 64, 160, 256], heads=[1, 2, 5, 8]),
             'mit_b1': dict(depths=[2, 2, 2, 2], hidden_sizes=[64, 128, 320, 512], heads=[1, 2, 5, 8]),
         }
         if variant not in settings:
@@ -314,33 +294,6 @@ class SegformerFeatureBackbone(nn.Module):
         raise ValueError(f'Segformer encoder must output 4 stage features, got {len(hidden)}')
 
 
-class ConvNextFeatureBackbone(nn.Module):
-    """HuggingFace ConvNeXt encoder (convnextv2_nano via timm below)."""
-
-    def __init__(self, variant='convnext_tiny', in_channels=3):
-        super().__init__()
-        variant = _normalize_backbone_name(variant)
-        settings = {'convnext_tiny': dict(depths=[3, 3, 9, 3], hidden_sizes=[96, 192, 384, 768])}
-        if variant not in settings:
-            raise ValueError(f'Unsupported HuggingFace ConvNeXt variant: {variant}')
-        if ConvNextConfig is None or ConvNextModel is None:
-            raise ImportError('HuggingFace ConvNeXt backbone requires transformers. Install: pip install transformers')
-        s = settings[variant]
-        config = ConvNextConfig(
-            num_channels=in_channels, depths=s['depths'], hidden_sizes=s['hidden_sizes'],
-            patch_size=4, out_features=['stage1', 'stage2', 'stage3', 'stage4'],
-        )
-        self.model = ConvNextModel(config)
-        self.feature_info = SimpleFeatureInfo(config.hidden_sizes)
-
-    def forward(self, x):
-        outputs = self.model(pixel_values=x, output_hidden_states=True, return_dict=True)
-        hidden = list(outputs.hidden_states)
-        if len(hidden) >= 5:
-            return hidden[1:5]
-        return hidden[-4:]
-
-
 class TimmFeatureBackbone(nn.Module):
     """timm features_only backbone (used for convnextv2_nano)."""
 
@@ -361,14 +314,10 @@ class TimmFeatureBackbone(nn.Module):
 def create_feature_backbone(backbone, in_channels=3):
     """Build a real encoder; never returns a fallback toy backbone."""
     backbone = _normalize_backbone_name(backbone)
-    if backbone in ('mit_b0', 'mit_b1'):
+    if backbone == 'mit_b1':
         if SegformerConfig is None or SegformerModel is None:
             raise ImportError('MiT encoder requires transformers. Install: pip install transformers')
         return SegformerFeatureBackbone(backbone, in_channels=in_channels)
-    if backbone == 'convnext_tiny':
-        if ConvNextConfig is None or ConvNextModel is None:
-            raise ImportError('ConvNeXt encoder requires transformers. Install: pip install transformers')
-        return ConvNextFeatureBackbone(backbone, in_channels=in_channels)
     if backbone in ('convnextv2_nano',):
         if timm is None:
             raise ImportError('convnextv2_nano requires timm. Install: pip install timm')

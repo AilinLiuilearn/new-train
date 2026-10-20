@@ -65,22 +65,31 @@ class PCLT20KSegDataset(Dataset):
         self.aug_mode = aug_mode
         self.norm_mode = norm_mode
         self.ct_only = bool(ct_only)
-        self.rng = random.Random(random_state)
 
     def __len__(self):
         return len(self.records)
 
     def __getitem__(self, idx):
+        load_pet = not self.ct_only
+        if isinstance(idx, tuple):
+            idx, load_pet = idx
         record = self.records[idx]
         ct = _imread_grayscale(record['ct_path'])
         mask = _imread_grayscale(record['mask_path'])
         if ct is None or mask is None:
             raise FileNotFoundError(record)
         pet = None
-        if not self.ct_only:
+        if load_pet:
             pet = _imread_grayscale(record['pet_path'])
             if pet is None:
                 raise FileNotFoundError(record)
+        if ct.shape != mask.shape or (pet is not None and ct.shape != pet.shape):
+            raise ValueError(f'Unregistered CT/PET/mask dimensions: {record}')
+        values = np.unique(mask)
+        if not set(values.tolist()).issubset({0, 1, 255}):
+            raise ValueError(f'Mask must contain only 0/1/255 before augmentation: {record}')
+        if mask.max() <= 1:
+            mask = mask * np.uint8(255)
         if ct.shape != (self.image_size, self.image_size):
             ct = _resize_gray(ct, self.image_size)
             mask = _resize_gray(mask, self.image_size, nearest=True)
@@ -120,8 +129,11 @@ class PCLT20KSegDataset(Dataset):
             'slice_id': record.get('slice_id', record.get('image_id', str(idx))),
             'idx': idx,
         }
-        if pet is not None:
-            out['pet'] = torch.tensor(_normalize_ch(pet, self.norm_mode), dtype=torch.float32)
+        if not self.ct_only:
+            # Missing rows are placeholders only; no PET file read, normalization or encoding.
+            out['pet'] = (torch.tensor(_normalize_ch(pet, self.norm_mode), dtype=torch.float32)
+                          if pet is not None else torch.zeros_like(ct_t))
+            out['is_full'] = bool(load_pet)
         return out
 
 
@@ -204,6 +216,8 @@ def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_wor
     for name, recs in [('train', train_records), ('val', val_records), ('test', test_records)]:
         if not recs:
             raise ValueError(f'{name} split is empty')
+        if len({r['image_id'] for r in recs}) != len(recs):
+            raise ValueError(f'{name} contains duplicate slice IDs')
         for r in recs:
             if not os.path.isfile(r['ct_path']) or not os.path.isfile(r['mask_path']):
                 raise FileNotFoundError(f'{name} split contains missing CT/mask files: {r}')
@@ -234,7 +248,3 @@ def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_wor
     return (_make_loader(train_ds, batch_size, num_workers, True, True, random_state + 11, pin_memory),
             _make_loader(val_ds, batch_size, num_workers, False, False, random_state + 17, pin_memory),
             _make_loader(test_ds, batch_size, num_workers, False, False, random_state + 23, pin_memory))
-
-
-def get_pclt20k_loaders(*args, **kwargs):
-    return get_pclt20k_loaders_cipa_aligned(*args, **kwargs)
