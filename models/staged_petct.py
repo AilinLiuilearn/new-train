@@ -1,4 +1,4 @@
-"""Fixed two-stage CT-pretrained PET/CT baseline; no retrieval or distillation.
+"""Fixed dual-path PET/CT baseline; no retrieval or distillation.
 
 Inputs: normalized Bx3xHxW (Bx1xHxW is repeated for smoke checks).
 Four aligned scales: 64,128,320,512. The existing BN aligners and GN decoder

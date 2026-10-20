@@ -1,4 +1,4 @@
-"""Clean CT-only pretraining -> dual-decoder Full/Missing joint training."""
+"""Clean paired Full/Missing training, with optional CT-only task initialization."""
 import argparse
 import csv
 import hashlib
@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from datasets.staged import loaders, split_signature
 from models.staged_petct import StagedPETCT
+from models.components.backbones import _resolve_weight_file
 from utils.ema import ModelEMA
 from utils.amp import make_grad_scaler, autocast_context
 from utils.metrics_seg import SegmentationMetricsCIPA
@@ -40,7 +41,7 @@ def prepare_output(output):
         return
     # A failure before optimizer/EMA initialization leaves only these audit files.
     # Preserve the entire failed startup instead of deleting or overwriting it.
-    startup_files = {'split_summary.json', 'transfer.json'}
+    startup_files = {'split_summary.json', 'transfer.json', 'initialization.json'}
     entries = list(output.iterdir())
     if all(x.is_file() and x.name in startup_files for x in entries):
         archive = output.with_name(output.name+f'.failed-start-{time.time_ns()}')
@@ -117,6 +118,31 @@ def import_stage1(model, path, cfg, signature):
     return report
 
 
+def build_fresh_model(cfg):
+    """Shared by training and preflight; never called to restore a checkpoint."""
+    joint = getattr(cfg, 'joint_from_pretrained', False)
+    load_ct = not cfg.no_pretrained and (cfg.stage == 1 or joint)
+    load_pet = not cfg.no_pretrained and cfg.stage == 2
+    if load_ct and not cfg.ct_pretrained_path:
+        raise ValueError('CT pretrained path is required; --no_pretrained is for smoke tests only')
+    if load_pet and not cfg.pet_pretrained_path:
+        raise ValueError('PET pretrained path is required; --no_pretrained is for smoke tests only')
+    return StagedPETCT(cfg.stage,
+        ct_pretrained_path=cfg.ct_pretrained_path if load_ct else None,
+        pet_pretrained_path=cfg.pet_pretrained_path if load_pet else None)
+
+
+def joint_initialization_report(cfg):
+    report = {'initialization': 'random_smoke' if cfg.no_pretrained else 'backbone_pretrained',
+              'stage1_checkpoint': None, 'aligners': 'random',
+              'ct_decoder': 'random', 'full_decoder': 'independent_copy_of_random_ct_decoder'}
+    if not cfg.no_pretrained:
+        for name in ('ct', 'pet'):
+            path = Path(_resolve_weight_file(getattr(cfg, name+'_pretrained_path'), name.upper()+'_Encoder')).resolve()
+            report[name] = {'weight_file': str(path), 'sha256': file_sha(path)}
+    return report
+
+
 def forward_loss(model, batch, stage, device, criterion):
     ct = batch['ct'].to(device, non_blocking=True)
     target = batch['mask'].to(device, non_blocking=True)
@@ -188,7 +214,10 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--stage', type=int, choices=[1, 2])
     p.add_argument('--output', help='New run directory, never overwritten')
-    p.add_argument('--stage1_checkpoint', help='Trusted CT-only checkpoint, required for new stage 2')
+    init = p.add_mutually_exclusive_group()
+    init.add_argument('--stage1_checkpoint', help='Initialize stage 2 from a trusted CT-only checkpoint')
+    init.add_argument('--joint_from_pretrained', action='store_true',
+                      help='Direct paired training: initialize BOTH encoders from local generic weights, no CT-only checkpoint')
     p.add_argument('--stage1_weights', choices=['auto', 'raw', 'ema'], default='auto')
     p.add_argument('--resume', help='Resume last.pt at an epoch boundary using saved config')
     p.add_argument('--evaluate', help='Evaluate selected raw/EMA checkpoint, no training')
@@ -228,6 +257,8 @@ def parser():
 def validate(cfg, evaluating=False):
     if cfg.stage not in (1, 2) or not cfg.output:
         raise ValueError('--stage and --output are required for new runs')
+    if getattr(cfg, 'joint_from_pretrained', False) and cfg.stage != 2:
+        raise ValueError('--joint_from_pretrained requires --stage 2 (the dual-path architecture)')
     if cfg.batch_size < 1 or cfg.image_size_2d < 64 or cfg.image_size_2d % 32:
         raise ValueError('batch_size >= 1; image_size_2d must be >=64 and a multiple of 32')
     if cfg.hd95_mode == 'cipa_official' and cfg.image_size_2d != 512:
@@ -278,6 +309,8 @@ def main(argv=None):
                          'Keep that run for evaluation; start a new --output from --stage1_checkpoint. '
                          'To continue the old protocol, use its original commit.')
     cfg = argparse.Namespace(**checkpoint['config']) if checkpoint else args
+    # Checkpoints from before direct joint training had only CT-task initialization.
+    cfg.joint_from_pretrained = getattr(cfg, 'joint_from_pretrained', False)
     cfg.training_protocol = ('ct_only' if cfg.stage == 1 else
         'half_missing_v1' if checkpoint and checkpoint.get('format') == LEGACY_FORMAT else 'paired_full_missing')
     if checkpoint:
@@ -292,8 +325,8 @@ def main(argv=None):
             if '--root' in supplied or any(x.startswith('--root=') for x in supplied): cfg.root = args.root
             cfg.eval_mode = args.eval_mode
     validate(cfg, bool(args.evaluate))
-    if not checkpoint and cfg.stage == 2 and not cfg.stage1_checkpoint:
-        raise ValueError('New stage 2 requires --stage1_checkpoint')
+    if not checkpoint and cfg.stage == 2 and not (cfg.stage1_checkpoint or cfg.joint_from_pretrained):
+        raise ValueError('Choose --joint_from_pretrained or --stage1_checkpoint for a new dual-path run')
     if checkpoint is None:
         cfg.output = str(Path(cfg.output).resolve())
         cfg.root = str(Path(cfg.root).resolve())
@@ -322,13 +355,15 @@ def main(argv=None):
     print(f'[DATA] train={len(train.dataset)} val={len(val.dataset)} test={len(test.dataset)} '
           f'train_batches={len(train)} dropped_per_epoch={len(train.dataset)%cfg.batch_size}', flush=True)
     fresh = checkpoint is None
-    model = StagedPETCT(cfg.stage,
-        ct_pretrained_path=cfg.ct_pretrained_path if fresh and cfg.stage == 1 and not cfg.no_pretrained else None,
-        pet_pretrained_path=cfg.pet_pretrained_path if fresh and cfg.stage == 2 and not cfg.no_pretrained else None)
+    model = build_fresh_model(cfg) if fresh else StagedPETCT(cfg.stage)
     source = None
     if checkpoint:
         model.load_state_dict(selected(checkpoint)[0] if args.evaluate else checkpoint['model'], strict=True)
         source = checkpoint['source']
+    elif cfg.stage == 2 and cfg.joint_from_pretrained:
+        source = joint_initialization_report(cfg)
+        (output/'initialization.json').write_text(json.dumps(source, indent=2))
+        print('[INIT] '+json.dumps(source)+'; no CT-only task weights loaded', flush=True)
     elif cfg.stage == 2:
         source = import_stage1(model, cfg.stage1_checkpoint, cfg, signature)
         (output/'transfer.json').write_text(json.dumps(source, indent=2))

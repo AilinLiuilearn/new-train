@@ -172,6 +172,7 @@ def test_real_two_stage_png_pipeline_resume_ema_and_reevaluation(tmp_path, monke
     # Stage-1 training is unchanged: legacy checkpoints/log schemas can resume.
     old_ct = runner.load(stage1/'last.pt'); old_ct['format'] = runner.LEGACY_FORMAT
     old_ct['config'].pop('training_protocol'); old_ct['log_row'].pop('training_protocol')
+    old_ct['config'].pop('joint_from_pretrained')
     torch.save(old_ct, stage1/'last.pt')
     del old_ct; gc.collect()
     old_rows = [json.loads(x) for x in (stage1/'train.jsonl').read_text().splitlines()]
@@ -218,6 +219,7 @@ def test_real_two_stage_png_pipeline_resume_ema_and_reevaluation(tmp_path, monke
     # Old routing checkpoints remain evaluable, but cannot silently resume as paired training.
     legacy = runner.load(full/'best.pt'); legacy['format'] = runner.LEGACY_FORMAT
     legacy['config'].pop('training_protocol')
+    legacy['config'].pop('joint_from_pretrained')
     legacy_path = tmp_path/'legacy_stage2.pt'; torch.save(legacy, legacy_path)
     del legacy; gc.collect()
     assert runner.main(['--evaluate', str(legacy_path), '--device', 'cpu']) == result
@@ -251,6 +253,83 @@ def test_official_metrics_and_protocol_guards():
     with pytest.raises(ValueError, match='requires image_size'): runner.validate(cfg)
     cfg.hd95_mode = 'surface'; cfg.eval_mode = 'missing'
     with pytest.raises(ValueError, match='evaluation-only'): runner.validate(cfg)
+
+
+def test_direct_joint_generic_initialization_and_resume_without_source_files(tmp_path, monkeypatch):
+    root = tmp_path/'data'; root.mkdir(); make_pngs(root)
+    donor = StagedPETCT(2)
+    ct_path, pet_path = tmp_path/'ct_generic.pt', tmp_path/'pet_generic.pt'
+    torch.save(donor.enc_ct.state_dict(), ct_path)
+    torch.save(donor.enc_pet.state_dict(), pet_path)
+    del donor; gc.collect()
+    common = ['--stage', '2', '--joint_from_pretrained', '--root', str(root),
+              '--ct_pretrained_path', str(ct_path), '--pet_pretrained_path', str(pet_path),
+              '--image_size_2d', '64', '--batch_size', '2', '--num_workers', '0',
+              '--epochs', '2', '--cosine_warmup', '0', '--ema_start_epoch', '0',
+              '--device', 'cpu', '--aug_mode', 'none', '--hd95_mode', 'surface']
+    cfg = runner.parser().parse_args([*common, '--output', str(tmp_path/'initial')])
+    # Generic weights affect only encoders, never aligners or the two GN decoders.
+    torch.manual_seed(31)
+    random_model = StagedPETCT(2)
+    random_parts = {name: {k: v.clone() for k, v in getattr(random_model, name).state_dict().items()}
+                    for name in ('ct_align', 'pet_align', 'decoder_ct', 'decoder_full')}
+    del random_model; gc.collect()
+    torch.manual_seed(31)
+    model = runner.build_fresh_model(cfg)
+    for name, path in [('enc_ct', ct_path), ('enc_pet', pet_path)]:
+        source = runner.load(path)
+        for key, value in getattr(model, name).state_dict().items():
+            torch.testing.assert_close(value, source[key], atol=0, rtol=0)
+    for name, state in random_parts.items():
+        for key, value in getattr(model, name).state_dict().items():
+            torch.testing.assert_close(value, state[key], atol=0, rtol=0)
+    for a, b in zip(model.decoder_ct.parameters(), model.decoder_full.parameters()):
+        torch.testing.assert_close(a, b, atol=0, rtol=0)
+        assert a.data_ptr() != b.data_ptr()
+    del model, random_parts, source; gc.collect()
+    cfg.ct_pretrained_path = ''
+    with pytest.raises(ValueError, match='CT pretrained path is required'):
+        runner.build_fresh_model(cfg)
+    with pytest.raises(SystemExit):
+        runner.parser().parse_args([*common, '--stage1_checkpoint', 'must_not_load.pt'])
+    cfg.stage = 1
+    with pytest.raises(ValueError, match='requires --stage 2'): runner.validate(cfg)
+
+    def forbidden_transfer(*args, **kwargs):
+        raise AssertionError('Direct joint mode must never import CT-only task weights')
+    monkeypatch.setattr(runner, 'import_stage1', forbidden_transfer)
+    output = tmp_path/'joint_direct'
+    result = runner.main([*common, '--output', str(output)])
+    report = json.loads((output/'initialization.json').read_text())
+    assert report['initialization'] == 'backbone_pretrained' and report['stage1_checkpoint'] is None
+    assert report['ct']['sha256'] == runner.file_sha(ct_path)
+    assert report['pet']['sha256'] == runner.file_sha(pet_path)
+    assert not (output/'transfer.json').exists()
+    rows = [json.loads(x) for x in (output/'train.jsonl').read_text().splitlines()]
+    assert all(r['ct_samples'] == r['full_samples'] == r['missing_samples'] == 4 for r in rows)
+    expected = runner.load(output/'last.pt')
+    assert expected['config']['joint_from_pretrained'] and expected['config']['stage1_checkpoint'] is None
+
+    interrupted = tmp_path/'joint_direct_interrupted'
+    original_save = runner.atomic_save
+    class StopAfterEpoch(Exception): pass
+    def stop_after_last(value, path):
+        original_save(value, path)
+        if Path(path).name == 'last.pt' and value['epoch'] == 1: raise StopAfterEpoch()
+    monkeypatch.setattr(runner, 'atomic_save', stop_after_last)
+    with pytest.raises(StopAfterEpoch): runner.main([*common, '--output', str(interrupted)])
+    monkeypatch.setattr(runner, 'atomic_save', original_save)
+    # A saved model is self-contained: neither generic files nor fresh init are needed.
+    ct_path.unlink(); pet_path.unlink()
+    monkeypatch.setattr(runner, 'build_fresh_model', forbidden_transfer)
+    resumed = runner.main(['--resume', str(interrupted/'last.pt'), '--device', 'cpu'])
+    actual = runner.load(interrupted/'last.pt')
+    assert resumed == result
+    for group in ('model', 'model_ema'):
+        for key, value in expected[group].items():
+            torch.testing.assert_close(value, actual[group][key], atol=0, rtol=0)
+    del expected, actual; gc.collect()
+    assert runner.main(['--evaluate', str(output/'best.pt'), '--device', 'cpu']) == result
 
 
 def test_legacy_amp_api_and_failed_start_retry(tmp_path, monkeypatch):
