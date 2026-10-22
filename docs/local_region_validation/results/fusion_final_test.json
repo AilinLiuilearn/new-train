@@ -1,0 +1,41 @@
+{
+  "epoch": 5,
+  "weights": "ema",
+  "metrics": {
+    "full": {
+      "dice": 0.7843807932604847,
+      "iou": 0.6452520566570507,
+      "acc": 0.8805236522009481,
+      "acc_pixel": 0.9988225743366017,
+      "sensitivity": 0.7615556136539161,
+      "specificity": 0.9994916907479799,
+      "precision": 0.8086164706618111,
+      "f1": 0.7843807932604847,
+      "hd95": 17.03742255999199,
+      "gt_positive_count": 4514,
+      "missed_positive_count": 26,
+      "hd95_sample_count": 4514,
+      "total_loss": 0.36671693286353846,
+      "eval_mode": "full",
+      "weights": "ema"
+    },
+    "missing": {
+      "dice": 0.7665255598934694,
+      "iou": 0.621436111661355,
+      "acc": 0.872105799151673,
+      "acc_pixel": 0.9987241282735613,
+      "sensitivity": 0.7447712978071875,
+      "specificity": 0.9994403004961585,
+      "precision": 0.7895889140081203,
+      "f1": 0.7665255598934693,
+      "hd95": 22.975224636813593,
+      "gt_positive_count": 4514,
+      "missed_positive_count": 24,
+      "hd95_sample_count": 4514,
+      "total_loss": 0.3860077091323944,
+      "eval_mode": "missing",
+      "weights": "ema"
+    },
+    "joint_dice": 0.775453176576977
+  }
+}

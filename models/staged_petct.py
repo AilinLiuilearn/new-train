@@ -1,8 +1,8 @@
 """Fixed dual-path PET/CT baseline; no retrieval or distillation.
 
 Inputs: normalized Bx3xHxW (Bx1xHxW is repeated for smoke checks).
-Four aligned scales: 64,128,320,512. The existing BN aligners and GN decoder
-are deliberately unchanged so old clean CT-only state dictionaries load exactly.
+Four aligned scales: 64,128,320,512. Aligners remain BN. Decoder normalization
+is explicit; legacy GN remains the default for exact old checkpoint loading.
 """
 import copy
 import torch
@@ -17,14 +17,21 @@ DECODER_CHANNELS = (512, 256, 128, 64)
 
 
 class StagedPETCT(nn.Module):
-    def __init__(self, stage, ct_pretrained_path=None, pet_pretrained_path=None):
+    def __init__(self, stage, ct_pretrained_path=None, pet_pretrained_path=None, decoder_norm='GN',
+                 fusion_type='add', fusion_config=None):
         super().__init__()
         if stage not in (1, 2):
             raise ValueError('stage must be 1 or 2')
+        if fusion_type not in ('add', 'local_region_residual'):
+            raise ValueError('unknown fusion_type')
+        if stage == 1 and fusion_type != 'add':
+            raise ValueError('new fusion is Full-only and requires stage=2')
+        self.fusion_type = fusion_type
         self.stage = stage
+        self.decoder_norm = decoder_norm
         self.enc_ct = create_feature_backbone('convnextv2_nano', in_channels=3)
         self.ct_align = StageChannelAlign(self.enc_ct.feature_info.channels(), CHANNELS)
-        decoder = UNetStyleDecoder(CHANNELS, DECODER_CHANNELS, use_deep_supervision=False)
+        decoder = UNetStyleDecoder(CHANNELS, DECODER_CHANNELS, use_deep_supervision=False, norm=decoder_norm)
         if stage == 1:
             # Keep the legacy stage-1 key "decoder.*" for exact checkpoint compatibility.
             self.decoder = decoder
@@ -38,6 +45,10 @@ class StagedPETCT(nn.Module):
             load_local_weights_safe(self.enc_ct, ct_pretrained_path, name='CT_Encoder')
         if stage == 2 and pet_pretrained_path:
             load_local_weights_safe(self.enc_pet, pet_pretrained_path, name='PET_Encoder')
+        # Construct only after every original module and generic weight load.
+        if stage == 2 and fusion_type == 'local_region_residual':
+            from models.components.local_region_residual_fusion import MultiScaleLocalRegionResidualFusion
+            self.fusion = MultiScaleLocalRegionResidualFusion(**(fusion_config or {}))
 
     @staticmethod
     def _input(x):

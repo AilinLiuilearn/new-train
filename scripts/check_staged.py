@@ -7,7 +7,7 @@ import sys
 import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
-from run_staged import forward_loss, import_stage1, parser, build_fresh_model
+from run_staged import forward_loss, import_stage1, parser, build_fresh_model, normalize_fusion_config
 from datasets.staged import split_signature
 from utils.ema import ModelEMA
 from utils.amp import make_grad_scaler, autocast_context
@@ -94,6 +94,9 @@ def main():
     p.add_argument('--ct_pretrained_path', default=defaults.ct_pretrained_path)
     p.add_argument('--pet_pretrained_path', default=defaults.pet_pretrained_path)
     p.add_argument('--no_pretrained', action='store_true', help='Random encoder smoke check only')
+    p.add_argument('--decoder_norm', choices=['GN','BN'], default='GN')
+    p.add_argument('--fusion_type', choices=['add', 'local_region_residual'], default='add')
+    p.add_argument('--fusion_gaussian', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--stage1_weights', default='auto', choices=['auto', 'raw', 'ema'])
     p.add_argument('--root', default='/root/autodl-tmp/data/PCLT20K')
     a = p.parse_args()
@@ -103,12 +106,16 @@ def main():
         p.error('joint/task checkpoint initialization requires stage 2')
     torch.set_num_threads(1)
     device = torch.device(a.device)
-    print('[CHECK] building real ConvNeXtV2-Nano / MiT-B1 + GN decoders', flush=True)
+    print(f'[CHECK] building real ConvNeXtV2-Nano / MiT-B1 + {a.decoder_norm} decoders', flush=True)
     cfg = parser().parse_args(['--stage', str(a.stage), '--root', a.root,
         '--stage1_weights', a.stage1_weights, '--image_size_2d', str(a.image_size),
         '--ct_pretrained_path', a.ct_pretrained_path, '--pet_pretrained_path', a.pet_pretrained_path,
         '--val_split_file', 'test.txt', '--test_split_file', 'test.txt'])
     cfg.joint_from_pretrained = a.joint_from_pretrained
+    cfg.decoder_norm = a.decoder_norm
+    cfg.fusion_type = a.fusion_type
+    cfg.fusion_gaussian = a.fusion_gaussian
+    normalize_fusion_config(cfg)
     cfg.no_pretrained = a.no_pretrained or not a.joint_from_pretrained
     model = build_fresh_model(cfg)
     if a.joint_from_pretrained:

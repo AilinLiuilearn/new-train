@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
-"""GroupNorm UNet-style decoder (Conv + GroupNorm + ReLU, unchanged)."""
+"""UNet-style decoder; legacy GN and explicit BN baseline ablation."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _norm_layer(channels):
+def _norm_layer(channels, norm='GN'):
+    if norm == 'BN':
+        return nn.BatchNorm2d(channels)
+    if norm != 'GN':
+        raise ValueError('decoder norm must be GN or BN')
     # Largest power-of-two group count (>=2) dividing the channels.
     groups = 8
     while groups > 1 and channels % groups != 0:
@@ -13,38 +17,40 @@ def _norm_layer(channels):
     return nn.GroupNorm(groups, channels)
 
 
-def _decoder_block(in_channels, out_channels, kernel_size=1, stride=1, dilation=1):
-    """Conv + GroupNorm + ReLU."""
+def _decoder_block(in_channels, out_channels, kernel_size=1, stride=1, dilation=1, norm='GN'):
+    """Conv + selected normalization + ReLU."""
     padding = kernel_size // 2
     return nn.Sequential(
         nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride,
                   padding=padding, dilation=dilation, bias=False),
-        _norm_layer(out_channels),
+        _norm_layer(out_channels, norm),
         nn.ReLU(inplace=True),
     )
 
 
 class UNetStyleDecoder(nn.Module):
-    """GN decoder, instantiated independently for CT and Full. Expects exactly four scales."""
+    """Independent CT/Full decoder with GN or BN; exactly four feature scales."""
 
     def __init__(self, encoder_channels=(64, 128, 320, 512),
                  decoder_channels=(512, 256, 128, 64),
-                 out_channels=1, use_deep_supervision=False):
+                 out_channels=1, use_deep_supervision=False, norm='GN'):
         super().__init__()
+        if norm not in ('GN', 'BN'):
+            raise ValueError('decoder norm must be GN or BN')
         c1, c2, c3, c4 = encoder_channels
         d4, d3, d2, d1 = decoder_channels
         if use_deep_supervision:
             raise ValueError("This clean baseline does not use deep supervision")
-        self.proj4 = _decoder_block(c4, d4, kernel_size=1)
-        self.proj3 = _decoder_block(c3, d3, kernel_size=1)
-        self.proj2 = _decoder_block(c2, d2, kernel_size=1)
-        self.proj1 = _decoder_block(c1, d1, kernel_size=1)
-        self.fuse3 = nn.Sequential(_decoder_block(d4 + d3, d3, kernel_size=3),
-                                   _decoder_block(d3, d3, kernel_size=3))
-        self.fuse2 = nn.Sequential(_decoder_block(d3 + d2, d2, kernel_size=3),
-                                   _decoder_block(d2, d2, kernel_size=3))
-        self.fuse1 = nn.Sequential(_decoder_block(d2 + d1, d1, kernel_size=3),
-                                   _decoder_block(d1, d1, kernel_size=3))
+        self.proj4 = _decoder_block(c4, d4, kernel_size=1, norm=norm)
+        self.proj3 = _decoder_block(c3, d3, kernel_size=1, norm=norm)
+        self.proj2 = _decoder_block(c2, d2, kernel_size=1, norm=norm)
+        self.proj1 = _decoder_block(c1, d1, kernel_size=1, norm=norm)
+        self.fuse3 = nn.Sequential(_decoder_block(d4 + d3, d3, kernel_size=3, norm=norm),
+                                   _decoder_block(d3, d3, kernel_size=3, norm=norm))
+        self.fuse2 = nn.Sequential(_decoder_block(d3 + d2, d2, kernel_size=3, norm=norm),
+                                   _decoder_block(d2, d2, kernel_size=3, norm=norm))
+        self.fuse1 = nn.Sequential(_decoder_block(d2 + d1, d1, kernel_size=3, norm=norm),
+                                   _decoder_block(d1, d1, kernel_size=3, norm=norm))
         self.seg_head = nn.Conv2d(d1, out_channels, kernel_size=1)
 
     def forward(self, features, target_size):

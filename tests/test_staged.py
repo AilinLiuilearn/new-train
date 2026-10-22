@@ -56,8 +56,9 @@ def test_transfer_exact_legacy_ema_and_independent_decoders(tmp_path):
                                state['decoder.seg_head.weight'])
 
 
-def test_real_paths_exact_loss_gradients_and_pet_isolation():
-    model = StagedPETCT(2).eval()
+@pytest.mark.parametrize('decoder_norm', ['GN','BN'])
+def test_real_paths_exact_loss_gradients_and_pet_isolation(decoder_norm):
+    model = StagedPETCT(2,decoder_norm=decoder_norm).eval()
     ct = torch.randn(4, 3, 64, 64)
     pet = torch.randn_like(ct)
     flags = torch.ones(4, dtype=torch.bool)
@@ -163,7 +164,7 @@ def test_paired_loader_missing_io_and_mask_labels(tmp_path):
 
 def test_real_two_stage_png_pipeline_resume_ema_and_reevaluation(tmp_path, monkeypatch):
     root = tmp_path/'data'; root.mkdir(); make_pngs(root)
-    common = ['--root', str(root), '--image_size_2d', '64', '--batch_size', '2',
+    common = ['--save_last_checkpoint', '--root', str(root), '--image_size_2d', '64', '--batch_size', '2',
               '--num_workers', '0', '--epochs', '2', '--cosine_warmup', '0',
               '--ema_start_epoch', '0', '--device', 'cpu', '--no_pretrained',
               '--aug_mode', 'none', '--log_interval', '20', '--hd95_mode', 'surface']
@@ -173,6 +174,8 @@ def test_real_two_stage_png_pipeline_resume_ema_and_reevaluation(tmp_path, monke
     old_ct = runner.load(stage1/'last.pt'); old_ct['format'] = runner.LEGACY_FORMAT
     old_ct['config'].pop('training_protocol'); old_ct['log_row'].pop('training_protocol')
     old_ct['config'].pop('joint_from_pretrained')
+    for field in ('crop_guidance', 'guidance_map_dir', 'guided_crop_prob', 'early_stopping_patience'):
+        old_ct['config'].pop(field, None)
     torch.save(old_ct, stage1/'last.pt')
     del old_ct; gc.collect()
     old_rows = [json.loads(x) for x in (stage1/'train.jsonl').read_text().splitlines()]
@@ -262,7 +265,7 @@ def test_direct_joint_generic_initialization_and_resume_without_source_files(tmp
     torch.save(donor.enc_ct.state_dict(), ct_path)
     torch.save(donor.enc_pet.state_dict(), pet_path)
     del donor; gc.collect()
-    common = ['--stage', '2', '--joint_from_pretrained', '--root', str(root),
+    common = ['--save_last_checkpoint', '--stage', '2', '--joint_from_pretrained', '--root', str(root),
               '--ct_pretrained_path', str(ct_path), '--pet_pretrained_path', str(pet_path),
               '--image_size_2d', '64', '--batch_size', '2', '--num_workers', '0',
               '--epochs', '2', '--cosine_warmup', '0', '--ema_start_epoch', '0',
@@ -336,8 +339,13 @@ def test_legacy_amp_api_and_failed_start_retry(tmp_path, monkeypatch):
     from contextlib import nullcontext
     from utils.amp import make_grad_scaler, autocast_context
     # Reproduce the reported environment: torch.amp exists but has no GradScaler.
-    monkeypatch.delattr(torch.amp, 'GradScaler')
-    with pytest.warns(FutureWarning):
+    monkeypatch.delattr(torch.amp, 'GradScaler', raising=False)
+    # torch 2.1 already has the legacy API and does not emit its later deprecation.
+    if int(torch.__version__.split('.')[0]) >= 2 and int(torch.__version__.split('.')[1]) >= 4:
+        warning_context = pytest.warns(FutureWarning)
+    else:
+        warning_context = nullcontext()
+    with warning_context:
         scaler = make_grad_scaler('cpu', enabled=True)
     assert not scaler.is_enabled()
     layer = torch.nn.Linear(2, 1)

@@ -1,0 +1,19 @@
+{
+  "status": "completed_early_stopping",
+  "completed_epochs": 10,
+  "best_epoch": 5,
+  "weights": "ema",
+  "training_commit": "29e55f8729a12dfc49170c9993af0ef0accbec38",
+  "publication_branch": "exp/local-region-residual-gn-v1",
+  "checkpoint_local_path": "/root/autodl-tmp/mkd-main/new-train/checkpoints_new/AUGMENTATION/local-region-residual-gn-s2023-v1/best.pt",
+  "checkpoint_bytes": 752885931,
+  "checkpoint_sha256": "f11a1d9923851cf79f93a8b90a33866d9d3e9fb175722bbad8ba162a2a8e8192",
+  "checkpoint_uploaded": false,
+  "source_code_matches_trained_worktree": true,
+  "limitations": [
+    "Single seed",
+    "Validation and test reuse test.txt",
+    "Full improves, Missing Dice and HD95 regress",
+    "Gaussian-specific attribution requires a no-Gaussian comparison"
+  ]
+}

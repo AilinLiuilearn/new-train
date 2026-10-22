@@ -1,0 +1,162 @@
+{
+  "batch": 16,
+  "image_size": 512,
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "torch": "2.1.2+cu118",
+  "fusion_config": {
+    "channels": [
+      64,
+      128,
+      320,
+      512
+    ],
+    "window_size": 4,
+    "heads": 4,
+    "ffn_ratio": 2,
+    "use_gaussian": true,
+    "gaussian_pairs": [
+      [
+        [
+          3,
+          0.6
+        ],
+        [
+          5,
+          1.0
+        ]
+      ],
+      [
+        [
+          5,
+          1.0
+        ],
+        [
+          7,
+          1.4
+        ]
+      ],
+      [
+        [
+          7,
+          1.4
+        ],
+        [
+          9,
+          2.0
+        ]
+      ]
+    ]
+  },
+  "total_params": 46977746,
+  "scales": [
+    {
+      "scale": 1,
+      "params": 119524,
+      "ct": [
+        16,
+        64,
+        128,
+        128
+      ],
+      "pet": [
+        16,
+        64,
+        128,
+        128
+      ],
+      "region_tokens": 1024
+    },
+    {
+      "scale": 2,
+      "params": 473864,
+      "ct": [
+        16,
+        128,
+        64,
+        64
+      ],
+      "pet": [
+        16,
+        128,
+        64,
+        64
+      ],
+      "region_tokens": 256
+    },
+    {
+      "scale": 3,
+      "params": 2945780,
+      "ct": [
+        16,
+        320,
+        32,
+        32
+      ],
+      "pet": [
+        16,
+        320,
+        32,
+        32
+      ],
+      "region_tokens": 64
+    },
+    {
+      "scale": 4,
+      "params": 7531040,
+      "ct": [
+        16,
+        512,
+        16,
+        16
+      ],
+      "pet": [
+        16,
+        512,
+        16,
+        16
+      ],
+      "region_tokens": 16
+    }
+  ],
+  "fp32_initial_max_error": 0.0,
+  "amp_initial_max_error": 0.0,
+  "inference_fp32": {
+    "seconds": 0.24280073307454586,
+    "peak_allocated_gib": 1.4509544372558594,
+    "peak_reserved_gib": 1.609375
+  },
+  "inference_amp": {
+    "seconds": 0.20553194731473923,
+    "peak_allocated_gib": 1.2948737144470215,
+    "peak_reserved_gib": 1.962890625
+  },
+  "training_amp": {
+    "successful_updates": 3,
+    "updates": [
+      {
+        "attempts": 2,
+        "skipped_updates": 1,
+        "amp_scale": 32768.0,
+        "grad_norm_before_clip": 11.541974067687988
+      },
+      {
+        "attempts": 1,
+        "skipped_updates": 0,
+        "amp_scale": 32768.0,
+        "grad_norm_before_clip": 4.863755226135254
+      },
+      {
+        "attempts": 2,
+        "skipped_updates": 1,
+        "amp_scale": 16384.0,
+        "grad_norm_before_clip": 8.077656745910645
+      }
+    ],
+    "seconds": 3.383076287806034,
+    "peak_allocated_gib": 15.235463619232178,
+    "peak_reserved_gib": 16.2578125,
+    "all_internal_branches_have_finite_nonzero_gradients_after_projection_update": true
+  },
+  "raw_strict_reconstruction": true,
+  "ema_strict_reconstruction": true
+}

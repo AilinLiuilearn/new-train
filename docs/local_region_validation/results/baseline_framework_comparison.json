@@ -1,0 +1,69 @@
+{
+  "GN": {
+    "epoch": 5,
+    "weights": "ema",
+    "full_dice": 0.7786667593364266,
+    "missing_dice": 0.7687558183192236,
+    "joint_dice": 0.773711288827825,
+    "full_hd95": 17.804063111401533,
+    "missing_hd95": 22.55460179123631,
+    "full_precision": 0.8048316014236702,
+    "missing_precision": 0.7970930647142546,
+    "full_sensitivity": 0.7541495752308659,
+    "missing_sensitivity": 0.7423642226289108,
+    "full_missed_positive_count": 59,
+    "missing_missed_positive_count": 67
+  },
+  "BN": {
+    "epoch": 7,
+    "weights": "ema",
+    "full_dice": 0.772001075623977,
+    "missing_dice": 0.761023332441936,
+    "joint_dice": 0.7665122040329565,
+    "full_hd95": 18.599667391459842,
+    "missing_hd95": 22.52676608797895,
+    "full_precision": 0.8061198891491284,
+    "missing_precision": 0.7899035254794708,
+    "full_sensitivity": 0.740653125741881,
+    "missing_sensitivity": 0.7341804675315309,
+    "full_missed_positive_count": 71,
+    "missing_missed_positive_count": 31
+  },
+  "completed_epochs": {
+    "GN": 10,
+    "BN": 9
+  },
+  "BN_minus_GN": {
+    "full_dice": -0.006665683712449577,
+    "missing_dice": -0.007732485877287587,
+    "joint_dice": -0.007199084794868527,
+    "full_hd95": 0.7956042800583099,
+    "missing_hd95": -0.027835703257359512,
+    "full_precision": 0.0012882877254581926,
+    "missing_precision": -0.007189539234783715,
+    "full_sensitivity": -0.013496449488984874,
+    "missing_sensitivity": -0.008183755097379897,
+    "full_missed_positive_count": 12,
+    "missing_missed_positive_count": -36
+  },
+  "selected_decoder_norm": "GN",
+  "rule": "Higher selected-checkpoint Joint; exact tie retains GN. Same-epoch Full/Missing per run.",
+  "BN_run_status": "user_stopped_before_early_stopping",
+  "BN_final_test_executed": false,
+  "decision_scope": "Operational choice from a single-seed pilot point estimate, not proof of statistical superiority.",
+  "tradeoffs": [
+    "full_precision"
+  ],
+  "observed_policy": {
+    "GN_saved_patience": 10,
+    "BN_saved_patience": 5,
+    "future_patience": 5
+  },
+  "limits": [
+    "Same development data; val=test.txt reused. No independent final test.",
+    "Two configurations are not a multi-seed uncertainty analysis.",
+    "GN reference was paused; observed completed budget is reported without pretending identical histories.",
+    "User-stopped BN results do not establish convergence or an exhausted patience window.",
+    "Precision and sensitivity are reported alongside empty-prediction positive-slice counts; not 3D lesion detection."
+  ]
+}

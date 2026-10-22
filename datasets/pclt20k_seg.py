@@ -58,13 +58,36 @@ class PCLT20KSegDataset(Dataset):
     """
 
     def __init__(self, records, image_size=512, train=False, random_state=2023,
-                 aug_mode='cipa', norm_mode='imagenet', ct_only=False):
+                 aug_mode='cipa', norm_mode='imagenet', ct_only=False,
+                 crop_guidance='none', guided_crop_prob=.5, guidance_cache=None,
+                 guidance_region_sampling='uniform',copy_paste='none',copy_paste_prob=.3,paste_bank=None):
         self.records = records
         self.image_size = image_size
         self.train = train
         self.aug_mode = aug_mode
         self.norm_mode = norm_mode
         self.ct_only = bool(ct_only)
+        self.crop_guidance = crop_guidance
+        self.guided_crop_prob = guided_crop_prob
+        self.guidance_cache = guidance_cache
+        self.guidance_region_sampling = guidance_region_sampling
+        self.copy_paste=copy_paste;self.copy_paste_prob=copy_paste_prob;self.paste_bank=paste_bank
+        if copy_paste not in ('none','random','hard','dual_state') or not 0<=copy_paste_prob<=1:
+            raise ValueError('Invalid Copy-Paste configuration')
+        if copy_paste!='none' and (not train or ct_only or aug_mode!='cipa' or crop_guidance!='none' or paste_bank is None):
+            raise ValueError('Copy-Paste requires paired cipa train, a bank and ordinary baseline crops')
+        if guidance_region_sampling not in ('uniform', 'sqrt_area'):
+            raise ValueError('Invalid guidance_region_sampling')
+        if guidance_region_sampling != 'uniform' and crop_guidance not in ('hard', 'dual_state'):
+            raise ValueError('sqrt_area requires hard/dual_state guidance')
+        if crop_guidance not in ('none', 'foreground', 'hard', 'dual_state'):
+            raise ValueError('Invalid crop_guidance')
+        if not 0 <= guided_crop_prob <= 1:
+            raise ValueError('guided_crop_prob must be in [0,1]')
+        if crop_guidance != 'none' and (not train or ct_only or aug_mode != 'cipa'):
+            raise ValueError('Guidance requires paired cipa training')
+        if crop_guidance in ('hard', 'dual_state') and guidance_cache is None:
+            raise ValueError('Guidance cache is required')
 
     def __len__(self):
         return len(self.records)
@@ -95,6 +118,11 @@ class PCLT20KSegDataset(Dataset):
             mask = _resize_gray(mask, self.image_size, nearest=True)
             if pet is not None:
                 pet = _resize_gray(pet, self.image_size)
+        augmentation_stats = None
+        paste_stats=None
+        if self.copy_paste!='none':
+            if not load_pet:raise ValueError('Copy-Paste requires paired PET')
+            ct,pet,mask,paste_stats,_=self.paste_bank.paste(ct,pet,mask,idx,self.copy_paste,self.copy_paste_prob)
         if self.train and self.aug_mode == 'cipa':
             if pet is None:
                 # Augmentation helpers assume a 3D (H,W,C) image and cv2 drops
@@ -114,9 +142,18 @@ class PCLT20KSegDataset(Dataset):
                 mask = np.ascontiguousarray(mask_3d)[:, :, 0]
             else:
                 image = np.stack([ct, pet], axis=-1)
-                image, mask = randomShiftScaleRotate(image, mask)
-                image, mask = randomHorizontalFlip(image, mask)
-                image, mask = randomcrop(image, mask)
+                if self.crop_guidance == 'none':
+                    image, mask = randomShiftScaleRotate(image, mask)
+                    image, mask = randomHorizontalFlip(image, mask)
+                    image, mask = randomcrop(image, mask)
+                else:
+                    from utils.dual_state_augmentation import augment
+                    difference = (self.guidance_cache.read(record['image_id'])
+                                  if self.crop_guidance in ('hard', 'dual_state')
+                                  else np.zeros_like(mask))
+                    image, mask, augmentation_stats = augment(image, mask, difference,
+                        self.crop_guidance, self.guided_crop_prob,
+                        region_sampling=self.guidance_region_sampling)
                 ct, pet = image[..., 0], image[..., 1]
         ct_t = torch.tensor(_normalize_ch(ct, self.norm_mode), dtype=torch.float32)
         mask = (mask.astype(np.float32) / 255.0)
@@ -129,6 +166,10 @@ class PCLT20KSegDataset(Dataset):
             'slice_id': record.get('slice_id', record.get('image_id', str(idx))),
             'idx': idx,
         }
+        if augmentation_stats is not None:
+            out['augmentation_stats'] = augmentation_stats
+        if paste_stats is not None:
+            out['paste_stats']=paste_stats
         if not self.ct_only:
             # Missing rows are placeholders only; no PET file read, normalization or encoding.
             out['pet'] = (torch.tensor(_normalize_ch(pet, self.norm_mode), dtype=torch.float32)
@@ -194,7 +235,9 @@ def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_wor
                                      norm_mode='cipa', train_split_file='train.txt',
                                      val_split_file='val.txt', test_split_file='test.txt',
                                      checkpoint_dir=None, ct_only=False,
-                                     allow_val_equals_test=False):
+                                     allow_val_equals_test=False, crop_guidance='none',
+                                     guided_crop_prob=.5, guidance_cache=None,
+                                     guidance_region_sampling='uniform',copy_paste='none',copy_paste_prob=.3,paste_bank=None):
     train_ids = _read_list(os.path.join(root, train_split_file))
     val_ids = _read_list(os.path.join(root, val_split_file))
     test_ids = _read_list(os.path.join(root, test_split_file))
@@ -238,7 +281,11 @@ def get_pclt20k_loaders_cipa_aligned(root, image_size=512, batch_size=8, num_wor
         json.dump(split_summary, f, indent=2)
     train_ds = PCLT20KSegDataset(train_records, image_size=image_size, train=True,
                                  random_state=random_state, aug_mode=aug_mode,
-                                 norm_mode=norm_mode, ct_only=ct_only)
+                                 norm_mode=norm_mode, ct_only=ct_only,
+                                 crop_guidance=crop_guidance, guided_crop_prob=guided_crop_prob,
+                                 guidance_cache=guidance_cache,
+                                 guidance_region_sampling=guidance_region_sampling,
+                                 copy_paste=copy_paste,copy_paste_prob=copy_paste_prob,paste_bank=paste_bank)
     val_ds = PCLT20KSegDataset(val_records, image_size=image_size, train=False,
                                random_state=random_state, aug_mode='none',
                                norm_mode=norm_mode, ct_only=ct_only)

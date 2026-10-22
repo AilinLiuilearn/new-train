@@ -1,0 +1,53 @@
+[CHECK] building real ConvNeXtV2-Nano / MiT-B1 + GN decoders
+[+] CT_Encoder: loading local weights from /root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano/pytorch_model.bin
+[PRETRAIN] CT_Encoder: weight_file=/root/autodl-tmp/mkd-main/new-train/pretrained/convnextv2_nano/pytorch_model.bin
+[PRETRAIN] CT_Encoder: checkpoint_tensors=156 model_tensors=156
+[PRETRAIN] CT_Encoder: loaded_tensors=156 loaded_elements=14981520/14981520 (100.0% of model)
+[PRETRAIN] CT_Encoder: skipped_tensors=0 skipped_elements=0
+[PRETRAIN] CT_Encoder: missing_after_load=0 unexpected_after_load=0
+[+] PET_Encoder: loading local weights from /root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1/pytorch_model.bin
+[PRETRAIN] PET_Encoder: weight_file=/root/autodl-tmp/mkd-main/new-train/pretrained/mit-b1/pytorch_model.bin
+[PRETRAIN] PET_Encoder: checkpoint_tensors=194 model_tensors=192
+[PRETRAIN] PET_Encoder: loaded_tensors=192 loaded_elements=13151424/13151424 (100.0% of model)
+[PRETRAIN] PET_Encoder: skipped_tensors=2 skipped_elements=513000
+[PRETRAIN] PET_Encoder: missing_after_load=0 unexpected_after_load=0
+[PRETRAIN] PET_Encoder: skipped_examples=['classifier.weight', 'classifier.bias']
+[CHECK INIT] direct joint training; no CT-only task checkpoint; generic_pretrained=True
+[CHECK STEP 1/8] loss=1.541198 ct=1.540512 full=1.541883 scale=65536
+{
+  "stage": 2,
+  "batch": 16,
+  "size": 512,
+  "params": 46977746,
+  "loss": 1.541197657585144,
+  "ct_loss": 1.5405120849609375,
+  "full_loss": 1.5418832302093506,
+  "ct_samples": 16,
+  "full_samples": 16,
+  "missing_samples": 16,
+  "attempts": 1,
+  "skipped_updates": 0,
+  "amp_scale": 65536.0,
+  "grad_norm_before_clip": 6.295024871826172,
+  "gradients": {
+    "enc_ct": 1.6503915786743164,
+    "ct_align": 0.35266783833503723,
+    "decoder_ct": 2.958796739578247,
+    "decoder_full": 3.649749755859375,
+    "enc_pet": 0.22578877210617065,
+    "pet_align": 0.07185476273298264,
+    "fusion": 0.14328277111053467
+  },
+  "seconds": 2.3290011882781982,
+  "encoder_calls": {
+    "ct": [
+      16
+    ],
+    "pet": [
+      16
+    ]
+  },
+  "peak_allocated_gib": 14.8613600730896,
+  "peak_reserved_gib": 16.2265625,
+  "missing_isolated": true
+}

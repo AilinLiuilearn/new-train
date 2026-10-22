@@ -1,5 +1,21 @@
 # 全样本 Full/Missing 双路径干净基线
 
+新增独立的配对Copy-Paste候选与匹配对照，包含训练集供体索引、样例审查和有界条件迭代，
+详见 [Copy-Paste设计及实测记录](docs/paired_copy_paste.md)。默认关闭，不与引导裁剪叠加。
+
+权重保存现默认只更新 `best.pt`，不写 `last.pt`，详见
+[保存策略及历史断点兼容](docs/checkpoint_policy.md)。下文旧实验中的last.pt命令仅适用于已有断点，
+需要额外保留恢复断点时才显式使用 `--save_last_checkpoint`。
+
+新增可选的离线双状态引导裁剪 v1（模型结构/损失不变），建图、审查、测试、
+配置安全提取、对照训练及早停说明见 [方法与运行记录](docs/dual_state_augmentation_v1.md)。
+关闭 `--crop_guidance`（默认 `none`）保持原增强数值和 RNG；按用户最新要求，
+后续新实验所有入口默认早停 patience=5（连续5轮Joint无严格提升），总轮数上限及调度不变。
+历史实验记录中的patience=10是当时配置，已有checkpoint恢复仍使用其保存的配置。
+
+v1结果已分析，新增可选的类内平方根面积采样 v2，见
+[结果、单变量假设和执行状态](docs/dual_state_augmentation_v2.md)。默认仍为v1均匀区域采样。
+
 分支：`exp/ct-pretrain-dual-decoder-add-lr8e5`。
 当前实验直接联合训练：**不加载CT-only任务权重**，CT/PET各自加载本地通用预训练；每个样本同时接受Full和CT-only监督。保留旧CT预训练迁移入口用于对照。不含nnU-Net专家、蒸馏、原型库、检索、排序、补偿、复杂融合或深度监督。
 
