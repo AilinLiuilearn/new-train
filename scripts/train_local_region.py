@@ -7,10 +7,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import run_staged
 
 
-def training_argv(output, fusion_type='local_region_residual', use_gaussian=True):
+def training_argv(output, fusion_type='local_region_residual', use_gaussian=True,
+                  root=None, ct_pretrained_path=None, pet_pretrained_path=None, random_state=None):
     frozen = json.loads((Path(__file__).resolve().parents[1]/'configs/frozen_gn_training.json').read_text())
     frozen.pop('training_protocol')  # Derived/checked by run_staged, not a CLI setting.
     frozen.update(output=str(Path(output).resolve()), fusion_type=fusion_type, fusion_gaussian=use_gaussian)
+    for name, value in dict(root=root, ct_pretrained_path=ct_pretrained_path,
+                            pet_pretrained_path=pet_pretrained_path, random_state=random_state).items():
+        if value is not None:
+            frozen[name] = value
     actions = {a.dest: a for a in run_staged.parser()._actions}
     argv = []
     for name, value in frozen.items():
@@ -31,9 +36,15 @@ def main():
     p.add_argument('output')
     p.add_argument('--fusion_type', choices=['add','local_region_residual'], default='local_region_residual')
     p.add_argument('--fusion_gaussian', action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument('--root', help='Dataset path on this instance')
+    p.add_argument('--ct_pretrained_path')
+    p.add_argument('--pet_pretrained_path')
+    p.add_argument('--random_state', type=int, help='Paired comparison seed')
     p.add_argument('--print_command', action='store_true')
     a=p.parse_args()
-    argv=training_argv(a.output,a.fusion_type,a.fusion_gaussian)
+    argv=training_argv(a.output,a.fusion_type,a.fusion_gaussian,
+        root=a.root, ct_pretrained_path=a.ct_pretrained_path,
+        pet_pretrained_path=a.pet_pretrained_path, random_state=a.random_state)
     if a.print_command:
         import shlex
         print(shlex.join([sys.executable,'-u','run_staged.py',*argv]))

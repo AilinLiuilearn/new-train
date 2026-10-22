@@ -10,25 +10,6 @@ def split_signature(cfg):
 
 
 def loaders(cfg, output):
-    guidance = getattr(cfg, 'crop_guidance', 'none')
-    paste_mode=getattr(cfg,'copy_paste','none')
-    paste_bank=None
-    if not getattr(cfg,'_evaluation_only',False) and paste_mode!='none':
-        from utils.paired_copy_paste import PasteBank
-        paste_bank=PasteBank(cfg.paste_index,cfg.guidance_map_dir,vars(cfg),
-                             expected_identity=getattr(cfg,'copy_paste_identity',None),
-                             selection=getattr(cfg,'paste_selection','overlap'))
-        cfg.copy_paste_identity=paste_bank.identity
-    cache = None
-    if not getattr(cfg, '_evaluation_only', False) and guidance != 'none':
-        from utils.dual_state_maps import MapCache
-        if guidance in ('hard', 'dual_state') or getattr(cfg, 'guidance_map_dir', None):
-            cache = MapCache(cfg.guidance_map_dir, vars(cfg),
-                             expected_identity=getattr(cfg, 'guidance_identity', None))
-            cfg.guidance_identity = cache.identity
-    if getattr(cfg, '_evaluation_only', False):
-        guidance = 'none'
-        paste_mode='none'
     return get_pclt20k_loaders_cipa_aligned(
         root=cfg.root, image_size=cfg.image_size_2d, batch_size=cfg.batch_size,
         num_workers=cfg.num_workers, random_state=cfg.random_state,
@@ -36,9 +17,4 @@ def loaders(cfg, output):
         train_split_file=cfg.train_split_file, val_split_file=cfg.val_split_file,
         test_split_file=cfg.test_split_file, checkpoint_dir=str(output),
         ct_only=cfg.stage == 1 or getattr(cfg, 'eval_mode', 'both') == 'missing',
-        allow_val_equals_test=cfg.allow_val_equals_test,
-        crop_guidance=guidance, guided_crop_prob=getattr(cfg, 'guided_crop_prob', .5),
-        guidance_cache=cache,
-        guidance_region_sampling=(getattr(cfg, 'guidance_region_sampling', 'uniform')
-                                  if guidance != 'none' else 'uniform'),
-        copy_paste=paste_mode,copy_paste_prob=getattr(cfg,'copy_paste_prob',.3),paste_bank=paste_bank)
+        allow_val_equals_test=cfg.allow_val_equals_test)

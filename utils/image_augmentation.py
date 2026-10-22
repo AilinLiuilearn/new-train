@@ -8,7 +8,7 @@ def randomShiftScaleRotate(image, mask,
                            scale_limit=(-0.12, 0.12),
                            aspect_limit=(-0.1, 0.1),
                            rotate_limit=(-45, 45),
-                           borderMode=cv2.BORDER_CONSTANT, u=0.7, auxiliary=None):
+                           borderMode=cv2.BORDER_CONSTANT, u=0.7):
     if np.random.random() < u:
         height, width, channel = image.shape
         angle = np.random.uniform(rotate_limit[0], rotate_limit[1])
@@ -30,23 +30,13 @@ def randomShiftScaleRotate(image, mask,
                                     borderMode=borderMode, borderValue=(0, 0, 0))
         mask = cv2.warpPerspective(mask, mat, (width, height), flags=cv2.INTER_LINEAR,
                                    borderMode=borderMode, borderValue=(0, 0, 0))
-        if auxiliary is not None:
-            auxiliary = cv2.warpPerspective(auxiliary, mat, (width, height),
-                                            flags=cv2.INTER_NEAREST,
-                                            borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    if auxiliary is not None:
-        return image, mask, auxiliary
     return image, mask
 
 
-def randomHorizontalFlip(image, mask, u=0.5, auxiliary=None):
+def randomHorizontalFlip(image, mask, u=0.5):
     if np.random.random() < u:
         image = cv2.flip(image, 1)
         mask = cv2.flip(mask, 1)
-        if auxiliary is not None:
-            auxiliary = cv2.flip(auxiliary, 1)
-    if auxiliary is not None:
-        return image, mask, auxiliary
     return image, mask
 
 

@@ -178,5 +178,5 @@ def test_frozen_launcher_preserves_protocol():
     assert cfg.batch_size==16 and cfg.image_size_2d==512 and cfg.learning_rate==8e-5
     assert cfg.decoder_norm=='GN' and cfg.epochs==60 and cfg.early_stopping_patience==5
     assert cfg.joint_from_pretrained and not cfg.save_last_checkpoint
-    assert cfg.copy_paste=='none' and cfg.crop_guidance=='none'
+    assert not hasattr(cfg, 'copy_paste') and not hasattr(cfg, 'crop_guidance')
     assert not cfg.fusion_config['use_gaussian']

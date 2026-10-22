@@ -32,13 +32,8 @@
   "log_interval": 50,
   "hd95_mode": "cipa_official",
   "device": "cuda",
-  "crop_guidance": "none",
-  "guidance_map_dir": null,
-  "guided_crop_prob": 0.5,
   "early_stopping_patience": 5,
   "training_protocol": "paired_full_missing",
   "decoder_norm": "GN",
-  "save_last_checkpoint": false,
-  "copy_paste": "none",
-  "paste_index": null
+  "save_last_checkpoint": false
 }

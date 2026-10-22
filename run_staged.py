@@ -283,17 +283,21 @@ def parser():
     p.add_argument('--log_interval', type=int, default=50)
     p.add_argument('--hd95_mode', choices=['cipa_official', 'surface', 'legacy'], default='cipa_official')
     p.add_argument('--device', choices=['auto', 'cuda', 'cpu'], default='auto')
-    p.add_argument('--crop_guidance', choices=['none', 'foreground', 'hard', 'dual_state'], default='none')
-    p.add_argument('--guidance_map_dir')
-    p.add_argument('--guidance_region_sampling', choices=['uniform', 'sqrt_area'], default='uniform')
-    p.add_argument('--guided_crop_prob', type=float, default=.5)
-    p.add_argument('--copy_paste',choices=['none','random','hard','dual_state'],default='none')
-    p.add_argument('--copy_paste_prob',type=float,default=.3)
-    p.add_argument('--paste_index')
-    p.add_argument('--paste_selection',choices=['overlap','dominance'],default='overlap')
     p.add_argument('--early_stopping_patience', type=int, default=5,
                    help='Stop after 5 unimproved selection epochs by default; 0 disables early stopping')
     return p
+
+
+def clean_legacy_augmentation_config(cfg):
+    """Keep saved baseline/module checkpoints compatible without old experiments."""
+    for name in ('crop_guidance', 'copy_paste'):
+        if getattr(cfg, name, 'none') != 'none':
+            raise ValueError('Removed augmentation experiment; use the archived branch for '+name)
+    for name in ('crop_guidance', 'guidance_map_dir', 'guided_crop_prob',
+                 'guidance_region_sampling', 'guidance_identity', 'copy_paste',
+                 'copy_paste_prob', 'paste_index', 'paste_selection', 'copy_paste_identity'):
+        if hasattr(cfg, name):
+            delattr(cfg, name)
 
 
 def validate(cfg, evaluating=False):
@@ -301,26 +305,8 @@ def validate(cfg, evaluating=False):
         raise ValueError('residual fusion requires stage=2, image_size >=256 and divisible by128 (reflect kernels and 4x4 windows)')
     if getattr(cfg, 'decoder_norm', 'GN') not in ('GN', 'BN'):
         raise ValueError('Invalid decoder_norm')
-    paste_mode=getattr(cfg,'copy_paste','none')
-    if not 0<=getattr(cfg,'copy_paste_prob',.3)<=1:raise ValueError('Invalid copy_paste_prob')
-    if not evaluating and paste_mode!='none':
-        if cfg.stage!=2 or not cfg.joint_from_pretrained or cfg.stage1_checkpoint or cfg.aug_mode!='cipa' or cfg.crop_guidance!='none':
-            raise ValueError('Copy-Paste requires fresh paired cipa training without guided cropping')
-        if not cfg.paste_index or not cfg.guidance_map_dir:raise ValueError('Copy-Paste index/map directory required')
-    sampling = getattr(cfg, 'guidance_region_sampling', 'uniform')
-    if sampling not in ('uniform', 'sqrt_area'):
-        raise ValueError('Invalid guidance_region_sampling')
-    if not evaluating and sampling != 'uniform' and cfg.crop_guidance not in ('hard', 'dual_state'):
-        raise ValueError('sqrt_area requires hard/dual_state guidance')
-    if not 0 <= cfg.guided_crop_prob <= 1 or cfg.early_stopping_patience < 0:
-        raise ValueError('Invalid guided_crop_prob/early_stopping_patience')
-    if not evaluating and cfg.crop_guidance != 'none':
-        if cfg.stage != 2 or cfg.aug_mode != 'cipa':
-            raise ValueError('crop_guidance requires stage=2 and aug_mode=cipa')
-        if not cfg.joint_from_pretrained or cfg.stage1_checkpoint:
-            raise ValueError('Augmented runs must start from generic pretraining, never CT task weights')
-        if cfg.crop_guidance in ('hard', 'dual_state') and not cfg.guidance_map_dir:
-            raise ValueError('This crop_guidance requires --guidance_map_dir')
+    if cfg.early_stopping_patience < 0:
+        raise ValueError('Invalid early_stopping_patience')
     if cfg.stage not in (1, 2) or not cfg.output:
         raise ValueError('--stage and --output are required for new runs')
     if getattr(cfg, 'joint_from_pretrained', False) and cfg.stage != 2:
@@ -379,12 +365,8 @@ def main(argv=None):
     cfg.joint_from_pretrained = getattr(cfg, 'joint_from_pretrained', False)
     cfg.decoder_norm = getattr(cfg, 'decoder_norm', 'GN')
     normalize_fusion_config(cfg)
-    for name, default in [('crop_guidance', 'none'), ('guidance_map_dir', None),
-                          ('guided_crop_prob', .5), ('early_stopping_patience', 0),
-                          ('guidance_region_sampling', 'uniform')]:
-        setattr(cfg, name, getattr(cfg, name, default))
-    for name,default in [('copy_paste','none'),('copy_paste_prob',.3),('paste_index',None),('paste_selection','overlap')]:
-        setattr(cfg,name,getattr(cfg,name,default))
+    clean_legacy_augmentation_config(cfg)
+    cfg.early_stopping_patience = getattr(cfg, 'early_stopping_patience', 0)
     cfg.save_last_checkpoint = getattr(cfg, 'save_last_checkpoint', False)
     cfg._evaluation_only = bool(args.evaluate)
     cfg.training_protocol = ('ct_only' if cfg.stage == 1 else
@@ -430,11 +412,6 @@ def main(argv=None):
               'one shared CT encode; loss=0.5*CT_loss+0.5*Full_loss; no ranking/compensation', flush=True)
     print('[DATA] checking split membership and PNG paths', flush=True)
     train, val, test = loaders(cfg, output)
-    if cfg.crop_guidance != 'none' and not args.evaluate:
-        print('[AUGMENTATION] '+json.dumps({'strategy': cfg.crop_guidance,
-            'region_sampling': cfg.guidance_region_sampling,
-            'probability_conditional_on_crop': cfg.guided_crop_prob,
-            'identity': getattr(cfg, 'guidance_identity', None)}), flush=True)
     if not len(train): raise ValueError('No complete train batch; reduce batch_size')
     print(f'[DATA] train={len(train.dataset)} val={len(val.dataset)} test={len(test.dataset)} '
           f'train_batches={len(train)} dropped_per_epoch={len(train.dataset)%cfg.batch_size}', flush=True)
@@ -479,23 +456,6 @@ def main(argv=None):
             ema.model.load_state_dict(checkpoint['model_ema'], strict=True)
             ema.updates = checkpoint['ema_updates']
         restore_rng(checkpoint['rng'], train)
-        paste_log=output/'copy_paste.jsonl'
-        if paste_log.exists():
-            paste_rows=[json.loads(line) for line in paste_log.read_text().splitlines() if line.strip()]
-            paste_rows=[r for r in paste_rows if r['epoch']<checkpoint['epoch']]
-            if checkpoint.get('paste_row'):paste_rows.append(checkpoint['paste_row'])
-            paste_log.write_text(''.join(json.dumps(r)+'\n' for r in paste_rows))
-        elif checkpoint.get('paste_row'):
-            paste_log.write_text(json.dumps(checkpoint['paste_row'])+'\n')
-        augmentation_log = output/'augmentation.jsonl'
-        if augmentation_log.exists():
-            augmentation_rows = [json.loads(line) for line in augmentation_log.read_text().splitlines() if line.strip()]
-            augmentation_rows = [r for r in augmentation_rows if r['epoch'] < checkpoint['epoch']]
-            if checkpoint.get('augmentation_row'):
-                augmentation_rows.append(checkpoint['augmentation_row'])
-            augmentation_log.write_text(''.join(json.dumps(r)+'\n' for r in augmentation_rows))
-        elif checkpoint.get('augmentation_row'):
-            augmentation_log.write_text(json.dumps(checkpoint['augmentation_row'])+'\n')
         # A crash after last.pt but before log append can omit a row; never duplicate newer rows.
         log = output/'train.jsonl'
         if log.exists():
@@ -530,14 +490,8 @@ def main(argv=None):
         skipped = 0
         begin = time.time()
         grads = {}
-        augmentation_counts = {}
-        paste_counts={}
         print(f'[TRAIN {epoch}/{cfg.epochs}] start batches={len(train)}', flush=True)
         for step, batch in enumerate(train, 1):
-            for key,value in batch.get('paste_stats',{}).items():
-                paste_counts[key]=paste_counts.get(key,0.)+float(value.sum())
-            for key, value in batch.get('augmentation_stats', {}).items():
-                augmentation_counts[key] = augmentation_counts.get(key, 0.)+float(value.sum())
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, enabled=scaler.is_enabled()):
                 loss, stats = forward_loss(model, batch, cfg.stage, device, criterion)
@@ -580,35 +534,17 @@ def main(argv=None):
         for key, value in result.items():
             if isinstance(value, dict): row.update({key+'_'+k: v for k, v in value.items()})
             else: row[key] = value
-        augmentation_row = None
-        paste_row=None
-        if paste_counts:
-            from utils.paired_copy_paste import summarize as paste_summary
-            paste_row={'epoch':epoch,'mode':cfg.copy_paste,**paste_summary(paste_counts)}
-            print('[COPY-PASTE] '+json.dumps(paste_row),flush=True)
-        if augmentation_counts:
-            from utils.dual_state_augmentation import summarize
-            augmentation_row = {'epoch': epoch, 'strategy': cfg.crop_guidance,
-                                'region_sampling': cfg.guidance_region_sampling,
-                                **summarize(augmentation_counts)}
-            print('[AUGMENTATION] '+json.dumps(augmentation_row), flush=True)
         payload = {'format': FORMAT, 'config': vars(cfg), 'splits': signature, 'source': source,
             'epoch': epoch, 'global_step': global_step, 'model': model.state_dict(),
             'model_ema': ema.state_dict() if ema else None, 'ema_active': active,
             'ema_updates': ema.updates if ema else 0, 'eval_weights': weights,
             'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
             'scaler': scaler.state_dict(), 'best': best, 'best_epoch': best_epoch,
-            'val': result, 'rng': rng_state(train), 'log_row': row,
-            'augmentation_row': augmentation_row,'paste_row':paste_row}
+            'val': result, 'rng': rng_state(train), 'log_row': row}
         if improved: atomic_save(payload, output/'best.pt')
         if cfg.save_last_checkpoint:
             atomic_save(payload, output/'last.pt')
         append_log(output, row)
-        if paste_row is not None:
-            with (output/'copy_paste.jsonl').open('a') as stream:stream.write(json.dumps(paste_row)+'\n')
-        if augmentation_row is not None:
-            with (output/'augmentation.jsonl').open('a') as stream:
-                stream.write(json.dumps(augmentation_row)+'\n')
         print(f'[EPOCH {epoch}] score={score:.4f} best={best:.4f}@{best_epoch} {result}', flush=True)
         if patience_exhausted(epoch, best_epoch, cfg.early_stopping_patience):
             print(f'[EARLY STOP] {cfg.early_stopping_patience} epochs without strict selection improvement; '
