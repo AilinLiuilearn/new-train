@@ -67,7 +67,7 @@ size, and training budget.
 | Run | tacs_channel_ratio | Text | Purpose |
 |---|---:|---|---|
 | Add baseline | — | off | Existing reference |
-| Spatial-only TACS | 1.0 | off | Remove Top-K channel selection |
+| Spatial-only TACS | 1.0 | off | Disable channel routing/attention; retain sparse spatial interaction |
 | Channel + spatial TACS | 0.25 | off | Main module |
 | Channel + spatial + text | 0.25 | on | Measure text-prior contribution |
 
