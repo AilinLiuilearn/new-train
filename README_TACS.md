@@ -17,10 +17,15 @@ For each of the four aligned feature scales (channels 64/128/320/512):
    predict bounded 2-D offsets from an 8x8 reference grid (or the largest grid
    supported by a small smoke-test feature map). The union of both deformed
    point sets is used to sample both modalities.
-3. **Bidirectional sparse interaction.** CT reference queries retrieve PET
-   features sampled at the union positions; PET reference queries retrieve CT
-   features. Both directions operate only in the selected channel subspace.
-4. **Residual reinsertion.** The sparse correction is projected to K channels,
+3. **Bidirectional channel interaction (BCSI-inspired).** Each selected
+   channel is represented by its response profile over the sparse union of
+   spatial points. CT channel tokens retrieve PET channel context and PET
+   channel tokens retrieve CT channel context.
+4. **Bidirectional spatial interaction (DSCF-inspired).** CT reference queries
+   retrieve channel-refined PET features sampled at the union positions; PET
+   reference queries retrieve channel-refined CT features. Both directions
+   operate only in the selected channel subspace.
+5. **Residual reinsertion.** The sparse correction is projected to K channels,
    upsampled to the feature resolution, and scattered back only into the
    selected channel indices:
 
