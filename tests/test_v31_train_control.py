@@ -13,20 +13,21 @@ from variants.v31.losses import collate
 from utils.ema import ModelEMA
 
 
-@pytest.mark.parametrize('phase',['joint','correction'])
-def test_complete_stage_control_path(phase,tmp_path,monkeypatch):
+@pytest.mark.parametrize('phase,generic',[('joint',False),('joint',True),('correction',False)])
+def test_complete_stage_control_path(phase,generic,tmp_path,monkeypatch):
     torch.set_num_threads(2)
     class TinyJoint(torch.nn.Module):
         def __init__(self,*a,**kw):
             super().__init__();self.base=torch.nn.Conv2d(3,1,1)
             self.ct_expert=torch.nn.Conv2d(3,1,1);self.pet_expert=torch.nn.Conv2d(3,1,1)
+            self.base.enc_ct=torch.nn.Identity();self.base.enc_pet=torch.nn.Identity()
         def import_m1(self,ck):pass
         def forward(self,ct,pet,with_feature=False,capture=False):
             return {'logits':self.base(ct+pet),'ct_distance':self.ct_expert(ct).tanh(),
                     'pet_logits':self.pet_expert(pet),'feature':ct.mean(1,keepdim=True).expand(-1,64,-1,-1),'scales':{}}
     init=tmp_path/'input.pt';torch.save({'fixture':True},init)
     out=tmp_path/'run';out.mkdir()
-    cfg=json.loads((REPO/'configs/v31.json').read_text());cfg.update(epochs=1,mixed_precision=False)
+    cfg=json.loads((REPO/'configs/v31.json').read_text());cfg.update(epochs=1,mixed_precision=False,ct_pretrained_path="fixture",pet_pretrained_path="fixture")
     monkeypatch.setattr(runner,'prepare_run',lambda *a:(out,argparse.Namespace(**cfg),{}))
     monkeypatch.setattr(runner,'JointModel',TinyJoint)
     monkeypatch.setattr(runner,'load_joint',lambda p:(TinyJoint(),{}))
@@ -43,7 +44,9 @@ def test_complete_stage_control_path(phase,tmp_path,monkeypatch):
         def __len__(self):return 1
         def __iter__(self):yield b
     monkeypatch.setattr(runner,'loaders',lambda *a:(Loader(),Loader(),Loader()))
-    args=argparse.Namespace(init=str(init),phase=phase)
+    import models.components.backbones as backbones
+    monkeypatch.setattr(backbones,'load_local_weights_safe',lambda *a,**kw:None)
+    args=argparse.Namespace(init='generic' if generic else str(init),phase=phase)
     runner.main(args)
     assert json.loads((out/'status.json').read_text())['state']=='complete'
     assert json.loads((out/'RESULTS.json').read_text())['complete']

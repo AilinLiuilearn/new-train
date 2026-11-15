@@ -98,7 +98,8 @@ def main(args):
                 load_local_weights_safe(model.base.enc_pet,cfg.pet_pretrained_path,name='PET_Encoder')
             else:
                 bundle=torch.load(args.init,map_location='cpu',weights_only=False,mmap=True)
-                model.import_m1(bundle);del bundle;trainable=model
+                model.import_m1(bundle);del bundle
+            trainable=model
         else:
             base,_=load_joint(args.init);model=CorrectedModel(base);trainable=model.corrector
         model.cuda();frozen=fingerprint(model.base) if args.phase=='correction' else None
