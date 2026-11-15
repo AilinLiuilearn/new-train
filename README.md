@@ -22,6 +22,8 @@ paths.local.json      每台机器自己填写，不提交Git
 
 三组自然完成后的V3.1完整候选试跑见 [docs/V31_PILOT.md](docs/V31_PILOT.md)。按“专家联合训练→冻结基座纠错训练”执行，先自动做GPU预检；上游停止或失败则取消后续，不修改正在运行的三组代码。
 
+最新授权：V3.1已按用户要求停止。当前CC-SCMI完整模型先无文本、后固定文本两组，见 [docs/CCSCMI_IMPLEMENTATION.md](docs/CCSCMI_IMPLEMENTATION.md)。历史队列不会自动恢复。
+
 ## 首次准备
 
 ```bash

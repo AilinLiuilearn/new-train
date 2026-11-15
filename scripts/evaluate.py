@@ -10,7 +10,7 @@ from runtime import require_myenv, resolve_config, verify_resources, environment
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
-    p.add_argument('--variant', choices=['tsbci', 'a2', 'concat_single', 'v31'], required=True)
+    p.add_argument('--variant', choices=['tsbci', 'a2', 'concat_single', 'v31', 'ccscmi'], required=True)
     p.add_argument('--checkpoint', required=True)
     p.add_argument('--base-checkpoint',help='Relocated v31 joint best.pt; SHA must match correction checkpoint')
     p.add_argument('--paths', default='paths.local.json')
@@ -21,6 +21,7 @@ if __name__ == '__main__':
     import torch
     if not torch.cuda.is_available():raise RuntimeError('CUDA required')
     default_config='rerun_concat_single_p3.json' if args.variant=='concat_single' else args.variant+'.json'
+    if args.variant=='ccscmi':default_config='ccscmi_visual.json'
     args.config = args.config or str(Path(__file__).resolve().parents[1] / 'configs' / default_config)
     report_path = Path(args.output).resolve()
     if report_path.exists():raise FileExistsError(report_path)

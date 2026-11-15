@@ -1,0 +1,37 @@
+{
+  "visual": {
+    "passed": true,
+    "parameters": 44059697,
+    "shared_initialization_identical": true,
+    "loader_rng_identical": true,
+    "initial_output_exact": true,
+    "AMP_batch16_forward_backward_finite": true,
+    "AMP_attempts": 1,
+    "peak_allocated_GiB": 15.365726947784424,
+    "peak_reserved_GiB": 16.689453125
+  },
+  "text": {
+    "passed": true,
+    "parameters": 44341041,
+    "shared_initialization_identical": true,
+    "loader_rng_identical": true,
+    "initial_output_exact": true,
+    "AMP_batch16_forward_backward_finite": true,
+    "AMP_attempts": 1,
+    "peak_allocated_GiB": 15.374310970306396,
+    "peak_reserved_GiB": 16.705078125
+  },
+  "scope": "Temporary preflight, no experiment performance metrics or reusable trained weights",
+  "source_sha256": {
+    "variants/ccscmi/__init__.py": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+    "variants/ccscmi/front.py": "9f23a6e857a00e6c2f140c91cd7e1ff8576b6a4867d1f3b1474a7140ef3f9c9d",
+    "variants/ccscmi/model.py": "1ce469ded94ad08687c50719592e05c7220ede91369654d70cdf42efbc0b9633",
+    "variants/ccscmi/inference.py": "fe94c0ad5f0616c87a91db20437cd5e9d485ab49b992969ceb656c65ac8ba7cb",
+    "variants/ccscmi/train.py": "a50e26e97773a41e52c30b0f8745b0681bf66ab905d07e00f0ced7905a4f335f",
+    "third_party/__init__.py": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+    "third_party/ktb_sampling.py": "7f06a99496f07c128b36599cd254989970cc22d4c12dabd1401dbc23bde14ed6",
+    "variants/tsbci/train.py": "1d21fd71e2119305a516c46385c05c88513f9e5da3d93aca32bf71f03f292b5c",
+    "configs/ccscmi_visual.json": "fc1238f4fef00697b557c6d56ae46c1bf5ca52b787f45b697715eaec1dc9e732",
+    "configs/ccscmi_text.json": "15ddbbe1eb82c77ad2ccdde8881fec5a63927c1c4cbeab39435abe77bb8aa1e7"
+  }
+}

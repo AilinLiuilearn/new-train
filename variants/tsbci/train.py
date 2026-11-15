@@ -168,7 +168,8 @@ def main(args,variant='tsbci',model_factory=None,results_fn=None,diagnostics_fn=
             'groups':{n:sum(p.numel() for p in v.parameters()) for n,v in m.named_children()},
             'GN_decoder':sum(isinstance(v,torch.nn.GroupNorm) for v in m.decoder_full.modules()),
             'BN_decoder':sum(isinstance(v,torch.nn.modules.batchnorm._BatchNorm) for v in m.decoder_full.modules()),
-            'text':('frozen512D role buffers concatenated with visual32D descriptors; shared544->64->1 selector per scale' if hasattr(m,'shci') else 'none')})
+            'text':('frozen512D role buffers concatenated with visual32D descriptors; shared544->64->1 selector per scale' if hasattr(m,'shci') else
+                    'frozen BioMedCLIP role buffers condition sample-specific routing only' if getattr(getattr(m,'front',None),'text_enabled',False) else 'none')})
         snapshot_sources(OUT)
         opt=torch.optim.AdamW(m.parameters(),lr=cfg.learning_rate,weight_decay=cfg.weight_decay)
         sch=get_cosine_scheduler(opt,cfg.epochs,warmup_steps=cfg.cosine_warmup*len(train),min_lr=cfg.cosine_min_lr,
