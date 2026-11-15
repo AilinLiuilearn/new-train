@@ -173,16 +173,25 @@ class TACSStage(nn.Module):
         self.offset_ct = OffsetNet(selected_channels, stride)
         self.offset_pet = OffsetNet(selected_channels, stride)
 
-        # BCSI-inspired channel-wise interaction: each selected channel is
-        # represented by its profile over the 2N sampled spatial positions.
+        # BCSI-inspired channel-wise interaction is enabled only when
+        # Top-K channel sparsification is active. With ratio=1.0 this becomes
+        # the spatial-only ablation.
+        self.use_channel_interaction = self.selected_channels < self.channels
         union_points = 2 * self.grid_size * self.grid_size
-        self.ct_channel_profile = nn.Linear(union_points, embed_dim)
-        self.pet_channel_profile = nn.Linear(union_points, embed_dim)
-        self.channel_attention = nn.MultiheadAttention(
-            embed_dim, num_heads=num_heads, batch_first=True
-        )
-        self.ct_channel_restore = nn.Linear(embed_dim, union_points)
-        self.pet_channel_restore = nn.Linear(embed_dim, union_points)
+        if self.use_channel_interaction:
+            self.ct_channel_profile = nn.Linear(union_points, embed_dim)
+            self.pet_channel_profile = nn.Linear(union_points, embed_dim)
+            self.channel_attention = nn.MultiheadAttention(
+                embed_dim, num_heads=num_heads, batch_first=True
+            )
+            self.ct_channel_restore = nn.Linear(embed_dim, union_points)
+            self.pet_channel_restore = nn.Linear(embed_dim, union_points)
+        else:
+            self.ct_channel_profile = None
+            self.pet_channel_profile = None
+            self.channel_attention = None
+            self.ct_channel_restore = None
+            self.pet_channel_restore = None
 
         # DSCF-inspired spatial interaction over the selected spatial tokens.
         self.ct_query = nn.Linear(selected_channels, embed_dim)
@@ -268,20 +277,23 @@ class TACSStage(nn.Module):
             # First factor: channel-wise cross-modal interaction. A channel
             # token is the selected channel's response profile over the sparse
             # union of spatial points (length 2N).
-            ct_channel_tokens = self.ct_channel_profile(ct_key_features.transpose(1, 2))
-            pet_channel_tokens = self.pet_channel_profile(pet_key_features.transpose(1, 2))
-            channel_context_ct = self.channel_attention(
-                ct_channel_tokens, pet_channel_tokens, pet_channel_tokens, need_weights=False
-            )[0]
-            channel_context_pet = self.channel_attention(
-                pet_channel_tokens, ct_channel_tokens, ct_channel_tokens, need_weights=False
-            )[0]
-            ct_key_features = ct_key_features + self.ct_channel_restore(
-                channel_context_ct
-            ).transpose(1, 2)
-            pet_key_features = pet_key_features + self.pet_channel_restore(
-                channel_context_pet
-            ).transpose(1, 2)
+            if self.use_channel_interaction:
+                ct_channel_tokens = self.ct_channel_profile(ct_key_features.transpose(1, 2))
+                pet_channel_tokens = self.pet_channel_profile(pet_key_features.transpose(1, 2))
+                channel_context_ct = self.channel_attention(
+                    ct_channel_tokens, pet_channel_tokens, pet_channel_tokens,
+                    need_weights=False,
+                )[0]
+                channel_context_pet = self.channel_attention(
+                    pet_channel_tokens, ct_channel_tokens, ct_channel_tokens,
+                    need_weights=False,
+                )[0]
+                ct_key_features = ct_key_features + self.ct_channel_restore(
+                    channel_context_ct
+                ).transpose(1, 2)
+                pet_key_features = pet_key_features + self.pet_channel_restore(
+                    channel_context_pet
+                ).transpose(1, 2)
 
             # Second factor: spatial cross-modal interaction. CT reference
             # queries retrieve the channel-refined PET tokens; PET does the
