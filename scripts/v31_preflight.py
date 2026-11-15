@@ -24,7 +24,13 @@ if __name__=='__main__':
     with tempfile.TemporaryDirectory() as scratch:
         _,val,_=loaders(cfg,Path(scratch));b=collate([val.dataset[0]])
     b={k:v.cuda() for k,v in b.items() if torch.is_tensor(v)}
-    m=JointModel(vars(cfg));ck=torch.load(args.init,map_location='cpu',weights_only=False,mmap=True);m.import_m1(ck);del ck
+    m=JointModel(vars(cfg))
+    if args.init=='generic':
+        from models.components.backbones import load_local_weights_safe
+        load_local_weights_safe(m.base.enc_ct,cfg.ct_pretrained_path,name='CT_Encoder')
+        load_local_weights_safe(m.base.enc_pet,cfg.pet_pretrained_path,name='PET_Encoder')
+    else:
+        ck=torch.load(args.init,map_location='cpu',weights_only=False,mmap=True);m.import_m1(ck);del ck
     m.cuda().eval()
     with torch.no_grad():
         reference=m.base(b['ct'],b['pet'])['logits'];new=m(b['ct'],b['pet'])['logits']
@@ -45,9 +51,9 @@ if __name__=='__main__':
     assert all(torch.isfinite(p.grad).all() for p in corrected.corrector.parameters() if p.grad is not None)
     opt=torch.optim.AdamW(corrected.corrector.parameters(),lr=8e-5);opt.step()
     assert fingerprint(m)==before
-    report={'passed':True,'historical_M1_strict_EMA_import':True,'joint_fusion_initially_identical':True,
+    report={'passed':True,'historical_M1_strict_EMA_import':args.init!='generic','initialization':args.init,'joint_fusion_initially_identical':True,
             'independent_experts_receive_finite_gradients':True,'zero_corrector_exact_identity':True,
             'frozen_parameters_and_buffers_unchanged_after_update':True,'no_expert_gradient_in_correction':True,
-            'input_shape':list(b['ct'].shape),'init_sha256':sha(args.init),
+            'input_shape':list(b['ct'].shape),'init_sha256':('generic_encoders_only' if args.init=='generic' else sha(args.init)),
             'scope':'One actual validation sample for forward/backward only; not a performance evaluation'}
     Path(args.output).write_text(json.dumps(report,indent=2)+'\n');print(json.dumps(report,indent=2))

@@ -82,7 +82,7 @@ def evaluate(model,loader,cfg,phase,out,selected_corrector=None):
 
 def main(args):
     out,cfg,manifest=prepare_run(args,'v31_'+args.phase)
-    args.init=str(Path(args.init).resolve());base_sha=sha(args.init)
+    args.init='generic' if args.init=='generic' else str(Path(args.init).resolve());base_sha='generic_encoders_only' if args.init=='generic' else sha(args.init)
     dump(out/'status.json',{'state':'waiting_for_gpu','phase':args.phase})
     with open(gpu_lock_path(),'a') as lock:
         while True:
@@ -92,8 +92,13 @@ def main(args):
         seed_everything(cfg.random_state);torch.set_num_threads(4)
         if args.phase=='joint':
             model=JointModel(vars(cfg))
-            bundle=torch.load(args.init,map_location='cpu',weights_only=False,mmap=True)
-            model.import_m1(bundle);del bundle;trainable=model
+            if args.init=='generic':
+                from models.components.backbones import load_local_weights_safe
+                load_local_weights_safe(model.base.enc_ct,cfg.ct_pretrained_path,name='CT_Encoder')
+                load_local_weights_safe(model.base.enc_pet,cfg.pet_pretrained_path,name='PET_Encoder')
+            else:
+                bundle=torch.load(args.init,map_location='cpu',weights_only=False,mmap=True)
+                model.import_m1(bundle);del bundle;trainable=model
         else:
             base,_=load_joint(args.init);model=CorrectedModel(base);trainable=model.corrector
         model.cuda();frozen=fingerprint(model.base) if args.phase=='correction' else None

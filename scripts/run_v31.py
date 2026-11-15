@@ -61,12 +61,12 @@ def main(args):
             if (root/'STOP').exists():status('cancelled_by_request');return
             try:fcntl.flock(gpu,fcntl.LOCK_EX|fcntl.LOCK_NB);break
             except BlockingIOError:time.sleep(10)
-        cmd=[sys.executable,'-u','scripts/v31_preflight.py','--init',str(Path(args.init).resolve()),
+        cmd=[sys.executable,'-u','scripts/v31_preflight.py','--init',('generic' if args.init=='generic' else str(Path(args.init).resolve())),
              '--paths',str(Path(args.paths).resolve()),'--output',str(root/'PREFLIGHT.json')]
         if not run('preflight',cmd):return
     if not json.loads((root/'PREFLIGHT.json').read_text()).get('passed'):raise RuntimeError('Preflight failed')
     for stage in ['joint','correction']:
-        init=str(Path(args.init).resolve()) if stage=='joint' else str(root/'joint/best.pt')
+        init=('generic' if args.init=='generic' else str(Path(args.init).resolve())) if stage=='joint' else str(root/'joint/best.pt')
         cmd=[sys.executable,'-u','-m','variants.v31.train','--phase',stage,'--run',args.run+'_'+stage,
              '--paths',str(Path(args.paths).resolve()),'--output',str(root/stage),'--init',init,'--gpu',args.gpu]
         if not run(stage,cmd):return
