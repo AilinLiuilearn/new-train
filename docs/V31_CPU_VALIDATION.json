@@ -1,0 +1,8 @@
+{
+  "tests_passed": 14,
+  "historical_ema_strict_import": true,
+  "initial_joint_parameters": 50442643,
+  "base_sha256": "fc18edc8d588767eb4ec7c45d19d44e07f057920ecab965a482bd9047dc4fc0e",
+  "GPU_preflight": "deferred until upstream three trials complete",
+  "scope": "CPU engineering and gradient tests only; no new performance result"
+}

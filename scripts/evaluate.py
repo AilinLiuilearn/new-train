@@ -10,8 +10,9 @@ from runtime import require_myenv, resolve_config, verify_resources, environment
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
-    p.add_argument('--variant', choices=['tsbci', 'a2', 'concat_single'], required=True)
+    p.add_argument('--variant', choices=['tsbci', 'a2', 'concat_single', 'v31'], required=True)
     p.add_argument('--checkpoint', required=True)
+    p.add_argument('--base-checkpoint',help='Relocated v31 joint best.pt; SHA must match correction checkpoint')
     p.add_argument('--paths', default='paths.local.json')
     p.add_argument('--config')
     p.add_argument('--output', required=True, help='New evaluation report path')
@@ -28,7 +29,7 @@ if __name__ == '__main__':
     cfg._evaluation_only = True
     verify_resources(locations)
     module = importlib.import_module('variants.' + args.variant + '.inference')
-    m = module.load_model(args.checkpoint, device='cuda')
+    m = module.load_model(args.checkpoint, device='cuda',base_checkpoint=args.base_checkpoint) if args.variant=='v31' else module.load_model(args.checkpoint,device='cuda')
     from datasets.staged import loaders
     from utils.metrics_seg import SegmentationMetricsCIPA
     metric = SegmentationMetricsCIPA(hd95_mode=cfg.hd95_mode)
