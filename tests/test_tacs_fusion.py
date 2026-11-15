@@ -52,13 +52,18 @@ def test_tacs_backward_opens_residual_head_then_router():
         for stage in fusion.stages:
             assert stage.output_projection.weight.grad is not None
             assert torch.isfinite(stage.output_projection.weight.grad).all()
-            if step == 1 and stage.router is not None:
-                grad = sum(
-                    float(p.grad.abs().sum())
-                    for p in stage.router.parameters()
-                    if p.grad is not None
-                )
-                assert grad > 0
+            if step == 1:
+                channel_grad = float(stage.channel_attention.in_proj_weight.grad.abs().sum())
+                restore_grad = float(stage.ct_channel_restore.weight.grad.abs().sum())
+                assert channel_grad > 0
+                assert restore_grad > 0
+                if stage.router is not None:
+                    router_grad = sum(
+                        float(p.grad.abs().sum())
+                        for p in stage.router.parameters()
+                        if p.grad is not None
+                    )
+                    assert router_grad > 0
         optimizer.step()
 
 
