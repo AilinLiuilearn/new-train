@@ -293,8 +293,8 @@ class TACSStage(nn.Module):
         if not torch.isfinite(fused).all():
             raise RuntimeError("[NaN/Inf] TACSStage output")
         return fused.to(dtype=original_dtype), {
-            "delta_ratio": float(delta_ratio.detach()),
-            "offset_abs": float(offset_abs.detach()),
+            "delta_ratio": delta_ratio.detach(),
+            "offset_abs": offset_abs.detach(),
             "selected_channels": self.selected_channels,
         }
 
@@ -345,16 +345,18 @@ class TACSFusion(nn.Module):
         self.reset_diagnostics()
 
     def reset_diagnostics(self):
-        self._delta_sums = [0.0] * 4
-        self._offset_sums = [0.0] * 4
+        self._delta_sums = [None] * 4
+        self._offset_sums = [None] * 4
         self._sample_count = 0
 
     def pop_diagnostics(self):
         denom = max(1, self._sample_count)
         result = {}
         for i in range(4):
-            result[f"tacs_delta_ratio_s{i+1}"] = self._delta_sums[i] / denom
-            result[f"tacs_offset_abs_s{i+1}"] = self._offset_sums[i] / denom
+            delta = 0.0 if self._delta_sums[i] is None else float((self._delta_sums[i] / denom).cpu())
+            offset = 0.0 if self._offset_sums[i] is None else float((self._offset_sums[i] / denom).cpu())
+            result[f"tacs_delta_ratio_s{i+1}"] = delta
+            result[f"tacs_offset_abs_s{i+1}"] = offset
             result[f"tacs_selected_channels_s{i+1}"] = float(self.selected_channels[i])
         self.reset_diagnostics()
         return result
@@ -382,8 +384,10 @@ class TACSFusion(nn.Module):
             fused, stats = stage(ct, pet, self.text_embedding)
             outputs.append(fused)
             if self.training:
-                self._delta_sums[i] += stats["delta_ratio"] * batch_size
-                self._offset_sums[i] += stats["offset_abs"] * batch_size
+                delta_sum = stats["delta_ratio"] * batch_size
+                offset_sum = stats["offset_abs"] * batch_size
+                self._delta_sums[i] = delta_sum if self._delta_sums[i] is None else self._delta_sums[i] + delta_sum
+                self._offset_sums[i] = offset_sum if self._offset_sums[i] is None else self._offset_sums[i] + offset_sum
         if self.training:
             self._sample_count += batch_size
         return outputs
