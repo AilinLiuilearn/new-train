@@ -18,6 +18,10 @@ def test_tacs_four_scales_shape_and_exact_add_initialization(ratio):
     ct, pet = make_features()
     outputs = fusion(ct, pet)
     assert len(outputs) == 4
+    if ratio == 1.0:
+        assert all(stage.channel_attention is None for stage in fusion.stages)
+    else:
+        assert all(stage.channel_attention is not None for stage in fusion.stages)
     for out, c, p in zip(outputs, ct, pet):
         assert out.shape == c.shape
         assert torch.isfinite(out).all()
