@@ -214,7 +214,7 @@ class TACSStage(nn.Module):
         # one reference-grid cell to respect paired CT/PET spatial alignment.
         scale = self.max_offset_cells * (2.0 / max(1, self.grid_size - 1))
         offset = torch.tanh(raw).permute(0, 2, 3, 1) * scale
-        return (reference.reshape(1, self.grid_size, self.grid_size, 2) + offset).clamp(-1.0, 1.0)
+        return (reference[:1].reshape(1, self.grid_size, self.grid_size, 2) + offset).clamp(-1.0, 1.0)
 
     def forward(self, ct, pet, text_embedding=None):
         if ct.ndim != 4 or pet.ndim != 4 or ct.shape != pet.shape:
@@ -284,7 +284,7 @@ class TACSStage(nn.Module):
                 delta_full.flatten(1).norm(dim=1)
                 / base.flatten(1).norm(dim=1).clamp_min(1e-6)
             ).mean()
-            reference_2d = reference.reshape(1, self.grid_size, self.grid_size, 2)
+            reference_2d = reference[:1].reshape(1, self.grid_size, self.grid_size, 2)
             offset_abs = 0.5 * (
                 (grid_ct - reference_2d).abs().mean()
                 + (grid_pet - reference_2d).abs().mean()
