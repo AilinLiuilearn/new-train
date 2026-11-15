@@ -1,0 +1,3 @@
+# Keep the historical split bytes and SHA256 unchanged on every clone.
+splits/*.txt -text whitespace=cr-at-eol
+*.sh text eol=lf
