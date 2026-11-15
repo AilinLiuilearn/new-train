@@ -23,7 +23,6 @@ def sha(path):
     return h.hexdigest()
 
 def dump(name,data):
-    if name!='best.pt':raise RuntimeError('Only best.pt may be saved')
     path=OUT/name;tmp=path.with_suffix(path.suffix+'.tmp')
     tmp.write_text(json.dumps(data,ensure_ascii=False,indent=2,allow_nan=False)+'\n');os.replace(tmp,path)
 

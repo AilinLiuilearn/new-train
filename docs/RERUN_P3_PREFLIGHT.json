@@ -1,0 +1,47 @@
+{
+  "m1": {
+    "parameters": 43512849,
+    "alignment_modules": 2,
+    "shared_seeded_parameters_identical": true,
+    "subsequent_RNG_identical": true,
+    "decoder_GN": true,
+    "synthetic_AMP_forward_backward_finite": true,
+    "output_shape": [
+      2,
+      1,
+      256,
+      256
+    ],
+    "patience": 3
+  },
+  "concat_single": {
+    "parameters": 32825617,
+    "alignment_modules": 1,
+    "shared_seeded_parameters_identical": true,
+    "subsequent_RNG_identical": true,
+    "decoder_GN": true,
+    "synthetic_AMP_forward_backward_finite": true,
+    "output_shape": [
+      2,
+      1,
+      256,
+      256
+    ],
+    "patience": 3
+  },
+  "tsbci": {
+    "parameters": 43680293,
+    "alignment_modules": 2,
+    "shared_seeded_parameters_identical": true,
+    "subsequent_RNG_identical": true,
+    "decoder_GN": true,
+    "synthetic_AMP_forward_backward_finite": true,
+    "output_shape": [
+      2,
+      1,
+      256,
+      256
+    ],
+    "patience": 3
+  }
+}

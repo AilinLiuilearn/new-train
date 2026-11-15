@@ -31,6 +31,10 @@ def test_relocation_and_shared_split(tmp_path):
 def test_checkpoint_policy(variant,tmp_path,monkeypatch):
     trainer=importlib.import_module('variants.'+variant+'.train')
     monkeypatch.setattr(trainer,'OUT',tmp_path)
+    trainer.dump('protocol.json',{'phase':'setup'})
+    trainer.status('initializing')
+    assert json.loads((tmp_path/'protocol.json').read_text())['phase']=='setup'
+    assert json.loads((tmp_path/'status.json').read_text())['state']=='initializing'
     trainer.save('best.pt',{'weights':{'dummy':torch.ones(1)}})
     assert torch.equal(torch.load(tmp_path/'best.pt',weights_only=True)['weights']['dummy'],torch.ones(1))
     with pytest.raises(RuntimeError):trainer.save('last.pt',{})

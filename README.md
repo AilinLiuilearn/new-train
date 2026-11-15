@@ -18,6 +18,8 @@ paths.local.json      每台机器自己填写，不提交Git
 
 历史模型和文献分析索引见 [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md)。这是原实验的工程迁移，不是新的性能实验。没有启动正式训练。
 
+最新授权的三组patience=3重训方案及命令见 [docs/RERUN_P3.md](docs/RERUN_P3.md)：原M1、仅CT预对齐的拼接基线、原78.4970%架构。它们使用独立配置，不覆盖旧运行或旧最佳权重。
+
 ## 首次准备
 
 ```bash

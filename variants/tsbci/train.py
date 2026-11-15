@@ -23,7 +23,6 @@ def sha(path):
     return h.hexdigest()
 
 def dump(name,data):
-    if name!='best.pt':raise RuntimeError('Only best.pt may be saved')
     path=OUT/name;tmp=path.with_suffix(path.suffix+'.tmp')
     tmp.write_text(json.dumps(data,ensure_ascii=False,indent=2,allow_nan=False)+'\n');os.replace(tmp,path)
 
@@ -140,9 +139,12 @@ def results(rows,complete=False):
     lines+=['','Primary M1 rerun reference: Dice78.3644%, HD9517.4866. All visual parameters trainable, generic encoder pretraining only; aligners, M1, SHCI and GN decoder freshly initialized.','Only one full validation per epoch. Fixed text semantic contribution is not proven by this single run.']
     (OUT/'RESULTS.md').write_text('\n'.join(lines)+'\n')
 
-def main(args):
+def main(args,variant='tsbci',model_factory=None,results_fn=None,diagnostics_fn=None):
     global OUT
-    OUT,cfg,manifest=prepare_run(args,variant='tsbci')
+    OUT,cfg,manifest=prepare_run(args,variant=variant)
+    factory=model_factory or SHCIPETCT
+    write_results=results_fn or results
+    write_diagnostics=diagnostics_fn or diagnostics
     dump('process.json',{'pid':os.getpid(),'args':vars(args)});status('waiting_for_gpu')
     with open(gpu_lock_path(), 'a') as lock:
         while True:
@@ -152,13 +154,13 @@ def main(args):
         cfg.arm=args.arm;seed_everything(cfg.random_state);torch.set_num_threads(4)
         if getattr(cfg,'initial_checkpoint',None) or cfg.stage1_checkpoint:raise RuntimeError('Task checkpoints forbidden for this experiment')
         status('loading_model')
-        m=SHCIPETCT(vars(cfg),arm=args.arm,load_generic=True)
+        m=factory(vars(cfg),arm=args.arm,load_generic=True)
         dump('initialization.json',{'generic_encoders':manifest['generic_weights'],'task_checkpoint_loaded':False,'seed':cfg.random_state,'task_modules':'fresh'})
         m.to(DEVICE)
         if not all(p.requires_grad for p in m.parameters()):raise RuntimeError('Unexpected freezing')
         train,val,_=loaders(cfg,OUT);criterion=BCEDiceLoss()
         dump('protocol.json',{'config':vars(cfg),'manifest':manifest,'split_hashes':split_signature(cfg),
-            'train_batches':len(train),'val_batches':len(val),'initialization':'Generic encoder pretraining only; aligners, M1, SHCI and GN decoder initialized fresh. No historical segmentation or expert weights.',
+            'train_batches':len(train),'val_batches':len(val),'initialization':'Generic encoder pretraining only; all task modules fresh. No historical segmentation or expert weights.',
             'loss':'Original BCE + per-sample Dice only; no auxiliary losses',
             'validation':'One full model evaluation per epoch, original CIPA FP32 and pixel HD95',
             'scope':'Development set reused; full candidate only, no independent text efficacy or isolated module efficacy claims'})
@@ -166,7 +168,7 @@ def main(args):
             'groups':{n:sum(p.numel() for p in v.parameters()) for n,v in m.named_children()},
             'GN_decoder':sum(isinstance(v,torch.nn.GroupNorm) for v in m.decoder_full.modules()),
             'BN_decoder':sum(isinstance(v,torch.nn.modules.batchnorm._BatchNorm) for v in m.decoder_full.modules()),
-            'text':'frozen512D role buffers concatenated with visual32D descriptors; shared544->64->1 selector per scale'})
+            'text':('frozen512D role buffers concatenated with visual32D descriptors; shared544->64->1 selector per scale' if hasattr(m,'shci') else 'none')})
         snapshot_sources(OUT)
         opt=torch.optim.AdamW(m.parameters(),lr=cfg.learning_rate,weight_decay=cfg.weight_decay)
         sch=get_cosine_scheduler(opt,cfg.epochs,warmup_steps=cfg.cosine_warmup*len(train),min_lr=cfg.cosine_min_lr,
@@ -186,7 +188,7 @@ def main(args):
                 for k,v in parts.items():sums[k]+=v*len(y)
                 n+=len(y)
                 if capture:
-                    diagnostics(m,o,epoch,step,u)
+                    write_diagnostics(m,o,epoch,step,u)
                     dump('progress.json',{'activity':'training','epoch':epoch,'step':step,'steps':len(train),'losses':parts,'AMP_gradient':u})
                     print('TRAIN',epoch,step,'/',len(train),'loss',round(parts['total'],5),'grad',u['norm'],flush=True)
             status('validation',epoch=epoch);selected=ema.model if active else m
@@ -194,10 +196,10 @@ def main(args):
             if improved:best=score;best_epoch=epoch
             row={'epoch':epoch,'weights':'ema' if active else 'raw','train':{k:v/n for k,v in sums.items()},'validation':validation,
                 'AMP_skips':skips,'seconds':time.time()-begin,'best':best,'best_epoch':best_epoch,'lr':opt.param_groups[0]['lr'],'global_step':global_step}
-            if improved:save('best.pt',{'format':'tsbci_conditioned_null_inference_v1','weights':selected.state_dict(),'config':vars(cfg),'epoch':epoch,'validation':validation,'manifest':manifest})
-            log('train.jsonl',row);rows.append(row);results(rows);print('EPOCH_RESULT',json.dumps(row),flush=True)
+            if improved:save('best.pt',{'format':getattr(cfg,'checkpoint_format','tsbci_conditioned_null_inference_v1'),'weights':selected.state_dict(),'config':vars(cfg),'epoch':epoch,'validation':validation,'manifest':manifest})
+            log('train.jsonl',row);rows.append(row);write_results(rows);print('EPOCH_RESULT',json.dumps(row),flush=True)
             if epoch-best_epoch>=cfg.early_stopping_patience:break
-        results(rows,True);status('complete',best=best,best_epoch=best_epoch)
+        write_results(rows,True);status('complete',best=best,best_epoch=best_epoch)
         dump('COMPLETION.json',{'time_epoch':time.time(),'best_checkpoint':str(OUT/'best.pt'),'results':str(OUT/'RESULTS.json'),
             'next_experiments':[],'reason':'User requested only the complete candidate, no automatic ablation/tuning queue'})
 

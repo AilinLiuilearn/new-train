@@ -10,7 +10,7 @@ from runtime import require_myenv, resolve_config, verify_resources, environment
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
-    p.add_argument('--variant', choices=['tsbci', 'a2'], required=True)
+    p.add_argument('--variant', choices=['tsbci', 'a2', 'concat_single'], required=True)
     p.add_argument('--checkpoint', required=True)
     p.add_argument('--paths', default='paths.local.json')
     p.add_argument('--config')
@@ -19,7 +19,8 @@ if __name__ == '__main__':
     require_myenv()
     import torch
     if not torch.cuda.is_available():raise RuntimeError('CUDA required')
-    args.config = args.config or str(Path(__file__).resolve().parents[1] / 'configs' / (args.variant + '.json'))
+    default_config='rerun_concat_single_p3.json' if args.variant=='concat_single' else args.variant+'.json'
+    args.config = args.config or str(Path(__file__).resolve().parents[1] / 'configs' / default_config)
     report_path = Path(args.output).resolve()
     if report_path.exists():raise FileExistsError(report_path)
     args.output = None;args.run = 'evaluation';args.arm = 'full'
