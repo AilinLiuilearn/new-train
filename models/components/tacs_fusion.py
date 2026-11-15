@@ -173,6 +173,18 @@ class TACSStage(nn.Module):
         self.offset_ct = OffsetNet(selected_channels, stride)
         self.offset_pet = OffsetNet(selected_channels, stride)
 
+        # BCSI-inspired channel-wise interaction: each selected channel is
+        # represented by its profile over the 2N sampled spatial positions.
+        union_points = 2 * self.grid_size * self.grid_size
+        self.ct_channel_profile = nn.Linear(union_points, embed_dim)
+        self.pet_channel_profile = nn.Linear(union_points, embed_dim)
+        self.channel_attention = nn.MultiheadAttention(
+            embed_dim, num_heads=num_heads, batch_first=True
+        )
+        self.ct_channel_restore = nn.Linear(embed_dim, union_points)
+        self.pet_channel_restore = nn.Linear(embed_dim, union_points)
+
+        # DSCF-inspired spatial interaction over the selected spatial tokens.
         self.ct_query = nn.Linear(selected_channels, embed_dim)
         self.pet_query = nn.Linear(selected_channels, embed_dim)
         self.ct_key_value = nn.Linear(selected_channels, embed_dim)
@@ -182,7 +194,7 @@ class TACSStage(nn.Module):
             nn.GELU(),
             nn.Linear(embed_dim, embed_dim),
         )
-        self.cross_attention = nn.MultiheadAttention(
+        self.spatial_attention = nn.MultiheadAttention(
             embed_dim, num_heads=num_heads, batch_first=True
         )
         self.output_projection = nn.Linear(embed_dim, selected_channels)
@@ -253,17 +265,39 @@ class TACSStage(nn.Module):
             ct_key_features = _sample_points(ct_selected, union_points)
             pet_key_features = _sample_points(pet_selected, union_points)
 
+            # First factor: channel-wise cross-modal interaction. A channel
+            # token is the selected channel's response profile over the sparse
+            # union of spatial points (length 2N).
+            ct_channel_tokens = self.ct_channel_profile(ct_key_features.transpose(1, 2))
+            pet_channel_tokens = self.pet_channel_profile(pet_key_features.transpose(1, 2))
+            channel_context_ct = self.channel_attention(
+                ct_channel_tokens, pet_channel_tokens, pet_channel_tokens, need_weights=False
+            )[0]
+            channel_context_pet = self.channel_attention(
+                pet_channel_tokens, ct_channel_tokens, ct_channel_tokens, need_weights=False
+            )[0]
+            ct_key_features = ct_key_features + self.ct_channel_restore(
+                channel_context_ct
+            ).transpose(1, 2)
+            pet_key_features = pet_key_features + self.pet_channel_restore(
+                channel_context_pet
+            ).transpose(1, 2)
+
+            # Second factor: spatial cross-modal interaction. CT reference
+            # queries retrieve the channel-refined PET tokens; PET does the
+            # symmetric operation with channel-refined CT tokens.
             position_query = self.position(reference)
             position_union = self.position(union_points)
             query_ct = self.ct_query(ct_query_features) + position_query
             query_pet = self.pet_query(pet_query_features) + position_query
             key_ct = self.ct_key_value(ct_key_features) + position_union
             key_pet = self.pet_key_value(pet_key_features) + position_union
-
-            # Bidirectional interaction: CT queries retrieve PET context and
-            # PET queries retrieve CT context, both within the selected channels.
-            context_ct = self.cross_attention(query_ct, key_pet, key_pet, need_weights=False)[0]
-            context_pet = self.cross_attention(query_pet, key_ct, key_ct, need_weights=False)[0]
+            context_ct = self.spatial_attention(
+                query_ct, key_pet, key_pet, need_weights=False
+            )[0]
+            context_pet = self.spatial_attention(
+                query_pet, key_ct, key_ct, need_weights=False
+            )[0]
             context = 0.5 * (context_ct + context_pet)
 
             delta_tokens = self.output_projection(context)
