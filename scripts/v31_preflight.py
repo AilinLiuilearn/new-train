@@ -36,7 +36,7 @@ if __name__=='__main__':
     assert any(p.grad is not None and p.grad.abs().sum()>0 for p in m.pet_expert.parameters())
     assert all(torch.isfinite(p.grad).all() for p in m.parameters() if p.grad is not None)
     m.zero_grad(set_to_none=True);del o,loss,reference,new
-    corrected=CorrectedModel(m);before=fingerprint(m);corrected.train()
+    corrected=CorrectedModel(m).cuda();before=fingerprint(m);corrected.train()
     with autocast_context(torch.device('cuda'),True):o=corrected(b['ct'],b['pet'])
     assert torch.equal(o['logits'],o['base_logits'])
     loss,_=objective(o,b,'correction');loss.backward()
