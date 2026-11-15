@@ -1,0 +1,5 @@
+{
+  "data_root": "/path/to/PCLT20K",
+  "pretrained_root": "/path/to/pretrained",
+  "output_root": "/path/to/experiment_outputs"
+}

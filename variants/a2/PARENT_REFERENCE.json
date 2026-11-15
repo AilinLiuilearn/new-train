@@ -1,0 +1,18 @@
+{
+  "root": "historical/tsbci_conditioned_null_20261113",
+  "best_epoch": 6,
+  "metrics": {
+    "dice": 0.7849700014081679,
+    "iou": 0.646049893679921,
+    "acc": 0.8829297552829343,
+    "acc_pixel": 0.9988192328848985,
+    "sensitivity": 0.7663847894485364,
+    "specificity": 0.9994747211173323,
+    "precision": 0.8044790173227154,
+    "f1": 0.7849700014081679,
+    "hd95": 16.983383558560025,
+    "gt_positive_count": 4514,
+    "missed_positive_count": 22,
+    "hd95_sample_count": 4514
+  }
+}

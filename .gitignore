@@ -1,12 +1,27 @@
-# 忽略所有数据集目录
-# datasets/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.env.*
+paths.local.json
+*.local.json
 data/
 pretrained/
-# 忽略权重文件
+checkpoints/
+outputs/
+runs/
+*.pt
 *.pth
-*.pkl
-*.zip
+*.ckpt
+*.bin
+*.safetensors
 *.tar
-# 忽略日志
-log/
-__pycache__/
+*.tar.gz
+*.zip
+*.log
+*.png
+*.jpg
+*.npy
+*.npz
+.vscode/
+.idea/

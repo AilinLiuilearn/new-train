@@ -1,0 +1,18 @@
+{
+  "root": "historical/prem1_candidate_A_20261114",
+  "best_epoch": 10,
+  "metrics": {
+    "dice": 0.7814500154884146,
+    "iou": 0.6412950026023204,
+    "acc": 0.8678447471281439,
+    "acc_pixel": 0.998842125293899,
+    "sensitivity": 0.7361064281829137,
+    "specificity": 0.9995830660733739,
+    "precision": 0.8327465602724041,
+    "f1": 0.7814500154884148,
+    "hd95": 16.41734946984148,
+    "gt_positive_count": 4514,
+    "missed_positive_count": 77,
+    "hd95_sample_count": 4514
+  }
+}

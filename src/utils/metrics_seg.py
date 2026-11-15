@@ -1,0 +1,251 @@
+# -*- coding: utf-8 -*-
+"""
+分割评估指标（对齐 CIPA pred.py）：
+- IoU / Dice / Sensitivity / Specificity / Precision / F1
+- Acc：与 CIPA 一致 mean(TP/(TP+FN), TN/(TN+FP))，即 (Sens+Spec)/2，避免像素 Acc 虚高 ~98%
+- Acc_pixel：像素准确率 (TP+TN)/全部，仅作参考
+- HD95：逐图计算后取平均；legacy 优先 medpy 否则近似，surface 用表面定义，
+  cipa_official 对齐 CIPA 官方 pred.py（MedPy 必选）
+"""
+
+import numpy as np
+import torch
+
+
+def _hd95_scipy(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
+    """pred_bin, gt_bin: bool (H,W)，与 CIPA 一致的空集处理。"""
+    from scipy.ndimage import binary_erosion, distance_transform_edt
+
+    pred = pred_bin.astype(bool)
+    gt = gt_bin.astype(bool)
+    if pred.sum() == 0 and gt.sum() == 0:
+        return 0.0
+    if pred.sum() == 0 or gt.sum() == 0:
+        pred = pred.copy()
+        h, w = pred.shape
+        pred[h // 2, w // 2] = True
+
+    def _border(m):
+        if not m.any():
+            return np.zeros_like(m, dtype=bool)
+        return m & ~binary_erosion(m)
+
+    bp, bg = _border(pred), _border(gt)
+    if not bp.any() or not bg.any():
+        return float(np.sqrt(pred.shape[0] ** 2 + pred.shape[1] ** 2))
+
+    dt_gt = distance_transform_edt(~gt)
+    dt_pred = distance_transform_edt(~pred)
+    d_p2g = dt_gt[bp]
+    d_g2p = dt_pred[bg]
+    d = np.concatenate([d_p2g.ravel(), d_g2p.ravel()])
+    if d.size == 0:
+        return 0.0
+    return float(np.percentile(d, 95))
+
+
+def _hd95_numpy_fallback(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
+    pred = pred_bin.astype(bool)
+    gt = gt_bin.astype(bool)
+    if pred.sum() == 0 and gt.sum() == 0:
+        return 0.0
+    if pred.sum() == 0 or gt.sum() == 0:
+        return float(np.sqrt(pred.shape[0] ** 2 + pred.shape[1] ** 2))
+
+    def _border_coords(mask):
+        padded = np.pad(mask.astype(np.uint8), ((1, 1), (1, 1)), mode='constant')
+        neighbor = np.zeros_like(mask, dtype=np.uint8)
+        for dy in range(3):
+            for dx in range(3):
+                neighbor += padded[dy:dy + mask.shape[0], dx:dx + mask.shape[1]]
+        border = mask & (neighbor < 9)
+        coords = np.argwhere(border)
+        if coords.size == 0:
+            coords = np.argwhere(mask)
+        return coords.astype(np.float32)
+
+    cp = _border_coords(pred)
+    cg = _border_coords(gt)
+    if cp.size == 0 or cg.size == 0:
+        return float(np.sqrt(pred.shape[0] ** 2 + pred.shape[1] ** 2))
+    # Chunked all-pairs distance to avoid excessive memory on large contours.
+    dists = []
+    chunk = 1024
+    for start in range(0, cp.shape[0], chunk):
+        diff = cp[start:start + chunk, None, :] - cg[None, :, :]
+        dists.append(np.sqrt((diff ** 2).sum(axis=2)).min(axis=1))
+    for start in range(0, cg.shape[0], chunk):
+        diff = cg[start:start + chunk, None, :] - cp[None, :, :]
+        dists.append(np.sqrt((diff ** 2).sum(axis=2)).min(axis=1))
+    return float(np.percentile(np.concatenate(dists), 95))
+
+
+def hd95_surface_pair(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
+    """Surface-definition HD95 in pixels, with an explicit empty-set policy.
+
+    - Both empty: 0.0.
+    - Exactly one empty: image-grid diagonal sqrt((H-1)^2+(W-1)^2) as a
+      conventional failure penalty (an empty set has no standard HD95).
+    - Both nonempty: symmetric 95th percentile of surface-to-surface distances
+      with 4-connectivity boundary extraction. Fixed SciPy implementation;
+      raises ImportError when SciPy is unavailable instead of faking a value.
+    Inputs are not modified.
+    """
+    from scipy.ndimage import (binary_erosion, distance_transform_edt,
+                               generate_binary_structure)
+    pred = np.asarray(pred_bin, dtype=bool)
+    gt = np.asarray(gt_bin, dtype=bool)
+    if pred.sum() == 0 and gt.sum() == 0:
+        return 0.0
+    if pred.sum() == 0 or gt.sum() == 0:
+        h, w = pred.shape[-2], pred.shape[-1]
+        return float(np.sqrt((h - 1) ** 2 + (w - 1) ** 2))
+    footprint = generate_binary_structure(2, 1)
+    pred_surface = pred & ~binary_erosion(pred, structure=footprint, border_value=0)
+    gt_surface = gt & ~binary_erosion(gt, structure=footprint, border_value=0)
+    if not pred_surface.any() or not gt_surface.any():
+        h, w = pred.shape[-2], pred.shape[-1]
+        return float(np.sqrt((h - 1) ** 2 + (w - 1) ** 2))
+    dt_gt = distance_transform_edt(~gt_surface)
+    dt_pred = distance_transform_edt(~pred_surface)
+    distances = np.concatenate([dt_gt[pred_surface], dt_pred[gt_surface]])
+    if distances.size == 0:
+        return 0.0
+    return float(np.percentile(distances, 95))
+
+
+def hd95_cipa_official_pair(pred_bin: np.ndarray, gt_bin: np.ndarray) -> float:
+    """CIPA official pred.py HD95 (512x512 uint8-equivalent binary maps).
+
+    - Inputs must be same-shape 2D binary arrays; they are never modified
+      (the center-pixel fallback acts on an internal copy).
+    - Both empty: 0.0.
+    - GT nonempty, pred empty: copy pred, set [256,256]=1, then MedPy hd95.
+    - GT empty, pred nonempty: the official script has no working branch for
+      this case (MedPy raises on empty GT); raise explicitly instead of
+      inventing a new scoring rule.
+    - Both nonempty: MedPy hd95; on failure fall back to sqrt(H**2+W**2).
+    MedPy is mandatory; missing MedPy raises instead of switching backends.
+    No voxelspacing is passed; connectivity stays at the MedPy default (1).
+    """
+    from medpy.metric.binary import hd95 as medpy_hd95
+    pred = np.asarray(pred_bin, dtype=bool)
+    gt = np.asarray(gt_bin, dtype=bool)
+    if pred.ndim != 2 or gt.ndim != 2 or pred.shape != gt.shape \
+            or pred.shape != (512, 512):
+        raise ValueError('cipa_official HD95 requires same-shape 2D 512x512 binary arrays')
+    if pred.sum() == 0 and gt.sum() == 0:
+        return 0.0
+    if gt.sum() == 0:
+        raise ValueError('cipa_official HD95 has no defined branch for empty GT '
+                         'with nonempty prediction; refusing to invent a score')
+    work = pred.copy()
+    if work.sum() == 0:
+        work[256, 256] = True
+        # Official pred.py does not catch errors in its center-pixel branch.
+        return float(medpy_hd95(work.astype(np.uint8), gt.astype(np.uint8)))
+    try:
+        return float(medpy_hd95(work.astype(np.uint8), gt.astype(np.uint8)))
+    except Exception:
+        h, w = work.shape[-2], work.shape[-1]
+        return float(np.sqrt(h ** 2 + w ** 2))
+
+
+def compute_hd95_pair(pred_bin: np.ndarray, gt_bin: np.ndarray,
+                      hd95_mode: str = 'legacy') -> float:
+    """单张 2D 二值图 HD95；legacy 保持历史口径，surface 使用表面定义，cipa_official 对齐 CIPA 官方 pred.py。"""
+    if hd95_mode == 'cipa_official':
+        return hd95_cipa_official_pair(pred_bin, gt_bin)
+    if hd95_mode == 'surface':
+        return hd95_surface_pair(pred_bin, gt_bin)
+    if hd95_mode != 'legacy':
+        raise ValueError(f'unknown hd95_mode={hd95_mode!r}')
+    pred_bin = pred_bin.astype(bool)
+    gt_bin = gt_bin.astype(bool)
+    try:
+        from medpy.metric.binary import hd95 as medpy_hd95
+        return float(medpy_hd95(pred_bin.astype(np.uint8), gt_bin.astype(np.uint8)))
+    except Exception:
+        try:
+            return _hd95_scipy(pred_bin, gt_bin)
+        except Exception:
+            return _hd95_numpy_fallback(pred_bin, gt_bin)
+
+
+class SegmentationMetricsCIPA(torch.nn.Module):
+    """累积 TP/FP/FN/TN + 逐样本 HD95（与 CIPA 测试脚本一致）。"""
+
+    def __init__(self, threshold=0.5, hd95_mode='legacy'):
+        super().__init__()
+        if hd95_mode not in ('legacy', 'surface', 'cipa_official'):
+            raise ValueError(f'unknown hd95_mode={hd95_mode!r}')
+        self.threshold = threshold
+        self.hd95_mode = hd95_mode
+        self.reset()
+
+    def reset(self):
+        self.tp = 0.0
+        self.fp = 0.0
+        self.fn = 0.0
+        self.tn = 0.0
+        self.hd95_list = []
+        self.gt_positive_count = 0
+        self.missed_positive_count = 0
+        self.hd95_sample_count = 0
+
+    @torch.no_grad()
+    def update(self, pred_logits, target):
+        if pred_logits.dim() == 4:
+            pred_logits = pred_logits.squeeze(1)
+        if target.dim() == 4:
+            target = target.squeeze(1)
+        if target.shape[-2:] != pred_logits.shape[-2:]:
+            target = torch.nn.functional.interpolate(
+                target.unsqueeze(1).float(), size=pred_logits.shape[-2:], mode='nearest'
+            ).squeeze(1)
+        pred = torch.sigmoid(pred_logits)
+        pred_bin = (pred > self.threshold).float()
+        target = target.float()
+        pred_flat = pred_bin.reshape(-1)
+        target_flat = target.reshape(-1)
+        self.tp += (pred_flat * target_flat).sum().item()
+        self.fp += (pred_flat * (1 - target_flat)).sum().item()
+        self.fn += ((1 - pred_flat) * target_flat).sum().item()
+        self.tn += ((1 - pred_flat) * (1 - target_flat)).sum().item()
+
+        pb = pred_bin.cpu().numpy()
+        tb = target.cpu().numpy()
+        for b in range(pb.shape[0]):
+            pred_b = pb[b] > 0.5
+            gt_b = tb[b] > 0.5
+            self.hd95_list.append(compute_hd95_pair(pred_b, gt_b, self.hd95_mode))
+            self.hd95_sample_count += 1
+            if gt_b.any():
+                self.gt_positive_count += 1
+                if not pred_b.any():
+                    self.missed_positive_count += 1
+
+    def compute(self):
+        denom_iou = self.tp + self.fp + self.fn
+        denom_dice = 2 * self.tp + self.fp + self.fn
+        iou = 1.0 if denom_iou == 0 else (self.tp / denom_iou)
+        dice = 1.0 if denom_dice == 0 else ((2 * self.tp) / denom_dice)
+        total = self.tp + self.fp + self.fn + self.tn
+        acc_pixel = (self.tp + self.tn) / total if total > 0 else 0.0
+        sensitivity = (self.tp / (self.tp + self.fn)) if (self.tp + self.fn) > 0 else 0.0
+        specificity = (self.tn / (self.tn + self.fp)) if (self.tn + self.fp) > 0 else 0.0
+        acc = 0.5 * (sensitivity + specificity)
+        precision = (self.tp / (self.tp + self.fp)) if (self.tp + self.fp) > 0 else 0.0
+        f1 = (2 * precision * sensitivity / (precision + sensitivity)) if (precision + sensitivity) > 0 else 0.0
+        hd95 = float(np.mean(self.hd95_list)) if self.hd95_list else 0.0
+        return {
+            'dice': dice, 'iou': iou,
+            'acc': acc,
+            'acc_pixel': acc_pixel,
+            'sensitivity': sensitivity, 'specificity': specificity,
+            'precision': precision, 'f1': f1,
+            'hd95': hd95,
+            'gt_positive_count': int(self.gt_positive_count),
+            'missed_positive_count': int(self.missed_positive_count),
+            'hd95_sample_count': int(self.hd95_sample_count),
+        }

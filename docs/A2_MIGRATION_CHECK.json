@@ -1,0 +1,21 @@
+{
+  "variant": "a2",
+  "checkpoint_sha256": "7dba3c09792c0172e649ea7e49d0de8b8156d841605cdfddbd6b7a90c5e38ddc",
+  "myenv": "/root/miniconda3/envs/myenv/bin/python",
+  "shared_source_identical": true,
+  "numeric_trainer_functions_unchanged": [
+    "stats",
+    "gradients",
+    "diagnostics",
+    "batch_to",
+    "objective",
+    "update",
+    "evaluate"
+  ],
+  "fresh_initialization_bitwise_equal": true,
+  "strict_checkpoint_load": true,
+  "synthetic_eval_max_abs_difference": 0.0,
+  "synthetic_AMP_backward_finite": true,
+  "parameters": 43603463,
+  "scope": "256x256 synthetic migration check only; not full evaluation or a formal training run"
+}

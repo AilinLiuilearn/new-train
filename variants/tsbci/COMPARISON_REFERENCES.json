@@ -1,0 +1,95 @@
+{
+  "M1_rerun": {
+    "dice": 0.7836444556934279,
+    "hd95": 17.48659619401712
+  },
+  "previous_K50": {
+    "complete": false,
+    "best_epoch": 6,
+    "metrics": {
+      "dice": 0.7826432409439291,
+      "iou": 0.6429037626987709,
+      "acc": 0.8826175921388518,
+      "acc_pixel": 0.9988038617000149,
+      "sensitivity": 0.7657741556455079,
+      "specificity": 0.9994610286321958,
+      "precision": 0.800272278471472,
+      "f1": 0.7826432409439291,
+      "hd95": 17.380281960682364,
+      "gt_positive_count": 4514,
+      "missed_positive_count": 28,
+      "hd95_sample_count": 4514
+    },
+    "historical_M1": {
+      "dice": 0.7836444556934279,
+      "hd95": 17.48659619401712
+    },
+    "historical_dice_difference_pp": -0.10012147494987689,
+    "dice79_met": false,
+    "previous_text_reference": {
+      "path": "historical/full_s2023",
+      "best_epoch": 8,
+      "metrics": {
+        "dice": 0.7839584654831582,
+        "iou": 0.6446806652822439,
+        "acc": 0.8824639476240307,
+        "acc_pixel": 0.9988135868963226,
+        "sensitivity": 0.7654562173760175,
+        "specificity": 0.9994716778720438,
+        "precision": 0.8033773247848368,
+        "f1": 0.7839584654831582,
+        "hd95": 16.507729345960893,
+        "gt_positive_count": 4514,
+        "missed_positive_count": 14,
+        "hd95_sample_count": 4514
+      },
+      "completed_epochs": 10,
+      "stop": "User stopped during epoch11",
+      "scope": "Same-seed text run, user stopped before natural early stopping; training budgets may differ"
+    },
+    "previous_notext_reference": {
+      "path": "historical/full_s2023",
+      "best_epoch": 7,
+      "metrics": {
+        "dice": 0.7763706579297844,
+        "iou": 0.6344818902563012,
+        "acc": 0.8752824614008508,
+        "acc_pixel": 0.9987832003058086,
+        "sensitivity": 0.7510831838302245,
+        "specificity": 0.999481738971477,
+        "precision": 0.8034202155957331,
+        "f1": 0.7763706579297844,
+        "hd95": 16.929693608740767,
+        "gt_positive_count": 4514,
+        "missed_positive_count": 19,
+        "hd95_sample_count": 4514
+      },
+      "completed_epochs": 8,
+      "scope": "Stopped by user replacement; final partial epoch not evaluated"
+    },
+    "candidate_minus_previous_text_dice_pp": -0.1315224539229054,
+    "scope": "Single seed exploratory fresh task training from generic encoder weights only. Candidate changes scoring, prompts, descriptor and Top-K ratio; not a single-factor text ablation. Single seed, reused development set."
+  },
+  "previous_text_SHCI": {
+    "path": "historical/full_s2023",
+    "best_epoch": 8,
+    "metrics": {
+      "dice": 0.7839584654831582,
+      "iou": 0.6446806652822439,
+      "acc": 0.8824639476240307,
+      "acc_pixel": 0.9988135868963226,
+      "sensitivity": 0.7654562173760175,
+      "specificity": 0.9994716778720438,
+      "precision": 0.8033773247848368,
+      "f1": 0.7839584654831582,
+      "hd95": 16.507729345960893,
+      "gt_positive_count": 4514,
+      "missed_positive_count": 14,
+      "hd95_sample_count": 4514
+    },
+    "completed_epochs": 10,
+    "stop": "User stopped during epoch11",
+    "scope": "Same-seed text run, user stopped before natural early stopping; training budgets may differ"
+  },
+  "scope": "New complete candidate changes multiple mechanisms; no single-factor attribution"
+}

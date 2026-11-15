@@ -1,0 +1,21 @@
+{
+  "path": "historical/full_s2023",
+  "best_epoch": 8,
+  "metrics": {
+    "dice": 0.7839584654831582,
+    "iou": 0.6446806652822439,
+    "acc": 0.8824639476240307,
+    "acc_pixel": 0.9988135868963226,
+    "sensitivity": 0.7654562173760175,
+    "specificity": 0.9994716778720438,
+    "precision": 0.8033773247848368,
+    "f1": 0.7839584654831582,
+    "hd95": 16.507729345960893,
+    "gt_positive_count": 4514,
+    "missed_positive_count": 14,
+    "hd95_sample_count": 4514
+  },
+  "completed_epochs": 10,
+  "stop": "User stopped during epoch11",
+  "scope": "Same-seed text run, user stopped before natural early stopping; training budgets may differ"
+}

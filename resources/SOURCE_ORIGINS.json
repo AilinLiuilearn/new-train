@@ -1,0 +1,38 @@
+{
+  "tsbci": {
+    "local_snapshot": "channel_best_784970",
+    "source_sha256": {
+      "model.py": "dfe128c0a2616ffc9adebc416f5e1db9e39bf8fbbab2d67b336a260f082e077c",
+      "inference.py": "5d8a7eb7c2fda06812bdf64ddff4981d15eaa0ef33df626fe6c953d6aea044e1",
+      "shci.py": "159b90caff4ff38f9d55cf51fdb4658350b9e42acfb1e7ab5d58b69a4a6b34d6",
+      "run.py": "e3a3194715251fa434c40b195588c456b515328d1f5a0ad432ad9567fc1291e0",
+      "CONFIG.json": "0e0ba67e3765c7ab97a49c9b2d576d70d13251d1e06ab66354018572703b1c60"
+    },
+    "changes": [
+      "portable imports and paths",
+      "shared source",
+      "cached roles serialized as JSON",
+      "best-only fresh training",
+      "myenv enforcement and run provenance",
+      "per-GPU lock"
+    ]
+  },
+  "a2": {
+    "local_snapshot": "latest_A2_782261",
+    "source_sha256": {
+      "model.py": "e83d52e62d745a5390d3a6c0f94293f40c30ecad092a3789b93491cf6896e33a",
+      "inference.py": "790d2d3133be4178778a806021917d3853ea924d61d88f88d77ceb8c2bb9cd4f",
+      "front.py": "f4e97db50694094ecba21d2b0afa915c533cfe229d0421c5af2b2b036aea507b",
+      "run.py": "d04f1734f916ce5ac1d1326d31520ccbac85a2e31fda05629397d5acf2685eb1",
+      "CONFIG.json": "fd00829842680406be22fbcdd1d43752d3daf04a4f250333b2c89da4b01d2c43"
+    },
+    "changes": [
+      "portable imports and paths",
+      "shared source",
+      "cached roles serialized as JSON",
+      "best-only fresh training",
+      "myenv enforcement and run provenance",
+      "per-GPU lock"
+    ]
+  }
+}

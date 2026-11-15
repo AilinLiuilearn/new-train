@@ -1,0 +1,21 @@
+{
+  "variant": "tsbci",
+  "checkpoint_sha256": "072b80b51d213038259b7c3670734d0dc4ce2d23cd45f788d3b6bdb9d0a5c38b",
+  "myenv": "/root/miniconda3/envs/myenv/bin/python",
+  "shared_source_identical": true,
+  "numeric_trainer_functions_unchanged": [
+    "stats",
+    "gradients",
+    "diagnostics",
+    "batch_to",
+    "objective",
+    "update",
+    "evaluate"
+  ],
+  "fresh_initialization_bitwise_equal": true,
+  "strict_checkpoint_load": true,
+  "synthetic_eval_max_abs_difference": 0.0,
+  "synthetic_AMP_backward_finite": true,
+  "parameters": 43680293,
+  "scope": "256x256 synthetic migration check only; not full evaluation or a formal training run"
+}

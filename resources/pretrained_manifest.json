@@ -1,0 +1,12 @@
+{
+  "convnextv2_nano": {
+    "relative_file": "convnextv2_nano/pytorch_model.bin",
+    "sha256": "5d300cdff9d75330c788e7c9dabf7d3e370eba3a7bc10373b367c3c99e795cf9",
+    "bytes": 59983613
+  },
+  "mit-b1": {
+    "relative_file": "mit-b1/pytorch_model.bin",
+    "sha256": "980b86b60db37b1b1528086f6c53d253d879e9e09ebe07397b40fd275738a3bf",
+    "bytes": 54732285
+  }
+}
