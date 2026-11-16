@@ -1,0 +1,10 @@
+{
+  "phase": "execution_ready",
+  "round": 2,
+  "reviewer_task": "/root/scgr_factorized_review",
+  "status": "completed",
+  "verdict": "READY_FOR_PILOT; paper claims provisional",
+  "requested_model": "gpt-6.1-terra",
+  "requested_effort": "medium",
+  "actual_reported_model": "unknown"
+}
