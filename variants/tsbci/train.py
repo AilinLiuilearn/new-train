@@ -108,12 +108,13 @@ def update(loss,m,opt,sch,scaler,ema,active,capture):
     return {'success':True,'norm':float(norm),'groups_after_clip':g,'scale':scaler.get_scale(),'backward_scale':scale_before}
 
 @torch.no_grad()
-def evaluate(m,loader,cfg,criterion,epoch):
+def evaluate(m,loader,cfg,criterion,epoch,objective_fn=None):
     m.eval();metric=SegmentationMetricsCIPA(hd95_mode=cfg.hd95_mode);sums=defaultdict(float);n=0
+    compute_objective=objective_fn or objective
     for step,batch in enumerate(loader,1):
         ct,pet,y=batch_to(batch);o=m(ct,pet)
         if not torch.isfinite(o['logits']).all():raise RuntimeError('Nonfinite validation logits')
-        _,parts=objective(o,y,criterion);metric.update(o['logits'],y)
+        _,parts=compute_objective(o,y,criterion);metric.update(o['logits'],y)
         for k,v in parts.items():sums[k]+=v*len(y)
         n+=len(y)
         if step==1 or step%50==0 or step==len(loader):
@@ -139,12 +140,14 @@ def results(rows,complete=False):
     lines+=['','Primary M1 rerun reference: Dice78.3644%, HD9517.4866. All visual parameters trainable, generic encoder pretraining only; aligners, M1, SHCI and GN decoder freshly initialized.','Only one full validation per epoch. Fixed text semantic contribution is not proven by this single run.']
     (OUT/'RESULTS.md').write_text('\n'.join(lines)+'\n')
 
-def main(args,variant='tsbci',model_factory=None,results_fn=None,diagnostics_fn=None):
+def main(args,variant='tsbci',model_factory=None,results_fn=None,diagnostics_fn=None,
+         objective_fn=None,protocol_extra=None):
     global OUT
     OUT,cfg,manifest=prepare_run(args,variant=variant)
     factory=model_factory or SHCIPETCT
     write_results=results_fn or results
     write_diagnostics=diagnostics_fn or diagnostics
+    compute_objective=objective_fn or objective
     dump('process.json',{'pid':os.getpid(),'args':vars(args)});status('waiting_for_gpu')
     with open(gpu_lock_path(), 'a') as lock:
         while True:
@@ -163,7 +166,8 @@ def main(args,variant='tsbci',model_factory=None,results_fn=None,diagnostics_fn=
             'train_batches':len(train),'val_batches':len(val),'initialization':'Generic encoder pretraining only; all task modules fresh. No historical segmentation or expert weights.',
             'loss':'Original BCE + per-sample Dice only; no auxiliary losses',
             'validation':'One full model evaluation per epoch, original CIPA FP32 and pixel HD95',
-            'scope':'Development set reused; full candidate only, no independent text efficacy or isolated module efficacy claims'})
+            'scope':'Development set reused; full candidate only, no independent text efficacy or isolated module efficacy claims',
+            **(protocol_extra or {})})
         dump('trainable.json',{'all_trainable':True,'parameters':sum(p.numel() for p in m.parameters()),
             'groups':{n:sum(p.numel() for p in v.parameters()) for n,v in m.named_children()},
             'GN_decoder':sum(isinstance(v,torch.nn.GroupNorm) for v in m.decoder_full.modules()),
@@ -184,7 +188,7 @@ def main(args,variant='tsbci',model_factory=None,results_fn=None,diagnostics_fn=
             for step,batch in enumerate(train,1):
                 ct,pet,y=batch_to(batch);opt.zero_grad(set_to_none=True);capture=step==1 or step%100==0 or step==len(train)
                 with autocast_context(DEVICE,cfg.mixed_precision):o=m(ct,pet,capture=capture)
-                loss,parts=objective(o,y,criterion);u=update(loss,m,opt,sch,scaler,ema,active,capture)
+                loss,parts=compute_objective(o,y,criterion);u=update(loss,m,opt,sch,scaler,ema,active,capture)
                 global_step+=int(u['success']);skips+=int(not u['success'])
                 for k,v in parts.items():sums[k]+=v*len(y)
                 n+=len(y)
@@ -193,7 +197,7 @@ def main(args,variant='tsbci',model_factory=None,results_fn=None,diagnostics_fn=
                     dump('progress.json',{'activity':'training','epoch':epoch,'step':step,'steps':len(train),'losses':parts,'AMP_gradient':u})
                     print('TRAIN',epoch,step,'/',len(train),'loss',round(parts['total'],5),'grad',u['norm'],flush=True)
             status('validation',epoch=epoch);selected=ema.model if active else m
-            validation=evaluate(selected,val,cfg,criterion,epoch);score=validation['full']['dice'];improved=score>best
+            validation=evaluate(selected,val,cfg,criterion,epoch,objective_fn=compute_objective);score=validation['full']['dice'];improved=score>best
             if improved:best=score;best_epoch=epoch
             row={'epoch':epoch,'weights':'ema' if active else 'raw','train':{k:v/n for k,v in sums.items()},'validation':validation,
                 'AMP_skips':skips,'seconds':time.time()-begin,'best':best,'best_epoch':best_epoch,'lr':opt.param_groups[0]['lr'],'global_step':global_step}
