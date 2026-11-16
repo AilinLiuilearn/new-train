@@ -10,11 +10,12 @@ from variants.tsbci import train as engine
 from runtime import REPO
 
 
-@pytest.mark.parametrize('with_auxiliary', [False, True])
+@pytest.mark.parametrize('with_auxiliary', [False, True, 'model'])
 def test_one_epoch_control_path_writes_logs_and_best_only(tmp_path,monkeypatch,with_auxiliary):
     cfg=json.loads((REPO/'configs/rerun_m1_p3.json').read_text())
     cfg.update(epochs=1,device='cpu',mixed_precision=False,ct_pretrained_path=None,pet_pretrained_path=None)
     cfg=argparse.Namespace(**cfg)
+    if with_auxiliary=='model':cfg.ema_start_epoch=0
     monkeypatch.setattr(engine,'DEVICE',torch.device('cpu'))
     monkeypatch.setattr(engine,'prepare_run',lambda args,variant:(tmp_path,cfg,{'generic_weights':{}}))
     monkeypatch.setattr(engine,'gpu_lock_path',lambda:tmp_path/'gpu.lock')
@@ -30,6 +31,7 @@ def test_one_epoch_control_path_writes_logs_and_best_only(tmp_path,monkeypatch,w
     monkeypatch.setattr(engine,'loaders',lambda cfg,out:([batch],[batch],[batch]))
     def write_results(rows,complete=False):engine.dump('RESULTS.json',{'complete':complete,'rows':rows})
     calls=[]
+    model_ids=[]
     def custom_objective(o,y,criterion):
         calls.append(torch.is_grad_enabled())
         loss,parts=engine.objective(o,y,criterion)
@@ -39,11 +41,16 @@ def test_one_epoch_control_path_writes_logs_and_best_only(tmp_path,monkeypatch,w
     class ExtraMetric:
         def __init__(self):self.count=0
         def update(self,z,y):self.count+=len(y)
+        def update_output(self,o,y):self.update(o['logits'],y)
         def compute(self):return {'images':self.count}
+    def model_objective(model,o,y,criterion):
+        model_ids.append(id(model))
+        return custom_objective(o,y,criterion)
     args=argparse.Namespace(arm='m1')
     engine.main(args,variant='m1',model_factory=Tiny,results_fn=write_results,
                 diagnostics_fn=lambda *a:engine.log('diagnostics.jsonl',{'ok':True}),
-                objective_fn=custom_objective if with_auxiliary else None,
+                objective_fn=custom_objective if with_auxiliary is True else None,
+                model_objective_fn=model_objective if with_auxiliary=='model' else None,
                 protocol_extra={'loss':'test hook'} if with_auxiliary else None,
                 extra_metrics_factory=ExtraMetric if with_auxiliary else None)
     assert json.loads((tmp_path/'status.json').read_text())['state']=='complete'
@@ -57,3 +64,4 @@ def test_one_epoch_control_path_writes_logs_and_best_only(tmp_path,monkeypatch,w
         row=json.loads((tmp_path/'train.jsonl').read_text())
         assert 'test_auxiliary' in row['train'] and 'test_auxiliary' in row['validation']['losses']
         assert row['validation']['auxiliary_diagnostics']['images']==2
+        if with_auxiliary=='model':assert model_ids[0]!=model_ids[1], 'EMA validation must pass the EMA model to the loss'

@@ -53,7 +53,7 @@ class UNetStyleDecoder(nn.Module):
                                    _decoder_block(d1, d1, kernel_size=3, norm=norm))
         self.seg_head = nn.Conv2d(d1, out_channels, kernel_size=1)
 
-    def forward(self, features, target_size):
+    def forward(self, features, target_size, return_features=False):
         if len(features) != 4:
             raise ValueError(f'UNetStyleDecoder expects 4 scales, got {len(features)}')
         x1, x2, x3, x4 = features
@@ -71,4 +71,7 @@ class UNetStyleDecoder(nn.Module):
         final_logits = F.interpolate(logits, size=target_size, mode='bilinear', align_corners=False)
         if not torch.isfinite(final_logits).all():
             raise RuntimeError('[NaN/Inf] decoder logits contain invalid values')
-        return {'logits': final_logits}
+        result = {'logits': final_logits}
+        if return_features:
+            result['features'] = d1
+        return result
