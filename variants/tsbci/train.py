@@ -108,19 +108,23 @@ def update(loss,m,opt,sch,scaler,ema,active,capture):
     return {'success':True,'norm':float(norm),'groups_after_clip':g,'scale':scaler.get_scale(),'backward_scale':scale_before}
 
 @torch.no_grad()
-def evaluate(m,loader,cfg,criterion,epoch,objective_fn=None):
+def evaluate(m,loader,cfg,criterion,epoch,objective_fn=None,extra_metrics_factory=None):
     m.eval();metric=SegmentationMetricsCIPA(hd95_mode=cfg.hd95_mode);sums=defaultdict(float);n=0
     compute_objective=objective_fn or objective
+    extra_metric=extra_metrics_factory() if extra_metrics_factory else None
     for step,batch in enumerate(loader,1):
         ct,pet,y=batch_to(batch);o=m(ct,pet)
         if not torch.isfinite(o['logits']).all():raise RuntimeError('Nonfinite validation logits')
         _,parts=compute_objective(o,y,criterion);metric.update(o['logits'],y)
+        if extra_metric is not None:extra_metric.update(o['logits'],y)
         for k,v in parts.items():sums[k]+=v*len(y)
         n+=len(y)
         if step==1 or step%50==0 or step==len(loader):
             print('EVAL',epoch,step,'/',len(loader),flush=True)
             dump('progress.json',{'activity':'validation','epoch':epoch,'step':step,'steps':len(loader)})
-    return {'full':metric.compute(),'losses':{k:v/n for k,v in sums.items()},'validation':'one complete fusion, no module-on/off or single-direction evaluations'}
+    result={'full':metric.compute(),'losses':{k:v/n for k,v in sums.items()},'validation':'one complete fusion, no module-on/off or single-direction evaluations'}
+    if extra_metric is not None:result['auxiliary_diagnostics']=extra_metric.compute()
+    return result
 
 def results(rows,complete=False):
     if not rows:return
@@ -141,7 +145,7 @@ def results(rows,complete=False):
     (OUT/'RESULTS.md').write_text('\n'.join(lines)+'\n')
 
 def main(args,variant='tsbci',model_factory=None,results_fn=None,diagnostics_fn=None,
-         objective_fn=None,protocol_extra=None):
+         objective_fn=None,protocol_extra=None,extra_metrics_factory=None):
     global OUT
     OUT,cfg,manifest=prepare_run(args,variant=variant)
     factory=model_factory or SHCIPETCT
@@ -197,7 +201,8 @@ def main(args,variant='tsbci',model_factory=None,results_fn=None,diagnostics_fn=
                     dump('progress.json',{'activity':'training','epoch':epoch,'step':step,'steps':len(train),'losses':parts,'AMP_gradient':u})
                     print('TRAIN',epoch,step,'/',len(train),'loss',round(parts['total'],5),'grad',u['norm'],flush=True)
             status('validation',epoch=epoch);selected=ema.model if active else m
-            validation=evaluate(selected,val,cfg,criterion,epoch,objective_fn=compute_objective);score=validation['full']['dice'];improved=score>best
+            validation=evaluate(selected,val,cfg,criterion,epoch,objective_fn=compute_objective,
+                                extra_metrics_factory=extra_metrics_factory);score=validation['full']['dice'];improved=score>best
             if improved:best=score;best_epoch=epoch
             row={'epoch':epoch,'weights':'ema' if active else 'raw','train':{k:v/n for k,v in sums.items()},'validation':validation,
                 'AMP_skips':skips,'seconds':time.time()-begin,'best':best,'best_epoch':best_epoch,'lr':opt.param_groups[0]['lr'],'global_step':global_step}

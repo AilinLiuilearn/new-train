@@ -36,11 +36,16 @@ def test_one_epoch_control_path_writes_logs_and_best_only(tmp_path,monkeypatch,w
         auxiliary=o['logits'].float().square().mean()
         total=loss+0.1*auxiliary
         return total,{**parts,'total':float(total.detach()),'test_auxiliary':float(auxiliary.detach())}
+    class ExtraMetric:
+        def __init__(self):self.count=0
+        def update(self,z,y):self.count+=len(y)
+        def compute(self):return {'images':self.count}
     args=argparse.Namespace(arm='m1')
     engine.main(args,variant='m1',model_factory=Tiny,results_fn=write_results,
                 diagnostics_fn=lambda *a:engine.log('diagnostics.jsonl',{'ok':True}),
                 objective_fn=custom_objective if with_auxiliary else None,
-                protocol_extra={'loss':'test hook'} if with_auxiliary else None)
+                protocol_extra={'loss':'test hook'} if with_auxiliary else None,
+                extra_metrics_factory=ExtraMetric if with_auxiliary else None)
     assert json.loads((tmp_path/'status.json').read_text())['state']=='complete'
     assert json.loads((tmp_path/'RESULTS.json').read_text())['complete']
     assert (tmp_path/'best.pt').exists() and (tmp_path/'train.jsonl').exists()
@@ -51,3 +56,4 @@ def test_one_epoch_control_path_writes_logs_and_best_only(tmp_path,monkeypatch,w
         assert json.loads((tmp_path/'protocol.json').read_text())['loss']=='test hook'
         row=json.loads((tmp_path/'train.jsonl').read_text())
         assert 'test_auxiliary' in row['train'] and 'test_auxiliary' in row['validation']['losses']
+        assert row['validation']['auxiliary_diagnostics']['images']==2
