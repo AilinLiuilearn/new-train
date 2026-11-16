@@ -11,3 +11,8 @@
 - ../IMPLEMENTATION_REVIEW.md：fresh设计及实现审阅
 - ../GPU_PREFLIGHT.json：真实512/batch16数值及资源检查
 - ../FIGURE_PREFLIGHT.json：四例导出smoke
+
+- ../FINAL_RESULTS.md及20261117快照：三组最终结果与限制
+- ../FINAL_MODEL.md：实际保留T结构和损失
+- EXPERIMENT_TRACKER_20261117.md：执行完毕
+- PIPELINE_SUMMARY_20261117.md：目标达标，科研主张仍待验证

@@ -1,6 +1,5 @@
-# 流程摘要
-问题：M1融合后的错误位置细化。候选：分离视觉内容与评分接纳的四尺度后置残差，文本只调制通道。
-状态：REVISE_FOR_PAPER / READY_FOR_PILOT；不保证顶刊创新或性能。
-运行：V(无文本无score损失) -> T(只加文本) -> S(只加score损失)，三组从头。
-证据：方案FINAL_PROPOSAL.md；计划EXPERIMENT_PLAN.md；审查REVIEW_SUMMARY.md；执行EXPERIMENT_TRACKER.md。
-主要风险：粗分数与错误无关、额外监督干扰、语义常量可被吸收、参数容量混杂、开发集反复使用。
+# 流程最终摘要
+
+数值目标已完成：T best6 EMA Dice78.949269%、HD9516.169107，完整保存权重重载复核通过。V/T/S均已自然完成，当前保留T，无评分辅助损失。训练代码8cd9ce2及既定协议未改，不自动启动更多试验。
+
+数据证据：../FINAL_RESULTS.md；实际保留方法：../FINAL_MODEL.md；论文机制、语义和独立泛化仍待匹配验证，不能随数值达标视为成立。
