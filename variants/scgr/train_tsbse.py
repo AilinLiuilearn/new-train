@@ -45,7 +45,7 @@ class TSBSEErrorMetrics(ErrorMetrics):
 
 def objective(model,output,target,criterion):
     global LOSS,TRAIN_CALLS
-    if LOSS is None:LOSS=TSBSE()
+    if LOSS is None:LOSS=TSBSE(coverage_scale=model.cfg.get('tsbse_cover_scale','global'))
     primary,parts=criterion(output['logits'].float(),target)
     extra,stats,terms=LOSS(output['logits'],target)
     weight=getattr(model,'_tsbse_effective_weight',model.cfg['tsbse_weight'])
