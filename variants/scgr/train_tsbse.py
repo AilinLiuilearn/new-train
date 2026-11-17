@@ -48,7 +48,7 @@ def objective(model,output,target,criterion):
     if LOSS is None:LOSS=TSBSE()
     primary,parts=criterion(output['logits'].float(),target)
     extra,stats,terms=LOSS(output['logits'],target)
-    weight=model.cfg['tsbse_weight']
+    weight=getattr(model,'_tsbse_effective_weight',model.cfg['tsbse_weight'])
     total=primary+weight*extra
     if torch.is_grad_enabled():
         TRAIN_CALLS+=1
@@ -58,6 +58,8 @@ def objective(model,output,target,criterion):
             cg=torch.autograd.grad(.5*weight*terms['cover'],output['logits'],retain_graph=True)[0].float()
             sg=torch.autograd.grad(.5*weight*terms['spill'],output['logits'],retain_graph=True)[0].float()
             engine.log('loss_gradients.jsonl',{'training_call':TRAIN_CALLS,
+                'epoch':getattr(model,'_tsbse_epoch',None),
+                'effective_weight':weight,
                 'base_logit_grad_l2':float(base_grad.norm()),
                 'weighted_tsbse_logit_grad_l2':float(aux_grad.norm()),
                 'ratio':float(aux_grad.norm()/base_grad.norm().clamp_min(1e-12)),
@@ -67,7 +69,7 @@ def objective(model,output,target,criterion):
                 'scope':'Output-logit gradient diagnostics before AMP scaling; not proof of task benefit.'})
     return total,{'total':float(total.detach()),'bce':float(parts['loss_bce']),
         'dice_loss':float(parts['loss_dice']),'segmentation':float(primary.detach()),
-        'tsbse':float(extra.detach()),'tsbse_weighted':float((weight*extra).detach()),
+        'tsbse_effective_weight':weight,'tsbse':float(extra.detach()),'tsbse_weighted':float((weight*extra).detach()),
         **{'tsbse_'+k:v for k,v in stats.items()}}
 
 

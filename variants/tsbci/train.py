@@ -147,7 +147,7 @@ def results(rows,complete=False):
     (OUT/'RESULTS.md').write_text('\n'.join(lines)+'\n')
 
 def main(args,variant='tsbci',model_factory=None,results_fn=None,diagnostics_fn=None,
-         objective_fn=None,protocol_extra=None,extra_metrics_factory=None,model_objective_fn=None):
+         objective_fn=None,protocol_extra=None,extra_metrics_factory=None,model_objective_fn=None,epoch_start_fn=None):
     global OUT
     OUT,cfg,manifest=prepare_run(args,variant=variant)
     factory=model_factory or SHCIPETCT
@@ -191,6 +191,7 @@ def main(args,variant='tsbci',model_factory=None,results_fn=None,diagnostics_fn=
             stopped()
             if best_epoch and epoch-1-best_epoch>=cfg.early_stopping_patience:break
             if epoch>cfg.ema_start_epoch and not active:ema.reset(m);active=True
+            if epoch_start_fn is not None:epoch_start_fn(m,ema.model,epoch,cfg)
             m.train();status('training',epoch=epoch,best=best,best_epoch=best_epoch);sums=defaultdict(float);n=0;skips=0;begin=time.time()
             for step,batch in enumerate(train,1):
                 ct,pet,y=batch_to(batch);opt.zero_grad(set_to_none=True);capture=step==1 or step%100==0 or step==len(train)
