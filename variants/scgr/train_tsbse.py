@@ -50,6 +50,7 @@ def objective(model,output,target,criterion):
             coverage_scale=model.cfg.get('tsbse_cover_scale', 'global'),
             coverage_reference=model.cfg.get('tsbse_cover_reference', 'predicted_foreground'),
             spill_candidates=model.cfg.get('tsbse_spill_candidates', 'background'),
+            cover_allocation=model.cfg.get('tsbse_cover_allocation', 'distance'),
         )
     primary,parts=criterion(output['logits'].float(),target)
     extra,stats,terms=LOSS(output['logits'],target)

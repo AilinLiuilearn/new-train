@@ -3,6 +3,7 @@ import math
 import time
 import numpy as np
 from scipy.ndimage import distance_transform_edt
+from scipy.special import expit
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -10,7 +11,7 @@ from torch.nn import functional as F
 
 class TSBSE(nn.Module):
     def __init__(self,coverage_scale='global',coverage_reference='predicted_foreground',
-                 spill_candidates='background'):
+                 spill_candidates='background',cover_allocation='distance'):
         super().__init__()
         if coverage_scale not in ('global','gt_local_thickness'):
             raise ValueError('Unknown coverage scale')
@@ -21,6 +22,11 @@ class TSBSE(nn.Module):
         if spill_candidates not in ('background', 'false_positive'):
             raise ValueError('Unknown spill candidate set')
         self.spill_candidates = spill_candidates
+        if cover_allocation not in ('distance', 'pooled_foreground'):
+            raise ValueError('Unknown Cover allocation')
+        if cover_allocation == 'pooled_foreground' and coverage_reference != 'true_positive':
+            raise ValueError('Pooled Cover requires the true-positive reference')
+        self.cover_allocation = cover_allocation
 
     def forward(self, logits, target):
         if logits.shape != target.shape or logits.ndim != 4 or logits.shape[1] != 1:
@@ -33,7 +39,13 @@ class TSBSE(nn.Module):
                 gt=y[:,0].cpu().numpy()
                 use_true_positives = self.coverage_reference == 'true_positive'
                 detached_logits = z.detach()[:, 0]
-                pred = (detached_logits > 0 if use_true_positives else detached_logits >= 0).cpu().numpy()
+                pooled_cover = self.cover_allocation == 'pooled_foreground'
+                if pooled_cover:
+                    spatial_logits = detached_logits.cpu().numpy()
+                    pred = spatial_logits > 0
+                    slice_cover_mass = np.zeros(len(gt), dtype=np.float64)
+                else:
+                    pred = (detached_logits > 0 if use_true_positives else detached_logits >= 0).cpu().numpy()
                 wg=np.zeros(gt.shape,dtype=np.float32);wp=np.zeros_like(wg)
                 areas=[];ks=[];radii=[];fn_count=0;fn_weight_sum=0.;cover_scale_sum=0.;gt_count=0
                 for i,(g,p) in enumerate(zip(gt,pred)):
@@ -48,13 +60,27 @@ class TSBSE(nn.Module):
                     else:
                         dp = np.full(g.shape, math.hypot(*g.shape))
                     cover_radius=r
+                    fn = g & ~p
                     if self.coverage_scale=='gt_local_thickness':
                         inside=distance_transform_edt(np.pad(g,1))[1:-1,1:-1]
                         cover_radius=np.maximum(1.,inside)
                     wg[i]=dg/(dg+r);wp[i]=dp/(dp+cover_radius)
-                    fn=g&~p;fn_count+=int(fn.sum());fn_weight_sum+=float(wp[i][fn].sum())
+                    if pooled_cover and fn.any():
+                        # Absolute derivative of the parent's per-slice Cover mean.
+                        error_derivative = expit(-spatial_logits[i][fn].astype(np.float64))
+                        slice_cover_mass[i] = np.dot(wp[i][fn], error_derivative) / area
+                    fn_count+=int(fn.sum());fn_weight_sum+=float(wp[i][fn].sum())
                     gt_count+=area
                     cover_scale_sum+=float(np.asarray(cover_radius)[g].sum()) if np.ndim(cover_radius) else float(cover_radius*area)
+                if pooled_cover:
+                    # Cancel each slice's separate area denominator, then match
+                    # the parent's total Cover logit-gradient L1 in this batch.
+                    area_array = np.asarray(areas, dtype=np.float64)
+                    pooled_mass = np.dot(area_array, slice_cover_mass)
+                    if pooled_mass > 0:
+                        scales = area_array * (slice_cover_mass.sum() / pooled_mass)
+                        wp *= scales[:, None, None]
+                        fn_weight_sum = float(wp.sum(dtype=np.float64))
                 wg=torch.from_numpy(wg).to(z.device);wp=torch.from_numpy(wp).to(z.device)
             cover=[];spill=[]
             spill_selected = 0
