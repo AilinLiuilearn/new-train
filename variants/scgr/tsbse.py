@@ -9,11 +9,14 @@ from torch.nn import functional as F
 
 
 class TSBSE(nn.Module):
-    def __init__(self,coverage_scale='global'):
+    def __init__(self,coverage_scale='global',coverage_reference='predicted_foreground'):
         super().__init__()
         if coverage_scale not in ('global','gt_local_thickness'):
             raise ValueError('Unknown coverage scale')
         self.coverage_scale=coverage_scale
+        if coverage_reference not in ('predicted_foreground', 'true_positive'):
+            raise ValueError('Unknown coverage reference')
+        self.coverage_reference = coverage_reference
 
     def forward(self, logits, target):
         if logits.shape != target.shape or logits.ndim != 4 or logits.shape[1] != 1:
@@ -24,7 +27,9 @@ class TSBSE(nn.Module):
             # Only weights and foreground-set construction are detached.
             with torch.no_grad():
                 gt=y[:,0].cpu().numpy()
-                pred=(z.detach()[:,0]>=0).cpu().numpy()
+                use_true_positives = self.coverage_reference == 'true_positive'
+                detached_logits = z.detach()[:, 0]
+                pred = (detached_logits > 0 if use_true_positives else detached_logits >= 0).cpu().numpy()
                 wg=np.zeros(gt.shape,dtype=np.float32);wp=np.zeros_like(wg)
                 areas=[];ks=[];radii=[];fn_count=0;fn_weight_sum=0.;cover_scale_sum=0.;gt_count=0
                 for i,(g,p) in enumerate(zip(gt,pred)):
@@ -33,7 +38,11 @@ class TSBSE(nn.Module):
                     r=max(1.,math.sqrt(area/math.pi));radii.append(r)
                     if not area:continue
                     dg=distance_transform_edt(~g)
-                    dp=distance_transform_edt(~p) if p.any() else np.full(g.shape,math.hypot(*g.shape))
+                    reference = g & p if use_true_positives else p
+                    if reference.any():
+                        dp = distance_transform_edt(~reference)
+                    else:
+                        dp = np.full(g.shape, math.hypot(*g.shape))
                     cover_radius=r
                     if self.coverage_scale=='gt_local_thickness':
                         inside=distance_transform_edt(np.pad(g,1))[1:-1,1:-1]
