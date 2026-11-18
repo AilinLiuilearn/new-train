@@ -9,7 +9,8 @@ from torch.nn import functional as F
 
 
 class TSBSE(nn.Module):
-    def __init__(self,coverage_scale='global',coverage_reference='predicted_foreground'):
+    def __init__(self,coverage_scale='global',coverage_reference='predicted_foreground',
+                 spill_candidates='background'):
         super().__init__()
         if coverage_scale not in ('global','gt_local_thickness'):
             raise ValueError('Unknown coverage scale')
@@ -17,6 +18,9 @@ class TSBSE(nn.Module):
         if coverage_reference not in ('predicted_foreground', 'true_positive'):
             raise ValueError('Unknown coverage reference')
         self.coverage_reference = coverage_reference
+        if spill_candidates not in ('background', 'false_positive'):
+            raise ValueError('Unknown spill candidate set')
+        self.spill_candidates = spill_candidates
 
     def forward(self, logits, target):
         if logits.shape != target.shape or logits.ndim != 4 or logits.shape[1] != 1:
@@ -53,6 +57,7 @@ class TSBSE(nn.Module):
                     cover_scale_sum+=float(np.asarray(cover_radius)[g].sum()) if np.ndim(cover_radius) else float(cover_radius*area)
                 wg=torch.from_numpy(wg).to(z.device);wp=torch.from_numpy(wp).to(z.device)
             cover=[];spill=[]
+            spill_selected = 0
             for i,(area,k) in enumerate(zip(areas,ks)):
                 zero=z[i].sum()*0.
                 if not area:
@@ -60,14 +65,23 @@ class TSBSE(nn.Module):
                 mask=y[i,0]
                 cover.append((wp[i][mask]*F.softplus(-z[i,0][mask])).mean())
                 if k:
-                    risks=wg[i][~mask]*F.softplus(z[i,0][~mask])
-                    spill.append(torch.topk(risks,k,sorted=False).values.mean())
-                else:spill.append(zero)
+                    spill_mask = ~mask
+                    if self.spill_candidates == 'false_positive':
+                        spill_mask = spill_mask & (z[i, 0].detach() > 0)
+                    spill_logits = z[i, 0][spill_mask]
+                    k = min(k, spill_logits.numel())
+                    if k:
+                        risks = wg[i][spill_mask] * F.softplus(spill_logits)
+                        spill.append(torch.topk(risks, k, sorted=False).values.mean())
+                        spill_selected += k
+                        continue
+                spill.append(zero)
             c=torch.stack(cover).mean();s=torch.stack(spill).mean()
             loss=.5*(c+s)
             stats={'cover':float(c.detach()),'spill':float(s.detach()),
                 'valid':sum(a>0 for a in areas),'empty':sum(a==0 for a in areas),
                 'k_mean':float(np.mean(ks)),'area_min':min(areas),'area_mean':float(np.mean(areas)),
+                'spill_selected_mean':spill_selected / len(areas),
                 'radius_mean':float(np.mean(radii)),
                 'cover_local_scale':float(self.coverage_scale=='gt_local_thickness'),
                 'cover_FN_count':fn_count,'cover_FN_weight_sum':fn_weight_sum,
