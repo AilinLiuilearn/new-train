@@ -1,6 +1,9 @@
 import json
 import torch
 from runtime import REPO
+from models.components.backbones import create_feature_backbone, load_local_weights_safe
+from models.components.channel_align import StageChannelAlign
+from models.staged_petct import CHANNELS
 from variants.tsbci.model import SHCIPETCT
 from .module import MultiScaleRefiner
 
@@ -10,7 +13,24 @@ class Model(SHCIPETCT):
         if arm!='full' or cfg['recipe'] not in ('V','T','S'):raise ValueError('Unknown SCGR recipe')
         if cfg['text_enabled']!=(cfg['recipe']!='V') or cfg['score_enabled']!=(cfg['recipe']=='S'):
             raise ValueError('Recipe flags mismatch')
-        super().__init__(cfg,arm='m1',load_generic=load_generic)
+        defaults = {'ct': 'convnextv2_nano', 'pet': 'mit_b1'}
+        replacements = {branch: cfg[f'{branch}_backbone'] for branch, default in defaults.items()
+                        if cfg.get(f'{branch}_backbone', default) != default}
+        initial_cfg = dict(cfg)
+        for branch in replacements:
+            initial_cfg[f'{branch}_pretrained_path'] = None
+        super().__init__(initial_cfg,arm='m1',load_generic=load_generic)
+        for branch, backbone in replacements.items():
+            # Isolate encoder construction so identical task modules retain the
+            # historical initialization and the training RNG position.
+            with torch.random.fork_rng(devices=[]):
+                encoder = create_feature_backbone(backbone, in_channels=3)
+                aligner = StageChannelAlign(encoder.feature_info.channels(), CHANNELS)
+                if load_generic:
+                    load_local_weights_safe(encoder, cfg[f'{branch}_pretrained_path'],
+                                            name=f'{branch.upper()}_Encoder')
+            setattr(self, f'enc_{branch}', encoder)
+            setattr(self, f'{branch}_align', aligner)
         self.arm='full';self.cfg=dict(cfg)
         if text_anchor is None:
             data=json.loads((REPO/'resources/scgr_text.json').read_text())

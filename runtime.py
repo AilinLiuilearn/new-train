@@ -54,9 +54,14 @@ def local_paths(path):
 def resolve_config(args, variant):
     locations = local_paths(args.paths)
     cfg = json.loads(Path(args.config).read_text())
+    encoder_directories = {'convnextv2_nano': 'convnextv2_nano', 'mit_b1': 'mit-b1'}
+    ct_backbone = cfg.get('ct_backbone', 'convnextv2_nano')
+    pet_backbone = cfg.get('pet_backbone', 'mit_b1')
+    if ct_backbone not in encoder_directories or pet_backbone not in encoder_directories:
+        raise ValueError('Unsupported CT or PET backbone')
     cfg.update(root=locations['data_root'],
-               ct_pretrained_path=str(Path(locations['pretrained_root']) / 'convnextv2_nano'),
-               pet_pretrained_path=str(Path(locations['pretrained_root']) / 'mit-b1'),
+               ct_pretrained_path=str(Path(locations['pretrained_root']) / encoder_directories[ct_backbone]),
+               pet_pretrained_path=str(Path(locations['pretrained_root']) / encoder_directories[pet_backbone]),
                train_split_file=str(REPO / 'splits/train.txt'),
                val_split_file=str(REPO / 'splits/dev.txt'),
                test_split_file=str(REPO / 'splits/dev.txt'),
