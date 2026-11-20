@@ -8,7 +8,12 @@ from variants.tsbci.model import SHCIPETCT
 from .module import MultiScaleRefiner
 
 
-ABLATIONS = ('no_tccm', 'no_lcsg', 'learnable_vector', 'mismatched_text')
+FIXED_TEXT_ANCHORS = {
+    None: ('scgr_text.json', 'Pulmonary tumor lesion.'),
+    'mismatched_text': ('scgr_mismatched_text.json', 'Benign hepatic cyst.'),
+    'synonym_text': ('scgr_synonym_text.json', 'Lung tumor lesion.'),
+}
+ABLATIONS = ('no_tccm', 'no_lcsg', 'learnable_vector', 'mismatched_text', 'synonym_text')
 
 
 class Model(SHCIPETCT):
@@ -43,9 +48,7 @@ class Model(SHCIPETCT):
                 generator=torch.Generator().manual_seed(2803)
                 text_anchor=torch.nn.functional.normalize(torch.randn(512,generator=generator),dim=0)
             else:
-                wrong=ablation=='mismatched_text'
-                cache='scgr_mismatched_text.json' if wrong else 'scgr_text.json'
-                prompt='Benign hepatic cyst.' if wrong else 'Pulmonary tumor lesion.'
+                cache,prompt=FIXED_TEXT_ANCHORS.get(ablation,FIXED_TEXT_ANCHORS[None])
                 data=json.loads((REPO/'resources'/cache).read_text())
                 if data['prompts']!={'fusion':prompt}:raise ValueError('Text prompt mismatch')
                 text_anchor=data['embeddings'][0]

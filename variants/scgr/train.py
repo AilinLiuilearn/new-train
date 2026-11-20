@@ -4,7 +4,7 @@ import traceback
 from runtime import REPO,parser,local_paths
 from variants.tsbci import train as engine
 from utils.run_common import module_grad_norm
-from .model import Model
+from .model import FIXED_TEXT_ANCHORS, Model
 from .losses import objective
 from .metrics import ErrorMetrics
 
@@ -76,9 +76,9 @@ if __name__=='__main__':
         MLRF_ABLATION=cfg.get('mlrf_ablation')
         if MLRF_ABLATION and (ABLATION or RECIPE!='T'):
             raise ValueError('MLRF ablations require the complete text recipe T')
-        anchor_resource='scgr_mismatched_text.json' if ABLATION=='mismatched_text' else 'scgr_text.json'
-        anchor_text={'mismatched_text':'Benign hepatic cyst.', 'learnable_vector':None}.get(
-            ABLATION,'Pulmonary tumor lesion.')
+        anchor_resource,anchor_text=FIXED_TEXT_ANCHORS.get(ABLATION,FIXED_TEXT_ANCHORS[None])
+        if ABLATION=='learnable_vector':
+            anchor_text=None
         REFERENCE=Path(local_paths(args.paths)['output_root'])/cfg['comparison_m1_run']/'RESULTS.json'
         engine.main(args,variant='scgr_'+RECIPE,model_factory=Model,results_fn=results,
             diagnostics_fn=diagnostics,model_objective_fn=objective,extra_metrics_factory=ErrorMetrics,

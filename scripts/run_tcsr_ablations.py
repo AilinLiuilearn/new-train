@@ -17,6 +17,10 @@ DESIGNS = {
     'learnable_vector': ('T', 'Replace the frozen text embedding with one shared normalized learnable 512D vector.'),
     'mismatched_text': ('T', 'Replace the prompt with Benign hepatic cyst. using the same frozen encoder.'),
 }
+OPTIONAL_DESIGNS = {
+    'synonym_text': ('T', 'Replace Pulmonary with Lung in the fixed BioMedCLIP task prompt.'),
+}
+ALL_DESIGNS = {**DESIGNS, **OPTIONAL_DESIGNS}
 
 
 def reference_rows(output_root):
@@ -46,7 +50,7 @@ def run(args, output_root, root):
     configs = {r: load(REPO / 'configs' / f'scgr_{r}.json') for r in ('T', 'V')}
     write(root / 'PLAN.json', {
         'source': source, 'start_after': str(dependency), 'groups': plan,
-        'controls': {k: DESIGNS[k][1] for k in plan}, 'reference': reference,
+        'controls': {k: ALL_DESIGNS[k][1] for k in plan}, 'reference': reference,
         'fixed': configs['T'], 'device': args.gpu, 'postprocessing': False,
         'selection': 'Best direct-output development Dice and same-epoch HD95.',
         'scope': 'Single-seed within-module comparison. Fixed prompt differences do not establish semantic alignment.',
@@ -70,7 +74,7 @@ def run(args, output_root, root):
         (root / 'COMPARISON.md').write_text('\n'.join(lines) + '\n')
 
     summarize()
-    publish('waiting_for_encoder_experiments', pending=plan)
+    publish('waiting_for_prior_experiments', dependency=str(dependency), pending=plan)
     while True:
         if (root / 'STOP').exists():
             publish('stopped_by_request', pending=plan)
@@ -79,11 +83,12 @@ def run(args, output_root, root):
         if status_file.is_file():
             previous = load(status_file)
             if previous['state'] == 'complete':
-                if set(previous['completed']) != {'mit_b1', 'convnextv2_nano'}:
-                    raise RuntimeError('Expected both encoder experiments to finish')
+                if set(previous['completed']) != set(args.after_completed):
+                    raise RuntimeError(f'Expected the dependency to finish {args.after_completed}')
                 break
-            if previous['state'] in ('needs_analysis', 'stopped_by_request'):
-                publish('waiting_for_encoder_resolution', pending=plan, upstream=previous)
+            if previous['state'] in ('needs_analysis', 'stopped_by_request',
+                                         'waiting_for_dependency_resolution'):
+                publish('waiting_for_dependency_resolution', pending=plan, upstream=previous)
                 return
         time.sleep(15)
 
@@ -93,7 +98,7 @@ def run(args, output_root, root):
             return
         if git_identity() != source:
             raise RuntimeError('Ablation source changed after launch')
-        recipe, description = DESIGNS[group]
+        recipe, description = ALL_DESIGNS[group]
         cfg = dict(configs[recipe])
         if group != 'V_repeat':
             cfg.update(tcsr_ablation=group, text_description=description)
@@ -145,5 +150,6 @@ if __name__ == '__main__':
     p.add_argument('--campaign', required=True)
     p.add_argument('--gpu', default='0')
     p.add_argument('--after', type=Path, default=Path('scgr_homogeneous_20261120'))
-    p.add_argument('--only', choices=DESIGNS)
+    p.add_argument('--after-completed', nargs='+', default=['mit_b1', 'convnextv2_nano'])
+    p.add_argument('--only', choices=ALL_DESIGNS)
     main(p.parse_args())
