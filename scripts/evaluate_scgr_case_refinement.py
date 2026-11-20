@@ -104,7 +104,9 @@ def predict(root, ids, checkpoint):
             if step == 1 or step % 100 == 0 or end == len(ids):
                 print(f'PREDICT {end}/{len(ids)}', flush=True)
     assert offset == len(ids)
-    return packed, logits, {key: model.cfg.get(key) for key in ('ct_backbone', 'pet_backbone')}
+    encoders = {'ct_backbone': model.cfg.get('ct_backbone', 'convnextv2_nano'),
+                'pet_backbone': model.cfg.get('pet_backbone', 'mit_b1')}
+    return packed, logits, encoders, model.cfg.get('mlrf_ablation')
 
 
 def summarize(values):
@@ -130,7 +132,7 @@ def main(args):
         patients[identity.split('_')[0]].append(identity)
     with gpu_lock_path().open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        packed, logits, encoders = predict(root, ids, args.checkpoint)
+        packed, logits, encoders, mlrf_ablation = predict(root, ids, args.checkpoint)
     rows = []
     with ThreadPoolExecutor(max_workers=8) as pool:
         jobs = [pool.submit(score_case, case, root, packed, logits, index)
@@ -141,7 +143,8 @@ def main(args):
     baseline, refined = (summarize([r[k] for r in rows]) for k in (1, 2))
     report = {
         'checkpoint_sha256': sha(args.checkpoint), 'development_split_sha256': sha(split),
-        'encoders': encoders, 'patients': len(patients), 'slices': len(rows),
+        'encoders': encoders, 'mlrf_ablation': mlrf_ablation,
+        'patients': len(patients), 'slices': len(rows),
         'without_case_refinement': baseline, 'with_case_refinement': refined,
         'delta_dice_pp': refined['dice_percent'] - baseline['dice_percent'],
         'delta_hd95': refined['hd95'] - baseline['hd95'],

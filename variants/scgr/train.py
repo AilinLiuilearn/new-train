@@ -11,6 +11,7 @@ from .metrics import ErrorMetrics
 RECIPE=None
 REFERENCE=None
 ABLATION=None
+MLRF_ABLATION=None
 
 
 def diagnostics(model,output,epoch,step,update):
@@ -38,7 +39,7 @@ def results(rows,complete=False):
         'historical_diagnostic_reference':{'dice':.7836444556934279,'hd95':17.48659619401712,
             'scope':'Historical patience5 reference, not the matched current-protocol main comparison'},
         'target_788_hd17_met':m['dice']>=.788 and m['hd95']<17,
-        'tcsr_ablation':ABLATION,
+        'tcsr_ablation':ABLATION,'mlrf_ablation':MLRF_ABLATION,
         'scope':'Exploratory single-seed reused development set',
         'selection':'Best full fusion Dice; HD95 and diagnostics from that same epoch','next_experiments':[]}
     if REFERENCE and REFERENCE.exists():
@@ -46,7 +47,7 @@ def results(rows,complete=False):
         result['delta_M1_dice_pp']=100*(m['dice']-ref['metrics']['dice'])
         result['delta_M1_hd95']=m['hd95']-ref['metrics']['hd95']
     engine.dump('RESULTS.json',result)
-    lines=['# SCGR '+str(ABLATION or RECIPE),'','|Epoch|Weights|Fusion Dice %|Paired HD95|Sensitivity %|Precision %|',
+    lines=['# SCGR '+str(ABLATION or MLRF_ABLATION or RECIPE),'','|Epoch|Weights|Fusion Dice %|Paired HD95|Sensitivity %|Precision %|',
            '|---|---|---:|---:|---:|---:|']
     for r in rows:
         v=r['validation']['full'];lines.append(f"|{r['epoch']}|{r['weights']}|{100*v['dice']:.4f}|{v['hd95']:.4f}|{100*v['sensitivity']:.4f}|{100*v['precision']:.4f}|")
@@ -54,6 +55,9 @@ def results(rows,complete=False):
     if ABLATION:
         lines+=['Only the stated TCSR factor changes. One direct segmentation validation per epoch.',
                 'No case-level postprocessing or auxiliary loss.']
+    elif MLRF_ABLATION:
+        lines+=['Only the stated MLRF factor changes. Text-conditioned TCSR remains trainable.',
+                'One direct segmentation validation per epoch; case refinement is evaluated separately.']
     else:
         lines+=['V: no text/no score loss. T: text input only. S: T plus direct native-grid score BCE weight0.1.',
                 'V/T scores learn via segmentation, not direct GT; shared head is not automatic calibration.']
@@ -69,6 +73,9 @@ if __name__=='__main__':
         cfg=json.loads(Path(args.config).read_text())
         if cfg['recipe']!=RECIPE:raise ValueError('Recipe/config mismatch')
         ABLATION=cfg.get('tcsr_ablation')
+        MLRF_ABLATION=cfg.get('mlrf_ablation')
+        if MLRF_ABLATION and (ABLATION or RECIPE!='T'):
+            raise ValueError('MLRF ablations require the complete text recipe T')
         anchor_resource='scgr_mismatched_text.json' if ABLATION=='mismatched_text' else 'scgr_text.json'
         anchor_text={'mismatched_text':'Benign hepatic cyst.', 'learnable_vector':None}.get(
             ABLATION,'Pulmonary tumor lesion.')
@@ -77,7 +84,7 @@ if __name__=='__main__':
             diagnostics_fn=diagnostics,model_objective_fn=objective,extra_metrics_factory=ErrorMetrics,
             protocol_extra={'loss':'Original BCE+Dice. Only S adds mean of eight native-grid support BCE terms weight0.1.',
                 'recipe':RECIPE,'support':'Shared within-scale foreground head; native area-GT targets only in S; no correctness pseudo-labels.',
-                'tcsr_ablation':ABLATION,
+                'tcsr_ablation':ABLATION,'mlrf_ablation':MLRF_ABLATION,
                 'fixed_text':anchor_text if cfg['text_enabled'] and ABLATION!='no_tccm' else None,
                 'fixed_text_cache_sha256':engine.sha(REPO/'resources'/anchor_resource)
                     if anchor_text and cfg['text_enabled'] and ABLATION!='no_tccm' else None,
