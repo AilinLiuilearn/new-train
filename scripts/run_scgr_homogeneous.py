@@ -1,4 +1,4 @@
-"""Train homogeneous CT/PET alternatives to SCGR T and score the complete model."""
+"""Compare CT/PET encoder configurations in the complete SCGR T model."""
 import argparse
 import fcntl
 import json
@@ -13,6 +13,16 @@ from runtime import REPO, git_identity, local_paths, require_myenv, sha
 
 
 BACKBONES = ('mit_b1', 'convnextv2_nano')
+ENCODER_PAIRS = {
+    'mit_b1': ('mit_b1', 'mit_b1'),
+    'convnextv2_nano': ('convnextv2_nano', 'convnextv2_nano'),
+    'swapped': ('mit_b1', 'convnextv2_nano'),
+}
+DISPLAY_NAMES = {
+    'mit_b1': 'MiT-B1 CT + MiT-B1 PET',
+    'convnextv2_nano': 'ConvNeXtV2-Nano CT + ConvNeXtV2-Nano PET',
+    'swapped': 'MiT-B1 CT + ConvNeXtV2-Nano PET',
+}
 HETEROGENEOUS_REFERENCE = {
     'encoders': {'ct_backbone': 'convnextv2_nano', 'pet_backbone': 'mit_b1'},
     'development_split_sha256': '87888bee32380d3806ff8e65eac8da268b272994d2550b50fe6570a07c43171e',
@@ -54,18 +64,47 @@ def campaign(args, root):
     split = sha(REPO / 'splits/dev.txt')
     if split != HETEROGENEOUS_REFERENCE['development_split_sha256']:
         raise ValueError('Development split differs from the reference')
+    prior = {}
+    if args.prior_comparison:
+        prior_result = load(args.prior_comparison)
+        for group in BACKBONES:
+            previous = prior_result['homogeneous'][group]
+            metrics = previous['case_metrics']
+            if (metrics['development_split_sha256'] != split or
+                    any(metrics['encoders'][key] != group for key in ('ct_backbone', 'pet_backbone'))):
+                raise ValueError(f'Incompatible prior comparison for {group}')
+            prior[group] = previous
     write(root / 'PLAN.json', {
         'git': source, 'groups': groups, 'training': base, 'gpu': args.gpu,
         'control': HETEROGENEOUS_REFERENCE, 'pid': os.getpid(),
+        'encoder_pairs_ct_pet': {g: ENCODER_PAIRS[g] for g in groups},
+        'after': str(args.after) if args.after else None,
+        'prior_comparison': str(args.prior_comparison) if args.prior_comparison else None,
         'design': 'Independent pretrained encoders with common task initialization. Fixed T and case refinement.',
         'selection': 'Best single full-fusion development Dice selected during training. Run case refinement once per chosen checkpoint.',
-        'save': 'Two best-only runs; no snapshot of optimizer state and no large prediction caches.',
+        'save': 'Best-only checkpoints; no snapshot of optimizer state and no large prediction caches.',
     })
     records = {}
 
     def status(state, **details):
         write(root / 'STATUS.json', {'state': state, 'pid': os.getpid(),
                                      'updated': time.time(), 'completed': list(records), **details})
+
+    if args.after:
+        status('waiting_for_prior_experiments', pending=groups, dependency=str(args.after))
+        while True:
+            if (root / 'STOP').exists():
+                status('stopped_by_request', pending=groups)
+                return
+            if args.after.is_file():
+                dependency = load(args.after)
+                if dependency['state'] == 'complete':
+                    break
+                if dependency['state'] in ('stopped_by_request', 'needs_analysis',
+                                            'waiting_for_tcsr_resolution'):
+                    status('waiting_for_dependency_resolution', pending=groups, upstream=dependency)
+                    return
+            time.sleep(15)
 
     for position, name in enumerate(groups):
         pending = groups[position + 1:]
@@ -75,7 +114,9 @@ def campaign(args, root):
         if git_identity() != source:
             raise RuntimeError('Source changed after campaign launch')
         cfg = root / f'{name}.json'
-        write(cfg, {**base, 'ct_backbone': name, 'pet_backbone': name})
+        ct, pet = ENCODER_PAIRS[name]
+        encoders = {'ct_backbone': ct, 'pet_backbone': pet}
+        write(cfg, {**base, **encoders})
         output = root / name
         common = ['--paths', str(Path(args.paths).resolve()), '--output', str(output), '--gpu', args.gpu]
         cmd = [sys.executable, '-u', '-m', 'variants.scgr.train', '--recipe', 'T',
@@ -104,18 +145,23 @@ def campaign(args, root):
         if ret != 0:
             raise RuntimeError(f'{name}: case evaluation failed, see {root / (name + "_case.log")}')
         case_metrics = load(output / 'CASE_REFINEMENT.json')
-        if case_metrics['development_split_sha256'] != split or any(
-                case_metrics['encoders'][key] != name for key in ('ct_backbone', 'pet_backbone')):
+        if case_metrics['development_split_sha256'] != split or case_metrics['encoders'] != encoders:
             raise RuntimeError('Case result differs from the scheduled comparison')
         records[name] = {'case_metrics': case_metrics, 'best_epoch': result['best_epoch'],
                          'weights': result['weights'], 'selection_metrics': result['metrics']}
-        write(root / 'COMPARISON.json', {'reference': HETEROGENEOUS_REFERENCE, 'homogeneous': records,
-                                        'scope': 'Fixed seed and reused development split.'})
+        compared = {**prior, **records}
+        report = {'reference': HETEROGENEOUS_REFERENCE,
+                  'homogeneous': {key: row for key, row in compared.items() if key in BACKBONES},
+                  'scope': 'Fixed seed and reused development split.'}
+        if 'swapped' in compared:
+            report['swapped'] = compared['swapped']
+        write(root / 'COMPARISON.json', report)
         lines = ['# SCGR T encoder comparison', '',
                  '| Encoders | Best epoch | Raw Dice % | Raw HD95 | Full Dice % | Full HD95 | Zero overlap |',
                  '| --- | ---: | ---: | ---: | ---: | ---: | ---: |']
         candidates = [('ConvNeXtV2-Nano CT + MiT-B1 PET', 6, HETEROGENEOUS_REFERENCE)]
-        candidates.extend((key, row['best_epoch'], row['case_metrics']) for key, row in records.items())
+        candidates.extend((DISPLAY_NAMES[key], row['best_epoch'], row['case_metrics'])
+                          for key, row in compared.items())
         for label, epoch, entry in candidates:
             raw, full = (entry[k] for k in ('without_case_refinement', 'with_case_refinement'))
             lines.append(f"| {label} | {epoch} | {raw['dice_percent']:.4f} | {raw['hd95']:.4f} | "
@@ -145,5 +191,7 @@ if __name__ == '__main__':
     parser.add_argument('--paths', default=str(REPO / 'paths.local.json'))
     parser.add_argument('--campaign', required=True)
     parser.add_argument('--gpu', default='0')
-    parser.add_argument('--only', choices=BACKBONES)
+    parser.add_argument('--only', choices=ENCODER_PAIRS)
+    parser.add_argument('--after', type=Path, help='Wait for completion at this campaign STATUS.json')
+    parser.add_argument('--prior-comparison', type=Path, help='Optional comparison JSON for completed homogeneous runs')
     main(parser.parse_args())
