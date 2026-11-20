@@ -9,18 +9,21 @@ LABELS={'m1':'Original dual alignment + M1 + GN',
         'concat_single':'CT-only pre-alignment + raw PET + concat/compress + GN',
         'tsbci':'Original 50% TSBCI + M1 + GN'}
 ACTIVE=None
+ABLATION=None
 
 
 def results(rows,complete=False):
     if not rows:return
     best=max(rows,key=lambda r:r['validation']['full']['dice'])
     metrics=best['validation']['full']
-    engine.dump('RESULTS.json',{'complete':complete,'variant':ACTIVE,'label':LABELS[ACTIVE],
+    label=ABLATION or LABELS[ACTIVE]
+    engine.dump('RESULTS.json',{'complete':complete,'variant':ACTIVE,'label':label,
+                              'mlrf_ablation':ABLATION,
                               'best_epoch':best['epoch'],'weights':best['weights'],'metrics':metrics,
                               'selection':'maximum validation Dice; HD95 from that same checkpoint',
                               'patience':3,'scope':'Single seed exploratory reused development set',
                               'comparison_limit':'Concat removes PET pre-alignment as well as changing fusion; its difference from M1 is not an isolated M1 effect'})
-    lines=['# '+LABELS[ACTIVE],'','|Epoch|Weights|Dice %|Same-epoch HD95|','|---|---|---:|---:|']
+    lines=['# '+label,'','|Epoch|Weights|Dice %|Same-epoch HD95|','|---|---|---:|---:|']
     for row in rows:
         v=row['validation']['full'];lines.append(f"|{row['epoch']}|{row['weights']}|{100*v['dice']:.4f}|{v['hd95']:.4f}|")
     (engine.OUT/'RESULTS.md').write_text('\n'.join(lines)+'\n')
@@ -40,6 +43,8 @@ if __name__=='__main__':
     args.arm='m1' if ACTIVE=='m1' else 'full'
     try:
         cfg=json.loads(open(args.config).read())
+        ABLATION=cfg.get('mlrf_ablation')
+        if ABLATION and ACTIVE!='m1':raise ValueError('MLRF ablations require the standalone M1 recipe')
         if cfg['early_stopping_patience']!=3:raise ValueError('This rerun recipe requires patience=3')
         engine.main(args,variant=ACTIVE,
                     model_factory=ConcatSingle if ACTIVE=='concat_single' else None,

@@ -130,12 +130,18 @@ class RegionAttentionBlock(AttentionBlock):
 
 class LocalRegionResidualFusion(nn.Module):
     def __init__(self, channels, window_size=4, heads=4, ffn_ratio=2,
-                 use_gaussian=True, gaussian_pairs=None):
+                 use_gaussian=True, gaussian_pairs=None, *,
+                 use_local=True, use_regional=True, swap_roles=False):
         super().__init__()
         if window_size != 4 or channels < 16:
             raise ValueError('v1 retains CIPA width and fixed window_size=4; channels >=16')
         self.channels = channels
         self.use_gaussian = use_gaussian
+        self.use_local = use_local
+        self.use_regional = use_regional
+        self.swap_roles = swap_roles
+        if swap_roles and use_gaussian:
+            raise ValueError('Compare modality-role assignments with Gaussian contrast disabled')
         self.stem = CIPAConvStem(channels)
         # Keep names/state identical for the no-Gaussian controlled comparison.
         self.contrast = GaussianScaleContrast(channels, gaussian_pairs)
@@ -154,11 +160,16 @@ class LocalRegionResidualFusion(nn.Module):
             raise ValueError('CT/PET dtype and device must match')
         if C.shape[-2] % 4 or C.shape[-1] % 4:
             raise ValueError('v1 requires H and W divisible by window_size=4')
-        c, p, layout = self.stem(C, P)
-        h = self.contrast(c) if self.use_gaussian else torch.zeros_like(c)
-        z_ct = self.local_block(c, h, layout)
-        z_pet = self.region_block(p, layout)
-        return C + self.out_ct(z_ct), P + self.out_pet(z_pet)
+        local, regional = (P, C) if self.swap_roles else (C, P)
+        layout = (C.shape[0], *C.shape[-2:])
+        if self.use_local:
+            c = self.stem.inner_convs(local)
+            h = self.contrast(c) if self.use_gaussian else torch.zeros_like(c)
+            local = local + self.out_ct(self.local_block(c, h, layout))
+        if self.use_regional:
+            p = self.stem.outer_convs(regional)
+            regional = regional + self.out_pet(self.region_block(p, layout))
+        return (regional, local) if self.swap_roles else (local, regional)
 
     def forward(self, C, P):
         c, p = self.enhance(C, P)
@@ -167,12 +178,14 @@ class LocalRegionResidualFusion(nn.Module):
 
 class MultiScaleLocalRegionResidualFusion(nn.Module):
     def __init__(self, channels=(64, 128, 320, 512), window_size=4, heads=4,
-                 ffn_ratio=2, use_gaussian=True, gaussian_pairs=None):
+                 ffn_ratio=2, use_gaussian=True, gaussian_pairs=None, *,
+                 use_local=True, use_regional=True, swap_roles=False):
         super().__init__()
         if len(channels) != 4:
             raise ValueError('exactly four scales required')
         self.blocks = nn.ModuleList([LocalRegionResidualFusion(c, window_size, heads,
-            ffn_ratio, use_gaussian, gaussian_pairs) for c in channels])
+            ffn_ratio, use_gaussian, gaussian_pairs, use_local=use_local,
+            use_regional=use_regional, swap_roles=swap_roles) for c in channels])
 
     def forward(self, ct_feats, pet_feats):
         if len(ct_feats) != 4 or len(pet_feats) != 4:
