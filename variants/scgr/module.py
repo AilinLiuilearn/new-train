@@ -15,8 +15,10 @@ def projection(a,b,k=1):
 
 
 class ScaleRefiner(nn.Module):
-    def __init__(self,channels,context_channels,width=32):
+    def __init__(self,channels,context_channels,width=32,*,channel_enabled=True,spatial_enabled=True):
         super().__init__()
+        self.channel_enabled = channel_enabled
+        self.spatial_enabled = spatial_enabled
         self.local_dw=nn.Conv2d(channels,channels,3,padding=1,groups=channels)
         self.local=projection(2*channels,width)
         self.context=projection(context_channels,width)
@@ -35,13 +37,17 @@ class ScaleRefiner(nn.Module):
         ql_logit=self.support(local);qc_logit=self.support(context0)
         ql=ql_logit.float().sigmoid()
         qc=F.interpolate(qc_logit.float().sigmoid(),size=feature.shape[-2:],mode='bilinear',align_corners=False)
-        gate=self.accept(torch.cat([ql,qc],1).to(local.dtype)).sigmoid()
+        gate=(self.accept(torch.cat([ql,qc],1).to(local.dtype)).sigmoid()
+              if self.spatial_enabled else torch.full_like(ql,.5,dtype=local.dtype))
         value=self.value(torch.cat([local,context],1))
         # All recipes instantiate identical parameters. V uses zero text input,
         # T/S replace only that input with the same frozen normalized anchor.
-        text=anchor if text_enabled else torch.zeros_like(anchor)
-        e=self.text_projection(text).unsqueeze(0).expand(len(feature),-1)
-        channel=2*self.channel(torch.cat([value.mean((-2,-1)),e],1)).sigmoid()
+        if self.channel_enabled:
+            text=anchor if text_enabled else torch.zeros_like(anchor)
+            e=self.text_projection(text).unsqueeze(0).expand(len(feature),-1)
+            channel=2*self.channel(torch.cat([value.mean((-2,-1)),e],1)).sigmoid()
+        else:
+            channel=value.new_ones((value.shape[0],value.shape[1]))
         delta=self.exit(value*gate*channel[:,:,None,None])
         out={'feature':feature+delta,'local_logit':ql_logit,'context_logit':qc_logit}
         if capture:
@@ -51,22 +57,32 @@ class ScaleRefiner(nn.Module):
 
 
 class MultiScaleRefiner(nn.Module):
-    def __init__(self,anchor,text_enabled,width=32,pool_size=4):
+    def __init__(self,anchor,text_enabled,width=32,pool_size=4,*,
+                 trainable_anchor=False,channel_enabled=True,spatial_enabled=True):
         super().__init__()
         anchor=torch.as_tensor(anchor,dtype=torch.float32).reshape(512)
-        if not torch.isfinite(anchor).all() or abs(float(anchor.norm())-1)>1e-4:
-            raise ValueError('Expected a finite, normalized512 BioMedCLIP anchor')
-        self.register_buffer('text_anchor',anchor)
+        if not torch.isfinite(anchor).all() or not anchor.norm()>0:
+            raise ValueError('Expected a finite, nonzero 512-dimensional anchor')
+        if trainable_anchor:
+            self.text_anchor=nn.Parameter(anchor)
+        else:
+            if abs(float(anchor.norm())-1)>1e-4:
+                raise ValueError('Expected a unit-normalized frozen anchor')
+            self.register_buffer('text_anchor',anchor)
+        self.trainable_anchor=trainable_anchor
         self.text_enabled=bool(text_enabled);self.pool_size=int(pool_size)
         channels=[64,128,320,512]
-        self.blocks=nn.ModuleList([ScaleRefiner(c,channels[min(s+1,3)],width) for s,c in enumerate(channels)])
+        self.blocks=nn.ModuleList([ScaleRefiner(c,channels[min(s+1,3)],width,
+                                               channel_enabled=channel_enabled,spatial_enabled=spatial_enabled)
+                                   for s,c in enumerate(channels)])
 
     def forward(self,features,capture=False):
         if len(features)!=4:raise ValueError('Four M1 fusion scales required')
+        anchor=F.normalize(self.text_anchor,dim=0) if self.trainable_anchor else self.text_anchor
         refined=[];scores=[];details={}
         for s,block in enumerate(self.blocks):
             native=features[s+1] if s<3 else F.adaptive_avg_pool2d(features[3],(self.pool_size,self.pool_size))
-            out=block(features[s],native,self.text_anchor,self.text_enabled,capture)
+            out=block(features[s],native,anchor,self.text_enabled,capture)
             refined.append(out['feature']);scores.append((out['local_logit'],out['context_logit']))
             if capture:details[str(s+1)]=out['capture']
         return refined,scores,details

@@ -8,6 +8,9 @@ from variants.tsbci.model import SHCIPETCT
 from .module import MultiScaleRefiner
 
 
+ABLATIONS = ('no_tccm', 'no_lcsg', 'learnable_vector', 'mismatched_text')
+
+
 class Model(SHCIPETCT):
     def __init__(self,cfg,arm='full',load_generic=True,text_anchor=None):
         if arm!='full' or cfg['recipe'] not in ('V','T','S'):raise ValueError('Unknown SCGR recipe')
@@ -32,15 +35,28 @@ class Model(SHCIPETCT):
             setattr(self, f'enc_{branch}', encoder)
             setattr(self, f'{branch}_align', aligner)
         self.arm='full';self.cfg=dict(cfg)
+        ablation = cfg.get('tcsr_ablation')
+        if ablation is not None and (ablation not in ABLATIONS or cfg['recipe'] != 'T'):
+            raise ValueError('TCSR ablations require text recipe T')
         if text_anchor is None:
-            data=json.loads((REPO/'resources/scgr_text.json').read_text())
-            if data['prompts']!={'fusion':'Pulmonary tumor lesion.'}:raise ValueError('Text prompt mismatch')
-            text_anchor=data['embeddings'][0]
+            if ablation == 'learnable_vector':
+                generator=torch.Generator().manual_seed(2803)
+                text_anchor=torch.nn.functional.normalize(torch.randn(512,generator=generator),dim=0)
+            else:
+                wrong=ablation=='mismatched_text'
+                cache='scgr_mismatched_text.json' if wrong else 'scgr_text.json'
+                prompt='Benign hepatic cyst.' if wrong else 'Pulmonary tumor lesion.'
+                data=json.loads((REPO/'resources'/cache).read_text())
+                if data['prompts']!={'fusion':prompt}:raise ValueError('Text prompt mismatch')
+                text_anchor=data['embeddings'][0]
         with torch.random.fork_rng(devices=[]):
             # CPU construction must not reseed the CUDA stream used by the
             # original encoder's stochastic layers during common training.
             torch.random.default_generator.manual_seed(cfg['refiner_seed'])
-            self.refiner=MultiScaleRefiner(text_anchor,cfg['text_enabled'],cfg['refiner_width'],cfg['context_pool'])
+            self.refiner=MultiScaleRefiner(text_anchor,cfg['text_enabled'],cfg['refiner_width'],cfg['context_pool'],
+                                           trainable_anchor=ablation=='learnable_vector',
+                                           channel_enabled=ablation!='no_tccm',
+                                           spatial_enabled=ablation!='no_lcsg')
 
     def forward(self,ct,pet,capture=False):
         if ct.shape!=pet.shape:raise ValueError('Paired CT/PET grids required')
