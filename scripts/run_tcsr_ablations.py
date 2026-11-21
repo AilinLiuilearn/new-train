@@ -18,7 +18,7 @@ DESIGNS = {
     'mismatched_text': ('T', 'Replace the prompt with Benign hepatic cyst. using the same frozen encoder.'),
 }
 OPTIONAL_DESIGNS = {
-    'synonym_text': ('T', 'Replace Pulmonary with Lung in the fixed BioMedCLIP task prompt.'),
+    'synonym_text': ('T', 'Use the synonymous fixed task prompt Lung tumor. with the same frozen BioMedCLIP encoder.'),
 }
 ALL_DESIGNS = {**DESIGNS, **OPTIONAL_DESIGNS}
 

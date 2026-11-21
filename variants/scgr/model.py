@@ -11,7 +11,7 @@ from .module import MultiScaleRefiner
 FIXED_TEXT_ANCHORS = {
     None: ('scgr_text.json', 'Pulmonary tumor lesion.'),
     'mismatched_text': ('scgr_mismatched_text.json', 'Benign hepatic cyst.'),
-    'synonym_text': ('scgr_synonym_text.json', 'Lung tumor lesion.'),
+    'synonym_text': ('scgr_synonym_text.json', 'Lung tumor.'),
 }
 ABLATIONS = ('no_tccm', 'no_lcsg', 'learnable_vector', 'mismatched_text', 'synonym_text')
 
