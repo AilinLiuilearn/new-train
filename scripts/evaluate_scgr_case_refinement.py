@@ -122,11 +122,19 @@ def main(args):
     torch.set_num_threads(2)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    split = REPO / 'splits/dev.txt'
+    root = Path(local_paths(args.paths)['data_root'])
+    split = args.split or REPO / 'splits/dev.txt'
+    if args.split:
+        checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+        expected = checkpoint['manifest']['splits'].get('test')
+        if not expected or sha(split) != expected['sha256']:
+            raise ValueError('Evaluation list must match the held-out test recorded during training')
+        if root != Path(checkpoint['config']['root']).resolve():
+            raise ValueError('Evaluation root must match the trained dataset')
+        del checkpoint
     ids = split.read_text().split()
     index = {identity: i for i, identity in enumerate(ids)}
     assert len(index) == len(ids)
-    root = Path(local_paths(args.paths)['data_root'])
     patients = defaultdict(list)
     for identity in ids:
         patients[identity.split('_')[0]].append(identity)
@@ -142,13 +150,15 @@ def main(args):
     assert len(rows) == len(ids) and {r[0] for r in rows} == set(index)
     baseline, refined = (summarize([r[k] for r in rows]) for k in (1, 2))
     report = {
-        'checkpoint_sha256': sha(args.checkpoint), 'development_split_sha256': sha(split),
+        'checkpoint_sha256': sha(args.checkpoint),
+        ('test_split_sha256' if args.split else 'development_split_sha256'): sha(split),
         'encoders': encoders, 'mlrf_ablation': mlrf_ablation,
         'patients': len(patients), 'slices': len(rows),
         'without_case_refinement': baseline, 'with_case_refinement': refined,
         'delta_dice_pp': refined['dice_percent'] - baseline['dice_percent'],
         'delta_hd95': refined['hd95'] - baseline['hd95'],
-        'scope': 'Frozen Dice-selected checkpoint, reused development cohort, GT only scored.',
+        'scope': ('Frozen validation-selected checkpoint, held-out test cohort, GT only scored.'
+                  if args.split else 'Frozen Dice-selected checkpoint, reused development cohort, GT only scored.'),
     }
     args.output.mkdir(parents=True, exist_ok=True)
     with (args.output / 'CASE_SLICES.csv').open('w') as file:
@@ -165,6 +175,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--paths', default=str(REPO / 'paths.local.json'))
     parser.add_argument('--checkpoint', type=Path, required=True)
+    parser.add_argument('--split', type=Path, help='Held-out test manifest recorded during training')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--gpu', default='0')
     main(parser.parse_args())

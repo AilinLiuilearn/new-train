@@ -66,6 +66,10 @@ def resolve_config(args, variant):
                val_split_file=str(REPO / 'splits/dev.txt'),
                test_split_file=str(REPO / 'splits/dev.txt'),
                save_last_checkpoint=False, resume=None, device='cuda', arm=args.arm)
+    if split_directory := getattr(args, 'split_directory', None):
+        split_directory = Path(split_directory).expanduser().resolve()
+        cfg.update({f'{name}_split_file': str(split_directory / f'{name}.txt')
+                    for name in ('train', 'val', 'test')}, allow_val_equals_test=False)
     if cfg.get('initial_checkpoint') or cfg.get('stage1_checkpoint') or cfg.get('evaluate'):
         raise ValueError('Training must not load historical task checkpoints')
     if not re.fullmatch(r'[A-Za-z0-9_.-]+', args.run) or args.run in ('.', '..'):
@@ -75,13 +79,17 @@ def resolve_config(args, variant):
     return argparse.Namespace(**cfg), out, locations
 
 
-def verify_resources(locations):
+def verify_resources(locations, cfg=None):
     from datasets.pclt20k_seg import _read_list, _records_from_ids, _check_patient_disjoint
     records = {}
     splits = {}
-    for name, filename in [('train', 'train.txt'), ('val', 'dev.txt')]:
-        p = REPO / 'splits' / filename
+    external = cfg is not None
+    paths = ({name: Path(getattr(cfg, f'{name}_split_file')) for name in ('train', 'val', 'test')}
+             if external else {'train': REPO / 'splits/train.txt', 'val': REPO / 'splits/dev.txt'})
+    for name, p in paths.items():
         ids = _read_list(p)
+        if not ids or len(set(ids)) != len(ids):
+            raise ValueError(f'Missing, empty or duplicated split entries: {p}')
         recs = _records_from_ids(locations['data_root'], ids)
         for rec in recs:
             for key in ('ct_path', 'pet_path', 'mask_path'):
@@ -89,7 +97,8 @@ def verify_resources(locations):
                     raise FileNotFoundError(rec[key])
         records[name] = recs
         splits[name] = {'sha256': sha(p), 'slices': len(recs)}
-    _check_patient_disjoint(records['train'], records['val'], records['val'], allow_val_equals_test=True)
+    _check_patient_disjoint(records['train'], records['val'], records.get('test', records['val']),
+                            allow_val_equals_test=not external)
     weights = {}
     for name, entry in json.loads((REPO / 'resources/pretrained_manifest.json').read_text()).items():
         p = Path(locations['pretrained_root']) / entry['relative_file']
@@ -98,7 +107,8 @@ def verify_resources(locations):
         weights[name] = {'file': str(p), 'sha256': entry['sha256']}
     return {'generic_weights': weights, 'splits': splits,
             'text_json_sha256': sha(REPO / 'resources/biomedclip_roles.json'),
-            'scope': 'Reused development set; no independent test claim'}
+            'scope': ('Patient-disjoint held-out test, reserved for final evaluation'
+                      if external else 'Reused development set; no independent test claim')}
 
 
 def git_identity():
@@ -146,7 +156,10 @@ def prepare_run(args, variant):
     identity = git_identity()
     if identity['dirty'] and not args.allow_dirty:
         raise RuntimeError('Commit code before training, or explicitly pass --allow-dirty')
-    manifest = verify_resources(locations)
+    manifest = (verify_resources(locations, cfg) if getattr(args, 'split_directory', None)
+                else verify_resources(locations))
+    if text_cache := getattr(args, 'text_cache', None):
+        manifest['text_json_sha256'] = sha(text_cache)
     out.mkdir(parents=True, exist_ok=True)
     record = {'variant': variant, 'git': identity, 'environment': environment(),
               'config': vars(cfg), 'resources': manifest,
