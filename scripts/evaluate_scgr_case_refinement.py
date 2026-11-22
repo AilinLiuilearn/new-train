@@ -55,16 +55,21 @@ def measure(mask, target):
             cropped_hd95(mask, target), int(tp == 0), int(not mask.any()))
 
 
-def score_case(ids, root, packed, logits, index):
+def score_case(ids, root, packed, logits, index, allowed_edges=None):
     ids = sorted(ids, key=lambda name: int(name.rsplit('_', 1)[1]))
-    if any(int(b.rsplit('_', 1)[1]) - int(a.rsplit('_', 1)[1]) != 1
-           for a, b in zip(ids, ids[1:])):
+    consecutive = [int(b.rsplit('_', 1)[1]) - int(a.rsplit('_', 1)[1]) == 1
+                   for a, b in zip(ids, ids[1:])]
+    if allowed_edges is None and not all(consecutive):
         raise ValueError('Expected consecutive numbered slices per patient')
     take = [index[identity] for identity in ids]
     masks = np.unpackbits(packed[take], axis=-1).astype(bool)
     ct = [read_image(root, identity, 'CT') for identity in ids]
     pet = [read_image(root, identity, 'PET') for identity in ids]
-    output = refine_case(masks, logits[take], ct, valid_neighbors(ct, pet))
+    valid = valid_neighbors(ct, pet)
+    if allowed_edges is not None:
+        valid &= np.asarray([adjacent and (a, b) in allowed_edges
+                             for adjacent, a, b in zip(consecutive, ids, ids[1:])], dtype=bool)
+    output = refine_case(masks, logits[take], ct, valid)
     scores = []
     for identity, a, b in zip(ids, masks, output):
         gt = load_target(root, identity)
@@ -135,6 +140,16 @@ def main(args):
     ids = split.read_text().split()
     index = {identity: i for i, identity in enumerate(ids)}
     assert len(index) == len(ids)
+    allowed_edges = None
+    if args.adjacent_edges:
+        if not args.split:
+            raise ValueError('Explicit adjacency requires an external holdout split')
+        allowed_edges = set()
+        for line in args.adjacent_edges.read_text().splitlines():
+            a, b = line.split()
+            if a not in index or b not in index or a.split('_')[0] != b.split('_')[0]:
+                raise ValueError('Each adjacency pair must belong to one held-out case')
+            allowed_edges.add((a, b))
     patients = defaultdict(list)
     for identity in ids:
         patients[identity.split('_')[0]].append(identity)
@@ -143,7 +158,7 @@ def main(args):
         packed, logits, encoders, mlrf_ablation = predict(root, ids, args.checkpoint)
     rows = []
     with ThreadPoolExecutor(max_workers=8) as pool:
-        jobs = [pool.submit(score_case, case, root, packed, logits, index)
+        jobs = [pool.submit(score_case, case, root, packed, logits, index, allowed_edges)
                 for case in patients.values()]
         for job in jobs:
             rows.extend(job.result())
@@ -152,6 +167,7 @@ def main(args):
     report = {
         'checkpoint_sha256': sha(args.checkpoint),
         ('test_split_sha256' if args.split else 'development_split_sha256'): sha(split),
+        'adjacent_edges_sha256': sha(args.adjacent_edges) if args.adjacent_edges else None,
         'encoders': encoders, 'mlrf_ablation': mlrf_ablation,
         'patients': len(patients), 'slices': len(rows),
         'without_case_refinement': baseline, 'with_case_refinement': refined,
@@ -176,6 +192,7 @@ if __name__ == '__main__':
     parser.add_argument('--paths', default=str(REPO / 'paths.local.json'))
     parser.add_argument('--checkpoint', type=Path, required=True)
     parser.add_argument('--split', type=Path, help='Held-out test manifest recorded during training')
+    parser.add_argument('--adjacent-edges', type=Path, help='Physically verified holdout slice pairs')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--gpu', default='0')
     main(parser.parse_args())
