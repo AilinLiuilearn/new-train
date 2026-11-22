@@ -13,14 +13,14 @@ from .train import diagnostics
 def main():
     cli = parser('scgr_T')
     cli.set_defaults(config=str(REPO / 'configs' / 'scgr_T.json'))
-    cli.add_argument('--split-directory', type=Path, required=True)
-    cli.add_argument('--text-cache', type=Path, required=True)
+    cli.add_argument('--split-directory', required=True)
+    cli.add_argument('--text-cache', required=True)
     args = cli.parse_args()
     config = json.loads(Path(args.config).read_text())
     if (config.get('recipe') != 'T' or not config.get('text_enabled') or config.get('score_enabled')
             or config.get('tcsr_ablation') or config.get('mlrf_ablation') or args.arm != 'full'):
         raise ValueError('External evaluation uses complete MLRF + TCSR with BCE + Dice')
-    text = json.loads(args.text_cache.read_text())
+    text = json.loads(Path(args.text_cache).read_text())
     prompt = text['prompts']['fusion']
     vector, = text['embeddings']
     if not text['frozen'] or set(text['prompts']) != {'fusion'} or not prompt.strip():
