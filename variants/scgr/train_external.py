@@ -15,7 +15,12 @@ def main():
     cli.set_defaults(config=str(REPO / 'configs' / 'scgr_T.json'))
     cli.add_argument('--split-directory', required=True)
     cli.add_argument('--text-cache', required=True)
+    cli.add_argument('--reuse-val-as-test', action='store_true',
+                     help='Use the same patient-disjoint roster for selection and evaluation')
     args = cli.parse_args()
+    scope = ('Shared validation and test cohort used for checkpoint selection'
+             if args.reuse_val_as_test else
+             'Internal training-cohort validation; held-out test never used for selection')
     config = json.loads(Path(args.config).read_text())
     if (config.get('recipe') != 'T' or not config.get('text_enabled') or config.get('score_enabled')
             or config.get('tcsr_ablation') or config.get('mlrf_ablation') or args.arm != 'full'):
@@ -36,7 +41,8 @@ def main():
         engine.dump('RESULTS.json', {
             'complete': complete, 'best_epoch': best['epoch'], 'weights': best['weights'],
             'validation_metrics': best['validation']['full'],
-            'selection': 'Patient-disjoint internal validation Dice',
+            'selection': 'Patient-disjoint validation Dice',
+            'scope': scope,
         })
 
     try:
@@ -44,7 +50,7 @@ def main():
                     diagnostics_fn=diagnostics, protocol_extra={
                         'fixed_text': prompt,
                         'fixed_text_cache_sha256': sha(args.text_cache),
-                        'scope': 'Internal training-cohort validation; held-out test never used for selection',
+                        'scope': scope,
                     })
     except Exception as error:
         traceback.print_exc()

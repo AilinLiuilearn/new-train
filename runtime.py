@@ -68,8 +68,13 @@ def resolve_config(args, variant):
                save_last_checkpoint=False, resume=None, device='cuda', arm=args.arm)
     if split_directory := getattr(args, 'split_directory', None):
         split_directory = Path(split_directory).expanduser().resolve()
+        shared_eval = getattr(args, 'reuse_val_as_test', False)
         cfg.update({f'{name}_split_file': str(split_directory / f'{name}.txt')
-                    for name in ('train', 'val', 'test')}, allow_val_equals_test=False)
+                    for name in ('train', 'val', 'test')}, allow_val_equals_test=shared_eval)
+        if shared_eval:
+            if (split_directory / 'val.txt').read_bytes() != (split_directory / 'test.txt').read_bytes():
+                raise ValueError('Shared validation/test requires identical val.txt and test.txt')
+            cfg['test_split_file'] = cfg['val_split_file']
     if cfg.get('initial_checkpoint') or cfg.get('stage1_checkpoint') or cfg.get('evaluate'):
         raise ValueError('Training must not load historical task checkpoints')
     if not re.fullmatch(r'[A-Za-z0-9_.-]+', args.run) or args.run in ('.', '..'):
@@ -97,8 +102,9 @@ def verify_resources(locations, cfg=None):
                     raise FileNotFoundError(rec[key])
         records[name] = recs
         splits[name] = {'sha256': sha(p), 'slices': len(recs)}
+    shared_eval = not external or (cfg.allow_val_equals_test and cfg.val_split_file == cfg.test_split_file)
     _check_patient_disjoint(records['train'], records['val'], records.get('test', records['val']),
-                            allow_val_equals_test=not external)
+                            allow_val_equals_test=shared_eval)
     weights = {}
     for name, entry in json.loads((REPO / 'resources/pretrained_manifest.json').read_text()).items():
         p = Path(locations['pretrained_root']) / entry['relative_file']
@@ -107,8 +113,8 @@ def verify_resources(locations, cfg=None):
         weights[name] = {'file': str(p), 'sha256': entry['sha256']}
     return {'generic_weights': weights, 'splits': splits,
             'text_json_sha256': sha(REPO / 'resources/biomedclip_roles.json'),
-            'scope': ('Patient-disjoint held-out test, reserved for final evaluation'
-                      if external else 'Reused development set; no independent test claim')}
+            'scope': ('Reused development set; no independent test claim' if shared_eval
+                      else 'Patient-disjoint held-out test, reserved for final evaluation')}
 
 
 def git_identity():
