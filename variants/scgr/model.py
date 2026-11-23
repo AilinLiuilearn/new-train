@@ -1,6 +1,7 @@
 import json
 import torch
 from runtime import REPO
+from models.components.add_fusion import AddFusion
 from models.components.backbones import create_feature_backbone, load_local_weights_safe
 from models.components.channel_align import StageChannelAlign
 from models.staged_petct import CHANNELS
@@ -28,6 +29,9 @@ class Model(SHCIPETCT):
         for branch in replacements:
             initial_cfg[f'{branch}_pretrained_path'] = None
         super().__init__(initial_cfg,arm='m1',load_generic=load_generic)
+        if cfg.get('fusion_type') == 'add':
+            self.fusion = AddFusion()
+            self.fusion_type = 'add'
         for branch, backbone in replacements.items():
             # Isolate encoder construction so identical task modules retain the
             # historical initialization and the training RNG position.
